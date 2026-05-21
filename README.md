@@ -20,6 +20,27 @@ Implemented:
 - Keyboard navigation (`j`/`k`, arrow keys, Home/End, `g`/`G`) and quit (`q` / Esc / Ctrl-C)
 - Error screen on bad password / bad path, returning to the menu without restarting
 
+## Install (prebuilt binary)
+
+A convenience script downloads the latest release binary from GitHub and drops
+it at `/usr/local/bin/wrustic`. Supported targets: `linux-amd64`,
+`linux-arm64`, `macos-arm64`.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/andrewtheguy/wrustic/main/install.sh | bash
+```
+
+Or clone the repo and run `./install.sh` directly. Useful flags:
+
+- `./install.sh v0.0.1` — install a specific release tag
+- `./install.sh --prerelease` — grab the latest prerelease
+- `./install.sh --download-only` — drop the binary in the current directory
+  (no `sudo`, no `/usr/local/bin`)
+- `RELEASE_TAG=v0.0.1 ./install.sh` — same as passing the tag positionally
+
+The script verifies the SHA-256 of the downloaded binary against the digest
+GitHub publishes in the release metadata before installing.
+
 ## Build & run
 
 Requires a Rust toolchain (developed against rustc 1.93).
