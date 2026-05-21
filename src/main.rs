@@ -1093,12 +1093,7 @@ fn render_first_run_choice(frame: &mut Frame, app: &mut App) {
     let items: Vec<ListItem> = FIRST_RUN_MENU.iter().map(|s| ListItem::new(*s)).collect();
     let list = List::new(items)
         .block(Block::bordered().title("j/k to move, Enter to pick, Esc to quit"))
-        .highlight_style(
-            Style::new()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
+        .highlight_style(selection_highlight())
         .highlight_symbol(">> ");
     frame.render_stateful_widget(list, list_area, &mut app.first_run_state);
 }
@@ -1141,6 +1136,10 @@ enum MainOrManage {
     Manage,
 }
 
+fn selection_highlight() -> Style {
+    Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+}
+
 fn render_menu(frame: &mut Frame, app: &mut App, which: MainOrManage) {
     let (entries, state, title) = match which {
         MainOrManage::Main => (
@@ -1157,12 +1156,7 @@ fn render_menu(frame: &mut Frame, app: &mut App, which: MainOrManage) {
     let items: Vec<ListItem> = entries.iter().map(|s| ListItem::new(*s)).collect();
     let list = List::new(items)
         .block(Block::bordered().title(title))
-        .highlight_style(
-            Style::new()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
+        .highlight_style(selection_highlight())
         .highlight_symbol(">> ");
     frame.render_stateful_widget(list, frame.area(), state);
 }
@@ -1187,12 +1181,7 @@ fn render_profile_list(frame: &mut Frame, app: &mut App, title: &str) {
 
     let list = List::new(items)
         .block(Block::bordered().title(title))
-        .highlight_style(
-            Style::new()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
+        .highlight_style(selection_highlight())
         .highlight_symbol(">> ");
 
     frame.render_stateful_widget(list, frame.area(), &mut app.profile_list_state);
@@ -1209,12 +1198,7 @@ fn render_backend_choice(frame: &mut Frame, app: &mut App) {
             Block::bordered()
                 .title("Choose backend — j/k to move, Enter to pick, Esc back"),
         )
-        .highlight_style(
-            Style::new()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
+        .highlight_style(selection_highlight())
         .highlight_symbol(">> ");
 
     frame.render_stateful_widget(list, frame.area(), &mut app.backend_list);
@@ -1259,12 +1243,7 @@ fn render_snapshots(frame: &mut Frame, app: &mut App) {
 
     let list = List::new(items)
         .block(Block::bordered().title(title))
-        .highlight_style(
-            Style::new()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
+        .highlight_style(selection_highlight())
         .highlight_symbol(">> ");
 
     frame.render_stateful_widget(list, frame.area(), &mut app.list_state);
