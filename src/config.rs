@@ -117,19 +117,21 @@ pub fn paths() -> Result<Paths> {
 
 /// Generate a fresh X25519 identity and write it to `path` in the sops-style
 /// format (commented public key + recipient hint, then the secret key).
-/// File is created with mode 0600.
-pub fn generate_identity(path: &Path) -> Result<()> {
+/// File is created with mode 0600. Returns the bech32-encoded public key
+/// (`age1…`) so the caller can display it to the user.
+pub fn generate_identity(path: &Path) -> Result<String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     let identity = Identity::generate();
     let public = identity.to_public();
+    let public_str = public.to_string();
     let secret = identity.to_string();
 
     let body = format!(
         "# created by wrustic\n# public key: {}\n{}\n",
-        public,
+        public_str,
         secret.expose_secret()
     );
 
@@ -141,7 +143,14 @@ pub fn generate_identity(path: &Path) -> Result<()> {
         .with_context(|| format!("creating {}", path.display()))?;
     file.write_all(body.as_bytes())
         .with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
+    Ok(public_str)
+}
+
+/// Validate that `path` contains a parseable age identity. Returns the
+/// derived public key string on success.
+pub fn validate_identity(path: &Path) -> Result<String> {
+    let identity = parse_identity_from_file(path)?;
+    Ok(identity.to_public().to_string())
 }
 
 fn parse_identity_from_file(path: &Path) -> Result<Identity> {
@@ -237,8 +246,12 @@ mod tests {
         let dir = fresh_dir("rt");
         let paths = test_paths(&dir);
 
-        generate_identity(&paths.identity)?;
+        let pubkey = generate_identity(&paths.identity)?;
         assert!(paths.identity.exists());
+        assert!(pubkey.starts_with("age1"), "expected age1 recipient, got {pubkey}");
+
+        // round-trip: parsing back yields the same public key
+        assert_eq!(validate_identity(&paths.identity)?, pubkey);
 
         // empty load works before any save
         let empty = load(&paths)?;

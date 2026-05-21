@@ -19,9 +19,16 @@ use crate::config::{BackendKind, Config, Paths, Profile};
 const BACKEND_ORDER: [BackendKind; 3] = [BackendKind::Local, BackendKind::Rest, BackendKind::S3];
 const MAIN_MENU: [&str; 3] = ["Work with a repo", "Manage profiles", "Quit"];
 const MANAGE_MENU: [&str; 3] = ["Create new profile", "Delete a profile", "Back"];
+const FIRST_RUN_MENU: [&str; 3] = [
+    "Create a new age key",
+    "Restore an existing age key",
+    "Quit",
+];
 
 enum Screen {
-    FirstRunInfo,
+    FirstRunChoice,
+    RestoreKeyWait,
+    KeyCreated,
     MainMenu,
     SelectProfileForOpen,
     Snapshots,
@@ -56,6 +63,7 @@ struct App {
     paths: Paths,
     config: Config,
 
+    first_run_state: ListState,
     main_menu_state: ListState,
     manage_menu_state: ListState,
     backend_list: ListState,
@@ -76,6 +84,9 @@ struct App {
     loading_index: usize,
     pending_delete: Option<usize>,
 
+    restore_error: Option<String>,
+    created_pubkey: String,
+
     snapshots: Vec<SnapshotRow>,
     error_is_fatal: bool,
     quit: bool,
@@ -84,6 +95,8 @@ struct App {
 impl App {
     fn boot() -> Result<Self> {
         let paths = config::paths()?;
+        let mut first_run_state = ListState::default();
+        first_run_state.select(Some(0));
         let mut main_menu_state = ListState::default();
         main_menu_state.select(Some(0));
         let mut manage_menu_state = ListState::default();
@@ -96,6 +109,7 @@ impl App {
             screen: Screen::MainMenu,
             paths,
             config: Config::default(),
+            first_run_state,
             main_menu_state,
             manage_menu_state,
             backend_list,
@@ -113,25 +127,31 @@ impl App {
             password: String::new(),
             loading_index: 0,
             pending_delete: None,
+            restore_error: None,
+            created_pubkey: String::new(),
             snapshots: Vec::new(),
             error_is_fatal: false,
             quit: false,
         };
 
         if !identity_exists {
-            app.screen = Screen::FirstRunInfo;
+            app.screen = Screen::FirstRunChoice;
             return Ok(app);
         }
 
-        match config::load(&app.paths) {
+        app.load_config_or_set_fatal();
+        Ok(app)
+    }
+
+    fn load_config_or_set_fatal(&mut self) {
+        match config::load(&self.paths) {
             Ok(cfg) => {
-                app.config = cfg;
-                Ok(app)
+                self.config = cfg;
+                self.screen = Screen::MainMenu;
             }
             Err(e) => {
-                app.error_is_fatal = true;
-                app.screen = Screen::Error(format!("{e:#}"));
-                Ok(app)
+                self.error_is_fatal = true;
+                self.screen = Screen::Error(format!("{e:#}"));
             }
         }
     }
@@ -185,14 +205,64 @@ impl App {
         }
 
         match &self.screen {
-            Screen::FirstRunInfo => match key.code {
-                KeyCode::Enter => match config::generate_identity(&self.paths.identity) {
-                    Ok(()) => self.screen = Screen::MainMenu,
-                    Err(e) => {
-                        self.error_is_fatal = true;
-                        self.screen = Screen::Error(format!("{e:#}"));
+            Screen::FirstRunChoice => match key.code {
+                KeyCode::Down | KeyCode::Char('j') => self.first_run_state.select_next(),
+                KeyCode::Up | KeyCode::Char('k') => self.first_run_state.select_previous(),
+                KeyCode::Esc => self.quit = true,
+                KeyCode::Enter => match self.first_run_state.selected().unwrap_or(0) {
+                    0 => match config::generate_identity(&self.paths.identity) {
+                        Ok(pubkey) => {
+                            self.created_pubkey = pubkey;
+                            self.screen = Screen::KeyCreated;
+                        }
+                        Err(e) => {
+                            self.error_is_fatal = true;
+                            self.screen = Screen::Error(format!("{e:#}"));
+                        }
+                    },
+                    1 => {
+                        self.restore_error = None;
+                        self.screen = Screen::RestoreKeyWait;
                     }
+                    _ => self.quit = true,
                 },
+                _ => {}
+            },
+
+            Screen::RestoreKeyWait => match key.code {
+                KeyCode::Esc => {
+                    self.restore_error = None;
+                    self.screen = Screen::FirstRunChoice;
+                }
+                KeyCode::Enter => {
+                    if !self.paths.identity.exists() {
+                        self.restore_error = Some(format!(
+                            "No file found at {}. Place your age.key there, then press Enter.",
+                            self.paths.identity.display()
+                        ));
+                    } else {
+                        match config::validate_identity(&self.paths.identity) {
+                            Ok(_) => {
+                                self.restore_error = None;
+                                self.load_config_or_set_fatal();
+                            }
+                            Err(e) => {
+                                self.restore_error = Some(format!(
+                                    "Could not read identity at {}: {e:#}",
+                                    self.paths.identity.display()
+                                ));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            },
+
+            Screen::KeyCreated => match key.code {
+                KeyCode::Enter => {
+                    self.created_pubkey.clear();
+                    self.load_config_or_set_fatal();
+                }
                 KeyCode::Esc => self.quit = true,
                 _ => {}
             },
@@ -567,7 +637,9 @@ fn load_snapshots(profile: &Profile) -> Result<Vec<SnapshotRow>> {
 
 fn render(frame: &mut Frame, app: &mut App) {
     match &app.screen {
-        Screen::FirstRunInfo => render_first_run(frame, &app.paths),
+        Screen::FirstRunChoice => render_first_run_choice(frame, app),
+        Screen::RestoreKeyWait => render_restore_wait(frame, app),
+        Screen::KeyCreated => render_key_created(frame, app),
         Screen::MainMenu => render_menu(frame, app, MainOrManage::Main),
         Screen::SelectProfileForOpen => {
             render_profile_list(frame, app, "Select profile to open (Esc back)")
@@ -670,14 +742,64 @@ fn render(frame: &mut Frame, app: &mut App) {
     }
 }
 
-fn render_first_run(frame: &mut Frame, paths: &Paths) {
+fn render_first_run_choice(frame: &mut Frame, app: &mut App) {
+    let [intro_area, list_area] = Layout::vertical([
+        Constraint::Length(5),
+        Constraint::Fill(1),
+    ])
+    .areas(frame.area());
+
+    let intro = Paragraph::new(format!(
+        "No age identity found at {}.\n\nEither restore an existing key to that path, or create a new one. Without a key, wrustic cannot decrypt or save profiles.",
+        app.paths.identity.display()
+    ))
+    .wrap(Wrap { trim: false })
+    .block(Block::bordered().title("Welcome to wrustic"));
+    frame.render_widget(intro, intro_area);
+
+    let items: Vec<ListItem> = FIRST_RUN_MENU.iter().map(|s| ListItem::new(*s)).collect();
+    let list = List::new(items)
+        .block(Block::bordered().title("j/k to move, Enter to pick, Esc to quit"))
+        .highlight_style(
+            Style::new()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol(">> ");
+    frame.render_stateful_widget(list, list_area, &mut app.first_run_state);
+}
+
+fn render_restore_wait(frame: &mut Frame, app: &App) {
+    let mut body = format!(
+        "Place your existing age.key file at:\n\n    {}\n\nMake sure it is mode 0600 (only readable by you). Press Enter once it is in place, or Esc to go back.",
+        app.paths.identity.display()
+    );
+    if let Some(msg) = &app.restore_error {
+        body.push_str("\n\n");
+        body.push_str(msg);
+    }
+    let style = if app.restore_error.is_some() {
+        Style::new().fg(Color::Red)
+    } else {
+        Style::new()
+    };
+    let para = Paragraph::new(body)
+        .style(style)
+        .wrap(Wrap { trim: false })
+        .block(Block::bordered().title("Restore existing age key"));
+    frame.render_widget(para, frame.area());
+}
+
+fn render_key_created(frame: &mut Frame, app: &App) {
     let body = format!(
-        "No age identity found at {}.\n\nwrustic will generate one for you now. Back it up — losing it means losing access to all saved profiles.\n\nPress Enter to create it, or Esc to quit.",
-        paths.identity.display()
+        "A new age key was created.\n\nKey file (back this up now!):\n    {}\n\nPublic key (recipient):\n    {}\n\nIf you lose the key file, every saved profile becomes unrecoverable. Copy it to a safe place before adding profiles.\n\nPress Enter to continue.",
+        app.paths.identity.display(),
+        app.created_pubkey,
     );
     let para = Paragraph::new(body)
         .wrap(Wrap { trim: false })
-        .block(Block::bordered().title("Welcome to wrustic"));
+        .block(Block::bordered().title("New age key created"));
     frame.render_widget(para, frame.area());
 }
 

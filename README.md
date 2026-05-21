@@ -33,9 +33,12 @@ Requires a Rust toolchain (developed against rustc 1.93).
 cargo run
 ```
 
-First run: if `~/.config/wrustic/age.key` is missing, the welcome screen
-generates one for you. **Back it up** — losing the key file means losing access
-to every profile stored in `config.toml.age`.
+First run: if `~/.config/wrustic/age.key` is missing, the welcome screen asks
+whether to **create a new key** or **restore an existing one** (copy your
+backup to that path, then press Enter). When creating a new key, the next
+screen shows the key path and the public-key recipient (`age1…`) — **back up
+the key file now**, since losing it means losing access to every profile
+stored in `config.toml.age`.
 
 Then in the TUI:
 1. The main menu lists **Work with a repo**, **Manage profiles**, and **Quit**.
