@@ -1,10 +1,11 @@
 mod config;
+mod crypto;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use ratatui::{
     DefaultTerminal, Frame,
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -38,6 +39,8 @@ enum Screen {
     BackendChoice,
     LocalPath,
     RestUrl,
+    RestUser,
+    RestPassword,
     S3Endpoint,
     S3Bucket,
     S3Region,
@@ -75,6 +78,8 @@ struct App {
     backend_kind: BackendKind,
     local_path: String,
     rest_url: String,
+    rest_user: String,
+    rest_password: String,
     s3_endpoint: String,
     s3_bucket: String,
     s3_region: String,
@@ -120,6 +125,8 @@ impl App {
             backend_kind: BackendKind::Local,
             local_path: String::new(),
             rest_url: String::new(),
+            rest_user: String::new(),
+            rest_password: String::new(),
             s3_endpoint: String::new(),
             s3_bucket: String::new(),
             s3_region: String::new(),
@@ -161,6 +168,8 @@ impl App {
         self.new_profile_name.clear();
         self.local_path.clear();
         self.rest_url.clear();
+        self.rest_user.clear();
+        self.rest_password.clear();
         self.s3_endpoint.clear();
         self.s3_bucket.clear();
         self.s3_region.clear();
@@ -182,6 +191,8 @@ impl App {
                 name,
                 password,
                 rest_url: self.rest_url.clone(),
+                rest_user: self.rest_user.clone(),
+                rest_password: self.rest_password.clone(),
             },
             BackendKind::S3 => Profile::S3 {
                 name,
@@ -391,9 +402,26 @@ impl App {
             Screen::RestUrl => match text_input(&mut self.rest_url, key) {
                 TextAction::Submit if !self.rest_url.trim().is_empty() => {
                     self.rest_url = self.rest_url.trim().to_string();
-                    self.screen = Screen::Password;
+                    self.screen = Screen::RestUser;
                 }
                 TextAction::Cancel => self.screen = Screen::BackendChoice,
+                _ => {}
+            },
+
+            Screen::RestUser => match text_input(&mut self.rest_user, key) {
+                TextAction::Submit => {
+                    self.rest_user = self.rest_user.trim().to_string();
+                    self.screen = Screen::RestPassword;
+                }
+                TextAction::Cancel => self.screen = Screen::RestUrl,
+                _ => {}
+            },
+
+            Screen::RestPassword => match text_input(&mut self.rest_password, key) {
+                TextAction::Submit => {
+                    self.screen = Screen::Password;
+                }
+                TextAction::Cancel => self.screen = Screen::RestUser,
                 _ => {}
             },
 
@@ -461,7 +489,7 @@ impl App {
                     self.password.clear();
                     self.screen = match self.backend_kind {
                         BackendKind::Local => Screen::LocalPath,
-                        BackendKind::Rest => Screen::RestUrl,
+                        BackendKind::Rest => Screen::RestPassword,
                         BackendKind::S3 => Screen::S3SecretKey,
                     };
                 }
@@ -643,8 +671,26 @@ fn load_snapshots(profile: &Profile) -> Result<Vec<SnapshotRow>> {
         Profile::Local { local_path, .. } => {
             opts = opts.repository(local_path.clone());
         }
-        Profile::Rest { rest_url, .. } => {
-            opts = opts.repository(format!("rest:{rest_url}"));
+        Profile::Rest {
+            rest_url,
+            rest_user,
+            rest_password,
+            ..
+        } => {
+            let mut url = url::Url::parse(rest_url)
+                .with_context(|| format!("parsing REST URL `{rest_url}`"))?;
+            if rest_user.is_empty() && !rest_password.is_empty() {
+                bail!("REST profile has a password but no username");
+            }
+            if !rest_user.is_empty() {
+                url.set_username(rest_user)
+                    .map_err(|_| anyhow!("REST URL `{rest_url}` cannot carry a username"))?;
+            }
+            if !rest_password.is_empty() {
+                url.set_password(Some(rest_password))
+                    .map_err(|_| anyhow!("REST URL `{rest_url}` cannot carry a password"))?;
+            }
+            opts = opts.repository(format!("rest:{url}"));
         }
         Profile::S3 {
             s3_endpoint,
@@ -716,8 +762,23 @@ fn render(frame: &mut Frame, app: &mut App) {
             frame,
             "REST URL",
             &app.rest_url,
-            "e.g. http://localhost:8000/  or  https://user:pass@host/path/ (Esc back)",
+            "e.g. http://localhost:8000/ — credentials go on the next two screens (Esc back)",
         ),
+        Screen::RestUser => render_input(
+            frame,
+            "REST username (optional)",
+            &app.rest_user,
+            "Leave blank for anonymous REST server (Esc back)",
+        ),
+        Screen::RestPassword => {
+            let masked = "*".repeat(app.rest_password.chars().count());
+            render_input(
+                frame,
+                "REST password (optional)",
+                &masked,
+                "Leave blank if the REST server has no password (Esc back)",
+            );
+        }
         Screen::S3Endpoint => render_input(
             frame,
             "S3 endpoint (optional)",

@@ -5442,12 +5442,14 @@ version = "0.0.1"
 dependencies = [
  "age",
  "anyhow",
+ "base64 0.22.1",
  "dirs 5.0.1",
  "ratatui",
  "rustic_backend",
  "rustic_core",
  "serde",
  "toml 0.8.23",
+ "url",
 ]
 
 [[package]]

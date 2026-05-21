@@ -9,10 +9,12 @@ use age::x25519::{Identity, Recipient};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::crypto::{decrypt_value, encrypt_value, is_age_encrypted};
+
 const CONFIG_DIR_NAME: &str = "wrustic";
 const IDENTITY_FILE: &str = "age.key";
-const CONFIG_FILE: &str = "config.toml.age";
-const CONFIG_VERSION: u32 = 1;
+const CONFIG_FILE: &str = "config.toml";
+const CONFIG_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy)]
 pub enum BackendKind {
@@ -43,6 +45,10 @@ pub enum Profile {
         name: String,
         password: String,
         rest_url: String,
+        #[serde(default)]
+        rest_user: String,
+        #[serde(default)]
+        rest_password: String,
     },
     S3 {
         name: String,
@@ -83,6 +89,8 @@ impl Profile {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub recipient: String,
     pub version: u32,
     #[serde(default)]
     pub profiles: Vec<Profile>,
@@ -90,7 +98,11 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { version: CONFIG_VERSION, profiles: Vec::new() }
+        Self {
+            recipient: String::new(),
+            version: CONFIG_VERSION,
+            profiles: Vec::new(),
+        }
     }
 }
 
@@ -159,17 +171,20 @@ pub fn validate_identity(path: &Path) -> Result<String> {
 fn parse_identity_from_file(path: &Path) -> Result<Identity> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("reading {}", path.display()))?;
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        if trimmed.starts_with("AGE-SECRET-KEY-") {
-            return Identity::from_str(trimmed)
-                .map_err(|e| anyhow!("parsing age identity in {}: {e}", path.display()));
-        }
+    let secret_lines: Vec<&str> = contents
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("AGE-SECRET-KEY-"))
+        .collect();
+    match secret_lines.len() {
+        0 => bail!("no AGE-SECRET-KEY line found in {}", path.display()),
+        1 => Identity::from_str(secret_lines[0])
+            .map_err(|e| anyhow!("parsing age identity in {}: {e}", path.display())),
+        n => bail!(
+            "age.key at {} contains {n} identities, but wrustic requires exactly one",
+            path.display()
+        ),
     }
-    bail!("no AGE-SECRET-KEY line found in {}", path.display())
 }
 
 /// Load the config. If the config file does not exist, returns a default
@@ -181,14 +196,28 @@ pub fn load(paths: &Paths) -> Result<Config> {
         return Ok(Config::default());
     }
 
-    let ciphertext = fs::read(&paths.config)
+    let text = fs::read_to_string(&paths.config)
         .with_context(|| format!("reading {}", paths.config.display()))?;
-    let plaintext = age::decrypt(&identity, &ciphertext)
-        .map_err(|e| anyhow!("decrypting {}: {e}", paths.config.display()))?;
-    let text = String::from_utf8(plaintext)
-        .context("config file is not valid UTF-8 after decryption")?;
-    let config: Config = toml::from_str(&text)
+    let mut config: Config = toml::from_str(&text)
         .with_context(|| format!("parsing TOML from {}", paths.config.display()))?;
+
+    let derived = identity.to_public().to_string();
+    if config.recipient.is_empty() {
+        bail!(
+            "{} is missing the `recipient` field (expected `{derived}` matching the identity at {})",
+            paths.config.display(),
+            paths.identity.display()
+        );
+    }
+    if config.recipient != derived {
+        bail!(
+            "recipient mismatch: {} has recipient `{}` but the identity at {} derives `{derived}`",
+            paths.config.display(),
+            config.recipient,
+            paths.identity.display()
+        );
+    }
+
     if config.version != CONFIG_VERSION {
         bail!(
             "config at {} has version {} but this build of wrustic expects version {} \
@@ -197,6 +226,11 @@ pub fn load(paths: &Paths) -> Result<Config> {
             config.version,
             CONFIG_VERSION
         );
+    }
+
+    for profile in &mut config.profiles {
+        decrypt_profile_fields(profile, &identity)
+            .with_context(|| format!("decrypting profile `{}`", profile.name()))?;
     }
     Ok(config)
 }
@@ -207,16 +241,22 @@ pub fn save(config: &Config, paths: &Paths) -> Result<()> {
     let identity = parse_identity_from_file(&paths.identity)?;
     let recipient: Recipient = identity.to_public();
 
-    let text = toml::to_string_pretty(config).context("serializing config to TOML")?;
-    let armored = age::encrypt_and_armor(&recipient, text.as_bytes())
-        .map_err(|e| anyhow!("encrypting config: {e}"))?;
+    let mut on_disk = config.clone();
+    on_disk.recipient = recipient.to_string();
+    on_disk.version = CONFIG_VERSION;
+    for profile in &mut on_disk.profiles {
+        encrypt_profile_fields(profile, &recipient)
+            .with_context(|| format!("encrypting profile `{}`", profile.name()))?;
+    }
+
+    let text = toml::to_string_pretty(&on_disk).context("serializing config to TOML")?;
 
     if let Some(parent) = paths.config.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
 
-    let tmp = paths.config.with_extension("age.tmp");
+    let tmp = paths.config.with_extension("toml.tmp");
     {
         let mut file = fs::OpenOptions::new()
             .write(true)
@@ -225,12 +265,86 @@ pub fn save(config: &Config, paths: &Paths) -> Result<()> {
             .mode(0o600)
             .open(&tmp)
             .with_context(|| format!("creating {}", tmp.display()))?;
-        file.write_all(armored.as_bytes())
+        file.write_all(text.as_bytes())
             .with_context(|| format!("writing {}", tmp.display()))?;
         file.sync_all().ok();
     }
     fs::rename(&tmp, &paths.config)
         .with_context(|| format!("renaming {} -> {}", tmp.display(), paths.config.display()))?;
+    Ok(())
+}
+
+fn encrypt_field(value: &mut String, recipient: &Recipient) -> Result<()> {
+    if value.is_empty() || is_age_encrypted(value) {
+        return Ok(());
+    }
+    *value = encrypt_value(value, recipient)?;
+    Ok(())
+}
+
+fn decrypt_field(value: &mut String, identity: &Identity) -> Result<()> {
+    if value.is_empty() || !is_age_encrypted(value) {
+        return Ok(());
+    }
+    *value = decrypt_value(value, identity)?;
+    Ok(())
+}
+
+fn encrypt_profile_fields(profile: &mut Profile, recipient: &Recipient) -> Result<()> {
+    match profile {
+        Profile::Local { password, .. } => {
+            encrypt_field(password, recipient)?;
+        }
+        Profile::Rest {
+            password,
+            rest_user,
+            rest_password,
+            ..
+        } => {
+            encrypt_field(password, recipient)?;
+            encrypt_field(rest_user, recipient)?;
+            encrypt_field(rest_password, recipient)?;
+        }
+        Profile::S3 {
+            password,
+            s3_access_key,
+            s3_secret_key,
+            ..
+        } => {
+            encrypt_field(password, recipient)?;
+            encrypt_field(s3_access_key, recipient)?;
+            encrypt_field(s3_secret_key, recipient)?;
+        }
+    }
+    Ok(())
+}
+
+fn decrypt_profile_fields(profile: &mut Profile, identity: &Identity) -> Result<()> {
+    match profile {
+        Profile::Local { password, .. } => {
+            decrypt_field(password, identity)?;
+        }
+        Profile::Rest {
+            password,
+            rest_user,
+            rest_password,
+            ..
+        } => {
+            decrypt_field(password, identity)?;
+            decrypt_field(rest_user, identity)?;
+            decrypt_field(rest_password, identity)?;
+        }
+        Profile::S3 {
+            password,
+            s3_access_key,
+            s3_secret_key,
+            ..
+        } => {
+            decrypt_field(password, identity)?;
+            decrypt_field(s3_access_key, identity)?;
+            decrypt_field(s3_secret_key, identity)?;
+        }
+    }
     Ok(())
 }
 
@@ -248,7 +362,7 @@ mod tests {
     fn test_paths(dir: &Path) -> Paths {
         Paths {
             identity: dir.join("age.key"),
-            config: dir.join("config.toml.age"),
+            config: dir.join("config.toml"),
         }
     }
 
@@ -261,15 +375,14 @@ mod tests {
         assert!(paths.identity.exists());
         assert!(pubkey.starts_with("age1"), "expected age1 recipient, got {pubkey}");
 
-        // round-trip: parsing back yields the same public key
         assert_eq!(validate_identity(&paths.identity)?, pubkey);
 
-        // empty load works before any save
         let empty = load(&paths)?;
         assert_eq!(empty.profiles.len(), 0);
         assert_eq!(empty.version, CONFIG_VERSION);
 
         let cfg = Config {
+            recipient: String::new(),
             version: CONFIG_VERSION,
             profiles: vec![
                 Profile::Local {
@@ -290,18 +403,30 @@ mod tests {
                     name: "rest-c".into(),
                     password: "pw3".into(),
                     rest_url: "https://r.example.com/repo".into(),
+                    rest_user: String::new(),
+                    rest_password: String::new(),
                 },
             ],
         };
         save(&cfg, &paths)?;
         assert!(paths.config.exists());
 
-        // ciphertext must be armored ASCII
         let raw = fs::read_to_string(&paths.config)?;
-        assert!(raw.starts_with("-----BEGIN AGE ENCRYPTED FILE-----"));
+        let parsed: toml::Value = toml::from_str(&raw)?;
+        assert_eq!(parsed["recipient"].as_str().unwrap(), pubkey);
+
+        for profile in parsed["profiles"].as_array().unwrap() {
+            let password = profile["password"].as_str().unwrap();
+            assert!(password.starts_with("ageenc:"), "password should be encrypted: {password}");
+            assert!(!password.contains('\n'), "ageenc value must be single-line");
+            if profile["backend"].as_str().unwrap() == "local" {
+                assert!(!profile["local_path"].as_str().unwrap().starts_with("ageenc:"));
+            }
+        }
 
         let loaded = load(&paths)?;
         assert_eq!(loaded.profiles.len(), 3);
+        assert_eq!(loaded.recipient, pubkey);
         assert_eq!(loaded.profiles[0].name(), "local-a");
         assert_eq!(loaded.profiles[0].password(), "pw1");
         match &loaded.profiles[1] {
@@ -325,11 +450,157 @@ mod tests {
     }
 
     #[test]
+    fn rest_round_trip_with_split_auth() -> Result<()> {
+        let dir = fresh_dir("rest_split");
+        let paths = test_paths(&dir);
+        generate_identity(&paths.identity)?;
+
+        let cfg = Config {
+            recipient: String::new(),
+            version: CONFIG_VERSION,
+            profiles: vec![Profile::Rest {
+                name: "rest-auth".into(),
+                password: "repo-pw".into(),
+                rest_url: "https://r.example.com/repo/".into(),
+                rest_user: "andrew".into(),
+                rest_password: "hunter2".into(),
+            }],
+        };
+        save(&cfg, &paths)?;
+
+        let raw = fs::read_to_string(&paths.config)?;
+        let parsed: toml::Value = toml::from_str(&raw)?;
+        let rest = &parsed["profiles"].as_array().unwrap()[0];
+        assert_eq!(rest["rest_url"].as_str().unwrap(), "https://r.example.com/repo/");
+        assert!(rest["rest_user"].as_str().unwrap().starts_with("ageenc:"));
+        assert!(rest["rest_password"].as_str().unwrap().starts_with("ageenc:"));
+
+        let loaded = load(&paths)?;
+        match &loaded.profiles[0] {
+            Profile::Rest {
+                rest_url,
+                rest_user,
+                rest_password,
+                password,
+                ..
+            } => {
+                assert_eq!(rest_url, "https://r.example.com/repo/");
+                assert_eq!(rest_user, "andrew");
+                assert_eq!(rest_password, "hunter2");
+                assert_eq!(password, "repo-pw");
+            }
+            other => panic!("expected Rest, got {other:?}"),
+        }
+
+        fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn recipient_mismatch_is_rejected() -> Result<()> {
+        let dir = fresh_dir("rcpt");
+        let paths = test_paths(&dir);
+        generate_identity(&paths.identity)?;
+
+        let cfg = Config {
+            recipient: String::new(),
+            version: CONFIG_VERSION,
+            profiles: vec![Profile::Local {
+                name: "x".into(),
+                password: "p".into(),
+                local_path: "/x".into(),
+            }],
+        };
+        save(&cfg, &paths)?;
+
+        // Replace recipient with a syntactically valid but unrelated age1 string.
+        let other = Identity::generate().to_public().to_string();
+        let raw = fs::read_to_string(&paths.config)?;
+        let mut doc: toml::Value = toml::from_str(&raw)?;
+        doc["recipient"] = toml::Value::String(other);
+        fs::write(&paths.config, toml::to_string_pretty(&doc)?)?;
+
+        let err = load(&paths).expect_err("recipient mismatch should error");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("recipient"), "error should mention recipient: {msg}");
+
+        fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn multiple_identities_rejected() -> Result<()> {
+        let dir = fresh_dir("multi");
+        let id_path = dir.join("age.key");
+
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let body = format!(
+            "# id a\n{}\n# id b\n{}\n",
+            a.to_string().expose_secret(),
+            b.to_string().expose_secret()
+        );
+        fs::write(&id_path, body)?;
+
+        let err = validate_identity(&id_path).expect_err("two identities should error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("exactly one"),
+            "error should mention exactly one: {msg}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn empty_string_field_not_encrypted() -> Result<()> {
+        let dir = fresh_dir("empty");
+        let paths = test_paths(&dir);
+        generate_identity(&paths.identity)?;
+
+        let cfg = Config {
+            recipient: String::new(),
+            version: CONFIG_VERSION,
+            profiles: vec![Profile::Rest {
+                name: "anon".into(),
+                password: "pw".into(),
+                rest_url: "http://localhost:8000/".into(),
+                rest_user: String::new(),
+                rest_password: String::new(),
+            }],
+        };
+        save(&cfg, &paths)?;
+
+        let raw = fs::read_to_string(&paths.config)?;
+        let parsed: toml::Value = toml::from_str(&raw)?;
+        let rest = &parsed["profiles"].as_array().unwrap()[0];
+        assert_eq!(rest["rest_user"].as_str().unwrap(), "");
+        assert_eq!(rest["rest_password"].as_str().unwrap(), "");
+
+        let loaded = load(&paths)?;
+        match &loaded.profiles[0] {
+            Profile::Rest {
+                rest_user,
+                rest_password,
+                ..
+            } => {
+                assert!(rest_user.is_empty());
+                assert!(rest_password.is_empty());
+            }
+            other => panic!("expected Rest, got {other:?}"),
+        }
+
+        fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    #[test]
     fn paths_uses_override_when_provided() -> Result<()> {
         let dir = fresh_dir("override");
         let p = paths(Some(dir.clone()))?;
         assert_eq!(p.identity, dir.join("age.key"));
-        assert_eq!(p.config, dir.join("config.toml.age"));
+        assert_eq!(p.config, dir.join("config.toml"));
         fs::remove_dir_all(&dir).ok();
         Ok(())
     }
@@ -340,12 +611,13 @@ mod tests {
         let paths = test_paths(&dir);
         generate_identity(&paths.identity)?;
 
-        // Save a config claiming a future version, then expect load() to refuse it.
-        let future = Config {
-            version: CONFIG_VERSION + 1,
-            profiles: Vec::new(),
-        };
-        save(&future, &paths)?;
+        // Save a real config first, then bump the version on disk to one
+        // wrustic doesn't know about, and confirm load() refuses it.
+        save(&Config::default(), &paths)?;
+        let raw = fs::read_to_string(&paths.config)?;
+        let mut doc: toml::Value = toml::from_str(&raw)?;
+        doc["version"] = toml::Value::Integer((CONFIG_VERSION + 1) as i64);
+        fs::write(&paths.config, toml::to_string_pretty(&doc)?)?;
 
         let err = load(&paths).expect_err("version mismatch should error");
         let msg = format!("{err:#}");
