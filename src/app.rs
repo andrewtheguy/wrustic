@@ -8,7 +8,7 @@ use ratatui::{
 use rustic_core::{IndexedIdsStatus, Repository, TreeId};
 
 use crate::config::{self, BackendKind, Config, Paths, Profile};
-use crate::repo::{ContentRow, SnapshotRow};
+use crate::repo::{ContentKind, ContentRow, SnapshotRow};
 
 pub(crate) const BACKEND_ORDER: [BackendKind; 3] =
     [BackendKind::Local, BackendKind::Rest, BackendKind::S3];
@@ -332,6 +332,19 @@ impl App {
         }
     }
 
+    fn go_up(&mut self) {
+        if self.browse_stack.len() > 1 {
+            self.browse_stack.pop();
+        } else {
+            self.repo_session = None;
+            self.browse_stack.clear();
+            self.browse_snapshot_id.clear();
+            self.pending_descend = None;
+            self.pending_refresh_path = None;
+            self.screen = Screen::Snapshots;
+        }
+    }
+
     pub(crate) fn handle_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.quit = true;
@@ -509,17 +522,20 @@ impl App {
                     if let Some(f) = self.browse_stack.last()
                         && let Some(idx) = f.list_state.selected()
                         && let Some(row) = f.items.get(idx)
-                        && let Some(subtree) = row.subtree
                     {
-                        self.pending_descend = Some((subtree, row.name.clone()));
-                        self.screen = Screen::LoadingDir;
+                        match row.kind {
+                            ContentKind::Parent => self.go_up(),
+                            ContentKind::Dir => {
+                                if let Some(subtree) = row.subtree {
+                                    self.pending_descend = Some((subtree, row.name.clone()));
+                                    self.screen = Screen::LoadingDir;
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                 }
-                KeyCode::Backspace => {
-                    if self.browse_stack.len() > 1 {
-                        self.browse_stack.pop();
-                    }
-                }
+                KeyCode::Backspace => self.go_up(),
                 KeyCode::Char('r') => {
                     let path: Vec<String> = self
                         .browse_stack

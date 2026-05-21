@@ -399,11 +399,15 @@ fn render_snapshot_contents(frame: &mut Frame, app: &mut App) {
         .items
         .iter()
         .map(|row| {
+            if matches!(row.kind, ContentKind::Parent) {
+                return ListItem::new("^  ..".to_string());
+            }
             let kind_char = match row.kind {
                 ContentKind::Dir => 'd',
                 ContentKind::File => '-',
                 ContentKind::Symlink => 'l',
                 ContentKind::Other => '?',
+                ContentKind::Parent => '^',
             };
             let display_name = if matches!(row.kind, ContentKind::Dir) {
                 format!("{}/", row.name)

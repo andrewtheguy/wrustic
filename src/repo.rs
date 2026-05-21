@@ -15,10 +15,23 @@ pub(crate) struct SnapshotRow {
 }
 
 pub(crate) enum ContentKind {
+    Parent,
     Dir,
     File,
     Symlink,
     Other,
+}
+
+impl ContentRow {
+    pub(crate) fn parent() -> Self {
+        Self {
+            name: "..".to_string(),
+            kind: ContentKind::Parent,
+            size: 0,
+            mtime: String::new(),
+            subtree: None,
+        }
+    }
 }
 
 pub(crate) struct ContentRow {
