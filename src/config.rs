@@ -57,6 +57,8 @@ pub enum Profile {
         s3_endpoint: String,
         s3_bucket: String,
         s3_region: String,
+        #[serde(default)]
+        s3_root: String,
         s3_access_key: String,
         s3_secret_key: String,
     },
@@ -400,6 +402,7 @@ mod tests {
                 s3_endpoint: "https://s3.example.com".into(),
                 s3_bucket: "buk".into(),
                 s3_region: "us-east-1".into(),
+                s3_root: "/sub/dir".into(),
                 s3_access_key: "AK".into(),
                 s3_secret_key: "SK".into(),
             },
@@ -449,7 +452,8 @@ mod tests {
             other => panic!("expected Local, got {other:?}"),
         }
         match loaded.profiles.get("s3-b") {
-            Some(Profile::S3 { s3_access_key, s3_secret_key, .. }) => {
+            Some(Profile::S3 { s3_root, s3_access_key, s3_secret_key, .. }) => {
+                assert_eq!(s3_root, "/sub/dir");
                 assert_eq!(s3_access_key, "AK");
                 assert_eq!(s3_secret_key, "SK");
             }

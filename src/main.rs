@@ -49,6 +49,7 @@ enum Screen {
     S3Endpoint,
     S3Bucket,
     S3Region,
+    S3Root,
     S3AccessKey,
     S3SecretKey,
     Password,
@@ -96,6 +97,7 @@ struct App {
     s3_endpoint: String,
     s3_bucket: String,
     s3_region: String,
+    s3_root: String,
     s3_access_key: String,
     s3_secret_key: String,
     password: String,
@@ -144,6 +146,7 @@ impl App {
             s3_endpoint: String::new(),
             s3_bucket: String::new(),
             s3_region: String::new(),
+            s3_root: String::new(),
             s3_access_key: String::new(),
             s3_secret_key: String::new(),
             password: String::new(),
@@ -188,6 +191,7 @@ impl App {
         self.s3_endpoint.clear();
         self.s3_bucket.clear();
         self.s3_region.clear();
+        self.s3_root.clear();
         self.s3_access_key.clear();
         self.s3_secret_key.clear();
         self.password.clear();
@@ -206,6 +210,7 @@ impl App {
         self.s3_endpoint.clear();
         self.s3_bucket.clear();
         self.s3_region.clear();
+        self.s3_root.clear();
         self.s3_access_key.clear();
         self.s3_secret_key.clear();
         match p {
@@ -226,6 +231,7 @@ impl App {
                 s3_endpoint,
                 s3_bucket,
                 s3_region,
+                s3_root,
                 s3_access_key,
                 s3_secret_key,
                 ..
@@ -233,6 +239,7 @@ impl App {
                 self.s3_endpoint = s3_endpoint.clone();
                 self.s3_bucket = s3_bucket.clone();
                 self.s3_region = s3_region.clone();
+                self.s3_root = s3_root.clone();
                 self.s3_access_key = s3_access_key.clone();
                 self.s3_secret_key = s3_secret_key.clone();
             }
@@ -261,6 +268,7 @@ impl App {
                 } else {
                     self.s3_region.clone()
                 },
+                s3_root: self.s3_root.clone(),
                 s3_access_key: self.s3_access_key.clone(),
                 s3_secret_key: self.s3_secret_key.clone(),
             },
@@ -569,9 +577,18 @@ impl App {
             Screen::S3Region => match text_input(&mut self.s3_region, key) {
                 TextAction::Submit => {
                     self.s3_region = self.s3_region.trim().to_string();
-                    self.screen = Screen::S3AccessKey;
+                    self.screen = Screen::S3Root;
                 }
                 TextAction::Cancel => self.screen = Screen::S3Bucket,
+                _ => {}
+            },
+
+            Screen::S3Root => match text_input(&mut self.s3_root, key) {
+                TextAction::Submit => {
+                    self.s3_root = self.s3_root.trim().to_string();
+                    self.screen = Screen::S3AccessKey;
+                }
+                TextAction::Cancel => self.screen = Screen::S3Region,
                 _ => {}
             },
 
@@ -580,7 +597,7 @@ impl App {
                     self.s3_access_key = self.s3_access_key.trim().to_string();
                     self.screen = Screen::S3SecretKey;
                 }
-                TextAction::Cancel => self.screen = Screen::S3Region,
+                TextAction::Cancel => self.screen = Screen::S3Root,
                 _ => {}
             },
 
@@ -861,6 +878,7 @@ fn build_backend_opts(profile: &Profile) -> Result<BackendOptions> {
             s3_endpoint,
             s3_bucket,
             s3_region,
+            s3_root,
             s3_access_key,
             s3_secret_key,
             ..
@@ -873,6 +891,9 @@ fn build_backend_opts(profile: &Profile) -> Result<BackendOptions> {
             s3_opts.insert("secret_access_key".to_string(), s3_secret_key.clone());
             if !s3_endpoint.is_empty() {
                 s3_opts.insert("endpoint".to_string(), s3_endpoint.clone());
+            }
+            if !s3_root.is_empty() {
+                s3_opts.insert("root".to_string(), s3_root.clone());
             }
             opts = opts.options(s3_opts);
         }
@@ -973,7 +994,13 @@ fn render(frame: &mut Frame, app: &mut App) {
             frame,
             "S3 region (optional)",
             &app.s3_region,
-            "Defaults to us-east-1 if left blank (Esc back)",
+            "Defaults to us-east-1 if left blank. Backblaze B2 uses 'auto'. (Esc back)",
+        ),
+        Screen::S3Root => render_input(
+            frame,
+            "Path within bucket (optional)",
+            &app.s3_root,
+            "e.g. /proxmox_vm_backup — leave blank to use the bucket root (Esc back)",
         ),
         Screen::S3AccessKey => render_input(
             frame,
