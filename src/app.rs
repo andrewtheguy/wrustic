@@ -86,6 +86,7 @@ pub(crate) struct App {
     pub(crate) created_pubkey: String,
 
     pub(crate) snapshots: Vec<SnapshotRow>,
+    pub(crate) active_profile_name: Option<String>,
     pub(crate) repo_session: Option<Repository<IndexedIdsStatus>>,
     pub(crate) browse_snapshot_id: String,
     pub(crate) browse_stack: Vec<BrowseFrame>,
@@ -132,6 +133,7 @@ impl App {
             restore_error: None,
             created_pubkey: String::new(),
             snapshots: Vec::new(),
+            active_profile_name: None,
             repo_session: None,
             browse_snapshot_id: String::new(),
             browse_stack: Vec::new(),
@@ -168,6 +170,7 @@ impl App {
     // the last row) doesn't highlight a phantom index on the next render.
     fn enter_home(&mut self) {
         self.clear_creation_scratch();
+        self.active_profile_name = None;
         let len = self.config.profiles.len();
         if len == 0 {
             self.profile_list_state.select(None);
@@ -429,6 +432,8 @@ impl App {
                         .unwrap_or(0)
                         .min(self.config.profiles.len() - 1);
                     self.loading_index = idx;
+                    self.active_profile_name =
+                        self.config.name_at(idx).cloned();
                     self.screen = Screen::Loading;
                 }
                 KeyCode::Char('e') if !self.config.profiles.is_empty() => {
