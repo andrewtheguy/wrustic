@@ -22,9 +22,9 @@ Implemented:
 
 ## Install (prebuilt binary)
 
-A convenience script downloads the latest release binary from GitHub and drops
-it at `/usr/local/bin/wrustic`. Supported targets: `linux-amd64`,
-`linux-arm64`, `macos-arm64`.
+A convenience script downloads the latest release binary from GitHub and
+drops it at `$HOME/.local/bin/wrustic` — no `sudo`, no system-wide install.
+Supported targets: `linux-amd64`, `linux-arm64`, `macos-arm64`.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/andrewtheguy/wrustic/main/install.sh | bash
@@ -35,11 +35,13 @@ Or clone the repo and run `./install.sh` directly. Useful flags:
 - `./install.sh v0.0.1` — install a specific release tag
 - `./install.sh --prerelease` — grab the latest prerelease
 - `./install.sh --download-only` — drop the binary in the current directory
-  (no `sudo`, no `/usr/local/bin`)
 - `RELEASE_TAG=v0.0.1 ./install.sh` — same as passing the tag positionally
 
 The script verifies the SHA-256 of the downloaded binary against the digest
-GitHub publishes in the release metadata before installing.
+GitHub publishes in the release metadata before installing, and runs the
+binary's `--help` once to confirm it loads on the host. If `$HOME/.local/bin`
+is not on your `$PATH`, the script prints the line you need to add to your
+shell profile.
 
 ## Build & run
 
