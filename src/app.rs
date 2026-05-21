@@ -26,15 +26,9 @@ pub(crate) enum Screen {
     CreateProfileName,
     BackendChoice,
     LocalPath,
-    RestUrl,
-    RestUser,
-    RestPassword,
-    S3Endpoint,
-    S3Bucket,
-    S3Region,
-    S3Root,
-    S3AccessKey,
-    S3SecretKey,
+    RestConfig,
+    S3Location,
+    S3Credentials,
     Password,
     ConfirmDelete,
     Loading,
@@ -76,6 +70,7 @@ pub(crate) struct App {
     pub(crate) loading_index: usize,
     pub(crate) pending_delete: Option<usize>,
     pub(crate) editing_original_name: Option<String>,
+    pub(crate) field_focus: usize,
 
     pub(crate) restore_error: Option<String>,
     pub(crate) created_pubkey: String,
@@ -118,6 +113,7 @@ impl App {
             loading_index: 0,
             pending_delete: None,
             editing_original_name: None,
+            field_focus: 0,
             restore_error: None,
             created_pubkey: String::new(),
             snapshots: Vec::new(),
@@ -176,6 +172,7 @@ impl App {
         self.s3_secret_key.clear();
         self.password.clear();
         self.editing_original_name = None;
+        self.field_focus = 0;
     }
 
     fn load_profile_into_scratch(&mut self, idx: usize) {
@@ -409,10 +406,11 @@ impl App {
                         .min(self.config.profiles.len() - 1);
                     self.load_profile_into_scratch(idx);
                     self.editing_original_name = Some(self.new_profile_name.clone());
+                    self.field_focus = 0;
                     self.screen = match self.backend_kind {
                         BackendKind::Local => Screen::LocalPath,
-                        BackendKind::Rest => Screen::RestUrl,
-                        BackendKind::S3 => Screen::S3Endpoint,
+                        BackendKind::Rest => Screen::RestConfig,
+                        BackendKind::S3 => Screen::S3Location,
                     };
                 }
                 KeyCode::Char('d') if !self.config.profiles.is_empty() => {
@@ -473,10 +471,11 @@ impl App {
                         .unwrap_or(0)
                         .min(BACKEND_ORDER.len() - 1);
                     self.backend_kind = BACKEND_ORDER[idx];
+                    self.field_focus = 0;
                     self.screen = match self.backend_kind {
                         BackendKind::Local => Screen::LocalPath,
-                        BackendKind::Rest => Screen::RestUrl,
-                        BackendKind::S3 => Screen::S3Endpoint,
+                        BackendKind::Rest => Screen::RestConfig,
+                        BackendKind::S3 => Screen::S3Location,
                     };
                 }
                 KeyCode::Esc => self.screen = Screen::CreateProfileName,
@@ -492,85 +491,94 @@ impl App {
                 _ => {}
             },
 
-            Screen::RestUrl => match text_input(&mut self.rest_url, key) {
-                TextAction::Submit if !self.rest_url.trim().is_empty() => {
-                    self.rest_url = self.rest_url.trim().to_string();
-                    self.screen = Screen::RestUser;
+            Screen::RestConfig => {
+                const N: usize = 3;
+                match key.code {
+                    KeyCode::Tab | KeyCode::Down => {
+                        self.field_focus = (self.field_focus + 1) % N;
+                    }
+                    KeyCode::BackTab | KeyCode::Up => {
+                        self.field_focus = (self.field_focus + N - 1) % N;
+                    }
+                    KeyCode::Esc => self.cancel_from_first_backend_input(),
+                    KeyCode::Enter => {
+                        self.rest_url = self.rest_url.trim().to_string();
+                        self.rest_user = self.rest_user.trim().to_string();
+                        if !self.rest_url.is_empty() {
+                            self.screen = Screen::Password;
+                        }
+                    }
+                    _ => {
+                        let buf: &mut String = match self.field_focus {
+                            0 => &mut self.rest_url,
+                            1 => &mut self.rest_user,
+                            _ => &mut self.rest_password,
+                        };
+                        let _ = text_input(buf, key);
+                    }
                 }
-                TextAction::Cancel => self.cancel_from_first_backend_input(),
-                _ => {}
-            },
+            }
 
-            Screen::RestUser => match text_input(&mut self.rest_user, key) {
-                TextAction::Submit => {
-                    self.rest_user = self.rest_user.trim().to_string();
-                    self.screen = Screen::RestPassword;
+            Screen::S3Location => {
+                const N: usize = 4;
+                match key.code {
+                    KeyCode::Tab | KeyCode::Down => {
+                        self.field_focus = (self.field_focus + 1) % N;
+                    }
+                    KeyCode::BackTab | KeyCode::Up => {
+                        self.field_focus = (self.field_focus + N - 1) % N;
+                    }
+                    KeyCode::Esc => self.cancel_from_first_backend_input(),
+                    KeyCode::Enter => {
+                        self.s3_endpoint = self.s3_endpoint.trim().to_string();
+                        self.s3_bucket = self.s3_bucket.trim().to_string();
+                        self.s3_region = self.s3_region.trim().to_string();
+                        self.s3_root = self.s3_root.trim().to_string();
+                        if !self.s3_bucket.is_empty() {
+                            self.field_focus = 0;
+                            self.screen = Screen::S3Credentials;
+                        }
+                    }
+                    _ => {
+                        let buf: &mut String = match self.field_focus {
+                            0 => &mut self.s3_endpoint,
+                            1 => &mut self.s3_bucket,
+                            2 => &mut self.s3_region,
+                            _ => &mut self.s3_root,
+                        };
+                        let _ = text_input(buf, key);
+                    }
                 }
-                TextAction::Cancel => self.screen = Screen::RestUrl,
-                _ => {}
-            },
+            }
 
-            Screen::RestPassword => match text_input(&mut self.rest_password, key) {
-                TextAction::Submit => {
-                    self.screen = Screen::Password;
+            Screen::S3Credentials => {
+                const N: usize = 2;
+                match key.code {
+                    KeyCode::Tab | KeyCode::Down => {
+                        self.field_focus = (self.field_focus + 1) % N;
+                    }
+                    KeyCode::BackTab | KeyCode::Up => {
+                        self.field_focus = (self.field_focus + N - 1) % N;
+                    }
+                    KeyCode::Esc => {
+                        self.field_focus = 0;
+                        self.screen = Screen::S3Location;
+                    }
+                    KeyCode::Enter => {
+                        self.s3_access_key = self.s3_access_key.trim().to_string();
+                        if !self.s3_access_key.is_empty() && !self.s3_secret_key.is_empty() {
+                            self.screen = Screen::Password;
+                        }
+                    }
+                    _ => {
+                        let buf: &mut String = match self.field_focus {
+                            0 => &mut self.s3_access_key,
+                            _ => &mut self.s3_secret_key,
+                        };
+                        let _ = text_input(buf, key);
+                    }
                 }
-                TextAction::Cancel => self.screen = Screen::RestUser,
-                _ => {}
-            },
-
-            Screen::S3Endpoint => match text_input(&mut self.s3_endpoint, key) {
-                TextAction::Submit => {
-                    self.s3_endpoint = self.s3_endpoint.trim().to_string();
-                    self.screen = Screen::S3Bucket;
-                }
-                TextAction::Cancel => self.cancel_from_first_backend_input(),
-                _ => {}
-            },
-
-            Screen::S3Bucket => match text_input(&mut self.s3_bucket, key) {
-                TextAction::Submit if !self.s3_bucket.trim().is_empty() => {
-                    self.s3_bucket = self.s3_bucket.trim().to_string();
-                    self.screen = Screen::S3Region;
-                }
-                TextAction::Cancel => self.screen = Screen::S3Endpoint,
-                _ => {}
-            },
-
-            Screen::S3Region => match text_input(&mut self.s3_region, key) {
-                TextAction::Submit => {
-                    self.s3_region = self.s3_region.trim().to_string();
-                    self.screen = Screen::S3Root;
-                }
-                TextAction::Cancel => self.screen = Screen::S3Bucket,
-                _ => {}
-            },
-
-            Screen::S3Root => match text_input(&mut self.s3_root, key) {
-                TextAction::Submit => {
-                    self.s3_root = self.s3_root.trim().to_string();
-                    self.screen = Screen::S3AccessKey;
-                }
-                TextAction::Cancel => self.screen = Screen::S3Region,
-                _ => {}
-            },
-
-            Screen::S3AccessKey => match text_input(&mut self.s3_access_key, key) {
-                TextAction::Submit if !self.s3_access_key.trim().is_empty() => {
-                    self.s3_access_key = self.s3_access_key.trim().to_string();
-                    self.screen = Screen::S3SecretKey;
-                }
-                TextAction::Cancel => self.screen = Screen::S3Root,
-                _ => {}
-            },
-
-            Screen::S3SecretKey => match text_input(&mut self.s3_secret_key, key) {
-                TextAction::Submit if !self.s3_secret_key.trim().is_empty() => {
-                    self.s3_secret_key = self.s3_secret_key.trim().to_string();
-                    self.screen = Screen::Password;
-                }
-                TextAction::Cancel => self.screen = Screen::S3AccessKey,
-                _ => {}
-            },
+            }
 
             Screen::Password => match text_input(&mut self.password, key) {
                 TextAction::Submit if !self.password.is_empty() => {
@@ -578,10 +586,11 @@ impl App {
                 }
                 TextAction::Cancel => {
                     self.password.clear();
+                    self.field_focus = 0;
                     self.screen = match self.backend_kind {
                         BackendKind::Local => Screen::LocalPath,
-                        BackendKind::Rest => Screen::RestPassword,
-                        BackendKind::S3 => Screen::S3SecretKey,
+                        BackendKind::Rest => Screen::RestConfig,
+                        BackendKind::S3 => Screen::S3Credentials,
                     };
                 }
                 _ => {}
@@ -620,10 +629,11 @@ impl App {
 
             Screen::VerifyFailed(_) => match key.code {
                 KeyCode::Char('r') | KeyCode::Char('R') => {
+                    self.field_focus = 0;
                     self.screen = match self.backend_kind {
                         BackendKind::Local => Screen::LocalPath,
-                        BackendKind::Rest => Screen::RestUrl,
-                        BackendKind::S3 => Screen::S3Endpoint,
+                        BackendKind::Rest => Screen::RestConfig,
+                        BackendKind::S3 => Screen::S3Location,
                     };
                 }
                 KeyCode::Char('s') | KeyCode::Char('S') => {
