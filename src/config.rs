@@ -283,8 +283,11 @@ fn encrypt_field(value: &mut String, recipient: &Recipient) -> Result<()> {
 }
 
 fn decrypt_field(value: &mut String, identity: &Identity) -> Result<()> {
-    if value.is_empty() || !is_age_encrypted(value) {
+    if value.is_empty() {
         return Ok(());
+    }
+    if !is_age_encrypted(value) {
+        bail!("field is not encrypted (missing `ageenc:` prefix)");
     }
     *value = decrypt_value(value, identity)?;
     Ok(())
