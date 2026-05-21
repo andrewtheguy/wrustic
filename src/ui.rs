@@ -5,24 +5,14 @@ use ratatui::{
     widgets::{Block, List, ListItem, Paragraph, Wrap},
 };
 
-use crate::app::{App, BACKEND_ORDER, FIRST_RUN_MENU, MAIN_MENU, MANAGE_MENU, Screen};
+use crate::app::{App, BACKEND_ORDER, FIRST_RUN_MENU, Screen};
 
 pub(crate) fn render(frame: &mut Frame, app: &mut App) {
     match &app.screen {
         Screen::FirstRunChoice => render_first_run_choice(frame, app),
         Screen::RestoreKeyWait => render_restore_wait(frame, app),
         Screen::KeyCreated => render_key_created(frame, app),
-        Screen::MainMenu => render_menu(frame, app, MainOrManage::Main),
-        Screen::SelectProfileForOpen => {
-            render_profile_list(frame, app, "Select profile to open (Esc back)")
-        }
-        Screen::SelectProfileForDelete => {
-            render_profile_list(frame, app, "Select profile to delete (Esc back)")
-        }
-        Screen::SelectProfileForEdit => {
-            render_profile_list(frame, app, "Select profile to edit (Esc back)")
-        }
-        Screen::ManageMenu => render_menu(frame, app, MainOrManage::Manage),
+        Screen::Home => render_home(frame, app),
         Screen::CreateProfileName => render_input(
             frame,
             "Profile name",
@@ -36,66 +26,9 @@ pub(crate) fn render(frame: &mut Frame, app: &mut App) {
             &app.local_path,
             "Filesystem path, e.g. /tmp/wrustic-test-repo (Esc back)",
         ),
-        Screen::RestUrl => render_input(
-            frame,
-            &profile_title("REST URL", app),
-            &app.rest_url,
-            "e.g. http://localhost:8000/ — credentials go on the next two screens (Esc back)",
-        ),
-        Screen::RestUser => render_input(
-            frame,
-            &profile_title("REST username (optional)", app),
-            &app.rest_user,
-            "Leave blank for anonymous REST server (Esc back)",
-        ),
-        Screen::RestPassword => {
-            let masked = "*".repeat(app.rest_password.chars().count());
-            render_input(
-                frame,
-                &profile_title("REST password (optional)", app),
-                &masked,
-                "Leave blank if the REST server has no password (Esc back)",
-            );
-        }
-        Screen::S3Endpoint => render_input(
-            frame,
-            &profile_title("S3 endpoint (optional)", app),
-            &app.s3_endpoint,
-            "Leave blank for AWS. For MinIO / rclone: http://127.0.0.1:8333 (Esc back)",
-        ),
-        Screen::S3Bucket => render_input(
-            frame,
-            &profile_title("S3 bucket", app),
-            &app.s3_bucket,
-            "Bucket / top-level directory name (Esc back)",
-        ),
-        Screen::S3Region => render_input(
-            frame,
-            &profile_title("S3 region (optional)", app),
-            &app.s3_region,
-            "Defaults to us-east-1 if left blank. Backblaze B2 uses 'auto'. (Esc back)",
-        ),
-        Screen::S3Root => render_input(
-            frame,
-            &profile_title("Path within bucket (optional)", app),
-            &app.s3_root,
-            "e.g. /proxmox_vm_backup — leave blank to use the bucket root (Esc back)",
-        ),
-        Screen::S3AccessKey => render_input(
-            frame,
-            &profile_title("S3 access key ID", app),
-            &app.s3_access_key,
-            "AWS_ACCESS_KEY_ID equivalent (Esc back)",
-        ),
-        Screen::S3SecretKey => {
-            let masked = "*".repeat(app.s3_secret_key.chars().count());
-            render_input(
-                frame,
-                &profile_title("S3 secret access key", app),
-                &masked,
-                "AWS_SECRET_ACCESS_KEY equivalent (Esc back)",
-            );
-        }
+        Screen::RestConfig => render_rest_config(frame, app),
+        Screen::S3Location => render_s3_location(frame, app),
+        Screen::S3Credentials => render_s3_credentials(frame, app),
         Screen::Password => {
             let masked = "*".repeat(app.password.chars().count());
             render_input(
@@ -210,11 +143,6 @@ fn render_key_created(frame: &mut Frame, app: &App) {
     frame.render_widget(para, frame.area());
 }
 
-enum MainOrManage {
-    Main,
-    Manage,
-}
-
 fn selection_highlight() -> Style {
     Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD)
 }
@@ -229,34 +157,13 @@ fn profile_title(base: &str, app: &App) -> String {
     }
 }
 
-fn render_menu(frame: &mut Frame, app: &mut App, which: MainOrManage) {
-    let (entries, state, title) = match which {
-        MainOrManage::Main => (
-            &MAIN_MENU[..],
-            &mut app.main_menu_state,
-            "wrustic — j/k to move, Enter to pick, q/Esc to quit",
-        ),
-        MainOrManage::Manage => (
-            &MANAGE_MENU[..],
-            &mut app.manage_menu_state,
-            "Manage profiles — j/k to move, Enter to pick, Esc back",
-        ),
-    };
-    let items: Vec<ListItem> = entries.iter().map(|s| ListItem::new(*s)).collect();
-    let list = List::new(items)
-        .block(Block::bordered().title(title))
-        .highlight_style(selection_highlight())
-        .highlight_symbol(">> ");
-    frame.render_stateful_widget(list, frame.area(), state);
-}
+fn render_home(frame: &mut Frame, app: &mut App) {
+    let title = "wrustic — j/k move, Enter open, n new, e edit, d delete, q quit";
 
-fn render_profile_list(frame: &mut Frame, app: &mut App, title: &str) {
     if app.config.profiles.is_empty() {
-        let para = Paragraph::new(
-            "No profiles yet. Go back (Esc) and choose 'Manage profiles' → 'Create new profile'.",
-        )
-        .wrap(Wrap { trim: false })
-        .block(Block::bordered().title(title));
+        let para = Paragraph::new("No profiles yet. Press 'n' to create one, 'q' to quit.")
+            .wrap(Wrap { trim: false })
+            .block(Block::bordered().title(title));
         frame.render_widget(para, frame.area());
         return;
     }
@@ -313,6 +220,114 @@ fn render_input(frame: &mut Frame, title: &str, value: &str, help: &str) {
 
     let help = Paragraph::new(help).style(Style::new().fg(Color::DarkGray));
     frame.render_widget(help, help_area);
+}
+
+fn render_grouped_input(
+    frame: &mut Frame,
+    title: &str,
+    fields: &[(&str, &str, bool)],
+    focus: usize,
+    help: &str,
+) {
+    let outer = Block::bordered().title(title);
+    let inner_area = outer.inner(frame.area());
+    frame.render_widget(outer, frame.area());
+
+    let mut constraints: Vec<Constraint> = fields.iter().map(|_| Constraint::Length(3)).collect();
+    constraints.push(Constraint::Length(1));
+    constraints.push(Constraint::Fill(1));
+    let areas = Layout::vertical(constraints).split(inner_area);
+
+    for (i, (label, value, masked)) in fields.iter().enumerate() {
+        let display: String = if *masked {
+            "*".repeat(value.chars().count())
+        } else {
+            (*value).to_string()
+        };
+        let value_str = if i == focus {
+            format!("{display}_")
+        } else {
+            display
+        };
+        let mut block = Block::bordered().title(*label);
+        if i == focus {
+            block = block.border_style(Style::new().fg(Color::Yellow));
+        }
+        let para = Paragraph::new(value_str).block(block);
+        frame.render_widget(para, areas[i]);
+    }
+
+    let help_para = Paragraph::new(help).style(Style::new().fg(Color::DarkGray));
+    frame.render_widget(help_para, areas[fields.len()]);
+}
+
+fn render_rest_config(frame: &mut Frame, app: &App) {
+    let title = profile_title(
+        "REST backend — Tab/Shift+Tab move, Enter continue, Esc back",
+        app,
+    );
+    let fields = [
+        ("URL (required)", app.rest_url.as_str(), false),
+        ("Username (optional)", app.rest_user.as_str(), false),
+        ("Password (optional)", app.rest_password.as_str(), true),
+    ];
+    render_grouped_input(
+        frame,
+        &title,
+        &fields,
+        app.field_focus,
+        "Anonymous server? Leave user/password blank. Enter advances to the repository password.",
+    );
+}
+
+fn render_s3_location(frame: &mut Frame, app: &App) {
+    let title = profile_title(
+        "S3 location — Tab/Shift+Tab move, Enter continue, Esc back",
+        app,
+    );
+    let fields = [
+        (
+            "Endpoint (optional)",
+            app.s3_endpoint.as_str(),
+            false,
+        ),
+        ("Bucket (required)", app.s3_bucket.as_str(), false),
+        (
+            "Region (optional, defaults to us-east-1)",
+            app.s3_region.as_str(),
+            false,
+        ),
+        (
+            "Path within bucket (optional)",
+            app.s3_root.as_str(),
+            false,
+        ),
+    ];
+    render_grouped_input(
+        frame,
+        &title,
+        &fields,
+        app.field_focus,
+        "Leave Endpoint blank for AWS. Backblaze B2 uses region 'auto'. MinIO/rclone: http://127.0.0.1:8333",
+    );
+}
+
+fn render_s3_credentials(frame: &mut Frame, app: &App) {
+    let title = profile_title(
+        "S3 credentials — Tab/Shift+Tab move, Enter continue, Esc back",
+        app,
+    );
+    let fields = [
+        ("Access key ID", app.s3_access_key.as_str(), false),
+        ("Secret access key", app.s3_secret_key.as_str(), true),
+    ];
+    render_grouped_input(
+        frame,
+        &title,
+        &fields,
+        app.field_focus,
+        "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY equivalents.",
+    );
 }
 
 fn render_snapshots(frame: &mut Frame, app: &mut App) {

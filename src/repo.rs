@@ -81,7 +81,7 @@ pub(crate) fn load_snapshots(profile: &Profile) -> Result<Vec<SnapshotRow>> {
         .open(&Credentials::password(profile.password()))?;
 
     let mut snaps = repo.get_all_snapshots()?;
-    snaps.sort_by(|a, b| a.time.cmp(&b.time));
+    snaps.sort_by(|a, b| b.time.cmp(&a.time));
 
     Ok(snaps
         .into_iter()

@@ -11,13 +11,6 @@ use crate::repo::SnapshotRow;
 
 pub(crate) const BACKEND_ORDER: [BackendKind; 3] =
     [BackendKind::Local, BackendKind::Rest, BackendKind::S3];
-pub(crate) const MAIN_MENU: [&str; 3] = ["Work with a repo", "Manage profiles", "Quit"];
-pub(crate) const MANAGE_MENU: [&str; 4] = [
-    "Create new profile",
-    "Edit a profile",
-    "Delete a profile",
-    "Back",
-];
 pub(crate) const FIRST_RUN_MENU: [&str; 3] = [
     "Create a new age key",
     "Restore an existing age key",
@@ -28,25 +21,15 @@ pub(crate) enum Screen {
     FirstRunChoice,
     RestoreKeyWait,
     KeyCreated,
-    MainMenu,
-    SelectProfileForOpen,
+    Home,
     Snapshots,
-    ManageMenu,
     CreateProfileName,
     BackendChoice,
     LocalPath,
-    RestUrl,
-    RestUser,
-    RestPassword,
-    S3Endpoint,
-    S3Bucket,
-    S3Region,
-    S3Root,
-    S3AccessKey,
-    S3SecretKey,
+    RestConfig,
+    S3Location,
+    S3Credentials,
     Password,
-    SelectProfileForDelete,
-    SelectProfileForEdit,
     ConfirmDelete,
     Loading,
     Verifying,
@@ -66,8 +49,6 @@ pub(crate) struct App {
     pub(crate) config: Config,
 
     pub(crate) first_run_state: ListState,
-    pub(crate) main_menu_state: ListState,
-    pub(crate) manage_menu_state: ListState,
     pub(crate) backend_list: ListState,
     pub(crate) profile_list_state: ListState,
     pub(crate) list_state: ListState,
@@ -89,6 +70,7 @@ pub(crate) struct App {
     pub(crate) loading_index: usize,
     pub(crate) pending_delete: Option<usize>,
     pub(crate) editing_original_name: Option<String>,
+    pub(crate) field_focus: usize,
 
     pub(crate) restore_error: Option<String>,
     pub(crate) created_pubkey: String,
@@ -103,21 +85,15 @@ impl App {
         let paths = config::paths(config_dir)?;
         let mut first_run_state = ListState::default();
         first_run_state.select(Some(0));
-        let mut main_menu_state = ListState::default();
-        main_menu_state.select(Some(0));
-        let mut manage_menu_state = ListState::default();
-        manage_menu_state.select(Some(0));
         let mut backend_list = ListState::default();
         backend_list.select(Some(0));
 
         let identity_exists = paths.identity.exists();
         let mut app = Self {
-            screen: Screen::MainMenu,
+            screen: Screen::Home,
             paths,
             config: Config::default(),
             first_run_state,
-            main_menu_state,
-            manage_menu_state,
             backend_list,
             profile_list_state: ListState::default(),
             list_state: ListState::default(),
@@ -137,6 +113,7 @@ impl App {
             loading_index: 0,
             pending_delete: None,
             editing_original_name: None,
+            field_focus: 0,
             restore_error: None,
             created_pubkey: String::new(),
             snapshots: Vec::new(),
@@ -157,13 +134,28 @@ impl App {
         match config::load(&self.paths) {
             Ok(cfg) => {
                 self.config = cfg;
-                self.screen = Screen::MainMenu;
+                self.enter_home();
             }
             Err(e) => {
                 self.error_is_fatal = true;
                 self.screen = Screen::Error(format!("{e:#}"));
             }
         }
+    }
+
+    // Single writer for `Screen::Home`. Clears profile-creation scratch and
+    // clamps `profile_list_state` so a stale selection (e.g. after deleting
+    // the last row) doesn't highlight a phantom index on the next render.
+    fn enter_home(&mut self) {
+        self.clear_creation_scratch();
+        let len = self.config.profiles.len();
+        if len == 0 {
+            self.profile_list_state.select(None);
+        } else {
+            let cur = self.profile_list_state.selected().unwrap_or(0);
+            self.profile_list_state.select(Some(cur.min(len - 1)));
+        }
+        self.screen = Screen::Home;
     }
 
     fn clear_creation_scratch(&mut self) {
@@ -180,6 +172,7 @@ impl App {
         self.s3_secret_key.clear();
         self.password.clear();
         self.editing_original_name = None;
+        self.field_focus = 0;
     }
 
     fn load_profile_into_scratch(&mut self, idx: usize) {
@@ -261,8 +254,7 @@ impl App {
 
     fn cancel_from_first_backend_input(&mut self) {
         if self.editing_original_name.is_some() {
-            self.clear_creation_scratch();
-            self.screen = Screen::ManageMenu;
+            self.enter_home();
         } else {
             self.screen = Screen::BackendChoice;
         }
@@ -304,8 +296,7 @@ impl App {
 
         match config::save(&self.config, &self.paths) {
             Ok(()) => {
-                self.clear_creation_scratch();
-                self.screen = Screen::MainMenu;
+                self.enter_home();
             }
             Err(e) => {
                 match restore {
@@ -390,28 +381,14 @@ impl App {
                 _ => {}
             },
 
-            Screen::MainMenu => match key.code {
-                KeyCode::Down | KeyCode::Char('j') => self.main_menu_state.select_next(),
-                KeyCode::Up | KeyCode::Char('k') => self.main_menu_state.select_previous(),
-                KeyCode::Esc | KeyCode::Char('q') => self.quit = true,
-                KeyCode::Enter => match self.main_menu_state.selected().unwrap_or(0) {
-                    0 => {
-                        self.profile_list_state.select(Some(0));
-                        self.screen = Screen::SelectProfileForOpen;
-                    }
-                    1 => {
-                        self.manage_menu_state.select(Some(0));
-                        self.screen = Screen::ManageMenu;
-                    }
-                    _ => self.quit = true,
-                },
-                _ => {}
-            },
-
-            Screen::SelectProfileForOpen => match key.code {
+            Screen::Home => match key.code {
                 KeyCode::Down | KeyCode::Char('j') => self.profile_list_state.select_next(),
                 KeyCode::Up | KeyCode::Char('k') => self.profile_list_state.select_previous(),
-                KeyCode::Esc => self.screen = Screen::MainMenu,
+                KeyCode::Esc | KeyCode::Char('q') => self.quit = true,
+                KeyCode::Char('n') => {
+                    self.clear_creation_scratch();
+                    self.screen = Screen::CreateProfileName;
+                }
                 KeyCode::Enter if !self.config.profiles.is_empty() => {
                     let idx = self
                         .profile_list_state
@@ -421,13 +398,37 @@ impl App {
                     self.loading_index = idx;
                     self.screen = Screen::Loading;
                 }
+                KeyCode::Char('e') if !self.config.profiles.is_empty() => {
+                    let idx = self
+                        .profile_list_state
+                        .selected()
+                        .unwrap_or(0)
+                        .min(self.config.profiles.len() - 1);
+                    self.load_profile_into_scratch(idx);
+                    self.editing_original_name = Some(self.new_profile_name.clone());
+                    self.field_focus = 0;
+                    self.screen = match self.backend_kind {
+                        BackendKind::Local => Screen::LocalPath,
+                        BackendKind::Rest => Screen::RestConfig,
+                        BackendKind::S3 => Screen::S3Location,
+                    };
+                }
+                KeyCode::Char('d') if !self.config.profiles.is_empty() => {
+                    let idx = self
+                        .profile_list_state
+                        .selected()
+                        .unwrap_or(0)
+                        .min(self.config.profiles.len() - 1);
+                    self.pending_delete = Some(idx);
+                    self.screen = Screen::ConfirmDelete;
+                }
                 _ => {}
             },
 
             Screen::Snapshots => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
                     self.snapshots.clear();
-                    self.screen = Screen::MainMenu;
+                    self.enter_home();
                 }
                 KeyCode::Down | KeyCode::Char('j') => self.list_state.select_next(),
                 KeyCode::Up | KeyCode::Char('k') => self.list_state.select_previous(),
@@ -437,28 +438,6 @@ impl App {
                         self.list_state.select(Some(self.snapshots.len() - 1));
                     }
                 }
-                _ => {}
-            },
-
-            Screen::ManageMenu => match key.code {
-                KeyCode::Down | KeyCode::Char('j') => self.manage_menu_state.select_next(),
-                KeyCode::Up | KeyCode::Char('k') => self.manage_menu_state.select_previous(),
-                KeyCode::Esc => self.screen = Screen::MainMenu,
-                KeyCode::Enter => match self.manage_menu_state.selected().unwrap_or(0) {
-                    0 => {
-                        self.clear_creation_scratch();
-                        self.screen = Screen::CreateProfileName;
-                    }
-                    1 => {
-                        self.profile_list_state.select(Some(0));
-                        self.screen = Screen::SelectProfileForEdit;
-                    }
-                    2 => {
-                        self.profile_list_state.select(Some(0));
-                        self.screen = Screen::SelectProfileForDelete;
-                    }
-                    _ => self.screen = Screen::MainMenu,
-                },
                 _ => {}
             },
 
@@ -478,10 +457,7 @@ impl App {
                     self.backend_list.select(Some(0));
                     self.screen = Screen::BackendChoice;
                 }
-                TextAction::Cancel => {
-                    self.clear_creation_scratch();
-                    self.screen = Screen::ManageMenu;
-                }
+                TextAction::Cancel => self.enter_home(),
                 _ => {}
             },
 
@@ -495,10 +471,11 @@ impl App {
                         .unwrap_or(0)
                         .min(BACKEND_ORDER.len() - 1);
                     self.backend_kind = BACKEND_ORDER[idx];
+                    self.field_focus = 0;
                     self.screen = match self.backend_kind {
                         BackendKind::Local => Screen::LocalPath,
-                        BackendKind::Rest => Screen::RestUrl,
-                        BackendKind::S3 => Screen::S3Endpoint,
+                        BackendKind::Rest => Screen::RestConfig,
+                        BackendKind::S3 => Screen::S3Location,
                     };
                 }
                 KeyCode::Esc => self.screen = Screen::CreateProfileName,
@@ -514,85 +491,95 @@ impl App {
                 _ => {}
             },
 
-            Screen::RestUrl => match text_input(&mut self.rest_url, key) {
-                TextAction::Submit if !self.rest_url.trim().is_empty() => {
-                    self.rest_url = self.rest_url.trim().to_string();
-                    self.screen = Screen::RestUser;
+            Screen::RestConfig => {
+                const N: usize = 3;
+                match key.code {
+                    KeyCode::Tab | KeyCode::Down => {
+                        self.field_focus = (self.field_focus + 1) % N;
+                    }
+                    KeyCode::BackTab | KeyCode::Up => {
+                        self.field_focus = (self.field_focus + N - 1) % N;
+                    }
+                    KeyCode::Esc => self.cancel_from_first_backend_input(),
+                    KeyCode::Enter => {
+                        self.rest_url = self.rest_url.trim().to_string();
+                        self.rest_user = self.rest_user.trim().to_string();
+                        if !self.rest_url.is_empty() {
+                            self.screen = Screen::Password;
+                        }
+                    }
+                    _ => {
+                        let buf: &mut String = match self.field_focus {
+                            0 => &mut self.rest_url,
+                            1 => &mut self.rest_user,
+                            _ => &mut self.rest_password,
+                        };
+                        let _ = text_input(buf, key);
+                    }
                 }
-                TextAction::Cancel => self.cancel_from_first_backend_input(),
-                _ => {}
-            },
+            }
 
-            Screen::RestUser => match text_input(&mut self.rest_user, key) {
-                TextAction::Submit => {
-                    self.rest_user = self.rest_user.trim().to_string();
-                    self.screen = Screen::RestPassword;
+            Screen::S3Location => {
+                const N: usize = 4;
+                match key.code {
+                    KeyCode::Tab | KeyCode::Down => {
+                        self.field_focus = (self.field_focus + 1) % N;
+                    }
+                    KeyCode::BackTab | KeyCode::Up => {
+                        self.field_focus = (self.field_focus + N - 1) % N;
+                    }
+                    KeyCode::Esc => self.cancel_from_first_backend_input(),
+                    KeyCode::Enter => {
+                        self.s3_endpoint = self.s3_endpoint.trim().to_string();
+                        self.s3_bucket = self.s3_bucket.trim().to_string();
+                        self.s3_region = self.s3_region.trim().to_string();
+                        self.s3_root = self.s3_root.trim().to_string();
+                        if !self.s3_bucket.is_empty() {
+                            self.field_focus = 0;
+                            self.screen = Screen::S3Credentials;
+                        }
+                    }
+                    _ => {
+                        let buf: &mut String = match self.field_focus {
+                            0 => &mut self.s3_endpoint,
+                            1 => &mut self.s3_bucket,
+                            2 => &mut self.s3_region,
+                            _ => &mut self.s3_root,
+                        };
+                        let _ = text_input(buf, key);
+                    }
                 }
-                TextAction::Cancel => self.screen = Screen::RestUrl,
-                _ => {}
-            },
+            }
 
-            Screen::RestPassword => match text_input(&mut self.rest_password, key) {
-                TextAction::Submit => {
-                    self.screen = Screen::Password;
+            Screen::S3Credentials => {
+                const N: usize = 2;
+                match key.code {
+                    KeyCode::Tab | KeyCode::Down => {
+                        self.field_focus = (self.field_focus + 1) % N;
+                    }
+                    KeyCode::BackTab | KeyCode::Up => {
+                        self.field_focus = (self.field_focus + N - 1) % N;
+                    }
+                    KeyCode::Esc => {
+                        self.field_focus = 0;
+                        self.screen = Screen::S3Location;
+                    }
+                    KeyCode::Enter => {
+                        self.s3_access_key = self.s3_access_key.trim().to_string();
+                        self.s3_secret_key = self.s3_secret_key.trim().to_string();
+                        if !self.s3_access_key.is_empty() && !self.s3_secret_key.is_empty() {
+                            self.screen = Screen::Password;
+                        }
+                    }
+                    _ => {
+                        let buf: &mut String = match self.field_focus {
+                            0 => &mut self.s3_access_key,
+                            _ => &mut self.s3_secret_key,
+                        };
+                        let _ = text_input(buf, key);
+                    }
                 }
-                TextAction::Cancel => self.screen = Screen::RestUser,
-                _ => {}
-            },
-
-            Screen::S3Endpoint => match text_input(&mut self.s3_endpoint, key) {
-                TextAction::Submit => {
-                    self.s3_endpoint = self.s3_endpoint.trim().to_string();
-                    self.screen = Screen::S3Bucket;
-                }
-                TextAction::Cancel => self.cancel_from_first_backend_input(),
-                _ => {}
-            },
-
-            Screen::S3Bucket => match text_input(&mut self.s3_bucket, key) {
-                TextAction::Submit if !self.s3_bucket.trim().is_empty() => {
-                    self.s3_bucket = self.s3_bucket.trim().to_string();
-                    self.screen = Screen::S3Region;
-                }
-                TextAction::Cancel => self.screen = Screen::S3Endpoint,
-                _ => {}
-            },
-
-            Screen::S3Region => match text_input(&mut self.s3_region, key) {
-                TextAction::Submit => {
-                    self.s3_region = self.s3_region.trim().to_string();
-                    self.screen = Screen::S3Root;
-                }
-                TextAction::Cancel => self.screen = Screen::S3Bucket,
-                _ => {}
-            },
-
-            Screen::S3Root => match text_input(&mut self.s3_root, key) {
-                TextAction::Submit => {
-                    self.s3_root = self.s3_root.trim().to_string();
-                    self.screen = Screen::S3AccessKey;
-                }
-                TextAction::Cancel => self.screen = Screen::S3Region,
-                _ => {}
-            },
-
-            Screen::S3AccessKey => match text_input(&mut self.s3_access_key, key) {
-                TextAction::Submit if !self.s3_access_key.trim().is_empty() => {
-                    self.s3_access_key = self.s3_access_key.trim().to_string();
-                    self.screen = Screen::S3SecretKey;
-                }
-                TextAction::Cancel => self.screen = Screen::S3Root,
-                _ => {}
-            },
-
-            Screen::S3SecretKey => match text_input(&mut self.s3_secret_key, key) {
-                TextAction::Submit if !self.s3_secret_key.trim().is_empty() => {
-                    self.s3_secret_key = self.s3_secret_key.trim().to_string();
-                    self.screen = Screen::Password;
-                }
-                TextAction::Cancel => self.screen = Screen::S3AccessKey,
-                _ => {}
-            },
+            }
 
             Screen::Password => match text_input(&mut self.password, key) {
                 TextAction::Submit if !self.password.is_empty() => {
@@ -600,47 +587,11 @@ impl App {
                 }
                 TextAction::Cancel => {
                     self.password.clear();
+                    self.field_focus = 0;
                     self.screen = match self.backend_kind {
                         BackendKind::Local => Screen::LocalPath,
-                        BackendKind::Rest => Screen::RestPassword,
-                        BackendKind::S3 => Screen::S3SecretKey,
-                    };
-                }
-                _ => {}
-            },
-
-            Screen::SelectProfileForDelete => match key.code {
-                KeyCode::Down | KeyCode::Char('j') => self.profile_list_state.select_next(),
-                KeyCode::Up | KeyCode::Char('k') => self.profile_list_state.select_previous(),
-                KeyCode::Esc => self.screen = Screen::ManageMenu,
-                KeyCode::Enter if !self.config.profiles.is_empty() => {
-                    let idx = self
-                        .profile_list_state
-                        .selected()
-                        .unwrap_or(0)
-                        .min(self.config.profiles.len() - 1);
-                    self.pending_delete = Some(idx);
-                    self.screen = Screen::ConfirmDelete;
-                }
-                _ => {}
-            },
-
-            Screen::SelectProfileForEdit => match key.code {
-                KeyCode::Down | KeyCode::Char('j') => self.profile_list_state.select_next(),
-                KeyCode::Up | KeyCode::Char('k') => self.profile_list_state.select_previous(),
-                KeyCode::Esc => self.screen = Screen::ManageMenu,
-                KeyCode::Enter if !self.config.profiles.is_empty() => {
-                    let idx = self
-                        .profile_list_state
-                        .selected()
-                        .unwrap_or(0)
-                        .min(self.config.profiles.len() - 1);
-                    self.load_profile_into_scratch(idx);
-                    self.editing_original_name = Some(self.new_profile_name.clone());
-                    self.screen = match self.backend_kind {
-                        BackendKind::Local => Screen::LocalPath,
-                        BackendKind::Rest => Screen::RestUrl,
-                        BackendKind::S3 => Screen::S3Endpoint,
+                        BackendKind::Rest => Screen::RestConfig,
+                        BackendKind::S3 => Screen::S3Credentials,
                     };
                 }
                 _ => {}
@@ -657,7 +608,7 @@ impl App {
                             .remove(&name)
                             .expect("name_at hit must exist");
                         match config::save(&self.config, &self.paths) {
-                            Ok(()) => self.screen = Screen::MainMenu,
+                            Ok(()) => self.enter_home(),
                             Err(e) => {
                                 self.config.profiles.insert(name, removed);
                                 self.screen =
@@ -665,12 +616,12 @@ impl App {
                             }
                         }
                     } else {
-                        self.screen = Screen::ManageMenu;
+                        self.enter_home();
                     }
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     self.pending_delete = None;
-                    self.screen = Screen::SelectProfileForDelete;
+                    self.screen = Screen::Home;
                 }
                 _ => {}
             },
@@ -679,19 +630,17 @@ impl App {
 
             Screen::VerifyFailed(_) => match key.code {
                 KeyCode::Char('r') | KeyCode::Char('R') => {
+                    self.field_focus = 0;
                     self.screen = match self.backend_kind {
                         BackendKind::Local => Screen::LocalPath,
-                        BackendKind::Rest => Screen::RestUrl,
-                        BackendKind::S3 => Screen::S3Endpoint,
+                        BackendKind::Rest => Screen::RestConfig,
+                        BackendKind::S3 => Screen::S3Location,
                     };
                 }
                 KeyCode::Char('s') | KeyCode::Char('S') => {
                     self.commit_profile();
                 }
-                KeyCode::Esc => {
-                    self.clear_creation_scratch();
-                    self.screen = Screen::ManageMenu;
-                }
+                KeyCode::Esc => self.enter_home(),
                 _ => {}
             },
 
@@ -699,7 +648,7 @@ impl App {
                 if self.error_is_fatal {
                     self.quit = true;
                 } else {
-                    self.screen = Screen::MainMenu;
+                    self.enter_home();
                 }
             }
         }
