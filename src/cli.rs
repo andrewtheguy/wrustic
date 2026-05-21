@@ -28,10 +28,17 @@ pub(crate) fn parse_cli() -> Result<Cli> {
                 let value = args
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("{arg} requires a path argument"))?;
+                if value.is_empty() {
+                    bail!("{arg} requires a non-empty path");
+                }
                 cli.config_dir = Some(PathBuf::from(value));
             }
             other if other.starts_with("--config-dir=") => {
-                cli.config_dir = Some(PathBuf::from(&other["--config-dir=".len()..]));
+                let value = &other["--config-dir=".len()..];
+                if value.is_empty() {
+                    bail!("--config-dir= requires a non-empty path");
+                }
+                cli.config_dir = Some(PathBuf::from(value));
             }
             other => bail!("unknown argument: {other}"),
         }

@@ -169,17 +169,15 @@ parse_args() {
         esac
     done
 
+    # If RELEASE_TAG is set in the environment, bash already promoted it to
+    # this variable, so the check below picks it up without an explicit branch.
     if [ -z "$RELEASE_TAG" ]; then
-        if [ -n "${RELEASE_TAG_ENV:-}" ]; then
-            RELEASE_TAG="$RELEASE_TAG_ENV"
+        if [ "$PREFER_PRERELEASE" = true ]; then
+            print_info "Fetching latest prerelease tag from GitHub..."
+            RELEASE_TAG=$(get_latest_prerelease_tag)
         else
-            if [ "$PREFER_PRERELEASE" = true ]; then
-                print_info "Fetching latest prerelease tag from GitHub..."
-                RELEASE_TAG=$(get_latest_prerelease_tag)
-            else
-                print_info "Fetching latest release tag from GitHub..."
-                RELEASE_TAG=$(get_latest_release_tag)
-            fi
+            print_info "Fetching latest release tag from GitHub..."
+            RELEASE_TAG=$(get_latest_release_tag)
         fi
     fi
 }
