@@ -1,0 +1,2 @@
+- no backward compatibility of any kind since it is a private and personal project.
+- use restic cli for write operations or operations not supported by wrustic for dev flows
