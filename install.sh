@@ -1,0 +1,398 @@
+#!/bin/bash
+
+# wrustic installer
+# Downloads latest binary from: https://github.com/andrewtheguy/wrustic/releases
+#
+# Usage: ./install.sh [RELEASE_TAG] [--prerelease] [--download-only]
+# Or set RELEASE_TAG environment variable
+
+set -e
+
+REPO_OWNER="andrewtheguy"
+REPO_NAME="wrustic"
+DOWNLOAD_ONLY=false
+PREFER_PRERELEASE=false
+
+# Color output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+print_info() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+print_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
+}
+
+print_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# Fetch the latest stable release tag (non-prerelease)
+get_latest_release_tag() {
+    local api_url="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest"
+    local release_json
+
+    if command -v curl >/dev/null 2>&1; then
+        release_json=$(curl -s "$api_url")
+    elif command -v wget >/dev/null 2>&1; then
+        release_json=$(wget -qO- "$api_url")
+    else
+        print_error "Neither curl nor wget is available. Please install one of them."
+        exit 1
+    fi
+
+    local tag
+    tag=$(echo "$release_json" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
+
+    if [ -z "$tag" ]; then
+        print_error "Could not find a latest release on GitHub"
+        exit 1
+    fi
+
+    echo "$tag"
+}
+
+# Fetch the latest prerelease tag
+get_latest_prerelease_tag() {
+    local api_url="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases?per_page=30"
+    local releases_json
+
+    if command -v curl >/dev/null 2>&1; then
+        releases_json=$(curl -s "$api_url")
+    elif command -v wget >/dev/null 2>&1; then
+        releases_json=$(wget -qO- "$api_url")
+    else
+        print_error "Neither curl nor wget is available. Please install one of them."
+        exit 1
+    fi
+
+    local tag
+    tag=$(echo "$releases_json" | awk '
+        /"tag_name"/ {gsub(/[,"]/, "", $2); tag=$2}
+        /"prerelease": *true/ {if(tag!=""){print tag; exit}}
+    ')
+
+    if [ -z "$tag" ]; then
+        print_error "Could not find any prerelease on GitHub"
+        exit 1
+    fi
+
+    echo "$tag"
+}
+
+# Fetch full release info from GitHub API
+get_release_info() {
+    local tag="$1"
+    local api_url="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/tags/${tag}"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -s "$api_url"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO- "$api_url"
+    else
+        print_error "Neither curl nor wget is available."
+        return 1
+    fi
+}
+
+# Extract SHA-256 checksum from release JSON for a specific binary
+get_expected_checksum() {
+    local release_json="$1"
+    local binary_name="$2"
+
+    echo "$release_json" | grep -A40 "\"name\": \"${binary_name}\"" | \
+        grep '"digest"' | head -1 | grep -o 'sha256:[a-f0-9]*' | cut -d: -f2
+}
+
+# Compute SHA-256 checksum of a file
+compute_checksum() {
+    local file="$1"
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$file" | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$file" | cut -d' ' -f1
+    else
+        print_error "Neither sha256sum nor shasum is available"
+        return 1
+    fi
+}
+
+# Verify file checksum against expected value
+verify_checksum() {
+    local file="$1"
+    local expected="$2"
+
+    print_info "Verifying checksum..."
+    local actual
+    actual=$(compute_checksum "$file")
+
+    if [ $? -ne 0 ]; then
+        return 1
+    fi
+
+    if [ "$expected" = "$actual" ]; then
+        print_info "Checksum verified: ${actual:0:16}..."
+        return 0
+    else
+        print_error "Checksum verification FAILED!"
+        print_error "Expected: $expected"
+        print_error "Actual:   $actual"
+        return 1
+    fi
+}
+
+# Parse command-line arguments
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --download-only)
+                DOWNLOAD_ONLY=true
+                shift
+                ;;
+            --prerelease)
+                PREFER_PRERELEASE=true
+                shift
+                ;;
+            --help|-h)
+                show_usage
+                exit 0
+                ;;
+            *)
+                RELEASE_TAG="$1"
+                shift
+                ;;
+        esac
+    done
+
+    # If RELEASE_TAG is set in the environment, bash already promoted it to
+    # this variable, so the check below picks it up without an explicit branch.
+    if [ -z "$RELEASE_TAG" ]; then
+        if [ "$PREFER_PRERELEASE" = true ]; then
+            print_info "Fetching latest prerelease tag from GitHub..."
+            RELEASE_TAG=$(get_latest_prerelease_tag)
+        else
+            print_info "Fetching latest release tag from GitHub..."
+            RELEASE_TAG=$(get_latest_release_tag)
+        fi
+    fi
+}
+
+# Detect OS (matches the release.yml label scheme: linux-* and macos-*)
+detect_os() {
+    case "$(uname -s)" in
+        Linux*)
+            OS="linux"
+            ;;
+        Darwin*)
+            OS="macos"
+            ;;
+        *)
+            print_error "Unsupported operating system: $(uname -s)"
+            print_error "Supported: Linux, macOS"
+            exit 1
+            ;;
+    esac
+}
+
+# Detect architecture
+detect_arch() {
+    ARCH=$(uname -m)
+    case $ARCH in
+        x86_64|amd64)
+            ARCH="amd64"
+            ;;
+        aarch64|arm64)
+            ARCH="arm64"
+            ;;
+        *)
+            print_error "Unsupported architecture: $ARCH"
+            print_error "Supported architectures: x86_64/amd64, aarch64/arm64"
+            exit 1
+            ;;
+    esac
+}
+
+# Map OS and architecture to binary name
+get_binary_name() {
+    BINARY_NAME="wrustic-${OS}-${ARCH}"
+
+    # Restrict to combinations that the release workflow actually builds.
+    case "${OS}-${ARCH}" in
+        linux-amd64|linux-arm64|macos-arm64)
+            ;;
+        *)
+            print_error "No prebuilt binary for ${OS}-${ARCH}."
+            print_error "Available targets: linux-amd64, linux-arm64, macos-arm64"
+            exit 1
+            ;;
+    esac
+}
+
+# Download binary
+download_binary() {
+    local base_url="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${RELEASE_TAG}"
+    local url="${base_url}/${BINARY_NAME}"
+    local output_path="$1"
+
+    print_info "Downloading ${BINARY_NAME} from ${url}"
+
+    if command -v curl >/dev/null 2>&1; then
+        if ! curl -L -o "$output_path" "$url"; then
+            print_error "Failed to download binary"
+            exit 1
+        fi
+    elif command -v wget >/dev/null 2>&1; then
+        if ! wget -O "$output_path" "$url"; then
+            print_error "Failed to download binary"
+            exit 1
+        fi
+    else
+        print_error "Neither curl nor wget is available. Please install one of them."
+        exit 1
+    fi
+
+    # Verify checksum if available
+    if [ -n "$EXPECTED_CHECKSUM" ]; then
+        if ! verify_checksum "$output_path" "$EXPECTED_CHECKSUM"; then
+            print_error "Binary integrity check failed. Aborting."
+            rm -f "$output_path"
+            exit 1
+        fi
+    else
+        print_warn "No checksum available for verification (may be a prerelease)"
+    fi
+}
+
+# Download only - save to current directory
+download_only() {
+    local output_file="./${BINARY_NAME}"
+
+    download_binary "$output_file"
+    chmod +x "$output_file"
+
+    print_info "Binary saved to: ${output_file}"
+}
+
+# Download binary to temporary location and install
+download_and_install() {
+    local temp_dir
+    temp_dir=$(mktemp -d)
+    local temp_binary="${temp_dir}/${BINARY_NAME}"
+    local install_dir="/usr/local/bin"
+    local final_path="${install_dir}/wrustic"
+
+    trap 'rm -rf "$temp_dir"' EXIT
+
+    download_binary "$temp_binary"
+    chmod +x "$temp_binary"
+
+    # Move the binary to final location (requires sudo unless already root)
+    if [ "$EUID" -eq 0 ]; then
+        if ! mv "$temp_binary" "$final_path"; then
+            print_error "Failed to install binary to ${final_path}"
+            exit 1
+        fi
+    else
+        if ! sudo mv "$temp_binary" "$final_path"; then
+            print_error "Failed to install binary to ${final_path}"
+            exit 1
+        fi
+    fi
+
+    rm -rf "$temp_dir"
+
+    print_info "Binary installed successfully to ${final_path}"
+}
+
+# Display usage information
+show_usage() {
+    echo "Usage: $0 [OPTIONS] [RELEASE_TAG]"
+    echo ""
+    echo "Download and install wrustic binary"
+    echo ""
+    echo "Options:"
+    echo "  --download-only  Download binary to current directory without installing"
+    echo "  --prerelease     Use latest prerelease instead of latest stable release"
+    echo "  -h, --help       Show this help message"
+    echo ""
+    echo "Arguments:"
+    echo "  RELEASE_TAG      GitHub release tag to download (default: latest)"
+    echo ""
+    echo "Examples:"
+    echo "  $0                              # Install latest release"
+    echo "  $0 v0.0.1                       # Install specific release"
+    echo "  $0 --prerelease                 # Install latest prerelease"
+    echo "  $0 --download-only              # Download latest to current directory"
+    echo ""
+    echo "Supported platforms: linux-amd64, linux-arm64, macos-arm64"
+}
+
+# Main installation function
+install() {
+    if [ "$DOWNLOAD_ONLY" = true ]; then
+        print_info "wrustic downloader"
+    else
+        print_info "wrustic installer"
+    fi
+    print_info "Release: ${RELEASE_TAG}"
+    print_info "Repository: ${REPO_OWNER}/${REPO_NAME}"
+
+    detect_os
+    detect_arch
+    get_binary_name
+
+    print_info "Platform detected: ${OS}-${ARCH}"
+    print_info "Binary name: ${BINARY_NAME}"
+
+    # Fetch release info for checksum verification
+    print_info "Fetching release information..."
+    RELEASE_JSON=$(get_release_info "$RELEASE_TAG")
+
+    if [ -z "$RELEASE_JSON" ] || echo "$RELEASE_JSON" | grep -q '"message": "Not Found"'; then
+        print_error "Could not fetch release info from GitHub."
+        exit 1
+    fi
+
+    EXPECTED_CHECKSUM=$(get_expected_checksum "$RELEASE_JSON" "$BINARY_NAME")
+    if [ -n "$EXPECTED_CHECKSUM" ]; then
+        print_info "Expected checksum: ${EXPECTED_CHECKSUM:0:16}..."
+    fi
+
+    if [ "$DOWNLOAD_ONLY" = true ]; then
+        download_only
+        print_info "Download completed successfully!"
+    else
+        download_and_install
+        print_info "Installation completed successfully!"
+        print_info "You can now run 'wrustic' from your terminal."
+    fi
+}
+
+# Check if sudo is available for installation
+check_privileges() {
+    if [ "$EUID" -ne 0 ] && ! command -v sudo >/dev/null 2>&1; then
+        print_error "sudo is required to install to /usr/local/bin. Please install sudo or run as root."
+        exit 1
+    fi
+}
+
+# Main execution
+main() {
+    parse_args "$@"
+
+    if [ "$DOWNLOAD_ONLY" = true ]; then
+        print_info "Starting wrustic download..."
+    else
+        print_info "Starting wrustic installation..."
+        check_privileges
+    fi
+
+    install
+}
+
+main "$@"
