@@ -162,7 +162,8 @@ impl App {
             },
 
             Screen::S3AccessKey => match text_input(&mut self.s3_access_key, key) {
-                TextAction::Submit if !self.s3_access_key.is_empty() => {
+                TextAction::Submit if !self.s3_access_key.trim().is_empty() => {
+                    self.s3_access_key = self.s3_access_key.trim().to_string();
                     self.screen = Screen::S3SecretKey;
                 }
                 TextAction::Cancel => self.screen = Screen::S3Region,
@@ -170,7 +171,8 @@ impl App {
             },
 
             Screen::S3SecretKey => match text_input(&mut self.s3_secret_key, key) {
-                TextAction::Submit if !self.s3_secret_key.is_empty() => {
+                TextAction::Submit if !self.s3_secret_key.trim().is_empty() => {
+                    self.s3_secret_key = self.s3_secret_key.trim().to_string();
                     self.screen = Screen::Password;
                 }
                 TextAction::Cancel => self.screen = Screen::S3AccessKey,
