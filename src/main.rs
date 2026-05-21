@@ -20,7 +20,12 @@ use crate::config::{BackendKind, Config, Paths, Profile};
 
 const BACKEND_ORDER: [BackendKind; 3] = [BackendKind::Local, BackendKind::Rest, BackendKind::S3];
 const MAIN_MENU: [&str; 3] = ["Work with a repo", "Manage profiles", "Quit"];
-const MANAGE_MENU: [&str; 3] = ["Create new profile", "Delete a profile", "Back"];
+const MANAGE_MENU: [&str; 4] = [
+    "Create new profile",
+    "Edit a profile",
+    "Delete a profile",
+    "Back",
+];
 const FIRST_RUN_MENU: [&str; 3] = [
     "Create a new age key",
     "Restore an existing age key",
@@ -48,11 +53,17 @@ enum Screen {
     S3SecretKey,
     Password,
     SelectProfileForDelete,
+    SelectProfileForEdit,
     ConfirmDelete,
     Loading,
     Verifying,
     VerifyFailed(String),
     Error(String),
+}
+
+enum ProfileRollback {
+    Pop,
+    Replace(usize, Profile),
 }
 
 struct SnapshotRow {
@@ -91,6 +102,7 @@ struct App {
 
     loading_index: usize,
     pending_delete: Option<usize>,
+    editing_index: Option<usize>,
 
     restore_error: Option<String>,
     created_pubkey: String,
@@ -137,6 +149,7 @@ impl App {
             password: String::new(),
             loading_index: 0,
             pending_delete: None,
+            editing_index: None,
             restore_error: None,
             created_pubkey: String::new(),
             snapshots: Vec::new(),
@@ -178,6 +191,52 @@ impl App {
         self.s3_access_key.clear();
         self.s3_secret_key.clear();
         self.password.clear();
+        self.editing_index = None;
+    }
+
+    fn load_profile_into_scratch(&mut self, idx: usize) {
+        let p = &self.config.profiles[idx];
+        self.new_profile_name = p.name().to_string();
+        self.password = p.password().to_string();
+        self.backend_kind = p.backend_kind();
+        self.local_path.clear();
+        self.rest_url.clear();
+        self.rest_user.clear();
+        self.rest_password.clear();
+        self.s3_endpoint.clear();
+        self.s3_bucket.clear();
+        self.s3_region.clear();
+        self.s3_access_key.clear();
+        self.s3_secret_key.clear();
+        match p {
+            Profile::Local { local_path, .. } => {
+                self.local_path = local_path.clone();
+            }
+            Profile::Rest {
+                rest_url,
+                rest_user,
+                rest_password,
+                ..
+            } => {
+                self.rest_url = rest_url.clone();
+                self.rest_user = rest_user.clone();
+                self.rest_password = rest_password.clone();
+            }
+            Profile::S3 {
+                s3_endpoint,
+                s3_bucket,
+                s3_region,
+                s3_access_key,
+                s3_secret_key,
+                ..
+            } => {
+                self.s3_endpoint = s3_endpoint.clone();
+                self.s3_bucket = s3_bucket.clone();
+                self.s3_region = s3_region.clone();
+                self.s3_access_key = s3_access_key.clone();
+                self.s3_secret_key = s3_secret_key.clone();
+            }
+        }
     }
 
     fn build_profile(&self) -> Profile {
@@ -212,16 +271,51 @@ impl App {
         }
     }
 
-    fn commit_new_profile(&mut self) {
+    fn cancel_from_first_backend_input(&mut self) {
+        if self.editing_index.is_some() {
+            self.clear_creation_scratch();
+            self.screen = Screen::ManageMenu;
+        } else {
+            self.screen = Screen::BackendChoice;
+        }
+    }
+
+    fn commit_profile(&mut self) {
         let profile = self.build_profile();
-        self.config.profiles.push(profile);
+
+        if self.editing_index.is_none() && self.config.has_profile(profile.name()) {
+            self.screen = Screen::Error(format!(
+                "A profile named '{}' already exists.",
+                profile.name()
+            ));
+            return;
+        }
+
+        let restore = match self.editing_index {
+            Some(idx) => ProfileRollback::Replace(
+                idx,
+                std::mem::replace(&mut self.config.profiles[idx], profile),
+            ),
+            None => {
+                self.config.profiles.push(profile);
+                ProfileRollback::Pop
+            }
+        };
+
         match config::save(&self.config, &self.paths) {
             Ok(()) => {
                 self.clear_creation_scratch();
                 self.screen = Screen::MainMenu;
             }
             Err(e) => {
-                self.config.profiles.pop();
+                match restore {
+                    ProfileRollback::Replace(idx, old) => {
+                        self.config.profiles[idx] = old;
+                    }
+                    ProfileRollback::Pop => {
+                        self.config.profiles.pop();
+                    }
+                }
                 self.screen = Screen::Error(format!("Saving config failed: {e:#}"));
             }
         }
@@ -357,6 +451,10 @@ impl App {
                     }
                     1 => {
                         self.profile_list_state.select(Some(0));
+                        self.screen = Screen::SelectProfileForEdit;
+                    }
+                    2 => {
+                        self.profile_list_state.select(Some(0));
                         self.screen = Screen::SelectProfileForDelete;
                     }
                     _ => self.screen = Screen::MainMenu,
@@ -412,7 +510,7 @@ impl App {
                     self.local_path = self.local_path.trim().to_string();
                     self.screen = Screen::Password;
                 }
-                TextAction::Cancel => self.screen = Screen::BackendChoice,
+                TextAction::Cancel => self.cancel_from_first_backend_input(),
                 _ => {}
             },
 
@@ -421,7 +519,7 @@ impl App {
                     self.rest_url = self.rest_url.trim().to_string();
                     self.screen = Screen::RestUser;
                 }
-                TextAction::Cancel => self.screen = Screen::BackendChoice,
+                TextAction::Cancel => self.cancel_from_first_backend_input(),
                 _ => {}
             },
 
@@ -447,7 +545,7 @@ impl App {
                     self.s3_endpoint = self.s3_endpoint.trim().to_string();
                     self.screen = Screen::S3Bucket;
                 }
-                TextAction::Cancel => self.screen = Screen::BackendChoice,
+                TextAction::Cancel => self.cancel_from_first_backend_input(),
                 _ => {}
             },
 
@@ -518,6 +616,27 @@ impl App {
                 _ => {}
             },
 
+            Screen::SelectProfileForEdit => match key.code {
+                KeyCode::Down | KeyCode::Char('j') => self.profile_list_state.select_next(),
+                KeyCode::Up | KeyCode::Char('k') => self.profile_list_state.select_previous(),
+                KeyCode::Esc => self.screen = Screen::ManageMenu,
+                KeyCode::Enter if !self.config.profiles.is_empty() => {
+                    let idx = self
+                        .profile_list_state
+                        .selected()
+                        .unwrap_or(0)
+                        .min(self.config.profiles.len() - 1);
+                    self.load_profile_into_scratch(idx);
+                    self.editing_index = Some(idx);
+                    self.screen = match self.backend_kind {
+                        BackendKind::Local => Screen::LocalPath,
+                        BackendKind::Rest => Screen::RestUrl,
+                        BackendKind::S3 => Screen::S3Endpoint,
+                    };
+                }
+                _ => {}
+            },
+
             Screen::ConfirmDelete => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     if let Some(idx) = self.pending_delete.take() {
@@ -556,7 +675,7 @@ impl App {
                     };
                 }
                 KeyCode::Char('s') | KeyCode::Char('S') => {
-                    self.commit_new_profile();
+                    self.commit_profile();
                 }
                 KeyCode::Esc => {
                     self.clear_creation_scratch();
@@ -682,7 +801,7 @@ fn run(terminal: &mut DefaultTerminal, config_dir: Option<PathBuf>) -> Result<()
         if matches!(app.screen, Screen::Verifying) {
             let profile = app.build_profile();
             match verify_profile(&profile) {
-                Ok(()) => app.commit_new_profile(),
+                Ok(()) => app.commit_profile(),
                 Err(e) => app.screen = Screen::VerifyFailed(format!("{e:#}")),
             }
             continue;
@@ -786,6 +905,9 @@ fn render(frame: &mut Frame, app: &mut App) {
         }
         Screen::SelectProfileForDelete => {
             render_profile_list(frame, app, "Select profile to delete (Esc back)")
+        }
+        Screen::SelectProfileForEdit => {
+            render_profile_list(frame, app, "Select profile to edit (Esc back)")
         }
         Screen::ManageMenu => render_menu(frame, app, MainOrManage::Manage),
         Screen::CreateProfileName => render_input(
