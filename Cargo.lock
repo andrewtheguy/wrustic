@@ -4611,6 +4611,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
+name = "tui-input"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "911e93158bf80bbc94bad533b2b16e3d711e1132d69a6a6980c3920a63422c19"
+dependencies = [
+ "crossterm",
+ "unicode-width",
+]
+
+[[package]]
 name = "type-map"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5438,7 +5448,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "wrustic"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "age",
  "anyhow",
@@ -5449,6 +5459,7 @@ dependencies = [
  "rustic_core",
  "serde",
  "toml 0.8.23",
+ "tui-input",
  "url",
 ]
 

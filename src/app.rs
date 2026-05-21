@@ -2,10 +2,12 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use ratatui::{
-    crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
+    crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers},
     widgets::ListState,
 };
 use rustic_core::{IndexedIdsStatus, Repository, TreeId};
+use tui_input::Input;
+use tui_input::backend::crossterm::EventHandler;
 
 use crate::config::{self, BackendKind, Config, Paths, Profile};
 use crate::repo::{ContentKind, ContentRow, SnapshotRow};
@@ -63,19 +65,19 @@ pub(crate) struct App {
     pub(crate) profile_list_state: ListState,
     pub(crate) list_state: ListState,
 
-    pub(crate) new_profile_name: String,
+    pub(crate) new_profile_name: Input,
     pub(crate) backend_kind: BackendKind,
-    pub(crate) local_path: String,
-    pub(crate) rest_url: String,
-    pub(crate) rest_user: String,
-    pub(crate) rest_password: String,
-    pub(crate) s3_endpoint: String,
-    pub(crate) s3_bucket: String,
-    pub(crate) s3_region: String,
-    pub(crate) s3_root: String,
-    pub(crate) s3_access_key: String,
-    pub(crate) s3_secret_key: String,
-    pub(crate) password: String,
+    pub(crate) local_path: Input,
+    pub(crate) rest_url: Input,
+    pub(crate) rest_user: Input,
+    pub(crate) rest_password: Input,
+    pub(crate) s3_endpoint: Input,
+    pub(crate) s3_bucket: Input,
+    pub(crate) s3_region: Input,
+    pub(crate) s3_root: Input,
+    pub(crate) s3_access_key: Input,
+    pub(crate) s3_secret_key: Input,
+    pub(crate) password: Input,
 
     pub(crate) loading_index: usize,
     pub(crate) pending_delete: Option<usize>,
@@ -113,19 +115,19 @@ impl App {
             backend_list,
             profile_list_state: ListState::default(),
             list_state: ListState::default(),
-            new_profile_name: String::new(),
+            new_profile_name: Input::default(),
             backend_kind: BackendKind::Local,
-            local_path: String::new(),
-            rest_url: String::new(),
-            rest_user: String::new(),
-            rest_password: String::new(),
-            s3_endpoint: String::new(),
-            s3_bucket: String::new(),
-            s3_region: String::new(),
-            s3_root: String::new(),
-            s3_access_key: String::new(),
-            s3_secret_key: String::new(),
-            password: String::new(),
+            local_path: Input::default(),
+            rest_url: Input::default(),
+            rest_user: Input::default(),
+            rest_password: Input::default(),
+            s3_endpoint: Input::default(),
+            s3_bucket: Input::default(),
+            s3_region: Input::default(),
+            s3_root: Input::default(),
+            s3_access_key: Input::default(),
+            s3_secret_key: Input::default(),
+            password: Input::default(),
             loading_index: 0,
             pending_delete: None,
             editing_original_name: None,
@@ -182,40 +184,40 @@ impl App {
     }
 
     fn clear_creation_scratch(&mut self) {
-        self.new_profile_name.clear();
-        self.local_path.clear();
-        self.rest_url.clear();
-        self.rest_user.clear();
-        self.rest_password.clear();
-        self.s3_endpoint.clear();
-        self.s3_bucket.clear();
-        self.s3_region.clear();
-        self.s3_root.clear();
-        self.s3_access_key.clear();
-        self.s3_secret_key.clear();
-        self.password.clear();
+        self.new_profile_name.reset();
+        self.local_path.reset();
+        self.rest_url.reset();
+        self.rest_user.reset();
+        self.rest_password.reset();
+        self.s3_endpoint.reset();
+        self.s3_bucket.reset();
+        self.s3_region.reset();
+        self.s3_root.reset();
+        self.s3_access_key.reset();
+        self.s3_secret_key.reset();
+        self.password.reset();
         self.editing_original_name = None;
         self.field_focus = 0;
     }
 
     fn load_profile_into_scratch(&mut self, idx: usize) {
         let Some((name, p)) = self.config.profile_at(idx) else { return };
-        self.new_profile_name = name.clone();
-        self.password = p.password().to_string();
+        self.new_profile_name = Input::new(name.clone());
+        self.password = Input::new(p.password().to_string());
         self.backend_kind = p.backend_kind();
-        self.local_path.clear();
-        self.rest_url.clear();
-        self.rest_user.clear();
-        self.rest_password.clear();
-        self.s3_endpoint.clear();
-        self.s3_bucket.clear();
-        self.s3_region.clear();
-        self.s3_root.clear();
-        self.s3_access_key.clear();
-        self.s3_secret_key.clear();
+        self.local_path.reset();
+        self.rest_url.reset();
+        self.rest_user.reset();
+        self.rest_password.reset();
+        self.s3_endpoint.reset();
+        self.s3_bucket.reset();
+        self.s3_region.reset();
+        self.s3_root.reset();
+        self.s3_access_key.reset();
+        self.s3_secret_key.reset();
         match p {
             Profile::Local { local_path, .. } => {
-                self.local_path = local_path.clone();
+                self.local_path = Input::new(local_path.clone());
             }
             Profile::Rest {
                 rest_url,
@@ -223,9 +225,9 @@ impl App {
                 rest_password,
                 ..
             } => {
-                self.rest_url = rest_url.clone();
-                self.rest_user = rest_user.clone();
-                self.rest_password = rest_password.clone();
+                self.rest_url = Input::new(rest_url.clone());
+                self.rest_user = Input::new(rest_user.clone());
+                self.rest_password = Input::new(rest_password.clone());
             }
             Profile::S3 {
                 s3_endpoint,
@@ -236,41 +238,41 @@ impl App {
                 s3_secret_key,
                 ..
             } => {
-                self.s3_endpoint = s3_endpoint.clone();
-                self.s3_bucket = s3_bucket.clone();
-                self.s3_region = s3_region.clone();
-                self.s3_root = s3_root.clone();
-                self.s3_access_key = s3_access_key.clone();
-                self.s3_secret_key = s3_secret_key.clone();
+                self.s3_endpoint = Input::new(s3_endpoint.clone());
+                self.s3_bucket = Input::new(s3_bucket.clone());
+                self.s3_region = Input::new(s3_region.clone());
+                self.s3_root = Input::new(s3_root.clone());
+                self.s3_access_key = Input::new(s3_access_key.clone());
+                self.s3_secret_key = Input::new(s3_secret_key.clone());
             }
         }
     }
 
     pub(crate) fn build_profile(&self) -> Profile {
-        let password = self.password.clone();
+        let password = self.password.value().to_string();
         match self.backend_kind {
             BackendKind::Local => Profile::Local {
                 password,
-                local_path: self.local_path.clone(),
+                local_path: self.local_path.value().to_string(),
             },
             BackendKind::Rest => Profile::Rest {
                 password,
-                rest_url: self.rest_url.clone(),
-                rest_user: self.rest_user.clone(),
-                rest_password: self.rest_password.clone(),
+                rest_url: self.rest_url.value().to_string(),
+                rest_user: self.rest_user.value().to_string(),
+                rest_password: self.rest_password.value().to_string(),
             },
             BackendKind::S3 => Profile::S3 {
                 password,
-                s3_endpoint: self.s3_endpoint.clone(),
-                s3_bucket: self.s3_bucket.clone(),
-                s3_region: if self.s3_region.is_empty() {
+                s3_endpoint: self.s3_endpoint.value().to_string(),
+                s3_bucket: self.s3_bucket.value().to_string(),
+                s3_region: if self.s3_region.value().is_empty() {
                     "us-east-1".into()
                 } else {
-                    self.s3_region.clone()
+                    self.s3_region.value().to_string()
                 },
-                s3_root: self.s3_root.clone(),
-                s3_access_key: self.s3_access_key.clone(),
-                s3_secret_key: self.s3_secret_key.clone(),
+                s3_root: self.s3_root.value().to_string(),
+                s3_access_key: self.s3_access_key.value().to_string(),
+                s3_secret_key: self.s3_secret_key.value().to_string(),
             },
         }
     }
@@ -285,7 +287,7 @@ impl App {
 
     pub(crate) fn commit_profile(&mut self) {
         let profile = self.build_profile();
-        let name = self.new_profile_name.clone();
+        let name = self.new_profile_name.value().to_string();
 
         if self.editing_original_name.is_none() && self.config.has_profile(&name) {
             self.screen = Screen::Error(format!(
@@ -443,7 +445,7 @@ impl App {
                         .unwrap_or(0)
                         .min(self.config.profiles.len() - 1);
                     self.load_profile_into_scratch(idx);
-                    self.editing_original_name = Some(self.new_profile_name.clone());
+                    self.editing_original_name = Some(self.new_profile_name.value().to_string());
                     self.field_focus = 0;
                     self.screen = match self.backend_kind {
                         BackendKind::Local => Screen::LocalPath,
@@ -559,9 +561,9 @@ impl App {
 
             Screen::OpeningSnapshot | Screen::LoadingDir => {}
 
-            Screen::CreateProfileName => match text_input(&mut self.new_profile_name, key) {
-                TextAction::Submit => {
-                    let name = self.new_profile_name.trim().to_string();
+            Screen::CreateProfileName => match key.code {
+                KeyCode::Enter => {
+                    let name = self.new_profile_name.value().trim().to_string();
                     if name.is_empty() {
                         return;
                     }
@@ -571,12 +573,14 @@ impl App {
                         ));
                         return;
                     }
-                    self.new_profile_name = name;
+                    self.new_profile_name = Input::new(name);
                     self.backend_list.select(Some(0));
                     self.screen = Screen::BackendChoice;
                 }
-                TextAction::Cancel => self.enter_home(),
-                _ => {}
+                KeyCode::Esc => self.enter_home(),
+                _ => {
+                    self.new_profile_name.handle_event(&Event::Key(key));
+                }
             },
 
             Screen::BackendChoice => match key.code {
@@ -600,13 +604,16 @@ impl App {
                 _ => {}
             },
 
-            Screen::LocalPath => match text_input(&mut self.local_path, key) {
-                TextAction::Submit if !self.local_path.trim().is_empty() => {
-                    self.local_path = self.local_path.trim().to_string();
+            Screen::LocalPath => match key.code {
+                KeyCode::Enter if !self.local_path.value().trim().is_empty() => {
+                    let trimmed = self.local_path.value().trim().to_string();
+                    self.local_path = Input::new(trimmed);
                     self.screen = Screen::Password;
                 }
-                TextAction::Cancel => self.cancel_from_first_backend_input(),
-                _ => {}
+                KeyCode::Esc => self.cancel_from_first_backend_input(),
+                _ => {
+                    self.local_path.handle_event(&Event::Key(key));
+                }
             },
 
             Screen::RestConfig => {
@@ -620,19 +627,19 @@ impl App {
                     }
                     KeyCode::Esc => self.cancel_from_first_backend_input(),
                     KeyCode::Enter => {
-                        self.rest_url = self.rest_url.trim().to_string();
-                        self.rest_user = self.rest_user.trim().to_string();
-                        if !self.rest_url.is_empty() {
+                        self.rest_url = Input::new(self.rest_url.value().trim().to_string());
+                        self.rest_user = Input::new(self.rest_user.value().trim().to_string());
+                        if !self.rest_url.value().is_empty() {
                             self.screen = Screen::Password;
                         }
                     }
                     _ => {
-                        let buf: &mut String = match self.field_focus {
+                        let buf: &mut Input = match self.field_focus {
                             0 => &mut self.rest_url,
                             1 => &mut self.rest_user,
                             _ => &mut self.rest_password,
                         };
-                        let _ = text_input(buf, key);
+                        buf.handle_event(&Event::Key(key));
                     }
                 }
             }
@@ -648,23 +655,24 @@ impl App {
                     }
                     KeyCode::Esc => self.cancel_from_first_backend_input(),
                     KeyCode::Enter => {
-                        self.s3_endpoint = self.s3_endpoint.trim().to_string();
-                        self.s3_bucket = self.s3_bucket.trim().to_string();
-                        self.s3_region = self.s3_region.trim().to_string();
-                        self.s3_root = self.s3_root.trim().to_string();
-                        if !self.s3_bucket.is_empty() {
+                        self.s3_endpoint =
+                            Input::new(self.s3_endpoint.value().trim().to_string());
+                        self.s3_bucket = Input::new(self.s3_bucket.value().trim().to_string());
+                        self.s3_region = Input::new(self.s3_region.value().trim().to_string());
+                        self.s3_root = Input::new(self.s3_root.value().trim().to_string());
+                        if !self.s3_bucket.value().is_empty() {
                             self.field_focus = 0;
                             self.screen = Screen::S3Credentials;
                         }
                     }
                     _ => {
-                        let buf: &mut String = match self.field_focus {
+                        let buf: &mut Input = match self.field_focus {
                             0 => &mut self.s3_endpoint,
                             1 => &mut self.s3_bucket,
                             2 => &mut self.s3_region,
                             _ => &mut self.s3_root,
                         };
-                        let _ = text_input(buf, key);
+                        buf.handle_event(&Event::Key(key));
                     }
                 }
             }
@@ -683,28 +691,32 @@ impl App {
                         self.screen = Screen::S3Location;
                     }
                     KeyCode::Enter => {
-                        self.s3_access_key = self.s3_access_key.trim().to_string();
-                        self.s3_secret_key = self.s3_secret_key.trim().to_string();
-                        if !self.s3_access_key.is_empty() && !self.s3_secret_key.is_empty() {
+                        self.s3_access_key =
+                            Input::new(self.s3_access_key.value().trim().to_string());
+                        self.s3_secret_key =
+                            Input::new(self.s3_secret_key.value().trim().to_string());
+                        if !self.s3_access_key.value().is_empty()
+                            && !self.s3_secret_key.value().is_empty()
+                        {
                             self.screen = Screen::Password;
                         }
                     }
                     _ => {
-                        let buf: &mut String = match self.field_focus {
+                        let buf: &mut Input = match self.field_focus {
                             0 => &mut self.s3_access_key,
                             _ => &mut self.s3_secret_key,
                         };
-                        let _ = text_input(buf, key);
+                        buf.handle_event(&Event::Key(key));
                     }
                 }
             }
 
-            Screen::Password => match text_input(&mut self.password, key) {
-                TextAction::Submit if !self.password.is_empty() => {
+            Screen::Password => match key.code {
+                KeyCode::Enter if !self.password.value().is_empty() => {
                     self.screen = Screen::Verifying;
                 }
-                TextAction::Cancel => {
-                    self.password.clear();
+                KeyCode::Esc => {
+                    self.password.reset();
                     self.field_focus = 0;
                     self.screen = match self.backend_kind {
                         BackendKind::Local => Screen::LocalPath,
@@ -712,7 +724,9 @@ impl App {
                         BackendKind::S3 => Screen::S3Credentials,
                     };
                 }
-                _ => {}
+                _ => {
+                    self.password.handle_event(&Event::Key(key));
+                }
             },
 
             Screen::ConfirmDelete => match key.code {
@@ -773,24 +787,3 @@ impl App {
     }
 }
 
-enum TextAction {
-    None,
-    Submit,
-    Cancel,
-}
-
-fn text_input(buf: &mut String, key: KeyEvent) -> TextAction {
-    match key.code {
-        KeyCode::Enter => TextAction::Submit,
-        KeyCode::Esc => TextAction::Cancel,
-        KeyCode::Backspace => {
-            buf.pop();
-            TextAction::None
-        }
-        KeyCode::Char(c) => {
-            buf.push(c);
-            TextAction::None
-        }
-        _ => TextAction::None,
-    }
-}
