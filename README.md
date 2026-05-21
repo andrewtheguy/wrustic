@@ -33,12 +33,30 @@ Requires a Rust toolchain (developed against rustc 1.93).
 cargo run
 ```
 
-First run: if `~/.config/wrustic/age.key` is missing, the welcome screen asks
+### CLI flags
+
+```text
+wrustic [-c|--config-dir <PATH>] [-h|--help]
+```
+
+`--config-dir <PATH>` overrides the default config location
+(`~/.config/wrustic`). The override applies to both the age identity file
+(`<PATH>/age.key`) and the encrypted profile store
+(`<PATH>/config.toml.age`). Useful for keeping separate profile sets, running
+tests, or driving an automation/CI flow against a throwaway directory:
+
+```sh
+cargo run -- --config-dir ./tmp/wrustic-sandbox
+```
+
+The directory is created on first run if it doesn't exist.
+
+First run: if `<config-dir>/age.key` is missing, the welcome screen asks
 whether to **create a new key** or **restore an existing one** (copy your
 backup to that path, then press Enter). When creating a new key, the next
 screen shows the key path and the public-key recipient (`age1…`) — **back up
 the key file now**, since losing it means losing access to every profile
-stored in `config.toml.age`.
+stored in the config file alongside it.
 
 Then in the TUI:
 1. The main menu lists **Work with a repo**, **Manage profiles**, and **Quit**.

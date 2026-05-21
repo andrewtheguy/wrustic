@@ -105,10 +105,13 @@ pub struct Paths {
     pub config: PathBuf,
 }
 
-pub fn paths() -> Result<Paths> {
-    let base = dirs::config_dir()
-        .ok_or_else(|| anyhow!("could not determine config directory"))?
-        .join(CONFIG_DIR_NAME);
+pub fn paths(override_dir: Option<PathBuf>) -> Result<Paths> {
+    let base = match override_dir {
+        Some(p) => p,
+        None => dirs::config_dir()
+            .ok_or_else(|| anyhow!("could not determine config directory"))?
+            .join(CONFIG_DIR_NAME),
+    };
     Ok(Paths {
         identity: base.join(IDENTITY_FILE),
         config: base.join(CONFIG_FILE),
@@ -309,6 +312,16 @@ mod tests {
             other => panic!("expected Rest, got {other:?}"),
         }
 
+        fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn paths_uses_override_when_provided() -> Result<()> {
+        let dir = fresh_dir("override");
+        let p = paths(Some(dir.clone()))?;
+        assert_eq!(p.identity, dir.join("age.key"));
+        assert_eq!(p.config, dir.join("config.toml.age"));
         fs::remove_dir_all(&dir).ok();
         Ok(())
     }

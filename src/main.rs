@@ -1,9 +1,10 @@
 mod config;
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use ratatui::{
     DefaultTerminal, Frame,
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -93,8 +94,8 @@ struct App {
 }
 
 impl App {
-    fn boot() -> Result<Self> {
-        let paths = config::paths()?;
+    fn boot(config_dir: Option<PathBuf>) -> Result<Self> {
+        let paths = config::paths(config_dir)?;
         let mut first_run_state = ListState::default();
         first_run_state.select(Some(0));
         let mut main_menu_state = ListState::default();
@@ -546,14 +547,64 @@ fn text_input(buf: &mut String, key: KeyEvent) -> TextAction {
 }
 
 fn main() -> Result<()> {
+    let cli = match parse_cli() {
+        Ok(cli) => cli,
+        Err(e) => {
+            eprintln!("{e:#}");
+            eprintln!("\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
+    if cli.show_help {
+        println!("{USAGE}");
+        return Ok(());
+    }
+
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal);
+    let result = run(&mut terminal, cli.config_dir);
     ratatui::restore();
     result
 }
 
-fn run(terminal: &mut DefaultTerminal) -> Result<()> {
-    let mut app = App::boot()?;
+const USAGE: &str = "\
+Usage: wrustic [OPTIONS]
+
+Options:
+  -c, --config-dir <PATH>  Use <PATH> as the wrustic config directory instead
+                           of the platform default (~/.config/wrustic on Linux).
+                           The directory will be created on first run.
+  -h, --help               Print this help text.
+";
+
+#[derive(Default)]
+struct Cli {
+    config_dir: Option<PathBuf>,
+    show_help: bool,
+}
+
+fn parse_cli() -> Result<Cli> {
+    let mut cli = Cli::default();
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => cli.show_help = true,
+            "-c" | "--config-dir" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("{arg} requires a path argument"))?;
+                cli.config_dir = Some(PathBuf::from(value));
+            }
+            other if other.starts_with("--config-dir=") => {
+                cli.config_dir = Some(PathBuf::from(&other["--config-dir=".len()..]));
+            }
+            other => bail!("unknown argument: {other}"),
+        }
+    }
+    Ok(cli)
+}
+
+fn run(terminal: &mut DefaultTerminal, config_dir: Option<PathBuf>) -> Result<()> {
+    let mut app = App::boot(config_dir)?;
 
     while !app.quit {
         terminal.draw(|f| render(f, &mut app))?;
