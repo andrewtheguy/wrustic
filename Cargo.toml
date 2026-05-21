@@ -4,11 +4,13 @@ version = "0.0.1"
 edition = "2024"
 
 [dependencies]
-age = { version = ">=0.11.3", features = ["armor"] }
+age = ">=0.11.3, <0.12"
 anyhow = "1.0.102"
+base64 = "0.22"
 dirs = "5"
 ratatui = "0.30.0"
 rustic_backend = { version = "0.6.1", default-features = false, features = ["rest", "opendal"] }
 rustic_core = { version = "0.11.0", default-features = false }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+url = "2"

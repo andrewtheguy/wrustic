@@ -1,10 +1,11 @@
 mod config;
+mod crypto;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use ratatui::{
     DefaultTerminal, Frame,
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -19,7 +20,12 @@ use crate::config::{BackendKind, Config, Paths, Profile};
 
 const BACKEND_ORDER: [BackendKind; 3] = [BackendKind::Local, BackendKind::Rest, BackendKind::S3];
 const MAIN_MENU: [&str; 3] = ["Work with a repo", "Manage profiles", "Quit"];
-const MANAGE_MENU: [&str; 3] = ["Create new profile", "Delete a profile", "Back"];
+const MANAGE_MENU: [&str; 4] = [
+    "Create new profile",
+    "Edit a profile",
+    "Delete a profile",
+    "Back",
+];
 const FIRST_RUN_MENU: [&str; 3] = [
     "Create a new age key",
     "Restore an existing age key",
@@ -38,6 +44,8 @@ enum Screen {
     BackendChoice,
     LocalPath,
     RestUrl,
+    RestUser,
+    RestPassword,
     S3Endpoint,
     S3Bucket,
     S3Region,
@@ -45,9 +53,17 @@ enum Screen {
     S3SecretKey,
     Password,
     SelectProfileForDelete,
+    SelectProfileForEdit,
     ConfirmDelete,
     Loading,
+    Verifying,
+    VerifyFailed(String),
     Error(String),
+}
+
+enum ProfileRollback {
+    Remove(String),
+    Restore(String, Profile),
 }
 
 struct SnapshotRow {
@@ -75,6 +91,8 @@ struct App {
     backend_kind: BackendKind,
     local_path: String,
     rest_url: String,
+    rest_user: String,
+    rest_password: String,
     s3_endpoint: String,
     s3_bucket: String,
     s3_region: String,
@@ -84,6 +102,7 @@ struct App {
 
     loading_index: usize,
     pending_delete: Option<usize>,
+    editing_original_name: Option<String>,
 
     restore_error: Option<String>,
     created_pubkey: String,
@@ -120,6 +139,8 @@ impl App {
             backend_kind: BackendKind::Local,
             local_path: String::new(),
             rest_url: String::new(),
+            rest_user: String::new(),
+            rest_password: String::new(),
             s3_endpoint: String::new(),
             s3_bucket: String::new(),
             s3_region: String::new(),
@@ -128,6 +149,7 @@ impl App {
             password: String::new(),
             loading_index: 0,
             pending_delete: None,
+            editing_original_name: None,
             restore_error: None,
             created_pubkey: String::new(),
             snapshots: Vec::new(),
@@ -161,30 +183,76 @@ impl App {
         self.new_profile_name.clear();
         self.local_path.clear();
         self.rest_url.clear();
+        self.rest_user.clear();
+        self.rest_password.clear();
         self.s3_endpoint.clear();
         self.s3_bucket.clear();
         self.s3_region.clear();
         self.s3_access_key.clear();
         self.s3_secret_key.clear();
         self.password.clear();
+        self.editing_original_name = None;
+    }
+
+    fn load_profile_into_scratch(&mut self, idx: usize) {
+        let Some((name, p)) = self.config.profile_at(idx) else { return };
+        self.new_profile_name = name.clone();
+        self.password = p.password().to_string();
+        self.backend_kind = p.backend_kind();
+        self.local_path.clear();
+        self.rest_url.clear();
+        self.rest_user.clear();
+        self.rest_password.clear();
+        self.s3_endpoint.clear();
+        self.s3_bucket.clear();
+        self.s3_region.clear();
+        self.s3_access_key.clear();
+        self.s3_secret_key.clear();
+        match p {
+            Profile::Local { local_path, .. } => {
+                self.local_path = local_path.clone();
+            }
+            Profile::Rest {
+                rest_url,
+                rest_user,
+                rest_password,
+                ..
+            } => {
+                self.rest_url = rest_url.clone();
+                self.rest_user = rest_user.clone();
+                self.rest_password = rest_password.clone();
+            }
+            Profile::S3 {
+                s3_endpoint,
+                s3_bucket,
+                s3_region,
+                s3_access_key,
+                s3_secret_key,
+                ..
+            } => {
+                self.s3_endpoint = s3_endpoint.clone();
+                self.s3_bucket = s3_bucket.clone();
+                self.s3_region = s3_region.clone();
+                self.s3_access_key = s3_access_key.clone();
+                self.s3_secret_key = s3_secret_key.clone();
+            }
+        }
     }
 
     fn build_profile(&self) -> Profile {
-        let name = self.new_profile_name.clone();
         let password = self.password.clone();
         match self.backend_kind {
             BackendKind::Local => Profile::Local {
-                name,
                 password,
                 local_path: self.local_path.clone(),
             },
             BackendKind::Rest => Profile::Rest {
-                name,
                 password,
                 rest_url: self.rest_url.clone(),
+                rest_user: self.rest_user.clone(),
+                rest_password: self.rest_password.clone(),
             },
             BackendKind::S3 => Profile::S3 {
-                name,
                 password,
                 s3_endpoint: self.s3_endpoint.clone(),
                 s3_bucket: self.s3_bucket.clone(),
@@ -196,6 +264,68 @@ impl App {
                 s3_access_key: self.s3_access_key.clone(),
                 s3_secret_key: self.s3_secret_key.clone(),
             },
+        }
+    }
+
+    fn cancel_from_first_backend_input(&mut self) {
+        if self.editing_original_name.is_some() {
+            self.clear_creation_scratch();
+            self.screen = Screen::ManageMenu;
+        } else {
+            self.screen = Screen::BackendChoice;
+        }
+    }
+
+    fn commit_profile(&mut self) {
+        let profile = self.build_profile();
+        let name = self.new_profile_name.clone();
+
+        if self.editing_original_name.is_none() && self.config.has_profile(&name) {
+            self.screen = Screen::Error(format!(
+                "A profile named '{name}' already exists."
+            ));
+            return;
+        }
+
+        let restore = match self.editing_original_name.clone() {
+            Some(original) => {
+                // Rename during edit is not exposed in the current UI; the edit
+                // flow skips the name screen. If a future screen lets the name
+                // drift, this catches it before we silently drop the new value.
+                debug_assert_eq!(
+                    original, name,
+                    "edit flow must not change the profile name; \
+                     add rename handling (remove old key, collision-check, insert new) to commit_profile",
+                );
+                let old = self
+                    .config
+                    .profiles
+                    .insert(original.clone(), profile)
+                    .expect("editing target should exist");
+                ProfileRollback::Restore(original, old)
+            }
+            None => {
+                self.config.profiles.insert(name.clone(), profile);
+                ProfileRollback::Remove(name)
+            }
+        };
+
+        match config::save(&self.config, &self.paths) {
+            Ok(()) => {
+                self.clear_creation_scratch();
+                self.screen = Screen::MainMenu;
+            }
+            Err(e) => {
+                match restore {
+                    ProfileRollback::Restore(key, old) => {
+                        self.config.profiles.insert(key, old);
+                    }
+                    ProfileRollback::Remove(key) => {
+                        self.config.profiles.remove(&key);
+                    }
+                }
+                self.screen = Screen::Error(format!("Saving config failed: {e:#}"));
+            }
         }
     }
 
@@ -329,6 +459,10 @@ impl App {
                     }
                     1 => {
                         self.profile_list_state.select(Some(0));
+                        self.screen = Screen::SelectProfileForEdit;
+                    }
+                    2 => {
+                        self.profile_list_state.select(Some(0));
                         self.screen = Screen::SelectProfileForDelete;
                     }
                     _ => self.screen = Screen::MainMenu,
@@ -384,16 +518,33 @@ impl App {
                     self.local_path = self.local_path.trim().to_string();
                     self.screen = Screen::Password;
                 }
-                TextAction::Cancel => self.screen = Screen::BackendChoice,
+                TextAction::Cancel => self.cancel_from_first_backend_input(),
                 _ => {}
             },
 
             Screen::RestUrl => match text_input(&mut self.rest_url, key) {
                 TextAction::Submit if !self.rest_url.trim().is_empty() => {
                     self.rest_url = self.rest_url.trim().to_string();
+                    self.screen = Screen::RestUser;
+                }
+                TextAction::Cancel => self.cancel_from_first_backend_input(),
+                _ => {}
+            },
+
+            Screen::RestUser => match text_input(&mut self.rest_user, key) {
+                TextAction::Submit => {
+                    self.rest_user = self.rest_user.trim().to_string();
+                    self.screen = Screen::RestPassword;
+                }
+                TextAction::Cancel => self.screen = Screen::RestUrl,
+                _ => {}
+            },
+
+            Screen::RestPassword => match text_input(&mut self.rest_password, key) {
+                TextAction::Submit => {
                     self.screen = Screen::Password;
                 }
-                TextAction::Cancel => self.screen = Screen::BackendChoice,
+                TextAction::Cancel => self.screen = Screen::RestUser,
                 _ => {}
             },
 
@@ -402,7 +553,7 @@ impl App {
                     self.s3_endpoint = self.s3_endpoint.trim().to_string();
                     self.screen = Screen::S3Bucket;
                 }
-                TextAction::Cancel => self.screen = Screen::BackendChoice,
+                TextAction::Cancel => self.cancel_from_first_backend_input(),
                 _ => {}
             },
 
@@ -444,24 +595,13 @@ impl App {
 
             Screen::Password => match text_input(&mut self.password, key) {
                 TextAction::Submit if !self.password.is_empty() => {
-                    let profile = self.build_profile();
-                    self.config.profiles.push(profile);
-                    match config::save(&self.config, &self.paths) {
-                        Ok(()) => {
-                            self.clear_creation_scratch();
-                            self.screen = Screen::MainMenu;
-                        }
-                        Err(e) => {
-                            self.config.profiles.pop();
-                            self.screen = Screen::Error(format!("Saving config failed: {e:#}"));
-                        }
-                    }
+                    self.screen = Screen::Verifying;
                 }
                 TextAction::Cancel => {
                     self.password.clear();
                     self.screen = match self.backend_kind {
                         BackendKind::Local => Screen::LocalPath,
-                        BackendKind::Rest => Screen::RestUrl,
+                        BackendKind::Rest => Screen::RestPassword,
                         BackendKind::S3 => Screen::S3SecretKey,
                     };
                 }
@@ -484,21 +624,44 @@ impl App {
                 _ => {}
             },
 
+            Screen::SelectProfileForEdit => match key.code {
+                KeyCode::Down | KeyCode::Char('j') => self.profile_list_state.select_next(),
+                KeyCode::Up | KeyCode::Char('k') => self.profile_list_state.select_previous(),
+                KeyCode::Esc => self.screen = Screen::ManageMenu,
+                KeyCode::Enter if !self.config.profiles.is_empty() => {
+                    let idx = self
+                        .profile_list_state
+                        .selected()
+                        .unwrap_or(0)
+                        .min(self.config.profiles.len() - 1);
+                    self.load_profile_into_scratch(idx);
+                    self.editing_original_name = Some(self.new_profile_name.clone());
+                    self.screen = match self.backend_kind {
+                        BackendKind::Local => Screen::LocalPath,
+                        BackendKind::Rest => Screen::RestUrl,
+                        BackendKind::S3 => Screen::S3Endpoint,
+                    };
+                }
+                _ => {}
+            },
+
             Screen::ConfirmDelete => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    if let Some(idx) = self.pending_delete.take() {
-                        if idx < self.config.profiles.len() {
-                            let removed = self.config.profiles.remove(idx);
-                            match config::save(&self.config, &self.paths) {
-                                Ok(()) => self.screen = Screen::MainMenu,
-                                Err(e) => {
-                                    self.config.profiles.insert(idx, removed);
-                                    self.screen =
-                                        Screen::Error(format!("Saving config failed: {e:#}"));
-                                }
+                    if let Some(idx) = self.pending_delete.take()
+                        && let Some(name) = self.config.name_at(idx).cloned()
+                    {
+                        let removed = self
+                            .config
+                            .profiles
+                            .remove(&name)
+                            .expect("name_at hit must exist");
+                        match config::save(&self.config, &self.paths) {
+                            Ok(()) => self.screen = Screen::MainMenu,
+                            Err(e) => {
+                                self.config.profiles.insert(name, removed);
+                                self.screen =
+                                    Screen::Error(format!("Saving config failed: {e:#}"));
                             }
-                        } else {
-                            self.screen = Screen::ManageMenu;
                         }
                     } else {
                         self.screen = Screen::ManageMenu;
@@ -511,7 +674,25 @@ impl App {
                 _ => {}
             },
 
-            Screen::Loading => {}
+            Screen::Loading | Screen::Verifying => {}
+
+            Screen::VerifyFailed(_) => match key.code {
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    self.screen = match self.backend_kind {
+                        BackendKind::Local => Screen::LocalPath,
+                        BackendKind::Rest => Screen::RestUrl,
+                        BackendKind::S3 => Screen::S3Endpoint,
+                    };
+                }
+                KeyCode::Char('s') | KeyCode::Char('S') => {
+                    self.commit_profile();
+                }
+                KeyCode::Esc => {
+                    self.clear_creation_scratch();
+                    self.screen = Screen::ManageMenu;
+                }
+                _ => {}
+            },
 
             Screen::Error(_) => {
                 if self.error_is_fatal {
@@ -611,7 +792,10 @@ fn run(terminal: &mut DefaultTerminal, config_dir: Option<PathBuf>) -> Result<()
 
         if matches!(app.screen, Screen::Loading) {
             let idx = app.loading_index;
-            let profile = &app.config.profiles[idx];
+            let Some((_, profile)) = app.config.profile_at(idx) else {
+                app.screen = Screen::Error("Selected profile no longer exists.".into());
+                continue;
+            };
             match load_snapshots(profile) {
                 Ok(snaps) => {
                     app.snapshots = snaps;
@@ -627,6 +811,15 @@ fn run(terminal: &mut DefaultTerminal, config_dir: Option<PathBuf>) -> Result<()
             continue;
         }
 
+        if matches!(app.screen, Screen::Verifying) {
+            let profile = app.build_profile();
+            match verify_profile(&profile) {
+                Ok(()) => app.commit_profile(),
+                Err(e) => app.screen = Screen::VerifyFailed(format!("{e:#}")),
+            }
+            continue;
+        }
+
         if event::poll(Duration::from_millis(100))?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
@@ -637,14 +830,32 @@ fn run(terminal: &mut DefaultTerminal, config_dir: Option<PathBuf>) -> Result<()
     Ok(())
 }
 
-fn load_snapshots(profile: &Profile) -> Result<Vec<SnapshotRow>> {
+fn build_backend_opts(profile: &Profile) -> Result<BackendOptions> {
     let mut opts = BackendOptions::default();
     match profile {
         Profile::Local { local_path, .. } => {
             opts = opts.repository(local_path.clone());
         }
-        Profile::Rest { rest_url, .. } => {
-            opts = opts.repository(format!("rest:{rest_url}"));
+        Profile::Rest {
+            rest_url,
+            rest_user,
+            rest_password,
+            ..
+        } => {
+            let mut url = url::Url::parse(rest_url)
+                .with_context(|| format!("parsing REST URL `{rest_url}`"))?;
+            if rest_user.is_empty() && !rest_password.is_empty() {
+                bail!("REST profile has a password but no username");
+            }
+            if !rest_user.is_empty() {
+                url.set_username(rest_user)
+                    .map_err(|_| anyhow!("REST URL `{rest_url}` cannot carry a username"))?;
+            }
+            if !rest_password.is_empty() {
+                url.set_password(Some(rest_password))
+                    .map_err(|_| anyhow!("REST URL `{rest_url}` cannot carry a password"))?;
+            }
+            opts = opts.repository(format!("rest:{url}"));
         }
         Profile::S3 {
             s3_endpoint,
@@ -666,8 +877,18 @@ fn load_snapshots(profile: &Profile) -> Result<Vec<SnapshotRow>> {
             opts = opts.options(s3_opts);
         }
     }
+    Ok(opts)
+}
 
-    let backends = opts.to_backends()?;
+fn verify_profile(profile: &Profile) -> Result<()> {
+    let backends = build_backend_opts(profile)?.to_backends()?;
+    Repository::new(&RepositoryOptions::default(), &backends)?
+        .open(&Credentials::password(profile.password()))?;
+    Ok(())
+}
+
+fn load_snapshots(profile: &Profile) -> Result<Vec<SnapshotRow>> {
+    let backends = build_backend_opts(profile)?.to_backends()?;
     let repo = Repository::new(&RepositoryOptions::default(), &backends)?
         .open(&Credentials::password(profile.password()))?;
 
@@ -698,6 +919,9 @@ fn render(frame: &mut Frame, app: &mut App) {
         Screen::SelectProfileForDelete => {
             render_profile_list(frame, app, "Select profile to delete (Esc back)")
         }
+        Screen::SelectProfileForEdit => {
+            render_profile_list(frame, app, "Select profile to edit (Esc back)")
+        }
         Screen::ManageMenu => render_menu(frame, app, MainOrManage::Manage),
         Screen::CreateProfileName => render_input(
             frame,
@@ -716,8 +940,23 @@ fn render(frame: &mut Frame, app: &mut App) {
             frame,
             "REST URL",
             &app.rest_url,
-            "e.g. http://localhost:8000/  or  https://user:pass@host/path/ (Esc back)",
+            "e.g. http://localhost:8000/ — credentials go on the next two screens (Esc back)",
         ),
+        Screen::RestUser => render_input(
+            frame,
+            "REST username (optional)",
+            &app.rest_user,
+            "Leave blank for anonymous REST server (Esc back)",
+        ),
+        Screen::RestPassword => {
+            let masked = "*".repeat(app.rest_password.chars().count());
+            render_input(
+                frame,
+                "REST password (optional)",
+                &masked,
+                "Leave blank if the REST server has no password (Esc back)",
+            );
+        }
         Screen::S3Endpoint => render_input(
             frame,
             "S3 endpoint (optional)",
@@ -763,8 +1002,8 @@ fn render(frame: &mut Frame, app: &mut App) {
         Screen::ConfirmDelete => {
             let name = app
                 .pending_delete
-                .and_then(|i| app.config.profiles.get(i))
-                .map(|p| p.name())
+                .and_then(|i| app.config.name_at(i))
+                .map(String::as_str)
                 .unwrap_or("(unknown)");
             let body = format!("Delete profile '{name}'? Press y to confirm, n/Esc to cancel.");
             let para = Paragraph::new(body)
@@ -775,6 +1014,22 @@ fn render(frame: &mut Frame, app: &mut App) {
         Screen::Loading => {
             let para = Paragraph::new("Opening repository and reading snapshots…")
                 .block(Block::bordered().title("Loading"));
+            frame.render_widget(para, frame.area());
+        }
+        Screen::Verifying => {
+            let para = Paragraph::new("Verifying profile — opening repository with the entered credentials…")
+                .wrap(Wrap { trim: false })
+                .block(Block::bordered().title("Verifying"));
+            frame.render_widget(para, frame.area());
+        }
+        Screen::VerifyFailed(msg) => {
+            let body = format!(
+                "Could not open the repository with this profile:\n\n{msg}\n\nPress r to re-enter the fields, s to save the profile anyway, or Esc to discard it.",
+            );
+            let para = Paragraph::new(body)
+                .style(Style::new().fg(Color::Yellow))
+                .wrap(Wrap { trim: false })
+                .block(Block::bordered().title("Verification failed"));
             frame.render_widget(para, frame.area());
         }
         Screen::Snapshots => render_snapshots(frame, app),
@@ -900,7 +1155,7 @@ fn render_profile_list(frame: &mut Frame, app: &mut App, title: &str) {
         .config
         .profiles
         .iter()
-        .map(|p| ListItem::new(format!("{:<24} [{}]", p.name(), p.backend_kind().label())))
+        .map(|(name, p)| ListItem::new(format!("{:<24} [{}]", name, p.backend_kind().label())))
         .collect();
 
     let list = List::new(items)
