@@ -503,7 +503,7 @@ fn render_snapshot_contents(frame: &mut Frame, app: &mut App, area: Rect) {
                 row.name.clone()
             };
             let size_col = if matches!(row.kind, ContentKind::File) {
-                format!("{:>10}", row.size)
+                format!("{:>10}", human_size(row.size))
             } else {
                 String::from("          ")
             };
@@ -526,4 +526,35 @@ fn render_snapshot_contents(frame: &mut Frame, app: &mut App, area: Rect) {
 fn short_snap_id(id: &str) -> &str {
     let end = id.char_indices().nth(8).map(|(i, _)| i).unwrap_or(id.len());
     &id[..end]
+}
+
+// 1024-based suffixes matching `ls -h` (e.g. "4.2K", "1.7M"). Bytes are shown
+// raw; larger values keep one decimal place.
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "K", "M", "G", "T", "P"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut v = bytes as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    format!("{:.1} {}", v, UNITS[i])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::human_size;
+
+    #[test]
+    fn human_size_formats() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(1023), "1023 B");
+        assert_eq!(human_size(1024), "1.0 K");
+        assert_eq!(human_size(1536), "1.5 K");
+        assert_eq!(human_size(1024 * 1024), "1.0 M");
+        assert_eq!(human_size(3 * 1024 * 1024 * 1024), "3.0 G");
+    }
 }
