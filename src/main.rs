@@ -50,6 +50,8 @@ enum Screen {
     SelectProfileForDelete,
     ConfirmDelete,
     Loading,
+    Verifying,
+    VerifyFailed(String),
     Error(String),
 }
 
@@ -207,6 +209,21 @@ impl App {
                 s3_access_key: self.s3_access_key.clone(),
                 s3_secret_key: self.s3_secret_key.clone(),
             },
+        }
+    }
+
+    fn commit_new_profile(&mut self) {
+        let profile = self.build_profile();
+        self.config.profiles.push(profile);
+        match config::save(&self.config, &self.paths) {
+            Ok(()) => {
+                self.clear_creation_scratch();
+                self.screen = Screen::MainMenu;
+            }
+            Err(e) => {
+                self.config.profiles.pop();
+                self.screen = Screen::Error(format!("Saving config failed: {e:#}"));
+            }
         }
     }
 
@@ -472,18 +489,7 @@ impl App {
 
             Screen::Password => match text_input(&mut self.password, key) {
                 TextAction::Submit if !self.password.is_empty() => {
-                    let profile = self.build_profile();
-                    self.config.profiles.push(profile);
-                    match config::save(&self.config, &self.paths) {
-                        Ok(()) => {
-                            self.clear_creation_scratch();
-                            self.screen = Screen::MainMenu;
-                        }
-                        Err(e) => {
-                            self.config.profiles.pop();
-                            self.screen = Screen::Error(format!("Saving config failed: {e:#}"));
-                        }
-                    }
+                    self.screen = Screen::Verifying;
                 }
                 TextAction::Cancel => {
                     self.password.clear();
@@ -539,7 +545,25 @@ impl App {
                 _ => {}
             },
 
-            Screen::Loading => {}
+            Screen::Loading | Screen::Verifying => {}
+
+            Screen::VerifyFailed(_) => match key.code {
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    self.screen = match self.backend_kind {
+                        BackendKind::Local => Screen::LocalPath,
+                        BackendKind::Rest => Screen::RestUrl,
+                        BackendKind::S3 => Screen::S3Endpoint,
+                    };
+                }
+                KeyCode::Char('s') | KeyCode::Char('S') => {
+                    self.commit_new_profile();
+                }
+                KeyCode::Esc => {
+                    self.clear_creation_scratch();
+                    self.screen = Screen::ManageMenu;
+                }
+                _ => {}
+            },
 
             Screen::Error(_) => {
                 if self.error_is_fatal {
@@ -655,6 +679,15 @@ fn run(terminal: &mut DefaultTerminal, config_dir: Option<PathBuf>) -> Result<()
             continue;
         }
 
+        if matches!(app.screen, Screen::Verifying) {
+            let profile = app.build_profile();
+            match verify_profile(&profile) {
+                Ok(()) => app.commit_new_profile(),
+                Err(e) => app.screen = Screen::VerifyFailed(format!("{e:#}")),
+            }
+            continue;
+        }
+
         if event::poll(Duration::from_millis(100))?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
@@ -665,7 +698,7 @@ fn run(terminal: &mut DefaultTerminal, config_dir: Option<PathBuf>) -> Result<()
     Ok(())
 }
 
-fn load_snapshots(profile: &Profile) -> Result<Vec<SnapshotRow>> {
+fn build_backend_opts(profile: &Profile) -> Result<BackendOptions> {
     let mut opts = BackendOptions::default();
     match profile {
         Profile::Local { local_path, .. } => {
@@ -712,8 +745,18 @@ fn load_snapshots(profile: &Profile) -> Result<Vec<SnapshotRow>> {
             opts = opts.options(s3_opts);
         }
     }
+    Ok(opts)
+}
 
-    let backends = opts.to_backends()?;
+fn verify_profile(profile: &Profile) -> Result<()> {
+    let backends = build_backend_opts(profile)?.to_backends()?;
+    Repository::new(&RepositoryOptions::default(), &backends)?
+        .open(&Credentials::password(profile.password()))?;
+    Ok(())
+}
+
+fn load_snapshots(profile: &Profile) -> Result<Vec<SnapshotRow>> {
+    let backends = build_backend_opts(profile)?.to_backends()?;
     let repo = Repository::new(&RepositoryOptions::default(), &backends)?
         .open(&Credentials::password(profile.password()))?;
 
@@ -836,6 +879,22 @@ fn render(frame: &mut Frame, app: &mut App) {
         Screen::Loading => {
             let para = Paragraph::new("Opening repository and reading snapshots…")
                 .block(Block::bordered().title("Loading"));
+            frame.render_widget(para, frame.area());
+        }
+        Screen::Verifying => {
+            let para = Paragraph::new("Verifying profile — opening repository with the entered credentials…")
+                .wrap(Wrap { trim: false })
+                .block(Block::bordered().title("Verifying"));
+            frame.render_widget(para, frame.area());
+        }
+        Screen::VerifyFailed(msg) => {
+            let body = format!(
+                "Could not open the repository with this profile:\n\n{msg}\n\nPress r to re-enter the fields, s to save the profile anyway, or Esc to discard it.",
+            );
+            let para = Paragraph::new(body)
+                .style(Style::new().fg(Color::Yellow))
+                .wrap(Wrap { trim: false })
+                .block(Block::bordered().title("Verification failed"));
             frame.render_widget(para, frame.area());
         }
         Screen::Snapshots => render_snapshots(frame, app),
