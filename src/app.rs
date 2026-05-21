@@ -566,6 +566,7 @@ impl App {
                     }
                     KeyCode::Enter => {
                         self.s3_access_key = self.s3_access_key.trim().to_string();
+                        self.s3_secret_key = self.s3_secret_key.trim().to_string();
                         if !self.s3_access_key.is_empty() && !self.s3_secret_key.is_empty() {
                             self.screen = Screen::Password;
                         }
