@@ -5,9 +5,10 @@ use ratatui::{
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
     widgets::ListState,
 };
+use rustic_core::{IndexedIdsStatus, Repository, TreeId};
 
 use crate::config::{self, BackendKind, Config, Paths, Profile};
-use crate::repo::SnapshotRow;
+use crate::repo::{ContentKind, ContentRow, SnapshotRow};
 
 pub(crate) const BACKEND_ORDER: [BackendKind; 3] =
     [BackendKind::Local, BackendKind::Rest, BackendKind::S3];
@@ -23,6 +24,9 @@ pub(crate) enum Screen {
     KeyCreated,
     Home,
     Snapshots,
+    OpeningSnapshot,
+    SnapshotContents,
+    LoadingDir,
     CreateProfileName,
     BackendChoice,
     LocalPath,
@@ -35,6 +39,12 @@ pub(crate) enum Screen {
     Verifying,
     VerifyFailed(String),
     Error(String),
+}
+
+pub(crate) struct BrowseFrame {
+    pub(crate) name: String,
+    pub(crate) items: Vec<ContentRow>,
+    pub(crate) list_state: ListState,
 }
 
 enum ProfileRollback {
@@ -76,6 +86,12 @@ pub(crate) struct App {
     pub(crate) created_pubkey: String,
 
     pub(crate) snapshots: Vec<SnapshotRow>,
+    pub(crate) active_profile_name: Option<String>,
+    pub(crate) repo_session: Option<Repository<IndexedIdsStatus>>,
+    pub(crate) browse_snapshot_id: String,
+    pub(crate) browse_stack: Vec<BrowseFrame>,
+    pub(crate) pending_descend: Option<(TreeId, String)>,
+    pub(crate) pending_refresh_path: Option<Vec<String>>,
     pub(crate) error_is_fatal: bool,
     pub(crate) quit: bool,
 }
@@ -117,6 +133,12 @@ impl App {
             restore_error: None,
             created_pubkey: String::new(),
             snapshots: Vec::new(),
+            active_profile_name: None,
+            repo_session: None,
+            browse_snapshot_id: String::new(),
+            browse_stack: Vec::new(),
+            pending_descend: None,
+            pending_refresh_path: None,
             error_is_fatal: false,
             quit: false,
         };
@@ -148,6 +170,7 @@ impl App {
     // the last row) doesn't highlight a phantom index on the next render.
     fn enter_home(&mut self) {
         self.clear_creation_scratch();
+        self.active_profile_name = None;
         let len = self.config.profiles.len();
         if len == 0 {
             self.profile_list_state.select(None);
@@ -312,6 +335,19 @@ impl App {
         }
     }
 
+    fn go_up(&mut self) {
+        if self.browse_stack.len() > 1 {
+            self.browse_stack.pop();
+        } else {
+            self.repo_session = None;
+            self.browse_stack.clear();
+            self.browse_snapshot_id.clear();
+            self.pending_descend = None;
+            self.pending_refresh_path = None;
+            self.screen = Screen::Snapshots;
+        }
+    }
+
     pub(crate) fn handle_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.quit = true;
@@ -396,6 +432,8 @@ impl App {
                         .unwrap_or(0)
                         .min(self.config.profiles.len() - 1);
                     self.loading_index = idx;
+                    self.active_profile_name =
+                        self.config.name_at(idx).cloned();
                     self.screen = Screen::Loading;
                 }
                 KeyCode::Char('e') if !self.config.profiles.is_empty() => {
@@ -438,8 +476,88 @@ impl App {
                         self.list_state.select(Some(self.snapshots.len() - 1));
                     }
                 }
+                KeyCode::Enter => {
+                    if let Some(idx) = self.list_state.selected()
+                        && let Some(s) = self.snapshots.get(idx)
+                    {
+                        self.browse_snapshot_id = s.short_id.clone();
+                        self.pending_refresh_path = None;
+                        self.screen = Screen::OpeningSnapshot;
+                    }
+                }
+                KeyCode::Char('r') => {
+                    self.snapshots.clear();
+                    self.screen = Screen::Loading;
+                }
                 _ => {}
             },
+
+            Screen::SnapshotContents => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.repo_session = None;
+                    self.browse_stack.clear();
+                    self.browse_snapshot_id.clear();
+                    self.pending_descend = None;
+                    self.pending_refresh_path = None;
+                    self.screen = Screen::Snapshots;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if let Some(f) = self.browse_stack.last_mut() {
+                        f.list_state.select_next();
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if let Some(f) = self.browse_stack.last_mut() {
+                        f.list_state.select_previous();
+                    }
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    if let Some(f) = self.browse_stack.last_mut() {
+                        f.list_state.select(Some(0));
+                    }
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    if let Some(f) = self.browse_stack.last_mut()
+                        && !f.items.is_empty()
+                    {
+                        f.list_state.select(Some(f.items.len() - 1));
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(f) = self.browse_stack.last()
+                        && let Some(idx) = f.list_state.selected()
+                        && let Some(row) = f.items.get(idx)
+                    {
+                        match row.kind {
+                            ContentKind::Parent => self.go_up(),
+                            ContentKind::Dir => {
+                                if let Some(subtree) = row.subtree {
+                                    self.pending_descend = Some((subtree, row.name.clone()));
+                                    self.screen = Screen::LoadingDir;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                KeyCode::Backspace => self.go_up(),
+                KeyCode::Char('r') => {
+                    let path: Vec<String> = self
+                        .browse_stack
+                        .iter()
+                        .skip(1)
+                        .map(|f| f.name.clone())
+                        .collect();
+                    self.pending_refresh_path = Some(path);
+                    self.repo_session = None;
+                    self.browse_stack.clear();
+                    self.pending_descend = None;
+                    self.screen = Screen::OpeningSnapshot;
+                }
+                _ => {}
+            },
+
+            Screen::OpeningSnapshot | Screen::LoadingDir => {}
 
             Screen::CreateProfileName => match text_input(&mut self.new_profile_name, key) {
                 TextAction::Submit => {
