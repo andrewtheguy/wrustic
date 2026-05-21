@@ -82,8 +82,7 @@ not need `restic` installed to run `wrustic`.
 You *will* want `restic` (>= 0.18.1) on your `$PATH` for development. Use it
 for:
 
-- **All write operations** (init, backup, forget, prune, copy, key management,
-  …) — these are out of scope for `wrustic` and will stay that way.
+- **All write operations** (init, backup, forget, prune, copy, key management, …).
 - Any read operation not yet wired up in the TUI.
 
 All dev/test artifacts in the snippets below go under the project's `./tmp/`
@@ -104,8 +103,7 @@ cargo run   # pick "Local filesystem", enter ./tmp/test-repo, then password
 ```
 
 As `wrustic` grows native support for more read operations, the set of things
-that still require the `restic` binary will shrink — but write operations are
-not on the roadmap.
+that still require the `restic` binary will shrink.
 
 ### REST-server dev workflow
 
