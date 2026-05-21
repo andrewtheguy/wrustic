@@ -1,6 +1,7 @@
 #!/bin/bash
 
-# wrustic installer
+# wrustic installer for Linux and macOS.
+# Installs to $HOME/.local/bin (no sudo required).
 # Downloads latest binary from: https://github.com/andrewtheguy/wrustic/releases
 #
 # Usage: ./install.sh [RELEASE_TAG] [--prerelease] [--download-only]
@@ -84,7 +85,7 @@ get_latest_prerelease_tag() {
     echo "$tag"
 }
 
-# Fetch full release info from GitHub API
+# Fetch full release info (including asset checksums) from GitHub API
 get_release_info() {
     local tag="$1"
     local api_url="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/tags/${tag}"
@@ -108,7 +109,7 @@ get_expected_checksum() {
         grep '"digest"' | head -1 | grep -o 'sha256:[a-f0-9]*' | cut -d: -f2
 }
 
-# Compute SHA-256 checksum of a file
+# Compute SHA-256 checksum of a file (cross-platform)
 compute_checksum() {
     local file="$1"
 
@@ -117,7 +118,7 @@ compute_checksum() {
     elif command -v shasum >/dev/null 2>&1; then
         shasum -a 256 "$file" | cut -d' ' -f1
     else
-        print_error "Neither sha256sum nor shasum is available"
+        print_error "No SHA-256 tool available (need sha256sum or shasum)"
         return 1
     fi
 }
@@ -182,7 +183,7 @@ parse_args() {
     fi
 }
 
-# Detect OS (matches the release.yml label scheme: linux-* and macos-*)
+# Detect OS
 detect_os() {
     case "$(uname -s)" in
         Linux*)
@@ -193,7 +194,7 @@ detect_os() {
             ;;
         *)
             print_error "Unsupported operating system: $(uname -s)"
-            print_error "Supported: Linux, macOS"
+            print_error "This script only supports Linux and macOS"
             exit 1
             ;;
     esac
@@ -219,21 +220,28 @@ detect_arch() {
 
 # Map OS and architecture to binary name
 get_binary_name() {
-    BINARY_NAME="wrustic-${OS}-${ARCH}"
-
-    # Restrict to combinations that the release workflow actually builds.
     case "${OS}-${ARCH}" in
-        linux-amd64|linux-arm64|macos-arm64)
+        "linux-amd64")
+            BINARY_NAME="wrustic-linux-amd64"
+            ;;
+        "linux-arm64")
+            BINARY_NAME="wrustic-linux-arm64"
+            ;;
+        "macos-arm64")
+            BINARY_NAME="wrustic-macos-arm64"
             ;;
         *)
-            print_error "No prebuilt binary for ${OS}-${ARCH}."
-            print_error "Available targets: linux-amd64, linux-arm64, macos-arm64"
+            print_error "Unsupported platform: ${OS}-${ARCH}"
+            print_error "Supported platforms:"
+            print_error "  - linux-amd64 (x86_64 Linux)"
+            print_error "  - linux-arm64 (aarch64 Linux)"
+            print_error "  - macos-arm64 (Apple Silicon Mac)"
             exit 1
             ;;
     esac
 }
 
-# Download binary
+# Download binary and verify checksum
 download_binary() {
     local base_url="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${RELEASE_TAG}"
     local url="${base_url}/${BINARY_NAME}"
@@ -256,16 +264,27 @@ download_binary() {
         exit 1
     fi
 
-    # Verify checksum if available
-    if [ -n "$EXPECTED_CHECKSUM" ]; then
-        if ! verify_checksum "$output_path" "$EXPECTED_CHECKSUM"; then
-            print_error "Binary integrity check failed. Aborting."
-            rm -f "$output_path"
-            exit 1
-        fi
-    else
-        print_warn "No checksum available for verification (may be a prerelease)"
+    if [ -z "$EXPECTED_CHECKSUM" ]; then
+        print_error "No checksum available. Aborting."
+        rm -f "$output_path"
+        exit 1
     fi
+    if ! verify_checksum "$output_path" "$EXPECTED_CHECKSUM"; then
+        print_error "Binary integrity check failed. Aborting."
+        rm -f "$output_path"
+        exit 1
+    fi
+}
+
+# Smoke-test the binary (wrustic exits 0 on --help; the TUI is not entered).
+test_binary() {
+    local binary="$1"
+    print_info "Testing downloaded binary..."
+    if ! "$binary" --help >/dev/null 2>&1; then
+        print_error "Binary test failed. The downloaded file may be corrupted or incompatible."
+        return 1
+    fi
+    print_info "Binary test successful"
 }
 
 # Download only - save to current directory
@@ -275,45 +294,117 @@ download_only() {
     download_binary "$output_file"
     chmod +x "$output_file"
 
+    if ! test_binary "$output_file"; then
+        rm -f "$output_file"
+        exit 1
+    fi
+
     print_info "Binary saved to: ${output_file}"
 }
 
-# Download binary to temporary location and install
+# Check if sourcing a profile would add target_dir to PATH
+check_profile_has_path() {
+    local profile="$1"
+    local target_dir="$2"
+
+    if [ -z "$profile" ] || [ ! -f "$profile" ]; then
+        return 1
+    fi
+
+    local new_path
+    new_path=$(HOME="$HOME" SHELL="$SHELL" bash -c "source '$profile' 2>/dev/null; echo \"\$PATH\"" 2>/dev/null)
+
+    if [[ ":$new_path:" == *":$target_dir:"* ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# Find a profile file that already configures .local/bin on PATH
+find_profile_with_local_bin() {
+    local target_dir="$1"
+    local shell_name
+    shell_name=$(basename "$SHELL")
+
+    local profiles=()
+    case "$shell_name" in
+        bash)
+            profiles=("$HOME/.bash_profile" "$HOME/.profile" "$HOME/.bashrc")
+            ;;
+        zsh)
+            profiles=("$HOME/.zprofile" "$HOME/.zshrc")
+            ;;
+        *)
+            profiles=("$HOME/.profile")
+            ;;
+    esac
+
+    for profile in "${profiles[@]}"; do
+        if check_profile_has_path "$profile" "$target_dir"; then
+            echo "$profile"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# Download binary to temporary location, test it, and install
 download_and_install() {
     local temp_dir
     temp_dir=$(mktemp -d)
     local temp_binary="${temp_dir}/${BINARY_NAME}"
-    local install_dir="/usr/local/bin"
-    local final_path="${install_dir}/wrustic"
+    local target_dir="$HOME/.local/bin"
+    local final_path="${target_dir}/wrustic"
 
     trap 'rm -rf "$temp_dir"' EXIT
 
     download_binary "$temp_binary"
     chmod +x "$temp_binary"
 
-    # Move the binary to final location (requires sudo unless already root)
-    if [ "$EUID" -eq 0 ]; then
-        if ! mv "$temp_binary" "$final_path"; then
-            print_error "Failed to install binary to ${final_path}"
-            exit 1
-        fi
-    else
-        if ! sudo mv "$temp_binary" "$final_path"; then
-            print_error "Failed to install binary to ${final_path}"
-            exit 1
-        fi
+    if ! test_binary "$temp_binary"; then
+        exit 1
+    fi
+
+    mkdir -p "$target_dir"
+
+    if ! mv "$temp_binary" "$final_path"; then
+        print_error "Failed to move binary to final location"
+        exit 1
     fi
 
     rm -rf "$temp_dir"
 
     print_info "Binary installed successfully to ${final_path}"
+
+    # Tell the user how to put $target_dir on PATH if it isn't already.
+    if [[ ":$PATH:" != *":$target_dir:"* ]]; then
+        local profile
+        profile=$(find_profile_with_local_bin "$target_dir")
+
+        if [ -n "$profile" ]; then
+            print_warn "${target_dir} is not in your current PATH, but is configured in your profile."
+            print_warn "To use wrustic now, reload your profile:"
+            echo ""
+            echo "    source $profile"
+            echo ""
+            print_warn "Or start a new terminal session."
+        else
+            print_warn "${target_dir} is not in your PATH"
+            print_warn "Add the following line to your shell profile (.bashrc, .zshrc, etc.):"
+            echo ""
+            echo "    export PATH=\"\$HOME/.local/bin:\$PATH\""
+            echo ""
+            print_warn "Then reload your profile or start a new terminal session."
+        fi
+    fi
 }
 
 # Display usage information
 show_usage() {
     echo "Usage: $0 [OPTIONS] [RELEASE_TAG]"
     echo ""
-    echo "Download and install wrustic binary"
+    echo "Download and install wrustic binary to \$HOME/.local/bin (no sudo)"
     echo ""
     echo "Options:"
     echo "  --download-only  Download binary to current directory without installing"
@@ -349,19 +440,20 @@ install() {
     print_info "Platform detected: ${OS}-${ARCH}"
     print_info "Binary name: ${BINARY_NAME}"
 
-    # Fetch release info for checksum verification
     print_info "Fetching release information..."
     RELEASE_JSON=$(get_release_info "$RELEASE_TAG")
 
     if [ -z "$RELEASE_JSON" ] || echo "$RELEASE_JSON" | grep -q '"message": "Not Found"'; then
-        print_error "Could not fetch release info from GitHub."
+        print_error "Could not fetch release info from GitHub. Cannot verify binary integrity."
         exit 1
     fi
 
     EXPECTED_CHECKSUM=$(get_expected_checksum "$RELEASE_JSON" "$BINARY_NAME")
-    if [ -n "$EXPECTED_CHECKSUM" ]; then
-        print_info "Expected checksum: ${EXPECTED_CHECKSUM:0:16}..."
+    if [ -z "$EXPECTED_CHECKSUM" ]; then
+        print_error "No checksum found for ${BINARY_NAME} in release. Cannot verify binary integrity."
+        exit 1
     fi
+    print_info "Expected checksum: ${EXPECTED_CHECKSUM:0:16}..."
 
     if [ "$DOWNLOAD_ONLY" = true ]; then
         download_only
@@ -373,11 +465,11 @@ install() {
     fi
 }
 
-# Check if sudo is available for installation
+# Warn if running as root — a user-local install under root's $HOME is almost
+# never what the caller wants.
 check_privileges() {
-    if [ "$EUID" -ne 0 ] && ! command -v sudo >/dev/null 2>&1; then
-        print_error "sudo is required to install to /usr/local/bin. Please install sudo or run as root."
-        exit 1
+    if [ "$EUID" -eq 0 ]; then
+        print_warn "Running as root. It's recommended to install as a regular user."
     fi
 }
 

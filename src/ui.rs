@@ -32,19 +32,19 @@ pub(crate) fn render(frame: &mut Frame, app: &mut App) {
         Screen::BackendChoice => render_backend_choice(frame, app),
         Screen::LocalPath => render_input(
             frame,
-            "Local repository path",
+            &profile_title("Local repository path", app),
             &app.local_path,
             "Filesystem path, e.g. /tmp/wrustic-test-repo (Esc back)",
         ),
         Screen::RestUrl => render_input(
             frame,
-            "REST URL",
+            &profile_title("REST URL", app),
             &app.rest_url,
             "e.g. http://localhost:8000/ — credentials go on the next two screens (Esc back)",
         ),
         Screen::RestUser => render_input(
             frame,
-            "REST username (optional)",
+            &profile_title("REST username (optional)", app),
             &app.rest_user,
             "Leave blank for anonymous REST server (Esc back)",
         ),
@@ -52,38 +52,38 @@ pub(crate) fn render(frame: &mut Frame, app: &mut App) {
             let masked = "*".repeat(app.rest_password.chars().count());
             render_input(
                 frame,
-                "REST password (optional)",
+                &profile_title("REST password (optional)", app),
                 &masked,
                 "Leave blank if the REST server has no password (Esc back)",
             );
         }
         Screen::S3Endpoint => render_input(
             frame,
-            "S3 endpoint (optional)",
+            &profile_title("S3 endpoint (optional)", app),
             &app.s3_endpoint,
             "Leave blank for AWS. For MinIO / rclone: http://127.0.0.1:8333 (Esc back)",
         ),
         Screen::S3Bucket => render_input(
             frame,
-            "S3 bucket",
+            &profile_title("S3 bucket", app),
             &app.s3_bucket,
             "Bucket / top-level directory name (Esc back)",
         ),
         Screen::S3Region => render_input(
             frame,
-            "S3 region (optional)",
+            &profile_title("S3 region (optional)", app),
             &app.s3_region,
             "Defaults to us-east-1 if left blank. Backblaze B2 uses 'auto'. (Esc back)",
         ),
         Screen::S3Root => render_input(
             frame,
-            "Path within bucket (optional)",
+            &profile_title("Path within bucket (optional)", app),
             &app.s3_root,
             "e.g. /proxmox_vm_backup — leave blank to use the bucket root (Esc back)",
         ),
         Screen::S3AccessKey => render_input(
             frame,
-            "S3 access key ID",
+            &profile_title("S3 access key ID", app),
             &app.s3_access_key,
             "AWS_ACCESS_KEY_ID equivalent (Esc back)",
         ),
@@ -91,7 +91,7 @@ pub(crate) fn render(frame: &mut Frame, app: &mut App) {
             let masked = "*".repeat(app.s3_secret_key.chars().count());
             render_input(
                 frame,
-                "S3 secret access key",
+                &profile_title("S3 secret access key", app),
                 &masked,
                 "AWS_SECRET_ACCESS_KEY equivalent (Esc back)",
             );
@@ -100,7 +100,7 @@ pub(crate) fn render(frame: &mut Frame, app: &mut App) {
             let masked = "*".repeat(app.password.chars().count());
             render_input(
                 frame,
-                "Repository password",
+                &profile_title("Repository password", app),
                 &masked,
                 "Restic repository password (Esc back; profile saves on Enter)",
             );
@@ -219,6 +219,16 @@ fn selection_highlight() -> Style {
     Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD)
 }
 
+// Decorate a creation/edit screen title with the in-progress profile name so
+// the user can always see which profile they are editing.
+fn profile_title(base: &str, app: &App) -> String {
+    if app.new_profile_name.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base} — profile '{}'", app.new_profile_name)
+    }
+}
+
 fn render_menu(frame: &mut Frame, app: &mut App, which: MainOrManage) {
     let (entries, state, title) = match which {
         MainOrManage::Main => (
@@ -272,11 +282,17 @@ fn render_backend_choice(frame: &mut Frame, app: &mut App) {
         .map(|k| ListItem::new(k.label()))
         .collect();
 
-    let list = List::new(items)
-        .block(
-            Block::bordered()
-                .title("Choose backend — j/k to move, Enter to pick, Esc back"),
+    let title = if app.new_profile_name.is_empty() {
+        "Choose backend — j/k to move, Enter to pick, Esc to rename".to_string()
+    } else {
+        format!(
+            "Choose backend for '{}' — j/k to move, Enter to pick, Esc to rename",
+            app.new_profile_name
         )
+    };
+
+    let list = List::new(items)
+        .block(Block::bordered().title(title))
         .highlight_style(selection_highlight())
         .highlight_symbol(">> ");
 
