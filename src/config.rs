@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -189,6 +189,15 @@ pub fn load(paths: &Paths) -> Result<Config> {
         .context("config file is not valid UTF-8 after decryption")?;
     let config: Config = toml::from_str(&text)
         .with_context(|| format!("parsing TOML from {}", paths.config.display()))?;
+    if config.version != CONFIG_VERSION {
+        bail!(
+            "config at {} has version {} but this build of wrustic expects version {} \
+             (no migrations are supported — this is a personal tool with no backwards compatibility)",
+            paths.config.display(),
+            config.version,
+            CONFIG_VERSION
+        );
+    }
     Ok(config)
 }
 
@@ -220,7 +229,6 @@ pub fn save(config: &Config, paths: &Paths) -> Result<()> {
             .with_context(|| format!("writing {}", tmp.display()))?;
         file.sync_all().ok();
     }
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600)).ok();
     fs::rename(&tmp, &paths.config)
         .with_context(|| format!("renaming {} -> {}", tmp.display(), paths.config.display()))?;
     Ok(())
@@ -322,6 +330,30 @@ mod tests {
         let p = paths(Some(dir.clone()))?;
         assert_eq!(p.identity, dir.join("age.key"));
         assert_eq!(p.config, dir.join("config.toml.age"));
+        fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn load_rejects_unknown_version() -> Result<()> {
+        let dir = fresh_dir("ver");
+        let paths = test_paths(&dir);
+        generate_identity(&paths.identity)?;
+
+        // Save a config claiming a future version, then expect load() to refuse it.
+        let future = Config {
+            version: CONFIG_VERSION + 1,
+            profiles: Vec::new(),
+        };
+        save(&future, &paths)?;
+
+        let err = load(&paths).expect_err("version mismatch should error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("version") && msg.contains(&(CONFIG_VERSION + 1).to_string()),
+            "error should mention version mismatch: {msg}"
+        );
+
         fs::remove_dir_all(&dir).ok();
         Ok(())
     }

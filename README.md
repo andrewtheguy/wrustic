@@ -29,6 +29,11 @@ Azure / GCS via opendal — Local, REST, and S3 are already supported).
 
 Requires a Rust toolchain (developed against rustc 1.93).
 
+Platform: Linux / macOS only. The config-file writer uses
+`std::os::unix::fs::OpenOptionsExt` to enforce mode `0600` on `age.key` and
+`config.toml.age`, so the crate does not build on Windows. Adding Windows
+support would mean swapping that for an ACL-based equivalent.
+
 ```sh
 cargo run
 ```
@@ -205,3 +210,7 @@ Caveats:
   `~/.config/wrustic/config.toml.age`, encrypted to the X25519 recipient
   derived from `~/.config/wrustic/age.key`. Inspect the cleartext with
   `age -d -i ~/.config/wrustic/age.key ~/.config/wrustic/config.toml.age`.
+  This `age -d` invocation is for advanced users debugging or inspecting the
+  store — it prints the decrypted `config.toml.age` (restic passwords and S3
+  keys included) to stdout, so only run it in a context where that exposure
+  is acceptable.

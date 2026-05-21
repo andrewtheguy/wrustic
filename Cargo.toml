@@ -4,7 +4,7 @@ version = "0.0.1"
 edition = "2024"
 
 [dependencies]
-age = { version = "0.11", features = ["armor"] }
+age = { version = ">=0.11.3", features = ["armor"] }
 anyhow = "1.0.102"
 dirs = "5"
 ratatui = "0.30.0"
