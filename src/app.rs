@@ -11,13 +11,6 @@ use crate::repo::SnapshotRow;
 
 pub(crate) const BACKEND_ORDER: [BackendKind; 3] =
     [BackendKind::Local, BackendKind::Rest, BackendKind::S3];
-pub(crate) const MAIN_MENU: [&str; 3] = ["Work with a repo", "Manage profiles", "Quit"];
-pub(crate) const MANAGE_MENU: [&str; 4] = [
-    "Create new profile",
-    "Edit a profile",
-    "Delete a profile",
-    "Back",
-];
 pub(crate) const FIRST_RUN_MENU: [&str; 3] = [
     "Create a new age key",
     "Restore an existing age key",
@@ -28,10 +21,8 @@ pub(crate) enum Screen {
     FirstRunChoice,
     RestoreKeyWait,
     KeyCreated,
-    MainMenu,
-    SelectProfileForOpen,
+    Home,
     Snapshots,
-    ManageMenu,
     CreateProfileName,
     BackendChoice,
     LocalPath,
@@ -45,8 +36,6 @@ pub(crate) enum Screen {
     S3AccessKey,
     S3SecretKey,
     Password,
-    SelectProfileForDelete,
-    SelectProfileForEdit,
     ConfirmDelete,
     Loading,
     Verifying,
@@ -66,8 +55,6 @@ pub(crate) struct App {
     pub(crate) config: Config,
 
     pub(crate) first_run_state: ListState,
-    pub(crate) main_menu_state: ListState,
-    pub(crate) manage_menu_state: ListState,
     pub(crate) backend_list: ListState,
     pub(crate) profile_list_state: ListState,
     pub(crate) list_state: ListState,
@@ -103,21 +90,15 @@ impl App {
         let paths = config::paths(config_dir)?;
         let mut first_run_state = ListState::default();
         first_run_state.select(Some(0));
-        let mut main_menu_state = ListState::default();
-        main_menu_state.select(Some(0));
-        let mut manage_menu_state = ListState::default();
-        manage_menu_state.select(Some(0));
         let mut backend_list = ListState::default();
         backend_list.select(Some(0));
 
         let identity_exists = paths.identity.exists();
         let mut app = Self {
-            screen: Screen::MainMenu,
+            screen: Screen::Home,
             paths,
             config: Config::default(),
             first_run_state,
-            main_menu_state,
-            manage_menu_state,
             backend_list,
             profile_list_state: ListState::default(),
             list_state: ListState::default(),
@@ -157,13 +138,28 @@ impl App {
         match config::load(&self.paths) {
             Ok(cfg) => {
                 self.config = cfg;
-                self.screen = Screen::MainMenu;
+                self.enter_home();
             }
             Err(e) => {
                 self.error_is_fatal = true;
                 self.screen = Screen::Error(format!("{e:#}"));
             }
         }
+    }
+
+    // Single writer for `Screen::Home`. Clears profile-creation scratch and
+    // clamps `profile_list_state` so a stale selection (e.g. after deleting
+    // the last row) doesn't highlight a phantom index on the next render.
+    fn enter_home(&mut self) {
+        self.clear_creation_scratch();
+        let len = self.config.profiles.len();
+        if len == 0 {
+            self.profile_list_state.select(None);
+        } else {
+            let cur = self.profile_list_state.selected().unwrap_or(0);
+            self.profile_list_state.select(Some(cur.min(len - 1)));
+        }
+        self.screen = Screen::Home;
     }
 
     fn clear_creation_scratch(&mut self) {
@@ -261,8 +257,7 @@ impl App {
 
     fn cancel_from_first_backend_input(&mut self) {
         if self.editing_original_name.is_some() {
-            self.clear_creation_scratch();
-            self.screen = Screen::ManageMenu;
+            self.enter_home();
         } else {
             self.screen = Screen::BackendChoice;
         }
@@ -304,8 +299,7 @@ impl App {
 
         match config::save(&self.config, &self.paths) {
             Ok(()) => {
-                self.clear_creation_scratch();
-                self.screen = Screen::MainMenu;
+                self.enter_home();
             }
             Err(e) => {
                 match restore {
@@ -390,28 +384,14 @@ impl App {
                 _ => {}
             },
 
-            Screen::MainMenu => match key.code {
-                KeyCode::Down | KeyCode::Char('j') => self.main_menu_state.select_next(),
-                KeyCode::Up | KeyCode::Char('k') => self.main_menu_state.select_previous(),
-                KeyCode::Esc | KeyCode::Char('q') => self.quit = true,
-                KeyCode::Enter => match self.main_menu_state.selected().unwrap_or(0) {
-                    0 => {
-                        self.profile_list_state.select(Some(0));
-                        self.screen = Screen::SelectProfileForOpen;
-                    }
-                    1 => {
-                        self.manage_menu_state.select(Some(0));
-                        self.screen = Screen::ManageMenu;
-                    }
-                    _ => self.quit = true,
-                },
-                _ => {}
-            },
-
-            Screen::SelectProfileForOpen => match key.code {
+            Screen::Home => match key.code {
                 KeyCode::Down | KeyCode::Char('j') => self.profile_list_state.select_next(),
                 KeyCode::Up | KeyCode::Char('k') => self.profile_list_state.select_previous(),
-                KeyCode::Esc => self.screen = Screen::MainMenu,
+                KeyCode::Esc | KeyCode::Char('q') => self.quit = true,
+                KeyCode::Char('n') => {
+                    self.clear_creation_scratch();
+                    self.screen = Screen::CreateProfileName;
+                }
                 KeyCode::Enter if !self.config.profiles.is_empty() => {
                     let idx = self
                         .profile_list_state
@@ -421,13 +401,36 @@ impl App {
                     self.loading_index = idx;
                     self.screen = Screen::Loading;
                 }
+                KeyCode::Char('e') if !self.config.profiles.is_empty() => {
+                    let idx = self
+                        .profile_list_state
+                        .selected()
+                        .unwrap_or(0)
+                        .min(self.config.profiles.len() - 1);
+                    self.load_profile_into_scratch(idx);
+                    self.editing_original_name = Some(self.new_profile_name.clone());
+                    self.screen = match self.backend_kind {
+                        BackendKind::Local => Screen::LocalPath,
+                        BackendKind::Rest => Screen::RestUrl,
+                        BackendKind::S3 => Screen::S3Endpoint,
+                    };
+                }
+                KeyCode::Char('d') if !self.config.profiles.is_empty() => {
+                    let idx = self
+                        .profile_list_state
+                        .selected()
+                        .unwrap_or(0)
+                        .min(self.config.profiles.len() - 1);
+                    self.pending_delete = Some(idx);
+                    self.screen = Screen::ConfirmDelete;
+                }
                 _ => {}
             },
 
             Screen::Snapshots => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
                     self.snapshots.clear();
-                    self.screen = Screen::MainMenu;
+                    self.enter_home();
                 }
                 KeyCode::Down | KeyCode::Char('j') => self.list_state.select_next(),
                 KeyCode::Up | KeyCode::Char('k') => self.list_state.select_previous(),
@@ -437,28 +440,6 @@ impl App {
                         self.list_state.select(Some(self.snapshots.len() - 1));
                     }
                 }
-                _ => {}
-            },
-
-            Screen::ManageMenu => match key.code {
-                KeyCode::Down | KeyCode::Char('j') => self.manage_menu_state.select_next(),
-                KeyCode::Up | KeyCode::Char('k') => self.manage_menu_state.select_previous(),
-                KeyCode::Esc => self.screen = Screen::MainMenu,
-                KeyCode::Enter => match self.manage_menu_state.selected().unwrap_or(0) {
-                    0 => {
-                        self.clear_creation_scratch();
-                        self.screen = Screen::CreateProfileName;
-                    }
-                    1 => {
-                        self.profile_list_state.select(Some(0));
-                        self.screen = Screen::SelectProfileForEdit;
-                    }
-                    2 => {
-                        self.profile_list_state.select(Some(0));
-                        self.screen = Screen::SelectProfileForDelete;
-                    }
-                    _ => self.screen = Screen::MainMenu,
-                },
                 _ => {}
             },
 
@@ -478,10 +459,7 @@ impl App {
                     self.backend_list.select(Some(0));
                     self.screen = Screen::BackendChoice;
                 }
-                TextAction::Cancel => {
-                    self.clear_creation_scratch();
-                    self.screen = Screen::ManageMenu;
-                }
+                TextAction::Cancel => self.enter_home(),
                 _ => {}
             },
 
@@ -609,43 +587,6 @@ impl App {
                 _ => {}
             },
 
-            Screen::SelectProfileForDelete => match key.code {
-                KeyCode::Down | KeyCode::Char('j') => self.profile_list_state.select_next(),
-                KeyCode::Up | KeyCode::Char('k') => self.profile_list_state.select_previous(),
-                KeyCode::Esc => self.screen = Screen::ManageMenu,
-                KeyCode::Enter if !self.config.profiles.is_empty() => {
-                    let idx = self
-                        .profile_list_state
-                        .selected()
-                        .unwrap_or(0)
-                        .min(self.config.profiles.len() - 1);
-                    self.pending_delete = Some(idx);
-                    self.screen = Screen::ConfirmDelete;
-                }
-                _ => {}
-            },
-
-            Screen::SelectProfileForEdit => match key.code {
-                KeyCode::Down | KeyCode::Char('j') => self.profile_list_state.select_next(),
-                KeyCode::Up | KeyCode::Char('k') => self.profile_list_state.select_previous(),
-                KeyCode::Esc => self.screen = Screen::ManageMenu,
-                KeyCode::Enter if !self.config.profiles.is_empty() => {
-                    let idx = self
-                        .profile_list_state
-                        .selected()
-                        .unwrap_or(0)
-                        .min(self.config.profiles.len() - 1);
-                    self.load_profile_into_scratch(idx);
-                    self.editing_original_name = Some(self.new_profile_name.clone());
-                    self.screen = match self.backend_kind {
-                        BackendKind::Local => Screen::LocalPath,
-                        BackendKind::Rest => Screen::RestUrl,
-                        BackendKind::S3 => Screen::S3Endpoint,
-                    };
-                }
-                _ => {}
-            },
-
             Screen::ConfirmDelete => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     if let Some(idx) = self.pending_delete.take()
@@ -657,7 +598,7 @@ impl App {
                             .remove(&name)
                             .expect("name_at hit must exist");
                         match config::save(&self.config, &self.paths) {
-                            Ok(()) => self.screen = Screen::MainMenu,
+                            Ok(()) => self.enter_home(),
                             Err(e) => {
                                 self.config.profiles.insert(name, removed);
                                 self.screen =
@@ -665,12 +606,12 @@ impl App {
                             }
                         }
                     } else {
-                        self.screen = Screen::ManageMenu;
+                        self.enter_home();
                     }
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     self.pending_delete = None;
-                    self.screen = Screen::SelectProfileForDelete;
+                    self.screen = Screen::Home;
                 }
                 _ => {}
             },
@@ -688,10 +629,7 @@ impl App {
                 KeyCode::Char('s') | KeyCode::Char('S') => {
                     self.commit_profile();
                 }
-                KeyCode::Esc => {
-                    self.clear_creation_scratch();
-                    self.screen = Screen::ManageMenu;
-                }
+                KeyCode::Esc => self.enter_home(),
                 _ => {}
             },
 
@@ -699,7 +637,7 @@ impl App {
                 if self.error_is_fatal {
                     self.quit = true;
                 } else {
-                    self.screen = Screen::MainMenu;
+                    self.enter_home();
                 }
             }
         }

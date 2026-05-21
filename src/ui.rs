@@ -5,24 +5,14 @@ use ratatui::{
     widgets::{Block, List, ListItem, Paragraph, Wrap},
 };
 
-use crate::app::{App, BACKEND_ORDER, FIRST_RUN_MENU, MAIN_MENU, MANAGE_MENU, Screen};
+use crate::app::{App, BACKEND_ORDER, FIRST_RUN_MENU, Screen};
 
 pub(crate) fn render(frame: &mut Frame, app: &mut App) {
     match &app.screen {
         Screen::FirstRunChoice => render_first_run_choice(frame, app),
         Screen::RestoreKeyWait => render_restore_wait(frame, app),
         Screen::KeyCreated => render_key_created(frame, app),
-        Screen::MainMenu => render_menu(frame, app, MainOrManage::Main),
-        Screen::SelectProfileForOpen => {
-            render_profile_list(frame, app, "Select profile to open (Esc back)")
-        }
-        Screen::SelectProfileForDelete => {
-            render_profile_list(frame, app, "Select profile to delete (Esc back)")
-        }
-        Screen::SelectProfileForEdit => {
-            render_profile_list(frame, app, "Select profile to edit (Esc back)")
-        }
-        Screen::ManageMenu => render_menu(frame, app, MainOrManage::Manage),
+        Screen::Home => render_home(frame, app),
         Screen::CreateProfileName => render_input(
             frame,
             "Profile name",
@@ -210,11 +200,6 @@ fn render_key_created(frame: &mut Frame, app: &App) {
     frame.render_widget(para, frame.area());
 }
 
-enum MainOrManage {
-    Main,
-    Manage,
-}
-
 fn selection_highlight() -> Style {
     Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD)
 }
@@ -229,34 +214,13 @@ fn profile_title(base: &str, app: &App) -> String {
     }
 }
 
-fn render_menu(frame: &mut Frame, app: &mut App, which: MainOrManage) {
-    let (entries, state, title) = match which {
-        MainOrManage::Main => (
-            &MAIN_MENU[..],
-            &mut app.main_menu_state,
-            "wrustic — j/k to move, Enter to pick, q/Esc to quit",
-        ),
-        MainOrManage::Manage => (
-            &MANAGE_MENU[..],
-            &mut app.manage_menu_state,
-            "Manage profiles — j/k to move, Enter to pick, Esc back",
-        ),
-    };
-    let items: Vec<ListItem> = entries.iter().map(|s| ListItem::new(*s)).collect();
-    let list = List::new(items)
-        .block(Block::bordered().title(title))
-        .highlight_style(selection_highlight())
-        .highlight_symbol(">> ");
-    frame.render_stateful_widget(list, frame.area(), state);
-}
+fn render_home(frame: &mut Frame, app: &mut App) {
+    let title = "wrustic — j/k move, Enter open, n new, e edit, d delete, q quit";
 
-fn render_profile_list(frame: &mut Frame, app: &mut App, title: &str) {
     if app.config.profiles.is_empty() {
-        let para = Paragraph::new(
-            "No profiles yet. Go back (Esc) and choose 'Manage profiles' → 'Create new profile'.",
-        )
-        .wrap(Wrap { trim: false })
-        .block(Block::bordered().title(title));
+        let para = Paragraph::new("No profiles yet. Press 'n' to create one, 'q' to quit.")
+            .wrap(Wrap { trim: false })
+            .block(Block::bordered().title(title));
         frame.render_widget(para, frame.area());
         return;
     }
