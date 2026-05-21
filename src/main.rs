@@ -289,6 +289,14 @@ impl App {
 
         let restore = match self.editing_original_name.clone() {
             Some(original) => {
+                // Rename during edit is not exposed in the current UI; the edit
+                // flow skips the name screen. If a future screen lets the name
+                // drift, this catches it before we silently drop the new value.
+                debug_assert_eq!(
+                    original, name,
+                    "edit flow must not change the profile name; \
+                     add rename handling (remove old key, collision-check, insert new) to commit_profile",
+                );
                 let old = self
                     .config
                     .profiles
