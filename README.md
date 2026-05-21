@@ -5,42 +5,78 @@ repositories, built on [`rustic_core`](https://crates.io/crates/rustic_core)
 and [`ratatui`](https://crates.io/crates/ratatui).
 
 The current scope is intentionally tiny: open a **local**, **REST-server**, or
-**S3** repository with credentials entered interactively, and list its
-snapshots.
+**S3** repository from a saved, age-encrypted profile, and list its snapshots.
 
 ## Status
 
 Implemented:
-- Interactive prompts for the repository path and password (masked input)
+- Named profiles stored in a single age-encrypted master file
+  (`~/.config/wrustic/config.toml.age`), unlocked by an X25519 identity at
+  `~/.config/wrustic/age.key` (sops-style; mode 0600)
+- Profile management screens: create new, delete existing (edit comes later)
 - Snapshot listing (short ID, time, host, tags, paths), sorted by time
 - Keyboard navigation (`j`/`k`, arrow keys, Home/End, `g`/`G`) and quit (`q` / Esc / Ctrl-C)
-- Error screen on bad password / bad path, with retry without restarting the binary
+- Error screen on bad password / bad path, returning to the menu without restarting
 
 Out of scope (by design): any write operation on the repository — init, backup,
 forget, prune, key management, etc. `wrustic` is a read-only viewer.
 
-Not yet implemented but in scope: browsing snapshot contents, restoring,
-encrypted credential profiles (so you don't re-enter S3 keys every time), and
-additional remote backends (SFTP via rclone, Azure / GCS via opendal — Local,
-REST, and S3 are already supported).
+Not yet implemented but in scope: editing existing profiles, browsing snapshot
+contents, restoring, and additional remote backends (SFTP via rclone,
+Azure / GCS via opendal — Local, REST, and S3 are already supported).
 
 ## Build & run
 
 Requires a Rust toolchain (developed against rustc 1.93).
 
+Platform: Linux / macOS only. The config-file writer uses
+`std::os::unix::fs::OpenOptionsExt` to enforce mode `0600` on `age.key` and
+`config.toml.age`, so the crate does not build on Windows. Adding Windows
+support would mean swapping that for an ACL-based equivalent.
+
 ```sh
 cargo run
 ```
 
+### CLI flags
+
+```text
+wrustic [-c|--config-dir <PATH>] [-h|--help]
+```
+
+`--config-dir <PATH>` overrides the default config location
+(`~/.config/wrustic`). The override applies to both the age identity file
+(`<PATH>/age.key`) and the encrypted profile store
+(`<PATH>/config.toml.age`). Useful for keeping separate profile sets, running
+tests, or driving an automation/CI flow against a throwaway directory:
+
+```sh
+cargo run -- --config-dir ./tmp/wrustic-sandbox
+```
+
+The directory is created on first run if it doesn't exist.
+
+First run: if `<config-dir>/age.key` is missing, the welcome screen asks
+whether to **create a new key** or **restore an existing one** (copy your
+backup to that path, then press Enter). When creating a new key, the next
+screen shows the key path and the public-key recipient (`age1…`) — **back up
+the key file now**, since losing it means losing access to every profile
+stored in the config file alongside it.
+
 Then in the TUI:
-1. Pick a backend on the first screen (Local / REST / S3) with `j`/`k` + Enter.
-2. Fill in the per-backend prompts (Esc on any prompt goes back one step):
+1. The main menu lists **Work with a repo**, **Manage profiles**, and **Quit**.
+2. **Manage profiles → Create new profile**: type a profile name, pick a
+   backend (Local / REST / S3), fill in the per-backend prompts (Esc on any
+   prompt goes back one step):
    - **Local**: filesystem path, e.g. `./tmp/repo`.
    - **REST**: URL, e.g. `http://localhost:8000/` or `https://user:pass@host/path/`.
    - **S3**: endpoint (blank → AWS default), bucket, region (blank → `us-east-1`),
      access key ID, secret access key (masked).
-3. Type the repository password (rendered as `*`), press Enter.
-4. Browse the snapshot list.
+   Finally type the repository password (masked) and press Enter — the profile
+   is encrypted into `config.toml.age` and you return to the main menu.
+3. **Work with a repo**: pick a profile from the list, and the snapshot view
+   opens directly. No re-typing the password; age unlock is the auth gate.
+4. **Manage profiles → Delete a profile**: pick a profile and confirm with `y`.
 
 ## Relationship to the `restic` binary
 
@@ -170,6 +206,11 @@ Caveats:
   to exist on disk before `restic init`.
 - `--force-path-style=true` is required — rclone's S3 server doesn't speak
   virtual-hosted-style addressing.
-- Credentials are only held in memory for the current `wrustic` session. A
-  later iteration will add encrypted credential profiles so you don't re-enter
-  S3 keys every time.
+- Profiles (including the S3 keys and restic password) are persisted in
+  `~/.config/wrustic/config.toml.age`, encrypted to the X25519 recipient
+  derived from `~/.config/wrustic/age.key`. Inspect the cleartext with
+  `age -d -i ~/.config/wrustic/age.key ~/.config/wrustic/config.toml.age`.
+  This `age -d` invocation is for advanced users debugging or inspecting the
+  store — it prints the decrypted `config.toml.age` (restic passwords and S3
+  keys included) to stdout, so only run it in a context where that exposure
+  is acceptable.

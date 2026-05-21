@@ -1,7 +1,10 @@
+mod config;
+
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use ratatui::{
     DefaultTerminal, Frame,
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -12,26 +15,26 @@ use ratatui::{
 use rustic_backend::BackendOptions;
 use rustic_core::{Credentials, Repository, RepositoryOptions};
 
-#[derive(Clone, Copy)]
-enum BackendKind {
-    Local,
-    Rest,
-    S3,
-}
-
-impl BackendKind {
-    fn label(self) -> &'static str {
-        match self {
-            BackendKind::Local => "Local filesystem",
-            BackendKind::Rest => "REST server",
-            BackendKind::S3 => "S3 (any S3-compatible endpoint)",
-        }
-    }
-}
+use crate::config::{BackendKind, Config, Paths, Profile};
 
 const BACKEND_ORDER: [BackendKind; 3] = [BackendKind::Local, BackendKind::Rest, BackendKind::S3];
+const MAIN_MENU: [&str; 3] = ["Work with a repo", "Manage profiles", "Quit"];
+const MANAGE_MENU: [&str; 3] = ["Create new profile", "Delete a profile", "Back"];
+const FIRST_RUN_MENU: [&str; 3] = [
+    "Create a new age key",
+    "Restore an existing age key",
+    "Quit",
+];
 
 enum Screen {
+    FirstRunChoice,
+    RestoreKeyWait,
+    KeyCreated,
+    MainMenu,
+    SelectProfileForOpen,
+    Snapshots,
+    ManageMenu,
+    CreateProfileName,
     BackendChoice,
     LocalPath,
     RestUrl,
@@ -41,8 +44,9 @@ enum Screen {
     S3AccessKey,
     S3SecretKey,
     Password,
+    SelectProfileForDelete,
+    ConfirmDelete,
     Loading,
-    Snapshots,
     Error(String),
 }
 
@@ -56,8 +60,19 @@ struct SnapshotRow {
 
 struct App {
     screen: Screen,
-    backend_kind: BackendKind,
+
+    paths: Paths,
+    config: Config,
+
+    first_run_state: ListState,
+    main_menu_state: ListState,
+    manage_menu_state: ListState,
     backend_list: ListState,
+    profile_list_state: ListState,
+    list_state: ListState,
+
+    new_profile_name: String,
+    backend_kind: BackendKind,
     local_path: String,
     rest_url: String,
     s3_endpoint: String,
@@ -66,19 +81,43 @@ struct App {
     s3_access_key: String,
     s3_secret_key: String,
     password: String,
+
+    loading_index: usize,
+    pending_delete: Option<usize>,
+
+    restore_error: Option<String>,
+    created_pubkey: String,
+
     snapshots: Vec<SnapshotRow>,
-    list_state: ListState,
+    error_is_fatal: bool,
     quit: bool,
 }
 
 impl App {
-    fn new() -> Self {
+    fn boot(config_dir: Option<PathBuf>) -> Result<Self> {
+        let paths = config::paths(config_dir)?;
+        let mut first_run_state = ListState::default();
+        first_run_state.select(Some(0));
+        let mut main_menu_state = ListState::default();
+        main_menu_state.select(Some(0));
+        let mut manage_menu_state = ListState::default();
+        manage_menu_state.select(Some(0));
         let mut backend_list = ListState::default();
         backend_list.select(Some(0));
-        Self {
-            screen: Screen::BackendChoice,
-            backend_kind: BackendKind::Local,
+
+        let identity_exists = paths.identity.exists();
+        let mut app = Self {
+            screen: Screen::MainMenu,
+            paths,
+            config: Config::default(),
+            first_run_state,
+            main_menu_state,
+            manage_menu_state,
             backend_list,
+            profile_list_state: ListState::default(),
+            list_state: ListState::default(),
+            new_profile_name: String::new(),
+            backend_kind: BackendKind::Local,
             local_path: String::new(),
             rest_url: String::new(),
             s3_endpoint: String::new(),
@@ -87,9 +126,76 @@ impl App {
             s3_access_key: String::new(),
             s3_secret_key: String::new(),
             password: String::new(),
+            loading_index: 0,
+            pending_delete: None,
+            restore_error: None,
+            created_pubkey: String::new(),
             snapshots: Vec::new(),
-            list_state: ListState::default(),
+            error_is_fatal: false,
             quit: false,
+        };
+
+        if !identity_exists {
+            app.screen = Screen::FirstRunChoice;
+            return Ok(app);
+        }
+
+        app.load_config_or_set_fatal();
+        Ok(app)
+    }
+
+    fn load_config_or_set_fatal(&mut self) {
+        match config::load(&self.paths) {
+            Ok(cfg) => {
+                self.config = cfg;
+                self.screen = Screen::MainMenu;
+            }
+            Err(e) => {
+                self.error_is_fatal = true;
+                self.screen = Screen::Error(format!("{e:#}"));
+            }
+        }
+    }
+
+    fn clear_creation_scratch(&mut self) {
+        self.new_profile_name.clear();
+        self.local_path.clear();
+        self.rest_url.clear();
+        self.s3_endpoint.clear();
+        self.s3_bucket.clear();
+        self.s3_region.clear();
+        self.s3_access_key.clear();
+        self.s3_secret_key.clear();
+        self.password.clear();
+    }
+
+    fn build_profile(&self) -> Profile {
+        let name = self.new_profile_name.clone();
+        let password = self.password.clone();
+        match self.backend_kind {
+            BackendKind::Local => Profile::Local {
+                name,
+                password,
+                local_path: self.local_path.clone(),
+            },
+            BackendKind::Rest => Profile::Rest {
+                name,
+                password,
+                rest_url: self.rest_url.clone(),
+            },
+            BackendKind::S3 => Profile::S3 {
+                name,
+                password,
+                s3_endpoint: self.s3_endpoint.clone(),
+                s3_bucket: self.s3_bucket.clone(),
+                s3_region: if self.s3_region.is_empty() {
+                    "us-east-1".into()
+                } else {
+                    self.s3_region.clone()
+                },
+                s3_access_key: self.s3_access_key.clone(),
+                s3_secret_key: self.s3_secret_key.clone(),
+            },
         }
     }
 
@@ -100,11 +206,168 @@ impl App {
         }
 
         match &self.screen {
+            Screen::FirstRunChoice => match key.code {
+                KeyCode::Down | KeyCode::Char('j') => self.first_run_state.select_next(),
+                KeyCode::Up | KeyCode::Char('k') => self.first_run_state.select_previous(),
+                KeyCode::Esc => self.quit = true,
+                KeyCode::Enter => match self.first_run_state.selected().unwrap_or(0) {
+                    0 => match config::generate_identity(&self.paths.identity) {
+                        Ok(pubkey) => {
+                            self.created_pubkey = pubkey;
+                            self.screen = Screen::KeyCreated;
+                        }
+                        Err(e) => {
+                            self.error_is_fatal = true;
+                            self.screen = Screen::Error(format!("{e:#}"));
+                        }
+                    },
+                    1 => {
+                        self.restore_error = None;
+                        self.screen = Screen::RestoreKeyWait;
+                    }
+                    _ => self.quit = true,
+                },
+                _ => {}
+            },
+
+            Screen::RestoreKeyWait => match key.code {
+                KeyCode::Esc => {
+                    self.restore_error = None;
+                    self.screen = Screen::FirstRunChoice;
+                }
+                KeyCode::Enter => {
+                    if !self.paths.identity.exists() {
+                        self.restore_error = Some(format!(
+                            "No file found at {}. Place your age.key there, then press Enter.",
+                            self.paths.identity.display()
+                        ));
+                    } else {
+                        match config::validate_identity(&self.paths.identity) {
+                            Ok(_) => {
+                                self.restore_error = None;
+                                self.load_config_or_set_fatal();
+                            }
+                            Err(e) => {
+                                self.restore_error = Some(format!(
+                                    "Could not read identity at {}: {e:#}",
+                                    self.paths.identity.display()
+                                ));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            },
+
+            Screen::KeyCreated => match key.code {
+                KeyCode::Enter => {
+                    self.created_pubkey.clear();
+                    self.load_config_or_set_fatal();
+                }
+                KeyCode::Esc => self.quit = true,
+                _ => {}
+            },
+
+            Screen::MainMenu => match key.code {
+                KeyCode::Down | KeyCode::Char('j') => self.main_menu_state.select_next(),
+                KeyCode::Up | KeyCode::Char('k') => self.main_menu_state.select_previous(),
+                KeyCode::Esc | KeyCode::Char('q') => self.quit = true,
+                KeyCode::Enter => match self.main_menu_state.selected().unwrap_or(0) {
+                    0 => {
+                        self.profile_list_state.select(Some(0));
+                        self.screen = Screen::SelectProfileForOpen;
+                    }
+                    1 => {
+                        self.manage_menu_state.select(Some(0));
+                        self.screen = Screen::ManageMenu;
+                    }
+                    _ => self.quit = true,
+                },
+                _ => {}
+            },
+
+            Screen::SelectProfileForOpen => match key.code {
+                KeyCode::Down | KeyCode::Char('j') => self.profile_list_state.select_next(),
+                KeyCode::Up | KeyCode::Char('k') => self.profile_list_state.select_previous(),
+                KeyCode::Esc => self.screen = Screen::MainMenu,
+                KeyCode::Enter if !self.config.profiles.is_empty() => {
+                    let idx = self
+                        .profile_list_state
+                        .selected()
+                        .unwrap_or(0)
+                        .min(self.config.profiles.len() - 1);
+                    self.loading_index = idx;
+                    self.screen = Screen::Loading;
+                }
+                _ => {}
+            },
+
+            Screen::Snapshots => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.snapshots.clear();
+                    self.screen = Screen::MainMenu;
+                }
+                KeyCode::Down | KeyCode::Char('j') => self.list_state.select_next(),
+                KeyCode::Up | KeyCode::Char('k') => self.list_state.select_previous(),
+                KeyCode::Home | KeyCode::Char('g') => self.list_state.select(Some(0)),
+                KeyCode::End | KeyCode::Char('G') => {
+                    if !self.snapshots.is_empty() {
+                        self.list_state.select(Some(self.snapshots.len() - 1));
+                    }
+                }
+                _ => {}
+            },
+
+            Screen::ManageMenu => match key.code {
+                KeyCode::Down | KeyCode::Char('j') => self.manage_menu_state.select_next(),
+                KeyCode::Up | KeyCode::Char('k') => self.manage_menu_state.select_previous(),
+                KeyCode::Esc => self.screen = Screen::MainMenu,
+                KeyCode::Enter => match self.manage_menu_state.selected().unwrap_or(0) {
+                    0 => {
+                        self.clear_creation_scratch();
+                        self.screen = Screen::CreateProfileName;
+                    }
+                    1 => {
+                        self.profile_list_state.select(Some(0));
+                        self.screen = Screen::SelectProfileForDelete;
+                    }
+                    _ => self.screen = Screen::MainMenu,
+                },
+                _ => {}
+            },
+
+            Screen::CreateProfileName => match text_input(&mut self.new_profile_name, key) {
+                TextAction::Submit => {
+                    let name = self.new_profile_name.trim().to_string();
+                    if name.is_empty() {
+                        return;
+                    }
+                    if self.config.has_profile(&name) {
+                        self.screen = Screen::Error(format!(
+                            "A profile named '{name}' already exists."
+                        ));
+                        return;
+                    }
+                    self.new_profile_name = name;
+                    self.backend_list.select(Some(0));
+                    self.screen = Screen::BackendChoice;
+                }
+                TextAction::Cancel => {
+                    self.clear_creation_scratch();
+                    self.screen = Screen::ManageMenu;
+                }
+                _ => {}
+            },
+
             Screen::BackendChoice => match key.code {
                 KeyCode::Down | KeyCode::Char('j') => self.backend_list.select_next(),
                 KeyCode::Up | KeyCode::Char('k') => self.backend_list.select_previous(),
                 KeyCode::Enter => {
-                    let idx = self.backend_list.selected().unwrap_or(0).min(BACKEND_ORDER.len() - 1);
+                    let idx = self
+                        .backend_list
+                        .selected()
+                        .unwrap_or(0)
+                        .min(BACKEND_ORDER.len() - 1);
                     self.backend_kind = BACKEND_ORDER[idx];
                     self.screen = match self.backend_kind {
                         BackendKind::Local => Screen::LocalPath,
@@ -112,7 +375,7 @@ impl App {
                         BackendKind::S3 => Screen::S3Endpoint,
                     };
                 }
-                KeyCode::Esc => self.quit = true,
+                KeyCode::Esc => self.screen = Screen::CreateProfileName,
                 _ => {}
             },
 
@@ -180,7 +443,20 @@ impl App {
             },
 
             Screen::Password => match text_input(&mut self.password, key) {
-                TextAction::Submit => self.screen = Screen::Loading,
+                TextAction::Submit if !self.password.is_empty() => {
+                    let profile = self.build_profile();
+                    self.config.profiles.push(profile);
+                    match config::save(&self.config, &self.paths) {
+                        Ok(()) => {
+                            self.clear_creation_scratch();
+                            self.screen = Screen::MainMenu;
+                        }
+                        Err(e) => {
+                            self.config.profiles.pop();
+                            self.screen = Screen::Error(format!("Saving config failed: {e:#}"));
+                        }
+                    }
+                }
                 TextAction::Cancel => {
                     self.password.clear();
                     self.screen = match self.backend_kind {
@@ -192,48 +468,58 @@ impl App {
                 _ => {}
             },
 
-            Screen::Loading => {}
-
-            Screen::Snapshots => match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
-                KeyCode::Down | KeyCode::Char('j') => self.list_state.select_next(),
-                KeyCode::Up | KeyCode::Char('k') => self.list_state.select_previous(),
-                KeyCode::Home | KeyCode::Char('g') => self.list_state.select(Some(0)),
-                KeyCode::End | KeyCode::Char('G') => {
-                    if !self.snapshots.is_empty() {
-                        self.list_state.select(Some(self.snapshots.len() - 1));
-                    }
+            Screen::SelectProfileForDelete => match key.code {
+                KeyCode::Down | KeyCode::Char('j') => self.profile_list_state.select_next(),
+                KeyCode::Up | KeyCode::Char('k') => self.profile_list_state.select_previous(),
+                KeyCode::Esc => self.screen = Screen::ManageMenu,
+                KeyCode::Enter if !self.config.profiles.is_empty() => {
+                    let idx = self
+                        .profile_list_state
+                        .selected()
+                        .unwrap_or(0)
+                        .min(self.config.profiles.len() - 1);
+                    self.pending_delete = Some(idx);
+                    self.screen = Screen::ConfirmDelete;
                 }
                 _ => {}
             },
 
-            Screen::Error(_) => {
-                self.screen = Screen::BackendChoice;
-                self.password.clear();
-                self.s3_secret_key.clear();
-            }
-        }
-    }
+            Screen::ConfirmDelete => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    if let Some(idx) = self.pending_delete.take() {
+                        if idx < self.config.profiles.len() {
+                            let removed = self.config.profiles.remove(idx);
+                            match config::save(&self.config, &self.paths) {
+                                Ok(()) => self.screen = Screen::MainMenu,
+                                Err(e) => {
+                                    self.config.profiles.insert(idx, removed);
+                                    self.screen =
+                                        Screen::Error(format!("Saving config failed: {e:#}"));
+                                }
+                            }
+                        } else {
+                            self.screen = Screen::ManageMenu;
+                        }
+                    } else {
+                        self.screen = Screen::ManageMenu;
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.pending_delete = None;
+                    self.screen = Screen::SelectProfileForDelete;
+                }
+                _ => {}
+            },
 
-    fn build_backend_config(&self) -> BackendConfig {
-        match self.backend_kind {
-            BackendKind::Local => BackendConfig::Local {
-                path: self.local_path.clone(),
-            },
-            BackendKind::Rest => BackendConfig::Rest {
-                url: self.rest_url.clone(),
-            },
-            BackendKind::S3 => BackendConfig::S3 {
-                endpoint: self.s3_endpoint.clone(),
-                bucket: self.s3_bucket.clone(),
-                region: if self.s3_region.is_empty() {
-                    "us-east-1".into()
+            Screen::Loading => {}
+
+            Screen::Error(_) => {
+                if self.error_is_fatal {
+                    self.quit = true;
                 } else {
-                    self.s3_region.clone()
-                },
-                access_key: self.s3_access_key.clone(),
-                secret_key: self.s3_secret_key.clone(),
-            },
+                    self.screen = Screen::MainMenu;
+                }
+            }
         }
     }
 }
@@ -260,38 +546,73 @@ fn text_input(buf: &mut String, key: KeyEvent) -> TextAction {
     }
 }
 
-enum BackendConfig {
-    Local {
-        path: String,
-    },
-    Rest {
-        url: String,
-    },
-    S3 {
-        endpoint: String,
-        bucket: String,
-        region: String,
-        access_key: String,
-        secret_key: String,
-    },
-}
-
 fn main() -> Result<()> {
+    let cli = match parse_cli() {
+        Ok(cli) => cli,
+        Err(e) => {
+            eprintln!("{e:#}");
+            eprintln!("\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
+    if cli.show_help {
+        println!("{USAGE}");
+        return Ok(());
+    }
+
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal);
+    let result = run(&mut terminal, cli.config_dir);
     ratatui::restore();
     result
 }
 
-fn run(terminal: &mut DefaultTerminal) -> Result<()> {
-    let mut app = App::new();
+const USAGE: &str = "\
+Usage: wrustic [OPTIONS]
+
+Options:
+  -c, --config-dir <PATH>  Use <PATH> as the wrustic config directory instead
+                           of the platform default (~/.config/wrustic on Linux).
+                           The directory will be created on first run.
+  -h, --help               Print this help text.
+";
+
+#[derive(Default)]
+struct Cli {
+    config_dir: Option<PathBuf>,
+    show_help: bool,
+}
+
+fn parse_cli() -> Result<Cli> {
+    let mut cli = Cli::default();
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => cli.show_help = true,
+            "-c" | "--config-dir" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("{arg} requires a path argument"))?;
+                cli.config_dir = Some(PathBuf::from(value));
+            }
+            other if other.starts_with("--config-dir=") => {
+                cli.config_dir = Some(PathBuf::from(&other["--config-dir=".len()..]));
+            }
+            other => bail!("unknown argument: {other}"),
+        }
+    }
+    Ok(cli)
+}
+
+fn run(terminal: &mut DefaultTerminal, config_dir: Option<PathBuf>) -> Result<()> {
+    let mut app = App::boot(config_dir)?;
 
     while !app.quit {
         terminal.draw(|f| render(f, &mut app))?;
 
         if matches!(app.screen, Screen::Loading) {
-            let cfg = app.build_backend_config();
-            match load_snapshots(&cfg, &app.password) {
+            let idx = app.loading_index;
+            let profile = &app.config.profiles[idx];
+            match load_snapshots(profile) {
                 Ok(snaps) => {
                     app.snapshots = snaps;
                     if !app.snapshots.is_empty() {
@@ -300,7 +621,6 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
                     app.screen = Screen::Snapshots;
                 }
                 Err(e) => {
-                    app.password.clear();
                     app.screen = Screen::Error(format!("{e:#}"));
                 }
             }
@@ -317,30 +637,31 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     Ok(())
 }
 
-fn load_snapshots(cfg: &BackendConfig, password: &str) -> Result<Vec<SnapshotRow>> {
+fn load_snapshots(profile: &Profile) -> Result<Vec<SnapshotRow>> {
     let mut opts = BackendOptions::default();
-    match cfg {
-        BackendConfig::Local { path } => {
-            opts = opts.repository(path.clone());
+    match profile {
+        Profile::Local { local_path, .. } => {
+            opts = opts.repository(local_path.clone());
         }
-        BackendConfig::Rest { url } => {
-            opts = opts.repository(format!("rest:{url}"));
+        Profile::Rest { rest_url, .. } => {
+            opts = opts.repository(format!("rest:{rest_url}"));
         }
-        BackendConfig::S3 {
-            endpoint,
-            bucket,
-            region,
-            access_key,
-            secret_key,
+        Profile::S3 {
+            s3_endpoint,
+            s3_bucket,
+            s3_region,
+            s3_access_key,
+            s3_secret_key,
+            ..
         } => {
             opts = opts.repository("opendal:s3:");
             let mut s3_opts = BTreeMap::new();
-            s3_opts.insert("bucket".to_string(), bucket.clone());
-            s3_opts.insert("region".to_string(), region.clone());
-            s3_opts.insert("access_key_id".to_string(), access_key.clone());
-            s3_opts.insert("secret_access_key".to_string(), secret_key.clone());
-            if !endpoint.is_empty() {
-                s3_opts.insert("endpoint".to_string(), endpoint.clone());
+            s3_opts.insert("bucket".to_string(), s3_bucket.clone());
+            s3_opts.insert("region".to_string(), s3_region.clone());
+            s3_opts.insert("access_key_id".to_string(), s3_access_key.clone());
+            s3_opts.insert("secret_access_key".to_string(), s3_secret_key.clone());
+            if !s3_endpoint.is_empty() {
+                s3_opts.insert("endpoint".to_string(), s3_endpoint.clone());
             }
             opts = opts.options(s3_opts);
         }
@@ -348,7 +669,7 @@ fn load_snapshots(cfg: &BackendConfig, password: &str) -> Result<Vec<SnapshotRow
 
     let backends = opts.to_backends()?;
     let repo = Repository::new(&RepositoryOptions::default(), &backends)?
-        .open(&Credentials::password(password))?;
+        .open(&Credentials::password(profile.password()))?;
 
     let mut snaps = repo.get_all_snapshots()?;
     snaps.sort_by(|a, b| a.time.cmp(&b.time));
@@ -367,48 +688,59 @@ fn load_snapshots(cfg: &BackendConfig, password: &str) -> Result<Vec<SnapshotRow
 
 fn render(frame: &mut Frame, app: &mut App) {
     match &app.screen {
+        Screen::FirstRunChoice => render_first_run_choice(frame, app),
+        Screen::RestoreKeyWait => render_restore_wait(frame, app),
+        Screen::KeyCreated => render_key_created(frame, app),
+        Screen::MainMenu => render_menu(frame, app, MainOrManage::Main),
+        Screen::SelectProfileForOpen => {
+            render_profile_list(frame, app, "Select profile to open (Esc back)")
+        }
+        Screen::SelectProfileForDelete => {
+            render_profile_list(frame, app, "Select profile to delete (Esc back)")
+        }
+        Screen::ManageMenu => render_menu(frame, app, MainOrManage::Manage),
+        Screen::CreateProfileName => render_input(
+            frame,
+            "Profile name",
+            &app.new_profile_name,
+            "Give this profile a short name, e.g. 'laptop-local' (Esc cancels)",
+        ),
         Screen::BackendChoice => render_backend_choice(frame, app),
         Screen::LocalPath => render_input(
             frame,
             "Local repository path",
             &app.local_path,
             "Filesystem path, e.g. /tmp/wrustic-test-repo (Esc back)",
-            false,
         ),
         Screen::RestUrl => render_input(
             frame,
             "REST URL",
             &app.rest_url,
             "e.g. http://localhost:8000/  or  https://user:pass@host/path/ (Esc back)",
-            false,
         ),
         Screen::S3Endpoint => render_input(
             frame,
             "S3 endpoint (optional)",
             &app.s3_endpoint,
             "Leave blank for AWS. For MinIO / rclone: http://127.0.0.1:8333 (Esc back)",
-            false,
         ),
         Screen::S3Bucket => render_input(
             frame,
             "S3 bucket",
             &app.s3_bucket,
             "Bucket / top-level directory name (Esc back)",
-            false,
         ),
         Screen::S3Region => render_input(
             frame,
             "S3 region (optional)",
             &app.s3_region,
             "Defaults to us-east-1 if left blank (Esc back)",
-            false,
         ),
         Screen::S3AccessKey => render_input(
             frame,
             "S3 access key ID",
             &app.s3_access_key,
             "AWS_ACCESS_KEY_ID equivalent (Esc back)",
-            false,
         ),
         Screen::S3SecretKey => {
             let masked = "*".repeat(app.s3_secret_key.chars().count());
@@ -417,7 +749,6 @@ fn render(frame: &mut Frame, app: &mut App) {
                 "S3 secret access key",
                 &masked,
                 "AWS_SECRET_ACCESS_KEY equivalent (Esc back)",
-                true,
             );
         }
         Screen::Password => {
@@ -426,9 +757,20 @@ fn render(frame: &mut Frame, app: &mut App) {
                 frame,
                 "Repository password",
                 &masked,
-                "Restic repository password (Esc back)",
-                true,
+                "Restic repository password (Esc back; profile saves on Enter)",
             );
+        }
+        Screen::ConfirmDelete => {
+            let name = app
+                .pending_delete
+                .and_then(|i| app.config.profiles.get(i))
+                .map(|p| p.name())
+                .unwrap_or("(unknown)");
+            let body = format!("Delete profile '{name}'? Press y to confirm, n/Esc to cancel.");
+            let para = Paragraph::new(body)
+                .style(Style::new().fg(Color::Yellow))
+                .block(Block::bordered().title("Confirm delete"));
+            frame.render_widget(para, frame.area());
         }
         Screen::Loading => {
             let para = Paragraph::new("Opening repository and reading snapshots…")
@@ -437,13 +779,141 @@ fn render(frame: &mut Frame, app: &mut App) {
         }
         Screen::Snapshots => render_snapshots(frame, app),
         Screen::Error(msg) => {
+            let title = if app.error_is_fatal {
+                "Error — press any key to quit"
+            } else {
+                "Error — press any key to return to menu"
+            };
             let para = Paragraph::new(msg.as_str())
                 .style(Style::new().fg(Color::Red))
                 .wrap(Wrap { trim: false })
-                .block(Block::bordered().title("Error — press any key to start over"));
+                .block(Block::bordered().title(title));
             frame.render_widget(para, frame.area());
         }
     }
+}
+
+fn render_first_run_choice(frame: &mut Frame, app: &mut App) {
+    let [intro_area, list_area] = Layout::vertical([
+        Constraint::Length(5),
+        Constraint::Fill(1),
+    ])
+    .areas(frame.area());
+
+    let intro = Paragraph::new(format!(
+        "No age identity found at {}.\n\nEither restore an existing key to that path, or create a new one. Without a key, wrustic cannot decrypt or save profiles.",
+        app.paths.identity.display()
+    ))
+    .wrap(Wrap { trim: false })
+    .block(Block::bordered().title("Welcome to wrustic"));
+    frame.render_widget(intro, intro_area);
+
+    let items: Vec<ListItem> = FIRST_RUN_MENU.iter().map(|s| ListItem::new(*s)).collect();
+    let list = List::new(items)
+        .block(Block::bordered().title("j/k to move, Enter to pick, Esc to quit"))
+        .highlight_style(
+            Style::new()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol(">> ");
+    frame.render_stateful_widget(list, list_area, &mut app.first_run_state);
+}
+
+fn render_restore_wait(frame: &mut Frame, app: &App) {
+    let mut body = format!(
+        "Place your existing age.key file at:\n\n    {}\n\nMake sure it is mode 0600 (only readable by you). Press Enter once it is in place, or Esc to go back.",
+        app.paths.identity.display()
+    );
+    if let Some(msg) = &app.restore_error {
+        body.push_str("\n\n");
+        body.push_str(msg);
+    }
+    let style = if app.restore_error.is_some() {
+        Style::new().fg(Color::Red)
+    } else {
+        Style::new()
+    };
+    let para = Paragraph::new(body)
+        .style(style)
+        .wrap(Wrap { trim: false })
+        .block(Block::bordered().title("Restore existing age key"));
+    frame.render_widget(para, frame.area());
+}
+
+fn render_key_created(frame: &mut Frame, app: &App) {
+    let body = format!(
+        "A new age key was created.\n\nKey file (back this up now!):\n    {}\n\nPublic key (recipient):\n    {}\n\nIf you lose the key file, every saved profile becomes unrecoverable. Copy it to a safe place before adding profiles.\n\nPress Enter to continue.",
+        app.paths.identity.display(),
+        app.created_pubkey,
+    );
+    let para = Paragraph::new(body)
+        .wrap(Wrap { trim: false })
+        .block(Block::bordered().title("New age key created"));
+    frame.render_widget(para, frame.area());
+}
+
+enum MainOrManage {
+    Main,
+    Manage,
+}
+
+fn render_menu(frame: &mut Frame, app: &mut App, which: MainOrManage) {
+    let (entries, state, title) = match which {
+        MainOrManage::Main => (
+            &MAIN_MENU[..],
+            &mut app.main_menu_state,
+            "wrustic — j/k to move, Enter to pick, q/Esc to quit",
+        ),
+        MainOrManage::Manage => (
+            &MANAGE_MENU[..],
+            &mut app.manage_menu_state,
+            "Manage profiles — j/k to move, Enter to pick, Esc back",
+        ),
+    };
+    let items: Vec<ListItem> = entries.iter().map(|s| ListItem::new(*s)).collect();
+    let list = List::new(items)
+        .block(Block::bordered().title(title))
+        .highlight_style(
+            Style::new()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol(">> ");
+    frame.render_stateful_widget(list, frame.area(), state);
+}
+
+fn render_profile_list(frame: &mut Frame, app: &mut App, title: &str) {
+    if app.config.profiles.is_empty() {
+        let para = Paragraph::new(
+            "No profiles yet. Go back (Esc) and choose 'Manage profiles' → 'Create new profile'.",
+        )
+        .wrap(Wrap { trim: false })
+        .block(Block::bordered().title(title));
+        frame.render_widget(para, frame.area());
+        return;
+    }
+
+    let items: Vec<ListItem> = app
+        .config
+        .profiles
+        .iter()
+        .map(|p| ListItem::new(format!("{:<24} [{}]", p.name(), p.backend_kind().label())))
+        .collect();
+
+    let list = List::new(items)
+        .block(Block::bordered().title(title))
+        .highlight_style(
+            Style::new()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol(">> ");
+
+    frame.render_stateful_widget(list, frame.area(), &mut app.profile_list_state);
 }
 
 fn render_backend_choice(frame: &mut Frame, app: &mut App) {
@@ -453,7 +923,10 @@ fn render_backend_choice(frame: &mut Frame, app: &mut App) {
         .collect();
 
     let list = List::new(items)
-        .block(Block::bordered().title("Choose backend — j/k to move, Enter to pick, Esc/Ctrl-C to quit"))
+        .block(
+            Block::bordered()
+                .title("Choose backend — j/k to move, Enter to pick, Esc back"),
+        )
         .highlight_style(
             Style::new()
                 .fg(Color::Black)
@@ -465,7 +938,7 @@ fn render_backend_choice(frame: &mut Frame, app: &mut App) {
     frame.render_stateful_widget(list, frame.area(), &mut app.backend_list);
 }
 
-fn render_input(frame: &mut Frame, title: &str, value: &str, help: &str, _masked: bool) {
+fn render_input(frame: &mut Frame, title: &str, value: &str, help: &str) {
     let [_top, input_area, help_area, _bottom] = Layout::vertical([
         Constraint::Fill(1),
         Constraint::Length(3),
@@ -483,7 +956,7 @@ fn render_input(frame: &mut Frame, title: &str, value: &str, help: &str, _masked
 
 fn render_snapshots(frame: &mut Frame, app: &mut App) {
     let title = format!(
-        "Snapshots ({}) — j/k to move, q to quit",
+        "Snapshots ({}) — j/k to move, q/Esc back to menu",
         app.snapshots.len()
     );
     let items: Vec<ListItem> = app
