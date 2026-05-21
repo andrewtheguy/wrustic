@@ -6,5 +6,5 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.102"
 ratatui = "0.30.0"
-rustic_backend = { version = "0.6.1", default-features = false }
+rustic_backend = { version = "0.6.1", default-features = false, features = ["rest"] }
 rustic_core = { version = "0.11.0", default-features = false }

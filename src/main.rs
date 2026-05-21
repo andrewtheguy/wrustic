@@ -175,7 +175,7 @@ fn render(frame: &mut Frame, app: &mut App) {
             frame,
             "Repository path",
             &app.repo_path,
-            "Enter the local restic repository path, then press Enter (Esc to quit)",
+            "Enter repository (local path or rest:http(s)://[user:pass@]host:port/), then Enter (Esc to quit)",
         ),
         Screen::Password => {
             let masked = "*".repeat(app.password.chars().count());
