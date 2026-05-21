@@ -6,6 +6,7 @@ use ratatui::{
 };
 
 use crate::app::{App, BACKEND_ORDER, FIRST_RUN_MENU, Screen};
+use crate::repo::ContentKind;
 
 pub(crate) fn render(frame: &mut Frame, app: &mut App) {
     match &app.screen {
@@ -72,6 +73,17 @@ pub(crate) fn render(frame: &mut Frame, app: &mut App) {
             frame.render_widget(para, frame.area());
         }
         Screen::Snapshots => render_snapshots(frame, app),
+        Screen::OpeningSnapshot => {
+            let para = Paragraph::new("Opening snapshot — reading root tree…")
+                .block(Block::bordered().title("Loading"));
+            frame.render_widget(para, frame.area());
+        }
+        Screen::LoadingDir => {
+            let para = Paragraph::new("Loading directory…")
+                .block(Block::bordered().title("Loading"));
+            frame.render_widget(para, frame.area());
+        }
+        Screen::SnapshotContents => render_snapshot_contents(frame, app),
         Screen::Error(msg) => {
             let title = if app.error_is_fatal {
                 "Error — press any key to quit"
@@ -332,7 +344,7 @@ fn render_s3_credentials(frame: &mut Frame, app: &App) {
 
 fn render_snapshots(frame: &mut Frame, app: &mut App) {
     let title = format!(
-        "Snapshots ({}) — j/k to move, q/Esc back to menu",
+        "Snapshots ({}) — j/k move, Enter browse, r refresh, q/Esc back to menu",
         app.snapshots.len()
     );
     let items: Vec<ListItem> = app
@@ -357,4 +369,69 @@ fn render_snapshots(frame: &mut Frame, app: &mut App) {
         .highlight_symbol(">> ");
 
     frame.render_stateful_widget(list, frame.area(), &mut app.list_state);
+}
+
+fn render_snapshot_contents(frame: &mut Frame, app: &mut App) {
+    if app.browse_stack.is_empty() {
+        let para = Paragraph::new("No content loaded.")
+            .block(Block::bordered().title("Snapshot contents"));
+        frame.render_widget(para, frame.area());
+        return;
+    }
+
+    let path = app
+        .browse_stack
+        .iter()
+        .skip(1)
+        .map(|f| f.name.as_str())
+        .collect::<Vec<_>>()
+        .join("/");
+    let path_display = if path.is_empty() { "/".to_string() } else { format!("/{path}") };
+    let title = format!(
+        "Snap {} {} — j/k move, Enter open, Backspace up, r reload, q/Esc back",
+        short_snap_id(&app.browse_snapshot_id),
+        path_display,
+    );
+
+    let frame_idx = app.browse_stack.len() - 1;
+    let top = &app.browse_stack[frame_idx];
+    let items: Vec<ListItem> = top
+        .items
+        .iter()
+        .map(|row| {
+            let kind_char = match row.kind {
+                ContentKind::Dir => 'd',
+                ContentKind::File => '-',
+                ContentKind::Symlink => 'l',
+                ContentKind::Other => '?',
+            };
+            let display_name = if matches!(row.kind, ContentKind::Dir) {
+                format!("{}/", row.name)
+            } else {
+                row.name.clone()
+            };
+            let size_col = if matches!(row.kind, ContentKind::File) {
+                format!("{:>10}", row.size)
+            } else {
+                String::from("          ")
+            };
+            ListItem::new(format!(
+                "{}  {:<40}  {}  {}",
+                kind_char, display_name, size_col, row.mtime
+            ))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(Block::bordered().title(title))
+        .highlight_style(selection_highlight())
+        .highlight_symbol(">> ");
+
+    let top_mut = &mut app.browse_stack[frame_idx];
+    frame.render_stateful_widget(list, frame.area(), &mut top_mut.list_state);
+}
+
+fn short_snap_id(id: &str) -> &str {
+    let end = id.char_indices().nth(8).map(|(i, _)| i).unwrap_or(id.len());
+    &id[..end]
 }

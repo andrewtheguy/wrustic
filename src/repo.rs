@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, anyhow, bail};
 use rustic_backend::BackendOptions;
-use rustic_core::{Credentials, Repository, RepositoryOptions};
+use rustic_core::{Credentials, IndexedIdsStatus, Repository, RepositoryOptions, TreeId};
 
 use crate::config::Profile;
 
@@ -12,6 +12,21 @@ pub(crate) struct SnapshotRow {
     pub(crate) host: String,
     pub(crate) tags: String,
     pub(crate) paths: String,
+}
+
+pub(crate) enum ContentKind {
+    Dir,
+    File,
+    Symlink,
+    Other,
+}
+
+pub(crate) struct ContentRow {
+    pub(crate) name: String,
+    pub(crate) kind: ContentKind,
+    pub(crate) size: u64,
+    pub(crate) mtime: String,
+    pub(crate) subtree: Option<TreeId>,
 }
 
 fn build_backend_opts(profile: &Profile) -> Result<BackendOptions> {
@@ -93,4 +108,62 @@ pub(crate) fn load_snapshots(profile: &Profile) -> Result<Vec<SnapshotRow>> {
             paths: s.paths.to_string(),
         })
         .collect())
+}
+
+pub(crate) fn open_indexed(profile: &Profile) -> Result<Repository<IndexedIdsStatus>> {
+    let backends = build_backend_opts(profile)?.to_backends()?;
+    let repo = Repository::new(&RepositoryOptions::default(), &backends)?
+        .open(&Credentials::password(profile.password()))?
+        .to_indexed_ids()?;
+    Ok(repo)
+}
+
+pub(crate) fn snapshot_root_tree(
+    repo: &Repository<IndexedIdsStatus>,
+    snapshot_id: &str,
+) -> Result<TreeId> {
+    let snap = repo.get_snapshot_from_str(snapshot_id, |_| true)?;
+    Ok(snap.tree)
+}
+
+pub(crate) fn list_tree(
+    repo: &Repository<IndexedIdsStatus>,
+    tree_id: TreeId,
+) -> Result<Vec<ContentRow>> {
+    let tree = repo.get_tree(&tree_id)?;
+    let mut rows: Vec<ContentRow> = tree
+        .nodes
+        .into_iter()
+        .map(|n| {
+            let kind = if n.is_dir() {
+                ContentKind::Dir
+            } else if n.is_file() {
+                ContentKind::File
+            } else if n.is_symlink() {
+                ContentKind::Symlink
+            } else {
+                ContentKind::Other
+            };
+            let mtime = n
+                .meta
+                .mtime
+                .map(|t| t.strftime("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_default();
+            ContentRow {
+                name: n.name().to_string_lossy().into_owned(),
+                kind,
+                size: n.meta.size,
+                mtime,
+                subtree: n.subtree,
+            }
+        })
+        .collect();
+
+    // Dirs first, then by name (case-sensitive, byte order).
+    rows.sort_by(|a, b| {
+        let ad = matches!(a.kind, ContentKind::Dir);
+        let bd = matches!(b.kind, ContentKind::Dir);
+        bd.cmp(&ad).then_with(|| a.name.cmp(&b.name))
+    });
+    Ok(rows)
 }
