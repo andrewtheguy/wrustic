@@ -4,8 +4,10 @@ A minimal read-only terminal UI for [restic](https://restic.net/)-format backup
 repositories, built on [`rustic_core`](https://crates.io/crates/rustic_core)
 and [`ratatui`](https://crates.io/crates/ratatui).
 
-The current scope is intentionally tiny: open a **local**, **REST-server**, or
-**S3** repository from a saved, age-encrypted profile, and list its snapshots.
+`wrustic` is read-only by design — write operations are out of scope, not a
+backlog item. The currently supported backends are **local**, **REST-server**,
+and **S3**, opened from a saved profile whose secrets (repository password, S3
+keys) are age-encrypted on disk.
 
 ## Status
 
@@ -17,13 +19,6 @@ Implemented:
 - Snapshot listing (short ID, time, host, tags, paths), sorted by time
 - Keyboard navigation (`j`/`k`, arrow keys, Home/End, `g`/`G`) and quit (`q` / Esc / Ctrl-C)
 - Error screen on bad password / bad path, returning to the menu without restarting
-
-Out of scope (by design): any write operation on the repository — init, backup,
-forget, prune, key management, etc. `wrustic` is a read-only viewer.
-
-Not yet implemented but in scope: editing existing profiles, browsing snapshot
-contents, restoring, and additional remote backends (SFTP via rclone,
-Azure / GCS via opendal — Local, REST, and S3 are already supported).
 
 ## Build & run
 
