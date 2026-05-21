@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -33,16 +34,17 @@ impl BackendKind {
     }
 }
 
+/// Profile body — the name is the key in [`Config::profiles`] and is not
+/// duplicated inside the variant. The map key is the primary identifier;
+/// renaming = remove old key + insert new key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "backend", rename_all = "lowercase")]
 pub enum Profile {
     Local {
-        name: String,
         password: String,
         local_path: String,
     },
     Rest {
-        name: String,
         password: String,
         rest_url: String,
         #[serde(default)]
@@ -51,7 +53,6 @@ pub enum Profile {
         rest_password: String,
     },
     S3 {
-        name: String,
         password: String,
         s3_endpoint: String,
         s3_bucket: String,
@@ -62,14 +63,6 @@ pub enum Profile {
 }
 
 impl Profile {
-    pub fn name(&self) -> &str {
-        match self {
-            Profile::Local { name, .. }
-            | Profile::Rest { name, .. }
-            | Profile::S3 { name, .. } => name,
-        }
-    }
-
     pub fn password(&self) -> &str {
         match self {
             Profile::Local { password, .. }
@@ -93,7 +86,7 @@ pub struct Config {
     pub recipient: String,
     pub version: u32,
     #[serde(default)]
-    pub profiles: Vec<Profile>,
+    pub profiles: BTreeMap<String, Profile>,
 }
 
 impl Default for Config {
@@ -101,14 +94,22 @@ impl Default for Config {
         Self {
             recipient: String::new(),
             version: CONFIG_VERSION,
-            profiles: Vec::new(),
+            profiles: BTreeMap::new(),
         }
     }
 }
 
 impl Config {
     pub fn has_profile(&self, name: &str) -> bool {
-        self.profiles.iter().any(|p| p.name() == name)
+        self.profiles.contains_key(name)
+    }
+
+    pub fn profile_at(&self, idx: usize) -> Option<(&String, &Profile)> {
+        self.profiles.iter().nth(idx)
+    }
+
+    pub fn name_at(&self, idx: usize) -> Option<&String> {
+        self.profiles.keys().nth(idx)
     }
 }
 
@@ -228,9 +229,9 @@ pub fn load(paths: &Paths) -> Result<Config> {
         );
     }
 
-    for profile in &mut config.profiles {
+    for (name, profile) in &mut config.profiles {
         decrypt_profile_fields(profile, &identity)
-            .with_context(|| format!("decrypting profile `{}`", profile.name()))?;
+            .with_context(|| format!("decrypting profile `{name}`"))?;
     }
     Ok(config)
 }
@@ -244,9 +245,9 @@ pub fn save(config: &Config, paths: &Paths) -> Result<()> {
     let mut on_disk = config.clone();
     on_disk.recipient = recipient.to_string();
     on_disk.version = CONFIG_VERSION;
-    for profile in &mut on_disk.profiles {
+    for (name, profile) in &mut on_disk.profiles {
         encrypt_profile_fields(profile, &recipient)
-            .with_context(|| format!("encrypting profile `{}`", profile.name()))?;
+            .with_context(|| format!("encrypting profile `{name}`"))?;
     }
 
     let text = toml::to_string_pretty(&on_disk).context("serializing config to TOML")?;
@@ -384,32 +385,38 @@ mod tests {
         assert_eq!(empty.profiles.len(), 0);
         assert_eq!(empty.version, CONFIG_VERSION);
 
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "local-a".to_string(),
+            Profile::Local {
+                password: "pw1".into(),
+                local_path: "/var/restic/a".into(),
+            },
+        );
+        profiles.insert(
+            "s3-b".to_string(),
+            Profile::S3 {
+                password: "pw2".into(),
+                s3_endpoint: "https://s3.example.com".into(),
+                s3_bucket: "buk".into(),
+                s3_region: "us-east-1".into(),
+                s3_access_key: "AK".into(),
+                s3_secret_key: "SK".into(),
+            },
+        );
+        profiles.insert(
+            "rest-c".to_string(),
+            Profile::Rest {
+                password: "pw3".into(),
+                rest_url: "https://r.example.com/repo".into(),
+                rest_user: String::new(),
+                rest_password: String::new(),
+            },
+        );
         let cfg = Config {
             recipient: String::new(),
             version: CONFIG_VERSION,
-            profiles: vec![
-                Profile::Local {
-                    name: "local-a".into(),
-                    password: "pw1".into(),
-                    local_path: "/var/restic/a".into(),
-                },
-                Profile::S3 {
-                    name: "s3-b".into(),
-                    password: "pw2".into(),
-                    s3_endpoint: "https://s3.example.com".into(),
-                    s3_bucket: "buk".into(),
-                    s3_region: "us-east-1".into(),
-                    s3_access_key: "AK".into(),
-                    s3_secret_key: "SK".into(),
-                },
-                Profile::Rest {
-                    name: "rest-c".into(),
-                    password: "pw3".into(),
-                    rest_url: "https://r.example.com/repo".into(),
-                    rest_user: String::new(),
-                    rest_password: String::new(),
-                },
-            ],
+            profiles,
         };
         save(&cfg, &paths)?;
         assert!(paths.config.exists());
@@ -418,10 +425,14 @@ mod tests {
         let parsed: toml::Value = toml::from_str(&raw)?;
         assert_eq!(parsed["recipient"].as_str().unwrap(), pubkey);
 
-        for profile in parsed["profiles"].as_array().unwrap() {
+        let table = parsed["profiles"].as_table().unwrap();
+        assert_eq!(table.len(), 3);
+        for (name, profile) in table {
+            let profile = profile.as_table().unwrap();
             let password = profile["password"].as_str().unwrap();
             assert!(password.starts_with("ageenc:"), "password should be encrypted: {password}");
             assert!(!password.contains('\n'), "ageenc value must be single-line");
+            assert!(!profile.contains_key("name"), "`name` should not be inside profile `{name}`");
             if profile["backend"].as_str().unwrap() == "local" {
                 assert!(!profile["local_path"].as_str().unwrap().starts_with("ageenc:"));
             }
@@ -430,21 +441,24 @@ mod tests {
         let loaded = load(&paths)?;
         assert_eq!(loaded.profiles.len(), 3);
         assert_eq!(loaded.recipient, pubkey);
-        assert_eq!(loaded.profiles[0].name(), "local-a");
-        assert_eq!(loaded.profiles[0].password(), "pw1");
-        match &loaded.profiles[1] {
-            Profile::S3 {
-                s3_access_key,
-                s3_secret_key,
-                ..
-            } => {
+        match loaded.profiles.get("local-a") {
+            Some(Profile::Local { password, local_path }) => {
+                assert_eq!(password, "pw1");
+                assert_eq!(local_path, "/var/restic/a");
+            }
+            other => panic!("expected Local, got {other:?}"),
+        }
+        match loaded.profiles.get("s3-b") {
+            Some(Profile::S3 { s3_access_key, s3_secret_key, .. }) => {
                 assert_eq!(s3_access_key, "AK");
                 assert_eq!(s3_secret_key, "SK");
             }
             other => panic!("expected S3, got {other:?}"),
         }
-        match &loaded.profiles[2] {
-            Profile::Rest { rest_url, .. } => assert_eq!(rest_url, "https://r.example.com/repo"),
+        match loaded.profiles.get("rest-c") {
+            Some(Profile::Rest { rest_url, .. }) => {
+                assert_eq!(rest_url, "https://r.example.com/repo");
+            }
             other => panic!("expected Rest, got {other:?}"),
         }
 
@@ -458,35 +472,38 @@ mod tests {
         let paths = test_paths(&dir);
         generate_identity(&paths.identity)?;
 
-        let cfg = Config {
-            recipient: String::new(),
-            version: CONFIG_VERSION,
-            profiles: vec![Profile::Rest {
-                name: "rest-auth".into(),
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "rest-auth".to_string(),
+            Profile::Rest {
                 password: "repo-pw".into(),
                 rest_url: "https://r.example.com/repo/".into(),
                 rest_user: "andrew".into(),
                 rest_password: "hunter2".into(),
-            }],
+            },
+        );
+        let cfg = Config {
+            recipient: String::new(),
+            version: CONFIG_VERSION,
+            profiles,
         };
         save(&cfg, &paths)?;
 
         let raw = fs::read_to_string(&paths.config)?;
         let parsed: toml::Value = toml::from_str(&raw)?;
-        let rest = &parsed["profiles"].as_array().unwrap()[0];
+        let rest = &parsed["profiles"]["rest-auth"];
         assert_eq!(rest["rest_url"].as_str().unwrap(), "https://r.example.com/repo/");
         assert!(rest["rest_user"].as_str().unwrap().starts_with("ageenc:"));
         assert!(rest["rest_password"].as_str().unwrap().starts_with("ageenc:"));
 
         let loaded = load(&paths)?;
-        match &loaded.profiles[0] {
-            Profile::Rest {
+        match loaded.profiles.get("rest-auth") {
+            Some(Profile::Rest {
                 rest_url,
                 rest_user,
                 rest_password,
                 password,
-                ..
-            } => {
+            }) => {
                 assert_eq!(rest_url, "https://r.example.com/repo/");
                 assert_eq!(rest_user, "andrew");
                 assert_eq!(rest_password, "hunter2");
@@ -505,14 +522,18 @@ mod tests {
         let paths = test_paths(&dir);
         generate_identity(&paths.identity)?;
 
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "x".to_string(),
+            Profile::Local {
+                password: "p".into(),
+                local_path: "/x".into(),
+            },
+        );
         let cfg = Config {
             recipient: String::new(),
             version: CONFIG_VERSION,
-            profiles: vec![Profile::Local {
-                name: "x".into(),
-                password: "p".into(),
-                local_path: "/x".into(),
-            }],
+            profiles,
         };
         save(&cfg, &paths)?;
 
@@ -562,32 +583,36 @@ mod tests {
         let paths = test_paths(&dir);
         generate_identity(&paths.identity)?;
 
-        let cfg = Config {
-            recipient: String::new(),
-            version: CONFIG_VERSION,
-            profiles: vec![Profile::Rest {
-                name: "anon".into(),
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "anon".to_string(),
+            Profile::Rest {
                 password: "pw".into(),
                 rest_url: "http://localhost:8000/".into(),
                 rest_user: String::new(),
                 rest_password: String::new(),
-            }],
+            },
+        );
+        let cfg = Config {
+            recipient: String::new(),
+            version: CONFIG_VERSION,
+            profiles,
         };
         save(&cfg, &paths)?;
 
         let raw = fs::read_to_string(&paths.config)?;
         let parsed: toml::Value = toml::from_str(&raw)?;
-        let rest = &parsed["profiles"].as_array().unwrap()[0];
+        let rest = &parsed["profiles"]["anon"];
         assert_eq!(rest["rest_user"].as_str().unwrap(), "");
         assert_eq!(rest["rest_password"].as_str().unwrap(), "");
 
         let loaded = load(&paths)?;
-        match &loaded.profiles[0] {
-            Profile::Rest {
+        match loaded.profiles.get("anon") {
+            Some(Profile::Rest {
                 rest_user,
                 rest_password,
                 ..
-            } => {
+            }) => {
                 assert!(rest_user.is_empty());
                 assert!(rest_password.is_empty());
             }

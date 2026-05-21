@@ -62,8 +62,8 @@ enum Screen {
 }
 
 enum ProfileRollback {
-    Pop,
-    Replace(usize, Profile),
+    Remove(String),
+    Restore(String, Profile),
 }
 
 struct SnapshotRow {
@@ -102,7 +102,7 @@ struct App {
 
     loading_index: usize,
     pending_delete: Option<usize>,
-    editing_index: Option<usize>,
+    editing_original_name: Option<String>,
 
     restore_error: Option<String>,
     created_pubkey: String,
@@ -149,7 +149,7 @@ impl App {
             password: String::new(),
             loading_index: 0,
             pending_delete: None,
-            editing_index: None,
+            editing_original_name: None,
             restore_error: None,
             created_pubkey: String::new(),
             snapshots: Vec::new(),
@@ -191,12 +191,12 @@ impl App {
         self.s3_access_key.clear();
         self.s3_secret_key.clear();
         self.password.clear();
-        self.editing_index = None;
+        self.editing_original_name = None;
     }
 
     fn load_profile_into_scratch(&mut self, idx: usize) {
-        let p = &self.config.profiles[idx];
-        self.new_profile_name = p.name().to_string();
+        let Some((name, p)) = self.config.profile_at(idx) else { return };
+        self.new_profile_name = name.clone();
         self.password = p.password().to_string();
         self.backend_kind = p.backend_kind();
         self.local_path.clear();
@@ -240,23 +240,19 @@ impl App {
     }
 
     fn build_profile(&self) -> Profile {
-        let name = self.new_profile_name.clone();
         let password = self.password.clone();
         match self.backend_kind {
             BackendKind::Local => Profile::Local {
-                name,
                 password,
                 local_path: self.local_path.clone(),
             },
             BackendKind::Rest => Profile::Rest {
-                name,
                 password,
                 rest_url: self.rest_url.clone(),
                 rest_user: self.rest_user.clone(),
                 rest_password: self.rest_password.clone(),
             },
             BackendKind::S3 => Profile::S3 {
-                name,
                 password,
                 s3_endpoint: self.s3_endpoint.clone(),
                 s3_bucket: self.s3_bucket.clone(),
@@ -272,7 +268,7 @@ impl App {
     }
 
     fn cancel_from_first_backend_input(&mut self) {
-        if self.editing_index.is_some() {
+        if self.editing_original_name.is_some() {
             self.clear_creation_scratch();
             self.screen = Screen::ManageMenu;
         } else {
@@ -282,23 +278,27 @@ impl App {
 
     fn commit_profile(&mut self) {
         let profile = self.build_profile();
+        let name = self.new_profile_name.clone();
 
-        if self.editing_index.is_none() && self.config.has_profile(profile.name()) {
+        if self.editing_original_name.is_none() && self.config.has_profile(&name) {
             self.screen = Screen::Error(format!(
-                "A profile named '{}' already exists.",
-                profile.name()
+                "A profile named '{name}' already exists."
             ));
             return;
         }
 
-        let restore = match self.editing_index {
-            Some(idx) => ProfileRollback::Replace(
-                idx,
-                std::mem::replace(&mut self.config.profiles[idx], profile),
-            ),
+        let restore = match self.editing_original_name.clone() {
+            Some(original) => {
+                let old = self
+                    .config
+                    .profiles
+                    .insert(original.clone(), profile)
+                    .expect("editing target should exist");
+                ProfileRollback::Restore(original, old)
+            }
             None => {
-                self.config.profiles.push(profile);
-                ProfileRollback::Pop
+                self.config.profiles.insert(name.clone(), profile);
+                ProfileRollback::Remove(name)
             }
         };
 
@@ -309,11 +309,11 @@ impl App {
             }
             Err(e) => {
                 match restore {
-                    ProfileRollback::Replace(idx, old) => {
-                        self.config.profiles[idx] = old;
+                    ProfileRollback::Restore(key, old) => {
+                        self.config.profiles.insert(key, old);
                     }
-                    ProfileRollback::Pop => {
-                        self.config.profiles.pop();
+                    ProfileRollback::Remove(key) => {
+                        self.config.profiles.remove(&key);
                     }
                 }
                 self.screen = Screen::Error(format!("Saving config failed: {e:#}"));
@@ -627,7 +627,7 @@ impl App {
                         .unwrap_or(0)
                         .min(self.config.profiles.len() - 1);
                     self.load_profile_into_scratch(idx);
-                    self.editing_index = Some(idx);
+                    self.editing_original_name = Some(self.new_profile_name.clone());
                     self.screen = match self.backend_kind {
                         BackendKind::Local => Screen::LocalPath,
                         BackendKind::Rest => Screen::RestUrl,
@@ -639,19 +639,21 @@ impl App {
 
             Screen::ConfirmDelete => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    if let Some(idx) = self.pending_delete.take() {
-                        if idx < self.config.profiles.len() {
-                            let removed = self.config.profiles.remove(idx);
-                            match config::save(&self.config, &self.paths) {
-                                Ok(()) => self.screen = Screen::MainMenu,
-                                Err(e) => {
-                                    self.config.profiles.insert(idx, removed);
-                                    self.screen =
-                                        Screen::Error(format!("Saving config failed: {e:#}"));
-                                }
+                    if let Some(idx) = self.pending_delete.take()
+                        && let Some(name) = self.config.name_at(idx).cloned()
+                    {
+                        let removed = self
+                            .config
+                            .profiles
+                            .remove(&name)
+                            .expect("name_at hit must exist");
+                        match config::save(&self.config, &self.paths) {
+                            Ok(()) => self.screen = Screen::MainMenu,
+                            Err(e) => {
+                                self.config.profiles.insert(name, removed);
+                                self.screen =
+                                    Screen::Error(format!("Saving config failed: {e:#}"));
                             }
-                        } else {
-                            self.screen = Screen::ManageMenu;
                         }
                     } else {
                         self.screen = Screen::ManageMenu;
@@ -782,7 +784,10 @@ fn run(terminal: &mut DefaultTerminal, config_dir: Option<PathBuf>) -> Result<()
 
         if matches!(app.screen, Screen::Loading) {
             let idx = app.loading_index;
-            let profile = &app.config.profiles[idx];
+            let Some((_, profile)) = app.config.profile_at(idx) else {
+                app.screen = Screen::Error("Selected profile no longer exists.".into());
+                continue;
+            };
             match load_snapshots(profile) {
                 Ok(snaps) => {
                     app.snapshots = snaps;
@@ -989,8 +994,8 @@ fn render(frame: &mut Frame, app: &mut App) {
         Screen::ConfirmDelete => {
             let name = app
                 .pending_delete
-                .and_then(|i| app.config.profiles.get(i))
-                .map(|p| p.name())
+                .and_then(|i| app.config.name_at(i))
+                .map(String::as_str)
                 .unwrap_or("(unknown)");
             let body = format!("Delete profile '{name}'? Press y to confirm, n/Esc to cancel.");
             let para = Paragraph::new(body)
@@ -1142,7 +1147,7 @@ fn render_profile_list(frame: &mut Frame, app: &mut App, title: &str) {
         .config
         .profiles
         .iter()
-        .map(|p| ListItem::new(format!("{:<24} [{}]", p.name(), p.backend_kind().label())))
+        .map(|(name, p)| ListItem::new(format!("{:<24} [{}]", name, p.backend_kind().label())))
         .collect();
 
     let list = List::new(items)
