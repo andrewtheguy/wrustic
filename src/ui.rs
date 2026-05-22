@@ -841,13 +841,16 @@ fn render_share_url(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     lines.push('\n');
 
-    match &app.share_url {
-        Some(u) => {
-            lines.push_str("URL:\n");
-            lines.push_str(u);
+    match (&app.share_short_url, &app.share_url) {
+        (Some(short), Some(long)) => {
+            lines.push_str("Short URL (302 redirects to the long URL):\n");
+            lines.push_str(short);
+            lines.push_str("\n\n");
+            lines.push_str("Long URL:\n");
+            lines.push_str(long);
             lines.push_str("\n\n");
         }
-        None => {
+        _ => {
             lines.push_str("URL: (none yet — start the server with `s`)\n\n");
         }
     }

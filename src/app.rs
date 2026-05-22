@@ -238,6 +238,7 @@ pub(crate) struct App {
     // user can still read/copy it; the URL stays cryptographically valid
     // until its embedded exp passes.
     pub(crate) share_url: Option<String>,
+    pub(crate) share_short_url: Option<String>,
     pub(crate) share_exp_unix: Option<u64>,
     // Inline error for the Share screen (e.g. EADDRINUSE on start) — keeps
     // the user on the Share screen instead of jumping to the global Error.
@@ -326,6 +327,7 @@ impl App {
             share_target: None,
             share_handle: None,
             share_url: None,
+            share_short_url: None,
             share_exp_unix: None,
             share_error: None,
             error_is_fatal: false,
@@ -865,6 +867,7 @@ impl App {
         }
         self.share_target = None;
         self.share_url = None;
+        self.share_short_url = None;
         self.share_exp_unix = None;
         self.share_error = None;
     }
@@ -896,6 +899,7 @@ impl App {
         match share::start(port, profile, key, target, SHARE_TTL) {
             Ok(h) => {
                 self.share_url = Some(h.url.clone());
+                self.share_short_url = Some(h.short_url.clone());
                 self.share_exp_unix = Some(h.exp_unix);
                 self.share_error = None;
                 self.share_handle = Some(h);

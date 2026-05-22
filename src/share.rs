@@ -7,9 +7,10 @@
 
 use std::convert::Infallible;
 use std::io;
+use std::io::Read;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::task::{Context as TaskContext, Poll};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -19,7 +20,7 @@ use bytes::Bytes;
 use hmac::{Hmac, Mac};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::{Body, Frame};
-use hyper::header::{CONTENT_DISPOSITION, CONTENT_TYPE, HeaderValue};
+use hyper::header::{CONTENT_DISPOSITION, CONTENT_TYPE, HeaderValue, LOCATION};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
@@ -48,18 +49,27 @@ pub(crate) struct ShareTarget {
 pub(crate) struct ShareHandle {
     pub(crate) port: u16,
     pub(crate) url: String,
+    // Short alias: http://127.0.0.1:<port>/s/<short_id>. The server holds
+    // <short_id> in-memory and 302-redirects it to the current long URL.
+    // The short id is freshly generated on every `start` call, so stopping
+    // and restarting (toggle 's' twice) gives a brand-new short URL.
+    pub(crate) short_url: String,
     pub(crate) exp_unix: u64,
     snap_id: String,
     tree_id: TreeId,
     name: String,
     signing_key: [u8; 32],
+    // Shared with the server task so `regenerate` updates the redirect
+    // target without having to restart the server. Stored as a path-only
+    // form (`/dl?...`) so the redirect doesn't pin a host:port.
+    long_path_cell: Arc<RwLock<String>>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     join_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl ShareHandle {
     pub(crate) fn regenerate(&mut self, ttl: Duration) {
-        let (url, exp) = build_signed_url(
+        let (url, path, exp) = build_signed_url(
             self.port,
             &self.snap_id,
             self.tree_id,
@@ -67,6 +77,9 @@ impl ShareHandle {
             ttl,
             &self.signing_key,
         );
+        if let Ok(mut w) = self.long_path_cell.write() {
+            *w = path;
+        }
         self.url = url;
         self.exp_unix = exp;
     }
@@ -95,6 +108,28 @@ pub(crate) fn derive_signing_key(identity_path: &Path) -> Result<[u8; 32]> {
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
     Ok(hasher.finalize().into())
+}
+
+// 16 hex chars (64 bits) of randomness for the short URL id. Read from
+// /dev/urandom so we never collide with a previous run's id and don't have
+// to guess at the OS rng story. Falls back to mixing process id + nanos if
+// /dev/urandom isn't readable, which is good enough for a localhost alias
+// that's only meant to deter someone shoulder-surfing the terminal.
+fn random_short_id() -> String {
+    let mut buf = [0u8; 8];
+    let filled = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .is_ok();
+    if !filled {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id();
+        let mix = (nanos as u64) ^ ((pid as u64) << 32);
+        buf.copy_from_slice(&mix.to_le_bytes());
+    }
+    hex_encode(&buf)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -142,6 +177,10 @@ fn compute_sig(key: &[u8; 32], snap: &str, tree_hex: &str, name: &str, exp: u64)
     hex_encode(&mac.finalize().into_bytes())
 }
 
+// Returns (absolute_url, relative_path, exp). The absolute form is for human
+// display ("here is the URL you can paste into a browser"); the relative
+// form (`/dl?...`) is what the short-URL handler emits as the redirect
+// `Location` so the browser stays on whatever host:port it dialed in on.
 pub(crate) fn build_signed_url(
     port: u16,
     snap_id: &str,
@@ -149,7 +188,7 @@ pub(crate) fn build_signed_url(
     name: &str,
     ttl: Duration,
     key: &[u8; 32],
-) -> (String, u64) {
+) -> (String, String, u64) {
     let exp = (SystemTime::now() + ttl)
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -163,7 +202,8 @@ pub(crate) fn build_signed_url(
         .append_pair("exp", &exp.to_string())
         .append_pair("sig", &sig)
         .finish();
-    (format!("http://127.0.0.1:{port}/dl?{qs}"), exp)
+    let path = format!("/dl?{qs}");
+    (format!("http://127.0.0.1:{port}{path}"), path, exp)
 }
 
 struct Ctx {
@@ -174,6 +214,11 @@ struct Ctx {
     tree_id: TreeId,
     name: String,
     display_path: String,
+    short_id: String,
+    // Current path+query for the long URL — read on every /s/<id> redirect.
+    // Mutated by ShareHandle::regenerate from outside the server thread.
+    // Path-only (no scheme/host/port) so the redirect stays same-origin.
+    long_path: Arc<RwLock<String>>,
 }
 
 pub(crate) fn start(
@@ -206,6 +251,12 @@ pub(crate) fn start(
         .map_err(|e| anyhow!("set_nonblocking: {e}"))?;
 
     let repo = open_indexed_full(&profile)?;
+
+    let (url, path, exp) = build_signed_url(port, &snap_id, tree_id, &name, ttl, &key);
+    let short_id = random_short_id();
+    let short_url = format!("http://127.0.0.1:{port}/s/{short_id}");
+    let long_path_cell = Arc::new(RwLock::new(path));
+
     let ctx = Arc::new(Ctx {
         repo: Arc::new(repo),
         key,
@@ -214,9 +265,10 @@ pub(crate) fn start(
         tree_id,
         name: name.clone(),
         display_path,
+        short_id,
+        long_path: long_path_cell.clone(),
     });
 
-    let (url, exp) = build_signed_url(port, &snap_id, tree_id, &name, ttl, &key);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
     let thread_ctx = ctx.clone();
@@ -244,11 +296,13 @@ pub(crate) fn start(
     Ok(ShareHandle {
         port,
         url,
+        short_url,
         exp_unix: exp,
         snap_id,
         tree_id,
         name,
         signing_key: key,
+        long_path_cell,
         shutdown_tx: Some(shutdown_tx),
         join_handle: Some(join),
     })
@@ -298,6 +352,31 @@ async fn handle(
     if req.method() != Method::GET {
         return Ok(err_resp(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"));
     }
+
+    // Short-URL redirect: /s/<short_id> -> 302 to the current long URL.
+    // The short id is fixed for the server's lifetime; the redirect target
+    // is read fresh on each request so `regenerate` is picked up
+    // immediately.
+    if let Some(rest) = req.uri().path().strip_prefix("/s/") {
+        if rest == ctx.short_id {
+            // Path-relative Location so the browser keeps its current
+            // host:port. Avoids surprises if someone reaches the server
+            // via a different name (loopback alias, ssh -L tunnel, etc.).
+            let target = ctx.long_path.read().map(|s| s.clone()).unwrap_or_default();
+            let mut resp = Response::new(
+                Full::new(Bytes::from_static(b""))
+                    .map_err(|never: Infallible| match never {})
+                    .boxed(),
+            );
+            *resp.status_mut() = StatusCode::FOUND;
+            if let Ok(v) = HeaderValue::from_str(&target) {
+                resp.headers_mut().insert(LOCATION, v);
+            }
+            return Ok(resp);
+        }
+        return Ok(err_resp(StatusCode::NOT_FOUND, "no such short id"));
+    }
+
     if req.uri().path() != "/dl" {
         return Ok(err_resp(StatusCode::NOT_FOUND, "not found"));
     }
@@ -640,6 +719,44 @@ mod tests {
         let alt_qs = qs.replace("name=greeting.txt", "name=other.txt");
         let mut sock = TcpStream::connect(("127.0.0.1", port)).unwrap();
         write!(sock, "GET /dl?{alt_qs} HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
+        let mut resp = Vec::new();
+        sock.read_to_end(&mut resp).unwrap();
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_str.starts_with("HTTP/1.0 404") || resp_str.starts_with("HTTP/1.1 404"),
+            "got: {resp_str}"
+        );
+
+        // Short URL: GET /s/<id> should 302 with Location = the long URL.
+        let short_path = handle.short_url.rsplit_once('/').unwrap().1.to_string();
+        let mut sock = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(
+            sock,
+            "GET /s/{short_path} HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n"
+        )
+        .unwrap();
+        let mut resp = Vec::new();
+        sock.read_to_end(&mut resp).unwrap();
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_str.starts_with("HTTP/1.0 302") || resp_str.starts_with("HTTP/1.1 302"),
+            "got: {resp_str}"
+        );
+        let loc = resp_str
+            .lines()
+            .find_map(|l| l.strip_prefix("location: "))
+            .or_else(|| resp_str.lines().find_map(|l| l.strip_prefix("Location: ")))
+            .expect("Location header");
+        // Path-relative redirect: no scheme/host/port in the Location.
+        assert!(
+            loc.trim().starts_with("/dl?"),
+            "Location should be path-relative, got: {loc}"
+        );
+        assert!(handle.url.ends_with(loc.trim()), "long URL should end with the redirect path");
+
+        // Unknown short id: 404.
+        let mut sock = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(sock, "GET /s/deadbeef HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
         let mut resp = Vec::new();
         sock.read_to_end(&mut resp).unwrap();
         let resp_str = String::from_utf8_lossy(&resp);
