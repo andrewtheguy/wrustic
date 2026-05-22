@@ -788,6 +788,38 @@ mod tests {
             "got: {resp_str}"
         );
 
+        // Expired URL: build one signed correctly but with exp 60s in the
+        // past. HMAC verifies (correct key + correct message), so the only
+        // thing that can reject it is the wall-clock check. Distinct code
+        // path from the tampered-sig case above.
+        let past_exp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .saturating_sub(60);
+        let past_sig =
+            compute_sig(&key, &snap_id, &tree_hex_str(source_tree), "greeting.txt", past_exp);
+        let past_qs: String = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("snap", &snap_id)
+            .append_pair("tree", &tree_hex_str(source_tree))
+            .append_pair("exp", &past_exp.to_string())
+            .append_pair("sig", &past_sig)
+            .finish();
+        let mut sock = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(sock, "GET /dl?{past_qs} HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
+        let mut resp = Vec::new();
+        sock.read_to_end(&mut resp).unwrap();
+        let resp_str = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_str.starts_with("HTTP/1.0 403") || resp_str.starts_with("HTTP/1.1 403"),
+            "got: {resp_str}"
+        );
+        // Reject by the *expired* branch, not the signature branch.
+        assert!(
+            resp_str.contains("expired"),
+            "expected `expired` body, got: {resp_str}"
+        );
+
         // Short URL: GET /s/<id> should 302 with Location = the long URL.
         let short_path = handle.short_url.rsplit_once('/').unwrap().1.to_string();
         let mut sock = TcpStream::connect(("127.0.0.1", port)).unwrap();
