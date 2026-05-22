@@ -891,7 +891,7 @@ fn render_share_url(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut lines = String::new();
     let running = app.share_handle.is_some();
     if running {
-        lines.push_str(&format!("Server: listening on 127.0.0.1:{port}\n"));
+        lines.push_str(&format!("Server: listening on localhost:{port}\n"));
     } else {
         lines.push_str("Server: not running\n");
     }

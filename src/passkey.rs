@@ -159,8 +159,10 @@ pub(crate) fn start(
     };
 
     let short_id = random_short_id();
-    let short_url = format!("http://127.0.0.1:{port}/auth/{short_id}");
-    let url = format!("http://127.0.0.1:{port}/");
+    // User-facing host is `localhost` (better browser/authenticator
+    // compatibility); the listener binds to 127.0.0.1 above.
+    let short_url = format!("http://localhost:{port}/auth/{short_id}");
+    let url = format!("http://localhost:{port}/");
 
     let (outcome_tx, outcome_rx) = std_mpsc::channel::<PasskeyOutcome>();
 
@@ -433,7 +435,7 @@ fn render_html(ctx: &Ctx) -> String {
 <p>{explanation}</p>
 <p><button id="go">{action_label}</button></p>
 <div id="status" class="note">Click the button above to begin.</div>
-<p><small>This page is served by the wrustic process on 127.0.0.1. You can close it when finished.</small></p>
+<p><small>This page is served by the wrustic process on localhost. You can close it when finished.</small></p>
 <script>
 const PHASE = {phase_js};
 const PRF_SALT_B64 = {prf_salt_js};
