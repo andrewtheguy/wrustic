@@ -1381,7 +1381,7 @@ impl App {
             | Screen::SnapshotCompareLoading => {}
 
             Screen::FileDetails => match key.code {
-                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Backspace => {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => {
                     self.stop_share();
                     self.file_details = None;
                     self.file_details_scroll = 0;
