@@ -60,9 +60,7 @@ fn bottom_bar_text(screen: &Screen) -> &'static str {
         Screen::FileDetails => {
             "j/k scroll  PgUp/PgDn page  g top  d share  Enter/Esc/Backspace/q back"
         }
-        Screen::ShareUrl => {
-            "s start/stop  r new URL  Esc back (server stops when leaving file details)"
-        }
+        Screen::ShareUrl => "Esc/Backspace/q back (stops the server)",
         Screen::SnapshotCompareFirst => {
             "j/k move  PgUp/PgDn page  g/G top/bottom  Enter pick FIRST  Esc cancel"
         }
@@ -834,10 +832,8 @@ fn render_share_url(frame: &mut Frame, app: &mut App, area: Rect) {
     let running = app.share_handle.is_some();
     if running {
         lines.push_str(&format!("Server: listening on 127.0.0.1:{port}\n"));
-    } else if app.share_url.is_some() {
-        lines.push_str("Server: stopped (the URL stays cryptographically valid until exp)\n");
     } else {
-        lines.push_str("Server: not started — press `s` to start\n");
+        lines.push_str("Server: not running\n");
     }
     lines.push('\n');
 
@@ -856,16 +852,20 @@ fn render_share_url(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 
     if let Some(exp) = app.share_exp_unix {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let remaining = exp.saturating_sub(now);
-        let mins = remaining / 60;
-        let secs = remaining % 60;
-        lines.push_str(&format!(
-            "Expires: unix {exp} ({mins}m {secs}s remaining)\n",
-        ));
+        // Absolute timestamp in local time — doesn't need re-rendering as
+        // the clock advances. `exp` is a u64 unix-seconds; convert via i64.
+        let when = jiff::Timestamp::from_second(exp as i64)
+            .and_then(|t| t.in_tz("UTC").map(|z| z.strftime("%Y-%m-%d %H:%M:%S UTC").to_string()))
+            .unwrap_or_else(|_| format!("unix {exp}"));
+        let local = jiff::Timestamp::from_second(exp as i64)
+            .map(|t| t.to_zoned(jiff::tz::TimeZone::system()))
+            .map(|z| z.strftime("%Y-%m-%d %H:%M:%S %Z").to_string())
+            .unwrap_or_default();
+        if local.is_empty() || local == when {
+            lines.push_str(&format!("Expires: {when}\n"));
+        } else {
+            lines.push_str(&format!("Expires: {local}  ({when})\n"));
+        }
     }
 
     if let Some(err) = &app.share_error {
@@ -873,8 +873,7 @@ fn render_share_url(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 
     lines.push_str(
-        "\nServer is bound to this file only. Leaving the File Details screen \
-         stops the server.",
+        "\nServer is bound to this file only. Leaving this screen stops it.",
     );
 
     let para = Paragraph::new(lines)

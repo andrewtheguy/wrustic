@@ -10,7 +10,7 @@ use std::io;
 use std::io::Read;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -47,43 +47,17 @@ pub(crate) struct ShareTarget {
 }
 
 pub(crate) struct ShareHandle {
-    pub(crate) port: u16,
     pub(crate) url: String,
     // Short alias: http://127.0.0.1:<port>/s/<short_id>. The server holds
-    // <short_id> in-memory and 302-redirects it to the current long URL.
-    // The short id is freshly generated on every `start` call, so stopping
-    // and restarting (toggle 's' twice) gives a brand-new short URL.
+    // <short_id> in-memory and 302-redirects it to the fixed long URL.
+    // The short id is freshly generated on every `start` call.
     pub(crate) short_url: String,
     pub(crate) exp_unix: u64,
-    snap_id: String,
-    tree_id: TreeId,
-    name: String,
-    signing_key: [u8; 32],
-    // Shared with the server task so `regenerate` updates the redirect
-    // target without having to restart the server. Stored as a path-only
-    // form (`/dl?...`) so the redirect doesn't pin a host:port.
-    long_path_cell: Arc<RwLock<String>>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     join_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl ShareHandle {
-    pub(crate) fn regenerate(&mut self, ttl: Duration) {
-        let (url, path, exp) = build_signed_url(
-            self.port,
-            &self.snap_id,
-            self.tree_id,
-            &self.name,
-            ttl,
-            &self.signing_key,
-        );
-        if let Ok(mut w) = self.long_path_cell.write() {
-            *w = path;
-        }
-        self.url = url;
-        self.exp_unix = exp;
-    }
-
     pub(crate) fn stop(mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
@@ -215,10 +189,10 @@ struct Ctx {
     name: String,
     display_path: String,
     short_id: String,
-    // Current path+query for the long URL — read on every /s/<id> redirect.
-    // Mutated by ShareHandle::regenerate from outside the server thread.
-    // Path-only (no scheme/host/port) so the redirect stays same-origin.
-    long_path: Arc<RwLock<String>>,
+    // Path+query that the short-URL redirect points at. Path-only (no
+    // scheme/host/port) so the redirect stays same-origin. Fixed for the
+    // server's lifetime — there's no regenerate.
+    long_path: String,
 }
 
 pub(crate) fn start(
@@ -255,18 +229,17 @@ pub(crate) fn start(
     let (url, path, exp) = build_signed_url(port, &snap_id, tree_id, &name, ttl, &key);
     let short_id = random_short_id();
     let short_url = format!("http://127.0.0.1:{port}/s/{short_id}");
-    let long_path_cell = Arc::new(RwLock::new(path));
 
     let ctx = Arc::new(Ctx {
         repo: Arc::new(repo),
         key,
-        snap_id: snap_id.clone(),
-        tree_hex: tree_hex.clone(),
+        snap_id,
+        tree_hex,
         tree_id,
-        name: name.clone(),
+        name,
         display_path,
         short_id,
-        long_path: long_path_cell.clone(),
+        long_path: path,
     });
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -294,15 +267,9 @@ pub(crate) fn start(
         .map_err(|e| anyhow!("spawning share thread: {e}"))?;
 
     Ok(ShareHandle {
-        port,
         url,
         short_url,
         exp_unix: exp,
-        snap_id,
-        tree_id,
-        name,
-        signing_key: key,
-        long_path_cell,
         shutdown_tx: Some(shutdown_tx),
         join_handle: Some(join),
     })
@@ -362,14 +329,13 @@ async fn handle(
             // Path-relative Location so the browser keeps its current
             // host:port. Avoids surprises if someone reaches the server
             // via a different name (loopback alias, ssh -L tunnel, etc.).
-            let target = ctx.long_path.read().map(|s| s.clone()).unwrap_or_default();
             let mut resp = Response::new(
                 Full::new(Bytes::from_static(b""))
                     .map_err(|never: Infallible| match never {})
                     .boxed(),
             );
             *resp.status_mut() = StatusCode::FOUND;
-            if let Ok(v) = HeaderValue::from_str(&target) {
+            if let Ok(v) = HeaderValue::from_str(&ctx.long_path) {
                 resp.headers_mut().insert(LOCATION, v);
             }
             return Ok(resp);

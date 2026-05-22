@@ -862,21 +862,30 @@ impl App {
     // Called when leaving FileDetails (back to SnapshotContents) and on app
     // exit — the share server is bound to the lifetime of viewing one file.
     pub(crate) fn stop_share(&mut self) {
+        self.stop_share_keep_target();
+        self.share_target = None;
+    }
+
+    // Stop the server and drop the minted URL but keep `share_target` so
+    // re-entering the share dialog from FileDetails still has the file
+    // info it needs. Used when leaving the share dialog back to file
+    // details.
+    fn stop_share_keep_target(&mut self) {
         if let Some(h) = self.share_handle.take() {
             h.stop();
         }
-        self.share_target = None;
         self.share_url = None;
         self.share_short_url = None;
         self.share_exp_unix = None;
         self.share_error = None;
     }
 
-    // 's' on the Share screen: toggle the server on/off.
-    fn toggle_share_server(&mut self) {
-        if let Some(h) = self.share_handle.take() {
-            // Running -> stop. Keep share_url/exp visible.
-            h.stop();
+    // Start the share server for the currently-loaded file. Called when
+    // entering the Share screen via `d` on FileDetails. No-op if a server
+    // is already running (shouldn't happen — we stop on every Esc — but
+    // defensive). Surfaces start errors inline on the Share screen.
+    fn start_share_server(&mut self) {
+        if self.share_handle.is_some() {
             return;
         }
         let Some(target) = self.share_target.clone() else {
@@ -910,15 +919,6 @@ impl App {
         }
     }
 
-    // 'r' on the Share screen: mint a fresh URL (new exp) without restarting
-    // the server. No-op when stopped — we don't have a key handy then.
-    fn regenerate_share_url(&mut self) {
-        if let Some(h) = self.share_handle.as_mut() {
-            h.regenerate(SHARE_TTL);
-            self.share_url = Some(h.url.clone());
-            self.share_exp_unix = Some(h.exp_unix);
-        }
-    }
 
     fn activate_backend(&mut self) {
         let idx = self
@@ -1393,6 +1393,9 @@ impl App {
                         .map(|d| matches!(d.kind, ContentKind::File))
                         .unwrap_or(false);
                     if is_file && self.share_target.is_some() {
+                        // Auto-start the server when entering the share
+                        // screen. Errors stay inline on ShareUrl.
+                        self.start_share_server();
                         self.screen = Screen::ShareUrl;
                     }
                 }
@@ -1417,11 +1420,11 @@ impl App {
             },
 
             Screen::ShareUrl => match key.code {
-                KeyCode::Char('s') => self.toggle_share_server(),
-                KeyCode::Char('r') => self.regenerate_share_url(),
                 KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('q') => {
-                    // Back to FileDetails; the server (if running) keeps
-                    // running until the user leaves FileDetails entirely.
+                    // Open ↔ server running: pressing `d` starts the
+                    // server and opens this screen; any back key stops it
+                    // and returns to FileDetails.
+                    self.stop_share_keep_target();
                     self.screen = Screen::FileDetails;
                 }
                 _ => {}
