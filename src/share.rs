@@ -20,7 +20,7 @@ use bytes::Bytes;
 use hmac::{Hmac, Mac};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::{Body, Frame};
-use hyper::header::{CONTENT_DISPOSITION, CONTENT_TYPE, HeaderValue, LOCATION};
+use hyper::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE, HeaderValue, LOCATION};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
@@ -155,6 +155,11 @@ fn compute_sig(key: &[u8; 32], snap: &str, tree_hex: &str, name: &str, exp: u64)
 // display ("here is the URL you can paste into a browser"); the relative
 // form (`/dl?...`) is what the short-URL handler emits as the redirect
 // `Location` so the browser stays on whatever host:port it dialed in on.
+//
+// `name` is part of the HMAC message but NOT a URL query parameter — the
+// server knows the file's name from its bound state, so putting it in the
+// URL would be redundant noise. Cross-file replays are still rejected at
+// the HMAC step (different bound name = different sig).
 pub(crate) fn build_signed_url(
     port: u16,
     snap_id: &str,
@@ -172,7 +177,6 @@ pub(crate) fn build_signed_url(
     let qs: String = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("snap", snap_id)
         .append_pair("tree", &tree_hex)
-        .append_pair("name", name)
         .append_pair("exp", &exp.to_string())
         .append_pair("sig", &sig)
         .finish();
@@ -350,29 +354,27 @@ async fn handle(
     let q = req.uri().query().unwrap_or("");
     let mut snap = None;
     let mut tree = None;
-    let mut name = None;
     let mut exp_s = None;
     let mut sig = None;
     for (k, v) in url::form_urlencoded::parse(q.as_bytes()) {
         match k.as_ref() {
             "snap" => snap = Some(v.into_owned()),
             "tree" => tree = Some(v.into_owned()),
-            "name" => name = Some(v.into_owned()),
             "exp" => exp_s = Some(v.into_owned()),
             "sig" => sig = Some(v.into_owned()),
             _ => {}
         }
     }
-    let (Some(snap), Some(tree), Some(name), Some(exp_s), Some(sig)) =
-        (snap, tree, name, exp_s, sig)
-    else {
+    let (Some(snap), Some(tree), Some(exp_s), Some(sig)) = (snap, tree, exp_s, sig) else {
         return Ok(err_resp(StatusCode::BAD_REQUEST, "missing query parameters"));
     };
 
-    // Cross-check the URL's identifiers against the server's bound values
-    // before any crypto work. Identical 404 message regardless of which field
-    // mismatched, so we don't leak which one's wrong.
-    if snap != ctx.snap_id || tree != ctx.tree_hex || name != ctx.name {
+    // Cross-check the URL's snap/tree against the server's bound values
+    // before any crypto work. The file's name isn't in the URL — the
+    // server already knows it — but it's part of the HMAC message, so a
+    // URL minted for a different file still fails at the verify step
+    // below.
+    if snap != ctx.snap_id || tree != ctx.tree_hex {
         return Ok(err_resp(StatusCode::NOT_FOUND, "no such file"));
     }
 
@@ -391,7 +393,7 @@ async fn handle(
         return Ok(err_resp(StatusCode::FORBIDDEN, "invalid signature"));
     };
     let mut mac = HmacSha256::new_from_slice(&ctx.key).expect("any-length");
-    mac.update(&canonical_message(&snap, &tree, &name, exp));
+    mac.update(&canonical_message(&snap, &tree, &ctx.name, exp));
     if mac.verify_slice(&sig_bytes).is_err() {
         return Ok(err_resp(StatusCode::FORBIDDEN, "invalid signature"));
     }
@@ -414,8 +416,14 @@ async fn handle(
         CONTENT_TYPE,
         HeaderValue::from_static("application/octet-stream"),
     );
+    // No caching: the URL is single-purpose and short-lived, and we don't
+    // want browsers/proxies to hand back stale bytes if the user reuses it.
+    resp.headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    // Inline so browsers/clients display the file in-place when they can,
+    // but still pass through a filename for save-as.
     let filename = sanitize_filename(basename(&ctx.display_path));
-    let disp = format!("attachment; filename=\"{filename}\"");
+    let disp = format!("inline; filename=\"{filename}\"");
     if let Ok(v) = HeaderValue::from_str(&disp) {
         resp.headers_mut().insert(CONTENT_DISPOSITION, v);
     }
@@ -620,6 +628,11 @@ mod tests {
             .expect("source dir node");
         let source_tree = source_node.subtree.expect("source has subtree");
 
+        // tiny helper inlined for the test
+        fn tree_hex_str(t: TreeId) -> String {
+            t.to_hex().as_str().to_string()
+        }
+
         // Free up our `repo` handle — share::start opens its own with the
         // full index. (Otherwise both repos would scribble on the same cache
         // dir; rustic_core is fine with concurrent opens, but we don't need
@@ -680,16 +693,30 @@ mod tests {
             "got: {resp_str}"
         );
 
-        // Cross-check: replace `name` in URL with a different filename. Server
-        // is bound to greeting.txt; this must come back 404 before HMAC.
-        let alt_qs = qs.replace("name=greeting.txt", "name=other.txt");
+        // Cross-replay check: forge a URL for the OTHER file in the same
+        // tree (`blob.bin`). The HMAC binds the bound name into the sig,
+        // so a URL legitimately signed for `blob.bin` should be rejected
+        // (403 invalid signature) by a server bound to `greeting.txt`.
+        let exp_for_other: u64 = qs
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("exp="))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let other_sig = compute_sig(&key, &snap_id, &tree_hex_str(source_tree), "blob.bin", exp_for_other);
+        let other_qs: String = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("snap", &snap_id)
+            .append_pair("tree", &tree_hex_str(source_tree))
+            .append_pair("exp", &exp_for_other.to_string())
+            .append_pair("sig", &other_sig)
+            .finish();
         let mut sock = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        write!(sock, "GET /dl?{alt_qs} HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
+        write!(sock, "GET /dl?{other_qs} HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
         let mut resp = Vec::new();
         sock.read_to_end(&mut resp).unwrap();
         let resp_str = String::from_utf8_lossy(&resp);
         assert!(
-            resp_str.starts_with("HTTP/1.0 404") || resp_str.starts_with("HTTP/1.1 404"),
+            resp_str.starts_with("HTTP/1.0 403") || resp_str.starts_with("HTTP/1.1 403"),
             "got: {resp_str}"
         );
 
