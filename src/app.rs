@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ratatui::{
@@ -248,7 +249,14 @@ pub(crate) struct App {
     // to translate click coordinates into a row index. Set by the renderer
     // each frame; read by the key/mouse handler on the next event.
     pub(crate) list_area: Option<Rect>,
+
+    // Last left-click on the SnapshotContents list: timestamp + clicked row
+    // index. Used to detect a double-click for opening file info.
+    pub(crate) last_content_click: Option<(Instant, usize)>,
 }
+
+// Two clicks on the same row within this window count as a double-click.
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 impl App {
     pub(crate) fn boot(config_dir: Option<PathBuf>) -> Result<Self> {
@@ -315,6 +323,7 @@ impl App {
             compare_results: None,
             compare_results_state: ListState::default(),
             list_area: None,
+            last_content_click: None,
         };
 
         if !identity_exists {
@@ -632,6 +641,8 @@ impl App {
     }
 
     fn go_up(&mut self) {
+        // Any pending double-click pair belonged to the old frame; drop it.
+        self.last_content_click = None;
         if self.browse_stack.len() > 1 {
             self.browse_stack.pop();
         } else {
@@ -774,6 +785,9 @@ impl App {
             ContentKind::Parent => self.go_up(),
             ContentKind::Dir => {
                 if let Some(subtree) = row.subtree {
+                    // Descending — drop any pending double-click pair so the
+                    // new frame can't inherit a stale match.
+                    self.last_content_click = None;
                     self.pending_descend = Some((subtree, row.name.clone()));
                     self.screen = Screen::LoadingDir;
                 }
@@ -1211,6 +1225,7 @@ impl App {
                     self.browse_snapshot_id.clear();
                     self.pending_descend = None;
                     self.pending_refresh_path = None;
+                    self.last_content_click = None;
                     self.screen = Screen::Snapshots;
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
@@ -1261,6 +1276,7 @@ impl App {
                     self.repo_session = None;
                     self.browse_stack.clear();
                     self.pending_descend = None;
+                    self.last_content_click = None;
                     self.screen = Screen::OpeningSnapshot;
                 }
                 _ => {}
@@ -1623,7 +1639,18 @@ impl App {
                 let offset = f.list_state.offset();
                 if let Some(idx) = click_to_index(area, offset, len, row, col) {
                     f.list_state.select(Some(idx));
-                    self.activate_snapshot_content();
+                    let now = Instant::now();
+                    let is_double = self
+                        .last_content_click
+                        .is_some_and(|(t, i)| i == idx && now.duration_since(t) < DOUBLE_CLICK);
+                    if is_double {
+                        // Consume the pair so a third click doesn't re-fire.
+                        self.last_content_click = None;
+                        self.open_selected_file_details();
+                    } else {
+                        self.last_content_click = Some((now, idx));
+                        self.activate_snapshot_content();
+                    }
                 }
             }
             // FileDetails has no list; clicks are ignored.
