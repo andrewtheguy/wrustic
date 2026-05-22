@@ -6,7 +6,6 @@ mod repo;
 mod ui;
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use anyhow::Result;
 use ratatui::{
@@ -130,11 +129,18 @@ fn run(terminal: &mut DefaultTerminal, config_dir: Option<PathBuf>) -> Result<()
             continue;
         }
 
-        if event::poll(Duration::from_millis(100))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            app.handle_key(key);
+        // Idle: block on events and only break out (to redraw) for ones
+        // that can change what's on screen. Ignoring focus/mouse/key-release
+        // events keeps the terminal quiet when the app has nothing to do.
+        loop {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    app.handle_key(key);
+                    break;
+                }
+                Event::Resize(_, _) => break,
+                _ => {}
+            }
         }
     }
     Ok(())
