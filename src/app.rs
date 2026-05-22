@@ -486,7 +486,7 @@ impl App {
     pub(crate) fn compare_second_visible_indices(&self) -> Vec<usize> {
         let base = self.visible_snapshot_indices();
         let Some(first_idx) = self.compare_first_row_idx else {
-            return base.into_iter().filter(|&i| Some(i) != self.compare_first_row_idx).collect();
+            return base;
         };
         let Some(first) = self.snapshots.get(first_idx) else {
             return base;

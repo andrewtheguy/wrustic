@@ -581,9 +581,9 @@ fn render_compare_results(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let [header, body] = Layout::vertical([Constraint::Length(3), Constraint::Fill(1)]).areas(inner);
 
-    let (summary_text, changes_len) = match &app.compare_results {
-        Some((sum, changes)) => (
-            format!(
+    let (summary_text, items) = match &app.compare_results {
+        Some((sum, changes)) => {
+            let text = format!(
                 "+{} files / -{} / M{}  |  +{} / -{}  ({} change{})",
                 sum.added_files,
                 sum.removed_files,
@@ -592,10 +592,14 @@ fn render_compare_results(frame: &mut Frame, app: &mut App, area: Rect) {
                 human_size(sum.removed_bytes),
                 changes.len(),
                 if changes.len() == 1 { "" } else { "s" },
-            ),
-            changes.len(),
-        ),
-        None => ("(no diff loaded)".to_string(), 0),
+            );
+            let items: Vec<ListItem> = changes
+                .iter()
+                .map(|c| ListItem::new(format!("{}  {}", c.modifier.as_char(), c.path)))
+                .collect();
+            (text, items)
+        }
+        None => ("(no diff loaded)".to_string(), Vec::new()),
     };
 
     let summary_para = Paragraph::new(summary_text)
@@ -603,7 +607,7 @@ fn render_compare_results(frame: &mut Frame, app: &mut App, area: Rect) {
         .block(Block::bordered().title("Summary"));
     frame.render_widget(summary_para, header);
 
-    if changes_len == 0 {
+    if items.is_empty() {
         let para = Paragraph::new("No file-level changes between these snapshots.")
             .style(Style::new().fg(Color::DarkGray))
             .block(Block::bordered().title("Changes"));
@@ -611,16 +615,9 @@ fn render_compare_results(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let items: Vec<ListItem> = app
-        .compare_results
-        .as_ref()
-        .unwrap()
-        .1
-        .iter()
-        .map(|c| ListItem::new(format!("{}  {}", c.modifier.as_char(), c.path)))
-        .collect();
+    let count = items.len();
     let list = List::new(items)
-        .block(Block::bordered().title(format!("Changes ({changes_len})")))
+        .block(Block::bordered().title(format!("Changes ({count})")))
         .highlight_style(selection_highlight())
         .highlight_symbol(">> ");
     frame.render_stateful_widget(list, body, &mut app.compare_results_state);
