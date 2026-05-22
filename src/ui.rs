@@ -57,7 +57,12 @@ fn bottom_bar_text(screen: &Screen) -> &'static str {
         Screen::SnapshotContents => {
             "j/k move  PgUp/PgDn page  g/G top/bottom  Enter open dir  i file info  Backspace up  r reload  q/Esc back"
         }
-        Screen::FileDetails => "j/k scroll  PgUp/PgDn page  g top  Enter/Esc/Backspace/q back",
+        Screen::FileDetails => {
+            "j/k scroll  PgUp/PgDn page  g top  d share  Enter/Esc/Backspace/q back"
+        }
+        Screen::ShareUrl => {
+            "s start/stop  r new URL  Esc back (server stops when leaving file details)"
+        }
         Screen::SnapshotCompareFirst => {
             "j/k move  PgUp/PgDn page  g/G top/bottom  Enter pick FIRST  Esc cancel"
         }
@@ -195,6 +200,7 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
         }
         Screen::SnapshotContents => render_snapshot_contents(frame, app, area),
         Screen::FileDetails => render_file_details(frame, app, area),
+        Screen::ShareUrl => render_share_url(frame, app, area),
         Screen::SnapshotCompareFirst => render_compare_first(frame, app, area),
         Screen::SnapshotCompareSecond => render_compare_second(frame, app, area),
         Screen::SnapshotCompareLoading => render_compare_loading(frame, app, area),
@@ -812,6 +818,65 @@ fn render_file_details(frame: &mut Frame, app: &mut App, area: Rect) {
         .block(
             Block::bordered().title(format!("File details — {}", short_path(&d.full_path))),
         );
+    record_list_area(app, area);
+    frame.render_widget(para, area);
+}
+
+fn render_share_url(frame: &mut Frame, app: &mut App, area: Rect) {
+    let port = app.config.server.port;
+    let target_label = app
+        .share_target
+        .as_ref()
+        .map(|t| short_path(&t.display_path))
+        .unwrap_or_else(|| "(no file)".to_string());
+
+    let mut lines = String::new();
+    let running = app.share_handle.is_some();
+    if running {
+        lines.push_str(&format!("Server: listening on 127.0.0.1:{port}\n"));
+    } else if app.share_url.is_some() {
+        lines.push_str("Server: stopped (the URL stays cryptographically valid until exp)\n");
+    } else {
+        lines.push_str("Server: not started — press `s` to start\n");
+    }
+    lines.push('\n');
+
+    match &app.share_url {
+        Some(u) => {
+            lines.push_str("URL:\n");
+            lines.push_str(u);
+            lines.push_str("\n\n");
+        }
+        None => {
+            lines.push_str("URL: (none yet — start the server with `s`)\n\n");
+        }
+    }
+
+    if let Some(exp) = app.share_exp_unix {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let remaining = exp.saturating_sub(now);
+        let mins = remaining / 60;
+        let secs = remaining % 60;
+        lines.push_str(&format!(
+            "Expires: unix {exp} ({mins}m {secs}s remaining)\n",
+        ));
+    }
+
+    if let Some(err) = &app.share_error {
+        lines.push_str(&format!("\nError: {err}\n"));
+    }
+
+    lines.push_str(
+        "\nServer is bound to this file only. Leaving the File Details screen \
+         stops the server.",
+    );
+
+    let para = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .block(Block::bordered().title(format!("Share — {target_label}")));
     record_list_area(app, area);
     frame.render_widget(para, area);
 }

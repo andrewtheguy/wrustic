@@ -14,6 +14,7 @@ use tui_input::backend::crossterm::EventHandler;
 use crate::config::{self, BackendKind, Config, Paths, Profile};
 use crate::repo::{ContentKind, ContentRow, ContentsPreview, FileDetails, SnapshotRow};
 use crate::restic::{self, DiffChange, DiffSummary, ResticError, ResticInfo, SnapshotDetails};
+use crate::share::{self, SHARE_TTL, ShareHandle, ShareTarget};
 
 pub(crate) const BACKEND_ORDER: [BackendKind; 3] =
     [BackendKind::Local, BackendKind::Rest, BackendKind::S3];
@@ -41,6 +42,7 @@ pub(crate) enum Screen {
     LoadingDir,
     LoadingFileDetails,
     FileDetails,
+    ShareUrl,
     SnapshotCompareFirst,
     SnapshotCompareSecond,
     SnapshotCompareLoading,
@@ -227,6 +229,19 @@ pub(crate) struct App {
     pub(crate) pending_file_lookup: Option<(TreeId, String, String)>,
     pub(crate) file_details: Option<FileDetails>,
     pub(crate) file_details_scroll: u16,
+    // What `Screen::ShareUrl` would serve if started. Captured at the moment
+    // 'd' is pressed on FileDetails so we don't need to walk back into the
+    // browse stack later.
+    pub(crate) share_target: Option<ShareTarget>,
+    pub(crate) share_handle: Option<ShareHandle>,
+    // Last minted URL — kept around even after the server is stopped so the
+    // user can still read/copy it; the URL stays cryptographically valid
+    // until its embedded exp passes.
+    pub(crate) share_url: Option<String>,
+    pub(crate) share_exp_unix: Option<u64>,
+    // Inline error for the Share screen (e.g. EADDRINUSE on start) — keeps
+    // the user on the Share screen instead of jumping to the global Error.
+    pub(crate) share_error: Option<String>,
     pub(crate) error_is_fatal: bool,
     pub(crate) quit: bool,
 
@@ -308,6 +323,11 @@ impl App {
             pending_file_lookup: None,
             file_details: None,
             file_details_scroll: 0,
+            share_target: None,
+            share_handle: None,
+            share_url: None,
+            share_exp_unix: None,
+            share_error: None,
             error_is_fatal: false,
             quit: false,
             restic_check: None,
@@ -825,9 +845,75 @@ impl App {
         } else {
             format!("/{}/{}", dir_path, row.name)
         };
+        self.share_target = Some(ShareTarget {
+            snap_id: self.browse_snapshot_id.clone(),
+            tree_id: f.tree_id,
+            name: row.name.clone(),
+            display_path: full_path.clone(),
+        });
         self.pending_file_lookup = Some((f.tree_id, row.name.clone(), full_path));
         self.file_details_scroll = 0;
         self.screen = Screen::LoadingFileDetails;
+    }
+
+    // Tear down any running share server and clear all share-related state.
+    // Called when leaving FileDetails (back to SnapshotContents) and on app
+    // exit — the share server is bound to the lifetime of viewing one file.
+    pub(crate) fn stop_share(&mut self) {
+        if let Some(h) = self.share_handle.take() {
+            h.stop();
+        }
+        self.share_target = None;
+        self.share_url = None;
+        self.share_exp_unix = None;
+        self.share_error = None;
+    }
+
+    // 's' on the Share screen: toggle the server on/off.
+    fn toggle_share_server(&mut self) {
+        if let Some(h) = self.share_handle.take() {
+            // Running -> stop. Keep share_url/exp visible.
+            h.stop();
+            return;
+        }
+        let Some(target) = self.share_target.clone() else {
+            self.share_error = Some("No file selected to share.".into());
+            return;
+        };
+        let Some((_, profile)) = self.config.profile_at(self.loading_index) else {
+            self.share_error = Some("Selected profile no longer exists.".into());
+            return;
+        };
+        let profile = profile.clone();
+        let key = match share::derive_signing_key(&self.paths.identity) {
+            Ok(k) => k,
+            Err(e) => {
+                self.share_error = Some(format!("Deriving signing key: {e:#}"));
+                return;
+            }
+        };
+        let port = self.config.server.port;
+        match share::start(port, profile, key, target, SHARE_TTL) {
+            Ok(h) => {
+                self.share_url = Some(h.url.clone());
+                self.share_exp_unix = Some(h.exp_unix);
+                self.share_error = None;
+                self.share_handle = Some(h);
+            }
+            Err(e) => {
+                self.share_error = Some(format!("{e:#}"));
+            }
+        }
+    }
+
+    // 'r' on the Share screen: mint a fresh URL (new exp) without restarting
+    // the server. No-op when stopped — we don't have a key handy then.
+    fn regenerate_share_url(&mut self) {
+        if let Some(h) = self.share_handle.as_mut() {
+            h.regenerate(SHARE_TTL);
+            self.share_url = Some(h.url.clone());
+            self.share_exp_unix = Some(h.exp_unix);
+        }
     }
 
     fn activate_backend(&mut self) {
@@ -1291,9 +1377,20 @@ impl App {
 
             Screen::FileDetails => match key.code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Backspace => {
+                    self.stop_share();
                     self.file_details = None;
                     self.file_details_scroll = 0;
                     self.screen = Screen::SnapshotContents;
+                }
+                KeyCode::Char('d') => {
+                    let is_file = self
+                        .file_details
+                        .as_ref()
+                        .map(|d| matches!(d.kind, ContentKind::File))
+                        .unwrap_or(false);
+                    if is_file && self.share_target.is_some() {
+                        self.screen = Screen::ShareUrl;
+                    }
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.file_details_scroll = self.file_details_scroll.saturating_add(1);
@@ -1311,6 +1408,17 @@ impl App {
                 KeyCode::PageUp => {
                     let step = self.page_step() as u16;
                     self.file_details_scroll = self.file_details_scroll.saturating_sub(step);
+                }
+                _ => {}
+            },
+
+            Screen::ShareUrl => match key.code {
+                KeyCode::Char('s') => self.toggle_share_server(),
+                KeyCode::Char('r') => self.regenerate_share_url(),
+                KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('q') => {
+                    // Back to FileDetails; the server (if running) keeps
+                    // running until the user leaves FileDetails entirely.
+                    self.screen = Screen::FileDetails;
                 }
                 _ => {}
             },

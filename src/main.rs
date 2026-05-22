@@ -4,6 +4,7 @@ mod config;
 mod crypto;
 mod repo;
 mod restic;
+mod share;
 mod ui;
 
 use std::path::PathBuf;
