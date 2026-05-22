@@ -11,7 +11,10 @@ use std::path::PathBuf;
 use anyhow::Result;
 use ratatui::{
     DefaultTerminal,
-    crossterm::event::{self, Event, KeyEventKind},
+    crossterm::{
+        self,
+        event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
+    },
 };
 
 use ratatui::widgets::ListState;
@@ -39,7 +42,15 @@ fn main() -> Result<()> {
     }
 
     let mut terminal = ratatui::init();
+    // Enable mouse reporting after entering raw mode. With capture on,
+    // terminals route clicks/scroll to us instead of doing native text
+    // selection; users can hold Shift to bypass and select text.
+    let mouse_enabled =
+        crossterm::execute!(std::io::stdout(), EnableMouseCapture).is_ok();
     let result = run(&mut terminal, cli.config_dir);
+    if mouse_enabled {
+        let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    }
     ratatui::restore();
     result
 }
@@ -258,6 +269,10 @@ fn run(terminal: &mut DefaultTerminal, config_dir: Option<PathBuf>) -> Result<()
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     app.handle_key(key);
+                    break;
+                }
+                Event::Mouse(m) => {
+                    app.handle_mouse(m);
                     break;
                 }
                 Event::Resize(_, _) => break,

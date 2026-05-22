@@ -2,7 +2,8 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use ratatui::{
-    crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers},
+    crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
+    layout::Rect,
     widgets::ListState,
 };
 use rustic_core::{IndexedIdsStatus, Repository, TreeId};
@@ -105,6 +106,53 @@ impl SnapshotFilter {
     }
 }
 
+// Translate a left-click at `(row, col)` (terminal coordinates) into an
+// index into the visible list. Returns None when the click misses the
+// list's bordered interior, when the list is empty, or when the click
+// lands past the last populated row. `offset` is the first-visible index
+// from `ListState::offset()`.
+fn click_to_index(
+    list_area: Rect,
+    offset: usize,
+    len: usize,
+    row: u16,
+    col: u16,
+) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    // Bordered interior: skip the top/left border and stop before the
+    // bottom/right border.
+    let inner_top = list_area.y.checked_add(1)?;
+    let inner_left = list_area.x.checked_add(1)?;
+    let inner_bottom = list_area.y.saturating_add(list_area.height.saturating_sub(1));
+    let inner_right = list_area.x.saturating_add(list_area.width.saturating_sub(1));
+    if row < inner_top || row >= inner_bottom {
+        return None;
+    }
+    if col < inner_left || col >= inner_right {
+        return None;
+    }
+    let row_in_list = (row - inner_top) as usize;
+    let idx = row_in_list.checked_add(offset)?;
+    (idx < len).then_some(idx)
+}
+
+// Jump a list selection by `step` rows in the given direction, clamping to
+// the list bounds. Used by PageUp/PageDown handlers.
+fn page_select(state: &mut ListState, len: usize, forward: bool, step: usize) {
+    if len == 0 {
+        return;
+    }
+    let cur = state.selected().unwrap_or(0);
+    let new = if forward {
+        cur.saturating_add(step).min(len - 1)
+    } else {
+        cur.saturating_sub(step)
+    };
+    state.select(Some(new));
+}
+
 pub(crate) struct BrowseFrame {
     pub(crate) name: String,
     pub(crate) tree_id: TreeId,
@@ -180,6 +228,12 @@ pub(crate) struct App {
     pub(crate) compare_picker_state: ListState,
     pub(crate) compare_results: Option<(DiffSummary, Vec<DiffChange>)>,
     pub(crate) compare_results_state: ListState,
+
+    // Outer rect of the currently-rendered list/paragraph (bordered area).
+    // Used by PageUp/PageDown to size the jump and by the mouse handler
+    // to translate click coordinates into a row index. Set by the renderer
+    // each frame; read by the key/mouse handler on the next event.
+    pub(crate) list_area: Option<Rect>,
 }
 
 impl App {
@@ -246,6 +300,7 @@ impl App {
             compare_picker_state: ListState::default(),
             compare_results: None,
             compare_results_state: ListState::default(),
+            list_area: None,
         };
 
         if !identity_exists {
@@ -440,6 +495,14 @@ impl App {
         }
     }
 
+    // Rows to jump on PageDown/PageUp. One row of overlap with the previous
+    // page keeps a bit of context across the jump.
+    fn page_step(&self) -> usize {
+        let h = self.list_area.map(|r| r.height).unwrap_or(0);
+        // height - 2 (borders) - 1 (overlap), with a floor of 1 row.
+        h.saturating_sub(3).max(1) as usize
+    }
+
     // Indices into `self.snapshots` for rows that pass the current filter,
     // preserving the underlying time-desc order.
     pub(crate) fn visible_snapshot_indices(&self) -> Vec<usize> {
@@ -567,6 +630,175 @@ impl App {
         }
     }
 
+    // ──── Activation helpers ────────────────────────────────────────────
+    // Each helper holds the body of one screen's "Enter" action so that the
+    // keyboard handler and the mouse-click handler both go through the same
+    // code path. The mouse handler updates the relevant selection first,
+    // then calls the matching helper.
+
+    fn activate_first_run(&mut self) {
+        match self.first_run_state.selected().unwrap_or(0) {
+            0 => match config::generate_identity(&self.paths.identity) {
+                Ok(pubkey) => {
+                    self.created_pubkey = pubkey;
+                    self.screen = Screen::KeyCreated;
+                }
+                Err(e) => {
+                    self.error_is_fatal = true;
+                    self.screen = Screen::Error(format!("{e:#}"));
+                }
+            },
+            1 => {
+                self.restore_error = None;
+                self.screen = Screen::RestoreKeyWait;
+            }
+            _ => self.quit = true,
+        }
+    }
+
+    fn activate_home_profile(&mut self) {
+        if self.config.profiles.is_empty() {
+            return;
+        }
+        let idx = self
+            .profile_list_state
+            .selected()
+            .unwrap_or(0)
+            .min(self.config.profiles.len() - 1);
+        self.loading_index = idx;
+        self.active_profile_name = self.config.name_at(idx).cloned();
+        self.screen = Screen::Loading;
+    }
+
+    fn activate_selected_snapshot(&mut self) {
+        let visible = self.visible_snapshot_indices();
+        if let Some(pos) = self.list_state.selected()
+            && let Some(&abs) = visible.get(pos)
+            && let Some(s) = self.snapshots.get(abs)
+        {
+            self.browse_snapshot_id = s.id.clone();
+            self.pending_refresh_path = None;
+            self.screen = Screen::OpeningSnapshot;
+        }
+    }
+
+    fn activate_compare_first(&mut self) {
+        let visible = self.visible_snapshot_indices();
+        if let Some(pos) = self.compare_picker_state.selected()
+            && let Some(&abs) = visible.get(pos)
+            && let Some(s) = self.snapshots.get(abs)
+        {
+            self.compare_first_id = Some(s.id.clone());
+            self.compare_first_row_idx = Some(abs);
+            self.compare_only_related = true;
+            // Reset picker selection — index meaning changes with the new
+            // (related-only) visible set.
+            self.compare_picker_state = ListState::default();
+            if !self.compare_second_visible_indices().is_empty() {
+                self.compare_picker_state.select(Some(0));
+            }
+            self.screen = Screen::SnapshotCompareSecond;
+        }
+    }
+
+    fn activate_compare_second(&mut self) {
+        let visible = self.compare_second_visible_indices();
+        if let Some(pos) = self.compare_picker_state.selected()
+            && let Some(&abs) = visible.get(pos)
+            && let Some(s) = self.snapshots.get(abs)
+        {
+            self.compare_second_id = Some(s.id.clone());
+            self.screen = Screen::SnapshotCompareLoading;
+        }
+    }
+
+    fn activate_filter_dim(&mut self) {
+        let entries = filter_dim_entries(self.snapshot_filter.is_some());
+        let idx = self
+            .filter_picker_state
+            .selected()
+            .unwrap_or(0)
+            .min(entries.len().saturating_sub(1));
+        match entries.get(idx) {
+            Some(FilterDimEntry::Clear) => {
+                self.snapshot_filter = None;
+                self.enter_snapshots_from_filter();
+            }
+            Some(FilterDimEntry::Kind(k)) => {
+                self.open_filter_value_picker(*k);
+            }
+            None => {}
+        }
+    }
+
+    fn activate_filter_value(&mut self) {
+        if let (Some(kind), Some(idx)) =
+            (self.filter_pending_kind, self.filter_picker_state.selected())
+            && let Some(value) = self.filter_values.get(idx).cloned()
+        {
+            self.snapshot_filter = Some(match kind {
+                FilterKind::Host => SnapshotFilter::Host(value),
+                FilterKind::Tag => SnapshotFilter::Tag(value),
+                FilterKind::Path => SnapshotFilter::Path(value),
+            });
+            self.filter_pending_kind = None;
+            self.enter_snapshots_from_filter();
+        }
+    }
+
+    fn activate_snapshot_content(&mut self) {
+        let Some(f) = self.browse_stack.last() else {
+            return;
+        };
+        let Some(idx) = f.list_state.selected() else {
+            return;
+        };
+        let Some(row) = f.items.get(idx) else {
+            return;
+        };
+        match row.kind {
+            ContentKind::Parent => self.go_up(),
+            ContentKind::Dir => {
+                if let Some(subtree) = row.subtree {
+                    self.pending_descend = Some((subtree, row.name.clone()));
+                    self.screen = Screen::LoadingDir;
+                }
+            }
+            ContentKind::File | ContentKind::Symlink | ContentKind::Other => {
+                let dir_path = self
+                    .browse_stack
+                    .iter()
+                    .skip(1)
+                    .map(|fr| fr.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                let full_path = if dir_path.is_empty() {
+                    format!("/{}", row.name)
+                } else {
+                    format!("/{}/{}", dir_path, row.name)
+                };
+                self.pending_file_lookup = Some((f.tree_id, row.name.clone(), full_path));
+                self.file_details_scroll = 0;
+                self.screen = Screen::LoadingFileDetails;
+            }
+        }
+    }
+
+    fn activate_backend(&mut self) {
+        let idx = self
+            .backend_list
+            .selected()
+            .unwrap_or(0)
+            .min(BACKEND_ORDER.len() - 1);
+        self.backend_kind = BACKEND_ORDER[idx];
+        self.field_focus = 0;
+        self.screen = match self.backend_kind {
+            BackendKind::Local => Screen::LocalPath,
+            BackendKind::Rest => Screen::RestConfig,
+            BackendKind::S3 => Screen::S3Location,
+        };
+    }
+
     pub(crate) fn handle_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.quit = true;
@@ -577,24 +809,16 @@ impl App {
             Screen::FirstRunChoice => match key.code {
                 KeyCode::Down | KeyCode::Char('j') => self.first_run_state.select_next(),
                 KeyCode::Up | KeyCode::Char('k') => self.first_run_state.select_previous(),
+                KeyCode::PageDown => {
+                    let step = self.page_step();
+                    page_select(&mut self.first_run_state, FIRST_RUN_MENU.len(), true, step);
+                }
+                KeyCode::PageUp => {
+                    let step = self.page_step();
+                    page_select(&mut self.first_run_state, FIRST_RUN_MENU.len(), false, step);
+                }
                 KeyCode::Esc => self.quit = true,
-                KeyCode::Enter => match self.first_run_state.selected().unwrap_or(0) {
-                    0 => match config::generate_identity(&self.paths.identity) {
-                        Ok(pubkey) => {
-                            self.created_pubkey = pubkey;
-                            self.screen = Screen::KeyCreated;
-                        }
-                        Err(e) => {
-                            self.error_is_fatal = true;
-                            self.screen = Screen::Error(format!("{e:#}"));
-                        }
-                    },
-                    1 => {
-                        self.restore_error = None;
-                        self.screen = Screen::RestoreKeyWait;
-                    }
-                    _ => self.quit = true,
-                },
+                KeyCode::Enter => self.activate_first_run(),
                 _ => {}
             },
 
@@ -639,22 +863,30 @@ impl App {
             Screen::Home => match key.code {
                 KeyCode::Down | KeyCode::Char('j') => self.profile_list_state.select_next(),
                 KeyCode::Up | KeyCode::Char('k') => self.profile_list_state.select_previous(),
+                KeyCode::PageDown => {
+                    let step = self.page_step();
+                    page_select(
+                        &mut self.profile_list_state,
+                        self.config.profiles.len(),
+                        true,
+                        step,
+                    );
+                }
+                KeyCode::PageUp => {
+                    let step = self.page_step();
+                    page_select(
+                        &mut self.profile_list_state,
+                        self.config.profiles.len(),
+                        false,
+                        step,
+                    );
+                }
                 KeyCode::Esc | KeyCode::Char('q') => self.quit = true,
                 KeyCode::Char('n') => {
                     self.clear_creation_scratch();
                     self.screen = Screen::CreateProfileName;
                 }
-                KeyCode::Enter if !self.config.profiles.is_empty() => {
-                    let idx = self
-                        .profile_list_state
-                        .selected()
-                        .unwrap_or(0)
-                        .min(self.config.profiles.len() - 1);
-                    self.loading_index = idx;
-                    self.active_profile_name =
-                        self.config.name_at(idx).cloned();
-                    self.screen = Screen::Loading;
-                }
+                KeyCode::Enter if !self.config.profiles.is_empty() => self.activate_home_profile(),
                 KeyCode::Char('e') if !self.config.profiles.is_empty() => {
                     let idx = self
                         .profile_list_state
@@ -697,17 +929,17 @@ impl App {
                         self.list_state.select(Some(visible.len() - 1));
                     }
                 }
-                KeyCode::Enter => {
-                    let visible = self.visible_snapshot_indices();
-                    if let Some(pos) = self.list_state.selected()
-                        && let Some(&abs) = visible.get(pos)
-                        && let Some(s) = self.snapshots.get(abs)
-                    {
-                        self.browse_snapshot_id = s.id.clone();
-                        self.pending_refresh_path = None;
-                        self.screen = Screen::OpeningSnapshot;
-                    }
+                KeyCode::PageDown => {
+                    let step = self.page_step();
+                    let len = self.visible_snapshot_indices().len();
+                    page_select(&mut self.list_state, len, true, step);
                 }
+                KeyCode::PageUp => {
+                    let step = self.page_step();
+                    let len = self.visible_snapshot_indices().len();
+                    page_select(&mut self.list_state, len, false, step);
+                }
+                KeyCode::Enter => self.activate_selected_snapshot(),
                 KeyCode::Char('r') => {
                     self.snapshots.clear();
                     self.snapshot_filter = None;
@@ -760,24 +992,17 @@ impl App {
                         self.compare_picker_state.select(Some(visible.len() - 1));
                     }
                 }
-                KeyCode::Enter => {
-                    let visible = self.visible_snapshot_indices();
-                    if let Some(pos) = self.compare_picker_state.selected()
-                        && let Some(&abs) = visible.get(pos)
-                        && let Some(s) = self.snapshots.get(abs)
-                    {
-                        self.compare_first_id = Some(s.id.clone());
-                        self.compare_first_row_idx = Some(abs);
-                        self.compare_only_related = true;
-                        // Reset picker selection — index meaning changes with
-                        // the new (related-only) visible set.
-                        self.compare_picker_state = ListState::default();
-                        if !self.compare_second_visible_indices().is_empty() {
-                            self.compare_picker_state.select(Some(0));
-                        }
-                        self.screen = Screen::SnapshotCompareSecond;
-                    }
+                KeyCode::PageDown => {
+                    let step = self.page_step();
+                    let len = self.visible_snapshot_indices().len();
+                    page_select(&mut self.compare_picker_state, len, true, step);
                 }
+                KeyCode::PageUp => {
+                    let step = self.page_step();
+                    let len = self.visible_snapshot_indices().len();
+                    page_select(&mut self.compare_picker_state, len, false, step);
+                }
+                KeyCode::Enter => self.activate_compare_first(),
                 _ => {}
             },
 
@@ -809,6 +1034,16 @@ impl App {
                         self.compare_picker_state.select(Some(visible.len() - 1));
                     }
                 }
+                KeyCode::PageDown => {
+                    let step = self.page_step();
+                    let len = self.compare_second_visible_indices().len();
+                    page_select(&mut self.compare_picker_state, len, true, step);
+                }
+                KeyCode::PageUp => {
+                    let step = self.page_step();
+                    let len = self.compare_second_visible_indices().len();
+                    page_select(&mut self.compare_picker_state, len, false, step);
+                }
                 KeyCode::Char('a') => {
                     self.compare_only_related = !self.compare_only_related;
                     // Selection index meaning changes with the toggle; reset
@@ -820,16 +1055,7 @@ impl App {
                         self.compare_picker_state.select(Some(0));
                     }
                 }
-                KeyCode::Enter => {
-                    let visible = self.compare_second_visible_indices();
-                    if let Some(pos) = self.compare_picker_state.selected()
-                        && let Some(&abs) = visible.get(pos)
-                        && let Some(s) = self.snapshots.get(abs)
-                    {
-                        self.compare_second_id = Some(s.id.clone());
-                        self.screen = Screen::SnapshotCompareLoading;
-                    }
-                }
+                KeyCode::Enter => self.activate_compare_second(),
                 _ => {}
             },
 
@@ -850,31 +1076,42 @@ impl App {
                         self.compare_results_state.select(Some(changes.len() - 1));
                     }
                 }
+                KeyCode::PageDown => {
+                    let step = self.page_step();
+                    let len = self
+                        .compare_results
+                        .as_ref()
+                        .map(|(_, c)| c.len())
+                        .unwrap_or(0);
+                    page_select(&mut self.compare_results_state, len, true, step);
+                }
+                KeyCode::PageUp => {
+                    let step = self.page_step();
+                    let len = self
+                        .compare_results
+                        .as_ref()
+                        .map(|(_, c)| c.len())
+                        .unwrap_or(0);
+                    page_select(&mut self.compare_results_state, len, false, step);
+                }
                 _ => {}
             },
 
             Screen::SnapshotFilterDim => match key.code {
                 KeyCode::Down | KeyCode::Char('j') => self.filter_picker_state.select_next(),
                 KeyCode::Up | KeyCode::Char('k') => self.filter_picker_state.select_previous(),
-                KeyCode::Esc | KeyCode::Char('q') => self.screen = Screen::Snapshots,
-                KeyCode::Enter => {
-                    let entries = filter_dim_entries(self.snapshot_filter.is_some());
-                    let idx = self
-                        .filter_picker_state
-                        .selected()
-                        .unwrap_or(0)
-                        .min(entries.len().saturating_sub(1));
-                    match entries.get(idx) {
-                        Some(FilterDimEntry::Clear) => {
-                            self.snapshot_filter = None;
-                            self.enter_snapshots_from_filter();
-                        }
-                        Some(FilterDimEntry::Kind(k)) => {
-                            self.open_filter_value_picker(*k);
-                        }
-                        None => {}
-                    }
+                KeyCode::PageDown => {
+                    let step = self.page_step();
+                    let len = filter_dim_entries(self.snapshot_filter.is_some()).len();
+                    page_select(&mut self.filter_picker_state, len, true, step);
                 }
+                KeyCode::PageUp => {
+                    let step = self.page_step();
+                    let len = filter_dim_entries(self.snapshot_filter.is_some()).len();
+                    page_select(&mut self.filter_picker_state, len, false, step);
+                }
+                KeyCode::Esc | KeyCode::Char('q') => self.screen = Screen::Snapshots,
+                KeyCode::Enter => self.activate_filter_dim(),
                 _ => {}
             },
 
@@ -888,26 +1125,23 @@ impl App {
                             .select(Some(self.filter_values.len() - 1));
                     }
                 }
+                KeyCode::PageDown => {
+                    let step = self.page_step();
+                    let len = self.filter_values.len();
+                    page_select(&mut self.filter_picker_state, len, true, step);
+                }
+                KeyCode::PageUp => {
+                    let step = self.page_step();
+                    let len = self.filter_values.len();
+                    page_select(&mut self.filter_picker_state, len, false, step);
+                }
                 KeyCode::Esc | KeyCode::Char('q') => {
                     self.filter_pending_kind = None;
                     self.filter_picker_state = ListState::default();
                     self.filter_picker_state.select(Some(0));
                     self.screen = Screen::SnapshotFilterDim;
                 }
-                KeyCode::Enter => {
-                    if let (Some(kind), Some(idx)) =
-                        (self.filter_pending_kind, self.filter_picker_state.selected())
-                        && let Some(value) = self.filter_values.get(idx).cloned()
-                    {
-                        self.snapshot_filter = Some(match kind {
-                            FilterKind::Host => SnapshotFilter::Host(value),
-                            FilterKind::Tag => SnapshotFilter::Tag(value),
-                            FilterKind::Path => SnapshotFilter::Path(value),
-                        });
-                        self.filter_pending_kind = None;
-                        self.enter_snapshots_from_filter();
-                    }
-                }
+                KeyCode::Enter => self.activate_filter_value(),
                 _ => {}
             },
 
@@ -969,40 +1203,19 @@ impl App {
                         f.list_state.select(Some(f.items.len() - 1));
                     }
                 }
-                KeyCode::Enter => {
-                    if let Some(f) = self.browse_stack.last()
-                        && let Some(idx) = f.list_state.selected()
-                        && let Some(row) = f.items.get(idx)
-                    {
-                        match row.kind {
-                            ContentKind::Parent => self.go_up(),
-                            ContentKind::Dir => {
-                                if let Some(subtree) = row.subtree {
-                                    self.pending_descend = Some((subtree, row.name.clone()));
-                                    self.screen = Screen::LoadingDir;
-                                }
-                            }
-                            ContentKind::File | ContentKind::Symlink | ContentKind::Other => {
-                                let dir_path = self
-                                    .browse_stack
-                                    .iter()
-                                    .skip(1)
-                                    .map(|fr| fr.name.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join("/");
-                                let full_path = if dir_path.is_empty() {
-                                    format!("/{}", row.name)
-                                } else {
-                                    format!("/{}/{}", dir_path, row.name)
-                                };
-                                self.pending_file_lookup =
-                                    Some((f.tree_id, row.name.clone(), full_path));
-                                self.file_details_scroll = 0;
-                                self.screen = Screen::LoadingFileDetails;
-                            }
-                        }
+                KeyCode::PageDown => {
+                    let step = self.page_step();
+                    if let Some(f) = self.browse_stack.last_mut() {
+                        page_select(&mut f.list_state, f.items.len(), true, step);
                     }
                 }
+                KeyCode::PageUp => {
+                    let step = self.page_step();
+                    if let Some(f) = self.browse_stack.last_mut() {
+                        page_select(&mut f.list_state, f.items.len(), false, step);
+                    }
+                }
+                KeyCode::Enter => self.activate_snapshot_content(),
                 KeyCode::Backspace => self.go_up(),
                 KeyCode::Char('r') => {
                     let path: Vec<String> = self
@@ -1042,6 +1255,14 @@ impl App {
                 KeyCode::Home | KeyCode::Char('g') => {
                     self.file_details_scroll = 0;
                 }
+                KeyCode::PageDown => {
+                    let step = self.page_step() as u16;
+                    self.file_details_scroll = self.file_details_scroll.saturating_add(step);
+                }
+                KeyCode::PageUp => {
+                    let step = self.page_step() as u16;
+                    self.file_details_scroll = self.file_details_scroll.saturating_sub(step);
+                }
                 _ => {}
             },
 
@@ -1070,20 +1291,15 @@ impl App {
             Screen::BackendChoice => match key.code {
                 KeyCode::Down | KeyCode::Char('j') => self.backend_list.select_next(),
                 KeyCode::Up | KeyCode::Char('k') => self.backend_list.select_previous(),
-                KeyCode::Enter => {
-                    let idx = self
-                        .backend_list
-                        .selected()
-                        .unwrap_or(0)
-                        .min(BACKEND_ORDER.len() - 1);
-                    self.backend_kind = BACKEND_ORDER[idx];
-                    self.field_focus = 0;
-                    self.screen = match self.backend_kind {
-                        BackendKind::Local => Screen::LocalPath,
-                        BackendKind::Rest => Screen::RestConfig,
-                        BackendKind::S3 => Screen::S3Location,
-                    };
+                KeyCode::PageDown => {
+                    let step = self.page_step();
+                    page_select(&mut self.backend_list, BACKEND_ORDER.len(), true, step);
                 }
+                KeyCode::PageUp => {
+                    let step = self.page_step();
+                    page_select(&mut self.backend_list, BACKEND_ORDER.len(), false, step);
+                }
+                KeyCode::Enter => self.activate_backend(),
                 KeyCode::Esc => self.screen = Screen::CreateProfileName,
                 _ => {}
             },
@@ -1269,6 +1485,191 @@ impl App {
             }
         }
     }
+
+    pub(crate) fn handle_mouse(&mut self, m: MouseEvent) {
+        // Only left-click and the vertical scroll wheel are wired up;
+        // right/middle/drag/motion are ignored.
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => self.handle_left_click(m.row, m.column),
+            MouseEventKind::ScrollDown => self.handle_wheel(true),
+            MouseEventKind::ScrollUp => self.handle_wheel(false),
+            _ => {}
+        }
+    }
+
+    fn handle_left_click(&mut self, row: u16, col: u16) {
+        let Some(area) = self.list_area else {
+            return;
+        };
+        match &self.screen {
+            Screen::FirstRunChoice => {
+                if let Some(idx) =
+                    click_to_index(area, self.first_run_state.offset(), FIRST_RUN_MENU.len(), row, col)
+                {
+                    self.first_run_state.select(Some(idx));
+                    self.activate_first_run();
+                }
+            }
+            Screen::Home => {
+                let len = self.config.profiles.len();
+                if let Some(idx) =
+                    click_to_index(area, self.profile_list_state.offset(), len, row, col)
+                {
+                    self.profile_list_state.select(Some(idx));
+                    self.activate_home_profile();
+                }
+            }
+            Screen::BackendChoice => {
+                if let Some(idx) =
+                    click_to_index(area, self.backend_list.offset(), BACKEND_ORDER.len(), row, col)
+                {
+                    self.backend_list.select(Some(idx));
+                    self.activate_backend();
+                }
+            }
+            Screen::Snapshots => {
+                let len = self.visible_snapshot_indices().len();
+                if let Some(idx) = click_to_index(area, self.list_state.offset(), len, row, col) {
+                    self.list_state.select(Some(idx));
+                    self.activate_selected_snapshot();
+                }
+            }
+            Screen::SnapshotCompareFirst => {
+                let len = self.visible_snapshot_indices().len();
+                if let Some(idx) =
+                    click_to_index(area, self.compare_picker_state.offset(), len, row, col)
+                {
+                    self.compare_picker_state.select(Some(idx));
+                    self.activate_compare_first();
+                }
+            }
+            Screen::SnapshotCompareSecond => {
+                let len = self.compare_second_visible_indices().len();
+                if let Some(idx) =
+                    click_to_index(area, self.compare_picker_state.offset(), len, row, col)
+                {
+                    self.compare_picker_state.select(Some(idx));
+                    self.activate_compare_second();
+                }
+            }
+            Screen::SnapshotCompareResults => {
+                let len = self
+                    .compare_results
+                    .as_ref()
+                    .map(|(_, c)| c.len())
+                    .unwrap_or(0);
+                if let Some(idx) =
+                    click_to_index(area, self.compare_results_state.offset(), len, row, col)
+                {
+                    self.compare_results_state.select(Some(idx));
+                }
+            }
+            Screen::SnapshotFilterDim => {
+                let len = filter_dim_entries(self.snapshot_filter.is_some()).len();
+                if let Some(idx) =
+                    click_to_index(area, self.filter_picker_state.offset(), len, row, col)
+                {
+                    self.filter_picker_state.select(Some(idx));
+                    self.activate_filter_dim();
+                }
+            }
+            Screen::SnapshotFilterValue => {
+                let len = self.filter_values.len();
+                if let Some(idx) =
+                    click_to_index(area, self.filter_picker_state.offset(), len, row, col)
+                {
+                    self.filter_picker_state.select(Some(idx));
+                    self.activate_filter_value();
+                }
+            }
+            Screen::SnapshotContents => {
+                let Some(f) = self.browse_stack.last_mut() else {
+                    return;
+                };
+                let len = f.items.len();
+                let offset = f.list_state.offset();
+                if let Some(idx) = click_to_index(area, offset, len, row, col) {
+                    f.list_state.select(Some(idx));
+                    self.activate_snapshot_content();
+                }
+            }
+            // FileDetails has no list; clicks are ignored.
+            // All other screens (Loading/Verifying/inputs/confirm dialogs)
+            // don't have a selectable list.
+            _ => {}
+        }
+    }
+
+    fn handle_wheel(&mut self, down: bool) {
+        match &self.screen {
+            Screen::FirstRunChoice => {
+                if down {
+                    self.first_run_state.select_next();
+                } else {
+                    self.first_run_state.select_previous();
+                }
+            }
+            Screen::Home => {
+                if down {
+                    self.profile_list_state.select_next();
+                } else {
+                    self.profile_list_state.select_previous();
+                }
+            }
+            Screen::BackendChoice => {
+                if down {
+                    self.backend_list.select_next();
+                } else {
+                    self.backend_list.select_previous();
+                }
+            }
+            Screen::Snapshots => {
+                if down {
+                    self.list_state.select_next();
+                } else {
+                    self.list_state.select_previous();
+                }
+            }
+            Screen::SnapshotCompareFirst | Screen::SnapshotCompareSecond => {
+                if down {
+                    self.compare_picker_state.select_next();
+                } else {
+                    self.compare_picker_state.select_previous();
+                }
+            }
+            Screen::SnapshotCompareResults => {
+                if down {
+                    self.compare_results_state.select_next();
+                } else {
+                    self.compare_results_state.select_previous();
+                }
+            }
+            Screen::SnapshotFilterDim | Screen::SnapshotFilterValue => {
+                if down {
+                    self.filter_picker_state.select_next();
+                } else {
+                    self.filter_picker_state.select_previous();
+                }
+            }
+            Screen::SnapshotContents => {
+                if let Some(f) = self.browse_stack.last_mut() {
+                    if down {
+                        f.list_state.select_next();
+                    } else {
+                        f.list_state.select_previous();
+                    }
+                }
+            }
+            Screen::FileDetails => {
+                if down {
+                    self.file_details_scroll = self.file_details_scroll.saturating_add(1);
+                } else {
+                    self.file_details_scroll = self.file_details_scroll.saturating_sub(1);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1442,5 +1843,46 @@ mod tests {
         app.compare_only_related = false;
         // Even with related=off, the host filter narrows to laptop rows only.
         assert_eq!(app.compare_second_visible_indices(), vec![1]);
+    }
+
+    #[test]
+    fn click_to_index_maps_interior_rows_through_offset() {
+        // A bordered 20×10 list at terminal (5, 2): borders consume row 2,
+        // row 11, col 5 and col 24. Interior rows are 3..=10.
+        let area = Rect { x: 5, y: 2, width: 20, height: 10 };
+        // Clicking the first interior row (row=3) with offset=0 → idx 0.
+        assert_eq!(click_to_index(area, 0, 100, 3, 10), Some(0));
+        // Last interior row (row=10) with offset=0 → idx 7.
+        assert_eq!(click_to_index(area, 0, 100, 10, 10), Some(7));
+        // Same click with offset=4 → idx 11.
+        assert_eq!(click_to_index(area, 4, 100, 10, 10), Some(11));
+    }
+
+    #[test]
+    fn click_to_index_rejects_borders_and_outside() {
+        let area = Rect { x: 5, y: 2, width: 20, height: 10 };
+        // Top border row.
+        assert_eq!(click_to_index(area, 0, 100, 2, 10), None);
+        // Bottom border row.
+        assert_eq!(click_to_index(area, 0, 100, 11, 10), None);
+        // Left border column.
+        assert_eq!(click_to_index(area, 0, 100, 5, 5), None);
+        // Right border column.
+        assert_eq!(click_to_index(area, 0, 100, 5, 24), None);
+        // Above and below the rect entirely.
+        assert_eq!(click_to_index(area, 0, 100, 0, 10), None);
+        assert_eq!(click_to_index(area, 0, 100, 99, 10), None);
+    }
+
+    #[test]
+    fn click_to_index_clamps_to_list_length() {
+        let area = Rect { x: 0, y: 0, width: 10, height: 10 };
+        // Interior rows 1..=8, but only 3 items in the list.
+        assert_eq!(click_to_index(area, 0, 3, 1, 5), Some(0));
+        assert_eq!(click_to_index(area, 0, 3, 3, 5), Some(2));
+        // Row 4 is the empty area past the last item.
+        assert_eq!(click_to_index(area, 0, 3, 4, 5), None);
+        // Empty list rejects all clicks.
+        assert_eq!(click_to_index(area, 0, 0, 1, 5), None);
     }
 }
