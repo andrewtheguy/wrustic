@@ -105,6 +105,21 @@ impl SnapshotFilter {
     }
 }
 
+// Jump a list selection by `step` rows in the given direction, clamping to
+// the list bounds. Used by PageUp/PageDown handlers.
+fn page_select(state: &mut ListState, len: usize, forward: bool, step: usize) {
+    if len == 0 {
+        return;
+    }
+    let cur = state.selected().unwrap_or(0);
+    let new = if forward {
+        cur.saturating_add(step).min(len - 1)
+    } else {
+        cur.saturating_sub(step)
+    };
+    state.select(Some(new));
+}
+
 pub(crate) struct BrowseFrame {
     pub(crate) name: String,
     pub(crate) tree_id: TreeId,
@@ -180,6 +195,11 @@ pub(crate) struct App {
     pub(crate) compare_picker_state: ListState,
     pub(crate) compare_results: Option<(DiffSummary, Vec<DiffChange>)>,
     pub(crate) compare_results_state: ListState,
+
+    // Inner height of the currently-rendered list/paragraph, used to size
+    // PageUp/PageDown jumps. Set by the renderer each frame; read by the
+    // key handler on the next event.
+    pub(crate) viewport_rows: u16,
 }
 
 impl App {
@@ -246,6 +266,7 @@ impl App {
             compare_picker_state: ListState::default(),
             compare_results: None,
             compare_results_state: ListState::default(),
+            viewport_rows: 0,
         };
 
         if !identity_exists {
@@ -440,6 +461,12 @@ impl App {
         }
     }
 
+    // Rows to jump on PageDown/PageUp. One row of overlap with the previous
+    // page keeps a bit of context across the jump.
+    fn page_step(&self) -> usize {
+        self.viewport_rows.saturating_sub(1).max(1) as usize
+    }
+
     // Indices into `self.snapshots` for rows that pass the current filter,
     // preserving the underlying time-desc order.
     pub(crate) fn visible_snapshot_indices(&self) -> Vec<usize> {
@@ -577,6 +604,14 @@ impl App {
             Screen::FirstRunChoice => match key.code {
                 KeyCode::Down | KeyCode::Char('j') => self.first_run_state.select_next(),
                 KeyCode::Up | KeyCode::Char('k') => self.first_run_state.select_previous(),
+                KeyCode::PageDown => {
+                    let step = self.page_step();
+                    page_select(&mut self.first_run_state, FIRST_RUN_MENU.len(), true, step);
+                }
+                KeyCode::PageUp => {
+                    let step = self.page_step();
+                    page_select(&mut self.first_run_state, FIRST_RUN_MENU.len(), false, step);
+                }
                 KeyCode::Esc => self.quit = true,
                 KeyCode::Enter => match self.first_run_state.selected().unwrap_or(0) {
                     0 => match config::generate_identity(&self.paths.identity) {
@@ -639,6 +674,24 @@ impl App {
             Screen::Home => match key.code {
                 KeyCode::Down | KeyCode::Char('j') => self.profile_list_state.select_next(),
                 KeyCode::Up | KeyCode::Char('k') => self.profile_list_state.select_previous(),
+                KeyCode::PageDown => {
+                    let step = self.page_step();
+                    page_select(
+                        &mut self.profile_list_state,
+                        self.config.profiles.len(),
+                        true,
+                        step,
+                    );
+                }
+                KeyCode::PageUp => {
+                    let step = self.page_step();
+                    page_select(
+                        &mut self.profile_list_state,
+                        self.config.profiles.len(),
+                        false,
+                        step,
+                    );
+                }
                 KeyCode::Esc | KeyCode::Char('q') => self.quit = true,
                 KeyCode::Char('n') => {
                     self.clear_creation_scratch();
@@ -696,6 +749,16 @@ impl App {
                     if !visible.is_empty() {
                         self.list_state.select(Some(visible.len() - 1));
                     }
+                }
+                KeyCode::PageDown => {
+                    let step = self.page_step();
+                    let len = self.visible_snapshot_indices().len();
+                    page_select(&mut self.list_state, len, true, step);
+                }
+                KeyCode::PageUp => {
+                    let step = self.page_step();
+                    let len = self.visible_snapshot_indices().len();
+                    page_select(&mut self.list_state, len, false, step);
                 }
                 KeyCode::Enter => {
                     let visible = self.visible_snapshot_indices();
@@ -760,6 +823,16 @@ impl App {
                         self.compare_picker_state.select(Some(visible.len() - 1));
                     }
                 }
+                KeyCode::PageDown => {
+                    let step = self.page_step();
+                    let len = self.visible_snapshot_indices().len();
+                    page_select(&mut self.compare_picker_state, len, true, step);
+                }
+                KeyCode::PageUp => {
+                    let step = self.page_step();
+                    let len = self.visible_snapshot_indices().len();
+                    page_select(&mut self.compare_picker_state, len, false, step);
+                }
                 KeyCode::Enter => {
                     let visible = self.visible_snapshot_indices();
                     if let Some(pos) = self.compare_picker_state.selected()
@@ -809,6 +882,16 @@ impl App {
                         self.compare_picker_state.select(Some(visible.len() - 1));
                     }
                 }
+                KeyCode::PageDown => {
+                    let step = self.page_step();
+                    let len = self.compare_second_visible_indices().len();
+                    page_select(&mut self.compare_picker_state, len, true, step);
+                }
+                KeyCode::PageUp => {
+                    let step = self.page_step();
+                    let len = self.compare_second_visible_indices().len();
+                    page_select(&mut self.compare_picker_state, len, false, step);
+                }
                 KeyCode::Char('a') => {
                     self.compare_only_related = !self.compare_only_related;
                     // Selection index meaning changes with the toggle; reset
@@ -850,12 +933,40 @@ impl App {
                         self.compare_results_state.select(Some(changes.len() - 1));
                     }
                 }
+                KeyCode::PageDown => {
+                    let step = self.page_step();
+                    let len = self
+                        .compare_results
+                        .as_ref()
+                        .map(|(_, c)| c.len())
+                        .unwrap_or(0);
+                    page_select(&mut self.compare_results_state, len, true, step);
+                }
+                KeyCode::PageUp => {
+                    let step = self.page_step();
+                    let len = self
+                        .compare_results
+                        .as_ref()
+                        .map(|(_, c)| c.len())
+                        .unwrap_or(0);
+                    page_select(&mut self.compare_results_state, len, false, step);
+                }
                 _ => {}
             },
 
             Screen::SnapshotFilterDim => match key.code {
                 KeyCode::Down | KeyCode::Char('j') => self.filter_picker_state.select_next(),
                 KeyCode::Up | KeyCode::Char('k') => self.filter_picker_state.select_previous(),
+                KeyCode::PageDown => {
+                    let step = self.page_step();
+                    let len = filter_dim_entries(self.snapshot_filter.is_some()).len();
+                    page_select(&mut self.filter_picker_state, len, true, step);
+                }
+                KeyCode::PageUp => {
+                    let step = self.page_step();
+                    let len = filter_dim_entries(self.snapshot_filter.is_some()).len();
+                    page_select(&mut self.filter_picker_state, len, false, step);
+                }
                 KeyCode::Esc | KeyCode::Char('q') => self.screen = Screen::Snapshots,
                 KeyCode::Enter => {
                     let entries = filter_dim_entries(self.snapshot_filter.is_some());
@@ -887,6 +998,16 @@ impl App {
                         self.filter_picker_state
                             .select(Some(self.filter_values.len() - 1));
                     }
+                }
+                KeyCode::PageDown => {
+                    let step = self.page_step();
+                    let len = self.filter_values.len();
+                    page_select(&mut self.filter_picker_state, len, true, step);
+                }
+                KeyCode::PageUp => {
+                    let step = self.page_step();
+                    let len = self.filter_values.len();
+                    page_select(&mut self.filter_picker_state, len, false, step);
                 }
                 KeyCode::Esc | KeyCode::Char('q') => {
                     self.filter_pending_kind = None;
@@ -969,6 +1090,18 @@ impl App {
                         f.list_state.select(Some(f.items.len() - 1));
                     }
                 }
+                KeyCode::PageDown => {
+                    let step = self.page_step();
+                    if let Some(f) = self.browse_stack.last_mut() {
+                        page_select(&mut f.list_state, f.items.len(), true, step);
+                    }
+                }
+                KeyCode::PageUp => {
+                    let step = self.page_step();
+                    if let Some(f) = self.browse_stack.last_mut() {
+                        page_select(&mut f.list_state, f.items.len(), false, step);
+                    }
+                }
                 KeyCode::Enter => {
                     if let Some(f) = self.browse_stack.last()
                         && let Some(idx) = f.list_state.selected()
@@ -1042,6 +1175,14 @@ impl App {
                 KeyCode::Home | KeyCode::Char('g') => {
                     self.file_details_scroll = 0;
                 }
+                KeyCode::PageDown => {
+                    let step = self.viewport_rows.saturating_sub(1).max(1);
+                    self.file_details_scroll = self.file_details_scroll.saturating_add(step);
+                }
+                KeyCode::PageUp => {
+                    let step = self.viewport_rows.saturating_sub(1).max(1);
+                    self.file_details_scroll = self.file_details_scroll.saturating_sub(step);
+                }
                 _ => {}
             },
 
@@ -1070,6 +1211,14 @@ impl App {
             Screen::BackendChoice => match key.code {
                 KeyCode::Down | KeyCode::Char('j') => self.backend_list.select_next(),
                 KeyCode::Up | KeyCode::Char('k') => self.backend_list.select_previous(),
+                KeyCode::PageDown => {
+                    let step = self.page_step();
+                    page_select(&mut self.backend_list, BACKEND_ORDER.len(), true, step);
+                }
+                KeyCode::PageUp => {
+                    let step = self.page_step();
+                    page_select(&mut self.backend_list, BACKEND_ORDER.len(), false, step);
+                }
                 KeyCode::Enter => {
                     let idx = self
                         .backend_list

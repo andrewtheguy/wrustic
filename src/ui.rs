@@ -45,29 +45,31 @@ fn render_bottom_bar(frame: &mut Frame, app: &App, area: Rect) {
 
 fn bottom_bar_text(screen: &Screen) -> &'static str {
     match screen {
-        Screen::FirstRunChoice => "j/k move  Enter pick  Esc quit",
+        Screen::FirstRunChoice => "j/k move  PgUp/PgDn page  Enter pick  Esc quit",
         Screen::RestoreKeyWait => "Enter retry  Esc back",
         Screen::KeyCreated => "Enter continue  Esc quit",
-        Screen::Home => "j/k move  Enter open  n new  e edit  d delete  q quit",
+        Screen::Home => "j/k move  PgUp/PgDn page  Enter open  n new  e edit  d delete  q quit",
         Screen::Snapshots => {
-            "j/k move  g/G top/bottom  Enter browse  c compare  f filter  d delete  r refresh  q/Esc back"
+            "j/k move  PgUp/PgDn page  g/G top/bottom  Enter browse  c compare  f filter  d delete  r refresh  q/Esc back"
         }
-        Screen::SnapshotFilterDim => "j/k move  Enter pick  Esc back",
-        Screen::SnapshotFilterValue => "j/k move  g/G top/bottom  Enter pick  Esc back",
+        Screen::SnapshotFilterDim => "j/k move  PgUp/PgDn page  Enter pick  Esc back",
+        Screen::SnapshotFilterValue => {
+            "j/k move  PgUp/PgDn page  g/G top/bottom  Enter pick  Esc back"
+        }
         Screen::SnapshotDeleteInfo => "y proceed  n/Esc cancel",
         Screen::SnapshotDeleteConfirm => "y confirm delete  n/Esc cancel",
         Screen::SnapshotDeleteError(_) => "any key to continue",
         Screen::SnapshotContents => {
-            "j/k move  g/G top/bottom  Enter open  Backspace up  r reload  q/Esc back"
+            "j/k move  PgUp/PgDn page  g/G top/bottom  Enter open  Backspace up  r reload  q/Esc back"
         }
-        Screen::FileDetails => "j/k scroll  g top  Enter/Esc/Backspace/q back",
+        Screen::FileDetails => "j/k scroll  PgUp/PgDn page  g top  Enter/Esc/Backspace/q back",
         Screen::SnapshotCompareFirst => {
-            "j/k move  g/G top/bottom  Enter pick FIRST  Esc cancel"
+            "j/k move  PgUp/PgDn page  g/G top/bottom  Enter pick FIRST  Esc cancel"
         }
         Screen::SnapshotCompareSecond => {
-            "j/k move  g/G top/bottom  Enter pick SECOND  a toggle related/all  Esc back"
+            "j/k move  PgUp/PgDn page  g/G top/bottom  Enter pick SECOND  a toggle related/all  Esc back"
         }
-        Screen::SnapshotCompareResults => "j/k move  g/G top/bottom  q/Esc back",
+        Screen::SnapshotCompareResults => "j/k move  PgUp/PgDn page  g/G top/bottom  q/Esc back",
         Screen::OpeningSnapshot
         | Screen::LoadingDir
         | Screen::LoadingFileDetails
@@ -77,7 +79,7 @@ fn bottom_bar_text(screen: &Screen) -> &'static str {
         | Screen::SnapshotDeleteContentsLoading
         | Screen::SnapshotCompareLoading => "working…",
         Screen::CreateProfileName => "type  Enter submit  Esc cancel",
-        Screen::BackendChoice => "j/k move  Enter pick  Esc back",
+        Screen::BackendChoice => "j/k move  PgUp/PgDn page  Enter pick  Esc back",
         Screen::LocalPath => "type  Enter submit  Esc back",
         Screen::RestConfig | Screen::S3Location | Screen::S3Credentials => {
             "Tab/Shift+Tab field  Enter continue  Esc back"
@@ -237,6 +239,7 @@ fn render_first_run_choice(frame: &mut Frame, app: &mut App, area: Rect) {
         .block(Block::bordered().title("j/k to move, Enter to pick, Esc to quit"))
         .highlight_style(selection_highlight())
         .highlight_symbol(">> ");
+    record_viewport(app, list_area);
     frame.render_stateful_widget(list, list_area, &mut app.first_run_state);
 }
 
@@ -277,6 +280,13 @@ fn selection_highlight() -> Style {
     Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD)
 }
 
+// Record the inner height of a bordered scroll/list area so PageUp/PageDown
+// can size their jump to the visible page. `area` is the outer rect that
+// gets `Block::bordered()` — subtract 2 rows for the borders.
+fn record_viewport(app: &mut App, area: Rect) {
+    app.viewport_rows = area.height.saturating_sub(2);
+}
+
 // Decorate a creation/edit screen title with the in-progress profile name so
 // the user can always see which profile they are editing.
 fn profile_title(base: &str, app: &App) -> String {
@@ -311,6 +321,7 @@ fn render_home(frame: &mut Frame, app: &mut App, area: Rect) {
         .highlight_style(selection_highlight())
         .highlight_symbol(">> ");
 
+    record_viewport(app, area);
     frame.render_stateful_widget(list, area, &mut app.profile_list_state);
 }
 
@@ -332,6 +343,7 @@ fn render_backend_choice(frame: &mut Frame, app: &mut App, area: Rect) {
         .highlight_style(selection_highlight())
         .highlight_symbol(">> ");
 
+    record_viewport(app, area);
     frame.render_stateful_widget(list, area, &mut app.backend_list);
 }
 
@@ -499,6 +511,7 @@ fn render_snapshots(frame: &mut Frame, app: &mut App, area: Rect) {
         ),
     };
 
+    record_viewport(app, area);
     render_snapshot_picker(frame, area, &title, &app.snapshots, &visible, &mut app.list_state);
 }
 
@@ -544,6 +557,7 @@ fn render_snapshot_picker(
 fn render_compare_first(frame: &mut Frame, app: &mut App, area: Rect) {
     let visible = app.visible_snapshot_indices();
     let title = format!("Compare — pick FIRST snapshot ({})", visible.len());
+    record_viewport(app, area);
     render_snapshot_picker(
         frame,
         area,
@@ -566,6 +580,7 @@ fn render_compare_second(frame: &mut Frame, app: &mut App, area: Rect) {
         "Compare {first_short}.. — pick SECOND snapshot ({}, {scope})",
         visible.len()
     );
+    record_viewport(app, area);
     render_snapshot_picker(
         frame,
         area,
@@ -634,6 +649,7 @@ fn render_compare_results(frame: &mut Frame, app: &mut App, area: Rect) {
         .block(Block::bordered().title(format!("Changes ({count})")))
         .highlight_style(selection_highlight())
         .highlight_symbol(">> ");
+    record_viewport(app, body);
     frame.render_stateful_widget(list, body, &mut app.compare_results_state);
 }
 
@@ -647,10 +663,12 @@ fn render_filter_dim(frame: &mut Frame, app: &mut App, area: Rect) {
         .block(Block::bordered().title("Filter snapshots by"))
         .highlight_style(selection_highlight())
         .highlight_symbol(">> ");
+    record_viewport(app, area);
     frame.render_stateful_widget(list, area, &mut app.filter_picker_state);
 }
 
 fn render_filter_value(frame: &mut Frame, app: &mut App, area: Rect) {
+    record_viewport(app, area);
     let kind_label = app
         .filter_pending_kind
         .map(|k| k.label())
@@ -728,11 +746,12 @@ fn render_snapshot_contents(frame: &mut Frame, app: &mut App, area: Rect) {
         .highlight_style(selection_highlight())
         .highlight_symbol(">> ");
 
+    record_viewport(app, area);
     let top_mut = &mut app.browse_stack[frame_idx];
     frame.render_stateful_widget(list, area, &mut top_mut.list_state);
 }
 
-fn render_file_details(frame: &mut Frame, app: &App, area: Rect) {
+fn render_file_details(frame: &mut Frame, app: &mut App, area: Rect) {
     let Some(d) = app.file_details.as_ref() else {
         let para = Paragraph::new("(no file selected)")
             .block(Block::bordered().title("File details"));
@@ -796,6 +815,7 @@ fn render_file_details(frame: &mut Frame, app: &App, area: Rect) {
         .block(
             Block::bordered().title(format!("File details — {}", short_path(&d.full_path))),
         );
+    record_viewport(app, area);
     frame.render_widget(para, area);
 }
 
