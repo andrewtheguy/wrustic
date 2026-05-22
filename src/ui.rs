@@ -60,6 +60,7 @@ fn bottom_bar_text(screen: &Screen) -> &'static str {
         Screen::SnapshotContents => {
             "j/k move  g/G top/bottom  Enter open  Backspace up  r reload  q/Esc back"
         }
+        Screen::FileDetails => "j/k scroll  g top  Enter/Esc/Backspace/q back",
         Screen::SnapshotCompareFirst => {
             "j/k move  g/G top/bottom  Enter pick FIRST  Esc cancel"
         }
@@ -69,6 +70,7 @@ fn bottom_bar_text(screen: &Screen) -> &'static str {
         Screen::SnapshotCompareResults => "j/k move  g/G top/bottom  q/Esc back",
         Screen::OpeningSnapshot
         | Screen::LoadingDir
+        | Screen::LoadingFileDetails
         | Screen::Loading
         | Screen::Verifying
         | Screen::SnapshotDeleting
@@ -189,7 +191,13 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
                 .block(Block::bordered().title("Loading"));
             frame.render_widget(para, area);
         }
+        Screen::LoadingFileDetails => {
+            let para = Paragraph::new("Reading file details…")
+                .block(Block::bordered().title("Loading"));
+            frame.render_widget(para, area);
+        }
         Screen::SnapshotContents => render_snapshot_contents(frame, app, area),
+        Screen::FileDetails => render_file_details(frame, app, area),
         Screen::SnapshotCompareFirst => render_compare_first(frame, app, area),
         Screen::SnapshotCompareSecond => render_compare_second(frame, app, area),
         Screen::SnapshotCompareLoading => render_compare_loading(frame, app, area),
@@ -724,6 +732,94 @@ fn render_snapshot_contents(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_stateful_widget(list, area, &mut top_mut.list_state);
 }
 
+fn render_file_details(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(d) = app.file_details.as_ref() else {
+        let para = Paragraph::new("(no file selected)")
+            .block(Block::bordered().title("File details"));
+        frame.render_widget(para, area);
+        return;
+    };
+
+    let mut lines = String::new();
+    lines.push_str(&format!("Name:  {}\n", d.name));
+    lines.push_str(&format!("Path:  {}\n", d.full_path));
+    lines.push_str(&format!("Type:  {}\n", d.kind_label));
+    lines.push_str(&format!("Size:  {} ({} bytes)\n", human_size(d.size), d.size));
+    if let Some(m) = d.mode {
+        lines.push_str(&format!("Mode:  0{m:o}\n"));
+    }
+    if let Some(t) = &d.mtime {
+        lines.push_str(&format!("mtime: {t}\n"));
+    }
+    if let Some(t) = &d.atime {
+        lines.push_str(&format!("atime: {t}\n"));
+    }
+    if let Some(t) = &d.ctime {
+        lines.push_str(&format!("ctime: {t}\n"));
+    }
+    let owner = match (d.user.as_deref(), d.uid) {
+        (Some(u), Some(n)) => format!("{u} ({n})"),
+        (Some(u), None) => u.to_string(),
+        (None, Some(n)) => n.to_string(),
+        (None, None) => String::new(),
+    };
+    let group = match (d.group.as_deref(), d.gid) {
+        (Some(g), Some(n)) => format!("{g} ({n})"),
+        (Some(g), None) => g.to_string(),
+        (None, Some(n)) => n.to_string(),
+        (None, None) => String::new(),
+    };
+    if !owner.is_empty() || !group.is_empty() {
+        lines.push_str(&format!("Owner: {owner} / {group}\n"));
+    }
+    if let Some(t) = &d.linktarget {
+        lines.push_str(&format!("Link target: {t}\n"));
+    }
+    if !d.content_hashes.is_empty() {
+        lines.push_str(&format!(
+            "\nContent blob SHA-256 ({} chunk{}):\n",
+            d.content_hashes.len(),
+            if d.content_hashes.len() == 1 { "" } else { "s" },
+        ));
+        for h in &d.content_hashes {
+            lines.push_str("  ");
+            lines.push_str(h);
+            lines.push('\n');
+        }
+    } else if matches!(d.kind, ContentKind::File) {
+        lines.push_str("\n(empty file — no content blobs)\n");
+    }
+
+    let para = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((app.file_details_scroll, 0))
+        .block(
+            Block::bordered().title(format!("File details — {}", short_path(&d.full_path))),
+        );
+    frame.render_widget(para, area);
+}
+
+// Truncate a path for a title — keep the tail since the basename is usually
+// the most identifying piece. Returns the full path if it already fits.
+// Operates on character counts (not bytes) so multi-byte filenames don't
+// panic from slicing inside a codepoint.
+fn short_path(p: &str) -> String {
+    const MAX_CHARS: usize = 60;
+    let nchars = p.chars().count();
+    if nchars <= MAX_CHARS {
+        return p.to_string();
+    }
+    // Keep the trailing (MAX_CHARS - 1) chars; the leading "…" takes the
+    // remaining char-width, so total displayed width stays at MAX_CHARS.
+    let skip = nchars - (MAX_CHARS - 1);
+    let byte_offset = p
+        .char_indices()
+        .nth(skip)
+        .map(|(i, _)| i)
+        .unwrap_or(p.len());
+    format!("…{}", &p[byte_offset..])
+}
+
 fn short_snap_id(id: &str) -> &str {
     let end = id.char_indices().nth(8).map(|(i, _)| i).unwrap_or(id.len());
     &id[..end]
@@ -923,7 +1019,7 @@ fn render_snapshot_delete_confirm(frame: &mut Frame, app: &App, area: Rect) {
 
 #[cfg(test)]
 mod tests {
-    use super::human_size;
+    use super::{human_size, short_path};
 
     #[test]
     fn human_size_formats() {
@@ -933,5 +1029,29 @@ mod tests {
         assert_eq!(human_size(1536), "1.5 K");
         assert_eq!(human_size(1024 * 1024), "1.0 M");
         assert_eq!(human_size(3 * 1024 * 1024 * 1024), "3.0 G");
+    }
+
+    #[test]
+    fn short_path_passes_short_inputs_through() {
+        let s = "/home/x/foo.txt";
+        assert_eq!(short_path(s), s);
+    }
+
+    #[test]
+    fn short_path_truncates_long_paths_from_the_head() {
+        let s: String = std::iter::repeat_n('a', 120).collect();
+        let out = short_path(&s);
+        assert_eq!(out.chars().count(), 60);
+        assert!(out.starts_with('…'));
+    }
+
+    #[test]
+    fn short_path_handles_multibyte_chars_without_panicking() {
+        // 80 emoji (4 bytes each in UTF-8) — the previous byte-indexed slice
+        // would land mid-codepoint and panic.
+        let s: String = std::iter::repeat_n('🦀', 80).collect();
+        let out = short_path(&s);
+        assert_eq!(out.chars().count(), 60);
+        assert!(out.starts_with('…'));
     }
 }

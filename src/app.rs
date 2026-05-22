@@ -10,7 +10,7 @@ use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
 use crate::config::{self, BackendKind, Config, Paths, Profile};
-use crate::repo::{ContentKind, ContentRow, ContentsPreview, SnapshotRow};
+use crate::repo::{ContentKind, ContentRow, ContentsPreview, FileDetails, SnapshotRow};
 use crate::restic::{self, DiffChange, DiffSummary, ResticError, ResticInfo, SnapshotDetails};
 
 pub(crate) const BACKEND_ORDER: [BackendKind; 3] =
@@ -37,6 +37,8 @@ pub(crate) enum Screen {
     OpeningSnapshot,
     SnapshotContents,
     LoadingDir,
+    LoadingFileDetails,
+    FileDetails,
     SnapshotCompareFirst,
     SnapshotCompareSecond,
     SnapshotCompareLoading,
@@ -105,6 +107,7 @@ impl SnapshotFilter {
 
 pub(crate) struct BrowseFrame {
     pub(crate) name: String,
+    pub(crate) tree_id: TreeId,
     pub(crate) items: Vec<ContentRow>,
     pub(crate) list_state: ListState,
 }
@@ -158,6 +161,9 @@ pub(crate) struct App {
     pub(crate) browse_stack: Vec<BrowseFrame>,
     pub(crate) pending_descend: Option<(TreeId, String)>,
     pub(crate) pending_refresh_path: Option<Vec<String>>,
+    pub(crate) pending_file_lookup: Option<(TreeId, String, String)>,
+    pub(crate) file_details: Option<FileDetails>,
+    pub(crate) file_details_scroll: u16,
     pub(crate) error_is_fatal: bool,
     pub(crate) quit: bool,
 
@@ -223,6 +229,9 @@ impl App {
             browse_stack: Vec::new(),
             pending_descend: None,
             pending_refresh_path: None,
+            pending_file_lookup: None,
+            file_details: None,
+            file_details_scroll: 0,
             error_is_fatal: false,
             quit: false,
             restic_check: None,
@@ -973,7 +982,24 @@ impl App {
                                     self.screen = Screen::LoadingDir;
                                 }
                             }
-                            _ => {}
+                            ContentKind::File | ContentKind::Symlink | ContentKind::Other => {
+                                let dir_path = self
+                                    .browse_stack
+                                    .iter()
+                                    .skip(1)
+                                    .map(|fr| fr.name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join("/");
+                                let full_path = if dir_path.is_empty() {
+                                    format!("/{}", row.name)
+                                } else {
+                                    format!("/{}/{}", dir_path, row.name)
+                                };
+                                self.pending_file_lookup =
+                                    Some((f.tree_id, row.name.clone(), full_path));
+                                self.file_details_scroll = 0;
+                                self.screen = Screen::LoadingFileDetails;
+                            }
                         }
                     }
                 }
@@ -996,9 +1022,28 @@ impl App {
 
             Screen::OpeningSnapshot
             | Screen::LoadingDir
+            | Screen::LoadingFileDetails
             | Screen::SnapshotDeleting
             | Screen::SnapshotDeleteContentsLoading
             | Screen::SnapshotCompareLoading => {}
+
+            Screen::FileDetails => match key.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Backspace => {
+                    self.file_details = None;
+                    self.file_details_scroll = 0;
+                    self.screen = Screen::SnapshotContents;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.file_details_scroll = self.file_details_scroll.saturating_add(1);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.file_details_scroll = self.file_details_scroll.saturating_sub(1);
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    self.file_details_scroll = 0;
+                }
+                _ => {}
+            },
 
             Screen::CreateProfileName => match key.code {
                 KeyCode::Enter => {
