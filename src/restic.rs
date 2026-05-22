@@ -98,10 +98,14 @@ pub(crate) struct SnapshotSummary {
     pub(crate) data_added_packed: Option<u64>,
 }
 
+/// `snapshot_id` must be the full 64-char hex hash (enforced — short ids are
+/// rejected to avoid prefix ambiguity). Errors if restic returns zero or more
+/// than one matching snapshot.
 pub(crate) fn snapshot_details_json(
     profile: &Profile,
     snapshot_id: &str,
 ) -> Result<(SnapshotDetails, String)> {
+    ensure_full_snapshot_id(snapshot_id)?;
     let output = spawn(profile, &["snapshots", snapshot_id, "--json"])?;
     let stdout = String::from_utf8_lossy(&output).into_owned();
     let value: serde_json::Value = serde_json::from_str(&stdout)
@@ -109,17 +113,44 @@ pub(crate) fn snapshot_details_json(
     let pretty = serde_json::to_string_pretty(&value)
         .map_err(|e| anyhow!("pretty-printing JSON: {e}"))?;
     let first = match value {
-        serde_json::Value::Array(mut arr) if !arr.is_empty() => arr.remove(0),
-        _ => return Err(anyhow!("restic returned no snapshot matching `{snapshot_id}`")),
+        serde_json::Value::Array(mut arr) => match arr.len() {
+            0 => return Err(anyhow!("restic returned no snapshot matching `{snapshot_id}`")),
+            1 => arr.remove(0),
+            n => {
+                return Err(anyhow!(
+                    "restic returned {n} snapshots matching `{snapshot_id}`, expected exactly one"
+                ));
+            }
+        },
+        _ => return Err(anyhow!("restic snapshots JSON was not an array: {stdout}")),
     };
     let one: SnapshotDetails = serde_json::from_value(first)
         .map_err(|e| anyhow!("converting JSON value to SnapshotDetails: {e}"))?;
     Ok((one, pretty))
 }
 
+/// `snapshot_id` must be the full 64-char hex hash (enforced — short ids are
+/// rejected to avoid silently forgetting the wrong snapshot when a prefix
+/// matches multiple).
 pub(crate) fn forget(profile: &Profile, snapshot_id: &str) -> Result<()> {
+    ensure_full_snapshot_id(snapshot_id)?;
     spawn(profile, &["forget", snapshot_id])?;
     Ok(())
+}
+
+// restic/rustic snapshot ids are SHA-256 hashes — 32 bytes = 64 hex chars
+// (either case accepted; hex is case-insensitive). Restic's CLI accepts
+// shorter prefixes, but we refuse them so callers can't accidentally act on
+// the wrong snapshot if a prefix matches multiple.
+fn ensure_full_snapshot_id(id: &str) -> Result<()> {
+    if id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "expected a full 64-char hex snapshot id, got `{id}` (length {})",
+            id.len()
+        ))
+    }
 }
 
 // Run `restic <args>` with credentials passed by the safest mechanism each
@@ -332,6 +363,27 @@ mod tests {
         assert_eq!(arr[0].tags, vec!["weekly"]);
         let sum = arr[0].summary.as_ref().unwrap();
         assert_eq!(sum.total_files_processed, Some(10));
+    }
+
+    #[test]
+    fn full_snapshot_id_accepts_64_hex() {
+        let full = "ceedd62f4a63412571eac929f67931fb9702f31b681387e446e61cae3e039e73";
+        assert!(ensure_full_snapshot_id(full).is_ok());
+    }
+
+    #[test]
+    fn full_snapshot_id_rejects_short_and_nonhex() {
+        assert!(ensure_full_snapshot_id("ceedd62f").is_err());
+        assert!(ensure_full_snapshot_id("").is_err());
+        // 64 chars but not all hex.
+        let mut bad = "z".repeat(64);
+        assert!(ensure_full_snapshot_id(&bad).is_err());
+        // 63 hex chars (just one short).
+        bad = "a".repeat(63);
+        assert!(ensure_full_snapshot_id(&bad).is_err());
+        // 65 hex chars.
+        bad = "a".repeat(65);
+        assert!(ensure_full_snapshot_id(&bad).is_err());
     }
 
     #[test]

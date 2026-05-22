@@ -484,7 +484,7 @@ fn render_snapshots(frame: &mut Frame, app: &mut App, area: Rect) {
             };
             ListItem::new(format!(
                 "{:<8}  {:<19}  {:<20}  {:<20}  {}",
-                s.short_id,
+                short_snap_id(&s.id),
                 s.time,
                 s.host,
                 tags,
