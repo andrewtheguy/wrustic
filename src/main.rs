@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod crypto;
 mod repo;
+mod restic;
 mod ui;
 
 use std::path::PathBuf;
@@ -96,6 +97,37 @@ fn run(terminal: &mut DefaultTerminal, config_dir: Option<PathBuf>) -> Result<()
                     app.repo_session = None;
                     app.browse_stack.clear();
                     app.screen = Screen::Error(format!("{e:#}"));
+                }
+            }
+            continue;
+        }
+
+        if matches!(app.screen, Screen::SnapshotDeleting) {
+            let Some(snapshot_id) = app.delete_target.take() else {
+                app.screen = Screen::SnapshotDeleteError(
+                    "No snapshot selected for deletion.".into(),
+                );
+                continue;
+            };
+            let idx = app.loading_index;
+            let Some((_, profile)) = app.config.profile_at(idx) else {
+                app.screen = Screen::SnapshotDeleteError(
+                    "Selected profile no longer exists.".into(),
+                );
+                continue;
+            };
+            match restic::forget(profile, &snapshot_id) {
+                Ok(()) => {
+                    app.delete_details_parsed = None;
+                    app.delete_details_raw = None;
+                    app.snapshots.clear();
+                    app.snapshot_filter = None;
+                    app.screen = Screen::Loading;
+                }
+                Err(e) => {
+                    app.delete_details_parsed = None;
+                    app.delete_details_raw = None;
+                    app.screen = Screen::SnapshotDeleteError(format!("{e:#}"));
                 }
             }
             continue;

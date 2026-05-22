@@ -11,6 +11,7 @@ use tui_input::backend::crossterm::EventHandler;
 
 use crate::config::{self, BackendKind, Config, Paths, Profile};
 use crate::repo::{ContentKind, ContentRow, SnapshotRow};
+use crate::restic::{self, ResticError, ResticInfo, SnapshotDetails};
 
 pub(crate) const BACKEND_ORDER: [BackendKind; 3] =
     [BackendKind::Local, BackendKind::Rest, BackendKind::S3];
@@ -28,6 +29,10 @@ pub(crate) enum Screen {
     Snapshots,
     SnapshotFilterDim,
     SnapshotFilterValue,
+    SnapshotDeleteInfo,
+    SnapshotDeleteConfirm,
+    SnapshotDeleting,
+    SnapshotDeleteError(String),
     OpeningSnapshot,
     SnapshotContents,
     LoadingDir,
@@ -150,6 +155,11 @@ pub(crate) struct App {
     pub(crate) pending_refresh_path: Option<Vec<String>>,
     pub(crate) error_is_fatal: bool,
     pub(crate) quit: bool,
+
+    pub(crate) restic_check: Option<Result<ResticInfo, ResticError>>,
+    pub(crate) delete_target: Option<String>,
+    pub(crate) delete_details_parsed: Option<SnapshotDetails>,
+    pub(crate) delete_details_raw: Option<String>,
 }
 
 impl App {
@@ -201,6 +211,10 @@ impl App {
             pending_refresh_path: None,
             error_is_fatal: false,
             quit: false,
+            restic_check: None,
+            delete_target: None,
+            delete_details_parsed: None,
+            delete_details_raw: None,
         };
 
         if !identity_exists {
@@ -429,6 +443,43 @@ impl App {
         self.screen = Screen::SnapshotFilterValue;
     }
 
+    fn clear_delete_scratch(&mut self) {
+        self.delete_target = None;
+        self.delete_details_parsed = None;
+        self.delete_details_raw = None;
+    }
+
+    // Run version detection lazily (cached) and, if restic is available, fetch
+    // the snapshot's `restic snapshots --json` details. On any failure, stash
+    // a user-facing message and transition to SnapshotDeleteError. On success,
+    // populate delete_target/details and transition to SnapshotDeleteInfo.
+    fn begin_delete_flow(&mut self, snapshot_id: String) {
+        if self.restic_check.is_none() {
+            self.restic_check = Some(restic::detect());
+        }
+        if let Some(Err(e)) = &self.restic_check {
+            self.screen = Screen::SnapshotDeleteError(e.user_message());
+            return;
+        }
+        let Some((_, profile)) = self.config.profile_at(self.loading_index) else {
+            self.screen = Screen::SnapshotDeleteError(
+                "Selected profile no longer exists.".into(),
+            );
+            return;
+        };
+        match restic::snapshot_details_json(profile, &snapshot_id) {
+            Ok((parsed, raw)) => {
+                self.delete_target = Some(snapshot_id);
+                self.delete_details_parsed = Some(parsed);
+                self.delete_details_raw = Some(raw);
+                self.screen = Screen::SnapshotDeleteInfo;
+            }
+            Err(e) => {
+                self.screen = Screen::SnapshotDeleteError(format!("{e:#}"));
+            }
+        }
+    }
+
     fn go_up(&mut self) {
         if self.browse_stack.len() > 1 {
             self.browse_stack.pop();
@@ -594,6 +645,16 @@ impl App {
                     self.filter_pending_kind = None;
                     self.screen = Screen::SnapshotFilterDim;
                 }
+                KeyCode::Char('d') => {
+                    let visible = self.visible_snapshot_indices();
+                    if let Some(pos) = self.list_state.selected()
+                        && let Some(&abs) = visible.get(pos)
+                        && let Some(s) = self.snapshots.get(abs)
+                    {
+                        let id = s.short_id.clone();
+                        self.begin_delete_flow(id);
+                    }
+                }
                 _ => {}
             },
 
@@ -654,6 +715,33 @@ impl App {
                 }
                 _ => {}
             },
+
+            Screen::SnapshotDeleteInfo => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.screen = Screen::SnapshotDeleteConfirm;
+                }
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.clear_delete_scratch();
+                    self.screen = Screen::Snapshots;
+                }
+                _ => {}
+            },
+
+            Screen::SnapshotDeleteConfirm => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.screen = Screen::SnapshotDeleting;
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.clear_delete_scratch();
+                    self.screen = Screen::Snapshots;
+                }
+                _ => {}
+            },
+
+            Screen::SnapshotDeleteError(_) => {
+                self.clear_delete_scratch();
+                self.screen = Screen::Snapshots;
+            }
 
             Screen::SnapshotContents => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
@@ -720,7 +808,7 @@ impl App {
                 _ => {}
             },
 
-            Screen::OpeningSnapshot | Screen::LoadingDir => {}
+            Screen::OpeningSnapshot | Screen::LoadingDir | Screen::SnapshotDeleting => {}
 
             Screen::CreateProfileName => match key.code {
                 KeyCode::Enter => {
