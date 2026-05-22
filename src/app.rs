@@ -991,12 +991,16 @@ pub(crate) fn distinct_values(rows: &[SnapshotRow], kind: FilterKind) -> Vec<Str
             }
             FilterKind::Tag => {
                 for t in &r.tags {
-                    set.insert(t.clone());
+                    if !t.is_empty() {
+                        set.insert(t.clone());
+                    }
                 }
             }
             FilterKind::Path => {
                 for p in &r.paths {
-                    set.insert(p.clone());
+                    if !p.is_empty() {
+                        set.insert(p.clone());
+                    }
                 }
             }
         }
