@@ -19,8 +19,8 @@ use ratatui::widgets::ListState;
 use crate::app::{App, BrowseFrame, Screen};
 use crate::cli::{USAGE, parse_cli};
 use crate::repo::{
-    ContentRow, list_tree, load_snapshots, open_indexed, preview_snapshot_contents,
-    snapshot_root_tree, verify_profile,
+    ContentRow, get_file_details, list_tree, load_snapshots, open_indexed,
+    preview_snapshot_contents, snapshot_root_tree, verify_profile,
 };
 use crate::ui::render;
 
@@ -215,6 +215,7 @@ fn run(terminal: &mut DefaultTerminal, config_dir: Option<PathBuf>) -> Result<()
                     let (items, list_state) = with_parent(items);
                     app.browse_stack.push(BrowseFrame {
                         name,
+                        tree_id,
                         items,
                         list_state,
                     });
@@ -223,6 +224,27 @@ fn run(terminal: &mut DefaultTerminal, config_dir: Option<PathBuf>) -> Result<()
                 Err(e) => {
                     app.repo_session = None;
                     app.browse_stack.clear();
+                    app.screen = Screen::Error(format!("{e:#}"));
+                }
+            }
+            continue;
+        }
+
+        if matches!(app.screen, Screen::LoadingFileDetails) {
+            let Some((tree_id, name, full_path)) = app.pending_file_lookup.take() else {
+                app.screen = Screen::SnapshotContents;
+                continue;
+            };
+            let Some(repo) = app.repo_session.as_ref() else {
+                app.screen = Screen::Error("Repository session was dropped.".into());
+                continue;
+            };
+            match get_file_details(repo, tree_id, &name, full_path) {
+                Ok(details) => {
+                    app.file_details = Some(details);
+                    app.screen = Screen::FileDetails;
+                }
+                Err(e) => {
                     app.screen = Screen::Error(format!("{e:#}"));
                 }
             }
@@ -260,6 +282,7 @@ fn open_and_walk(
     let (root_items, root_list_state) = with_parent(root_items);
     let mut stack = vec![BrowseFrame {
         name: String::new(),
+        tree_id: root_tree,
         items: root_items,
         list_state: root_list_state,
     }];
@@ -278,6 +301,7 @@ fn open_and_walk(
                     let (items, list_state) = with_parent(items);
                     stack.push(BrowseFrame {
                         name,
+                        tree_id,
                         items,
                         list_state,
                     });

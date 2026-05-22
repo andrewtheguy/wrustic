@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, anyhow, bail};
 use rustic_backend::BackendOptions;
+use rustic_core::repofile::NodeType;
 use rustic_core::{Credentials, IndexedIdsStatus, Repository, RepositoryOptions, TreeId};
 
 use crate::config::Profile;
@@ -52,6 +53,26 @@ pub(crate) struct ContentsPreview {
     pub(crate) entries: Vec<PreviewEntry>,
     pub(crate) truncated: bool,
     pub(crate) limit: usize,
+}
+
+pub(crate) struct FileDetails {
+    pub(crate) name: String,
+    pub(crate) full_path: String,
+    pub(crate) kind_label: String,
+    pub(crate) size: u64,
+    pub(crate) mode: Option<u32>,
+    pub(crate) mtime: Option<String>,
+    pub(crate) atime: Option<String>,
+    pub(crate) ctime: Option<String>,
+    pub(crate) uid: Option<u32>,
+    pub(crate) gid: Option<u32>,
+    pub(crate) user: Option<String>,
+    pub(crate) group: Option<String>,
+    pub(crate) linktarget: Option<String>,
+    // SHA-256 chunk ids that make up the file's content. For a single-chunk
+    // file this is effectively the file's SHA-256; for multi-chunk files
+    // (restic CDC-chunks anything large) each entry hashes one chunk.
+    pub(crate) content_hashes: Vec<String>,
 }
 
 fn build_backend_opts(profile: &Profile) -> Result<BackendOptions> {
@@ -210,6 +231,55 @@ pub(crate) fn preview_snapshot_contents(
     let mut truncated = false;
     walk_preview(repo, root, "", &mut entries, limit, &mut truncated)?;
     Ok(ContentsPreview { entries, truncated, limit })
+}
+
+pub(crate) fn get_file_details(
+    repo: &Repository<IndexedIdsStatus>,
+    tree_id: TreeId,
+    file_name: &str,
+    full_path: String,
+) -> Result<FileDetails> {
+    let tree = repo.get_tree(&tree_id)?;
+    let node = tree
+        .nodes
+        .into_iter()
+        .find(|n| n.name().to_string_lossy() == file_name)
+        .ok_or_else(|| anyhow!("file `{file_name}` not found in tree"))?;
+
+    let (kind_label, linktarget) = match &node.node_type {
+        NodeType::File => ("file".to_string(), None),
+        NodeType::Dir => ("directory".to_string(), None),
+        NodeType::Symlink { linktarget, .. } => {
+            (format!("symlink → {linktarget}"), Some(linktarget.clone()))
+        }
+        other => (other.to_string(), None),
+    };
+
+    let content_hashes = node
+        .content
+        .map(|ids| {
+            ids.iter()
+                .map(|id| id.to_hex().as_str().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(FileDetails {
+        name: file_name.to_string(),
+        full_path,
+        kind_label,
+        size: node.meta.size,
+        mode: node.meta.mode,
+        mtime: node.meta.mtime.map(|t| t.strftime("%Y-%m-%d %H:%M:%S").to_string()),
+        atime: node.meta.atime.map(|t| t.strftime("%Y-%m-%d %H:%M:%S").to_string()),
+        ctime: node.meta.ctime.map(|t| t.strftime("%Y-%m-%d %H:%M:%S").to_string()),
+        uid: node.meta.uid,
+        gid: node.meta.gid,
+        user: node.meta.user,
+        group: node.meta.group,
+        linktarget,
+        content_hashes,
+    })
 }
 
 fn walk_preview(
