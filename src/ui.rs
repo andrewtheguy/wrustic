@@ -796,15 +796,25 @@ fn render_file_details(frame: &mut Frame, app: &mut App, area: Rect) {
         lines.push_str(&format!("Link target: {t}\n"));
     }
     if !d.content_hashes.is_empty() {
+        // Cap the displayed list so deeply-chunked files don't push the rest
+        // of the metadata off-screen. Show the first MAX hashes; the count
+        // in the header already tells the reader how many are hidden.
+        const MAX: usize = 10;
         lines.push_str(&format!(
             "\nContent blob SHA-256 ({} chunk{}):\n",
             d.content_hashes.len(),
             if d.content_hashes.len() == 1 { "" } else { "s" },
         ));
-        for h in &d.content_hashes {
+        for h in d.content_hashes.iter().take(MAX) {
             lines.push_str("  ");
             lines.push_str(h);
             lines.push('\n');
+        }
+        if d.content_hashes.len() > MAX {
+            lines.push_str(&format!(
+                "  … ({} more)\n",
+                d.content_hashes.len() - MAX
+            ));
         }
     } else if matches!(d.kind, ContentKind::File) {
         lines.push_str("\n(empty file — no content blobs)\n");
