@@ -2,10 +2,12 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use ratatui::{
-    crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
+    crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers},
     widgets::ListState,
 };
 use rustic_core::{IndexedIdsStatus, Repository, TreeId};
+use tui_input::Input;
+use tui_input::backend::crossterm::EventHandler;
 
 use crate::config::{self, BackendKind, Config, Paths, Profile};
 use crate::repo::{ContentKind, ContentRow, SnapshotRow};
@@ -24,6 +26,8 @@ pub(crate) enum Screen {
     KeyCreated,
     Home,
     Snapshots,
+    SnapshotFilterDim,
+    SnapshotFilterValue,
     OpeningSnapshot,
     SnapshotContents,
     LoadingDir,
@@ -39,6 +43,54 @@ pub(crate) enum Screen {
     Verifying,
     VerifyFailed(String),
     Error(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FilterKind {
+    Host,
+    Tag,
+    Path,
+}
+
+impl FilterKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            FilterKind::Host => "host",
+            FilterKind::Tag => "tag",
+            FilterKind::Path => "path",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum SnapshotFilter {
+    Host(String),
+    Tag(String),
+    Path(String),
+}
+
+impl SnapshotFilter {
+    pub(crate) fn kind(&self) -> FilterKind {
+        match self {
+            SnapshotFilter::Host(_) => FilterKind::Host,
+            SnapshotFilter::Tag(_) => FilterKind::Tag,
+            SnapshotFilter::Path(_) => FilterKind::Path,
+        }
+    }
+
+    pub(crate) fn value(&self) -> &str {
+        match self {
+            SnapshotFilter::Host(v) | SnapshotFilter::Tag(v) | SnapshotFilter::Path(v) => v,
+        }
+    }
+
+    pub(crate) fn matches(&self, row: &SnapshotRow) -> bool {
+        match self {
+            SnapshotFilter::Host(h) => &row.host == h,
+            SnapshotFilter::Tag(t) => row.tags.iter().any(|x| x == t),
+            SnapshotFilter::Path(p) => row.paths.iter().any(|x| x == p),
+        }
+    }
 }
 
 pub(crate) struct BrowseFrame {
@@ -63,19 +115,19 @@ pub(crate) struct App {
     pub(crate) profile_list_state: ListState,
     pub(crate) list_state: ListState,
 
-    pub(crate) new_profile_name: String,
+    pub(crate) new_profile_name: Input,
     pub(crate) backend_kind: BackendKind,
-    pub(crate) local_path: String,
-    pub(crate) rest_url: String,
-    pub(crate) rest_user: String,
-    pub(crate) rest_password: String,
-    pub(crate) s3_endpoint: String,
-    pub(crate) s3_bucket: String,
-    pub(crate) s3_region: String,
-    pub(crate) s3_root: String,
-    pub(crate) s3_access_key: String,
-    pub(crate) s3_secret_key: String,
-    pub(crate) password: String,
+    pub(crate) local_path: Input,
+    pub(crate) rest_url: Input,
+    pub(crate) rest_user: Input,
+    pub(crate) rest_password: Input,
+    pub(crate) s3_endpoint: Input,
+    pub(crate) s3_bucket: Input,
+    pub(crate) s3_region: Input,
+    pub(crate) s3_root: Input,
+    pub(crate) s3_access_key: Input,
+    pub(crate) s3_secret_key: Input,
+    pub(crate) password: Input,
 
     pub(crate) loading_index: usize,
     pub(crate) pending_delete: Option<usize>,
@@ -86,6 +138,10 @@ pub(crate) struct App {
     pub(crate) created_pubkey: String,
 
     pub(crate) snapshots: Vec<SnapshotRow>,
+    pub(crate) snapshot_filter: Option<SnapshotFilter>,
+    pub(crate) filter_picker_state: ListState,
+    pub(crate) filter_values: Vec<String>,
+    pub(crate) filter_pending_kind: Option<FilterKind>,
     pub(crate) active_profile_name: Option<String>,
     pub(crate) repo_session: Option<Repository<IndexedIdsStatus>>,
     pub(crate) browse_snapshot_id: String,
@@ -113,19 +169,19 @@ impl App {
             backend_list,
             profile_list_state: ListState::default(),
             list_state: ListState::default(),
-            new_profile_name: String::new(),
+            new_profile_name: Input::default(),
             backend_kind: BackendKind::Local,
-            local_path: String::new(),
-            rest_url: String::new(),
-            rest_user: String::new(),
-            rest_password: String::new(),
-            s3_endpoint: String::new(),
-            s3_bucket: String::new(),
-            s3_region: String::new(),
-            s3_root: String::new(),
-            s3_access_key: String::new(),
-            s3_secret_key: String::new(),
-            password: String::new(),
+            local_path: Input::default(),
+            rest_url: Input::default(),
+            rest_user: Input::default(),
+            rest_password: Input::default(),
+            s3_endpoint: Input::default(),
+            s3_bucket: Input::default(),
+            s3_region: Input::default(),
+            s3_root: Input::default(),
+            s3_access_key: Input::default(),
+            s3_secret_key: Input::default(),
+            password: Input::default(),
             loading_index: 0,
             pending_delete: None,
             editing_original_name: None,
@@ -133,6 +189,10 @@ impl App {
             restore_error: None,
             created_pubkey: String::new(),
             snapshots: Vec::new(),
+            snapshot_filter: None,
+            filter_picker_state: ListState::default(),
+            filter_values: Vec::new(),
+            filter_pending_kind: None,
             active_profile_name: None,
             repo_session: None,
             browse_snapshot_id: String::new(),
@@ -182,40 +242,40 @@ impl App {
     }
 
     fn clear_creation_scratch(&mut self) {
-        self.new_profile_name.clear();
-        self.local_path.clear();
-        self.rest_url.clear();
-        self.rest_user.clear();
-        self.rest_password.clear();
-        self.s3_endpoint.clear();
-        self.s3_bucket.clear();
-        self.s3_region.clear();
-        self.s3_root.clear();
-        self.s3_access_key.clear();
-        self.s3_secret_key.clear();
-        self.password.clear();
+        self.new_profile_name.reset();
+        self.local_path.reset();
+        self.rest_url.reset();
+        self.rest_user.reset();
+        self.rest_password.reset();
+        self.s3_endpoint.reset();
+        self.s3_bucket.reset();
+        self.s3_region.reset();
+        self.s3_root.reset();
+        self.s3_access_key.reset();
+        self.s3_secret_key.reset();
+        self.password.reset();
         self.editing_original_name = None;
         self.field_focus = 0;
     }
 
     fn load_profile_into_scratch(&mut self, idx: usize) {
         let Some((name, p)) = self.config.profile_at(idx) else { return };
-        self.new_profile_name = name.clone();
-        self.password = p.password().to_string();
+        self.new_profile_name = Input::new(name.clone());
+        self.password = Input::new(p.password().to_string());
         self.backend_kind = p.backend_kind();
-        self.local_path.clear();
-        self.rest_url.clear();
-        self.rest_user.clear();
-        self.rest_password.clear();
-        self.s3_endpoint.clear();
-        self.s3_bucket.clear();
-        self.s3_region.clear();
-        self.s3_root.clear();
-        self.s3_access_key.clear();
-        self.s3_secret_key.clear();
+        self.local_path.reset();
+        self.rest_url.reset();
+        self.rest_user.reset();
+        self.rest_password.reset();
+        self.s3_endpoint.reset();
+        self.s3_bucket.reset();
+        self.s3_region.reset();
+        self.s3_root.reset();
+        self.s3_access_key.reset();
+        self.s3_secret_key.reset();
         match p {
             Profile::Local { local_path, .. } => {
-                self.local_path = local_path.clone();
+                self.local_path = Input::new(local_path.clone());
             }
             Profile::Rest {
                 rest_url,
@@ -223,9 +283,9 @@ impl App {
                 rest_password,
                 ..
             } => {
-                self.rest_url = rest_url.clone();
-                self.rest_user = rest_user.clone();
-                self.rest_password = rest_password.clone();
+                self.rest_url = Input::new(rest_url.clone());
+                self.rest_user = Input::new(rest_user.clone());
+                self.rest_password = Input::new(rest_password.clone());
             }
             Profile::S3 {
                 s3_endpoint,
@@ -236,41 +296,41 @@ impl App {
                 s3_secret_key,
                 ..
             } => {
-                self.s3_endpoint = s3_endpoint.clone();
-                self.s3_bucket = s3_bucket.clone();
-                self.s3_region = s3_region.clone();
-                self.s3_root = s3_root.clone();
-                self.s3_access_key = s3_access_key.clone();
-                self.s3_secret_key = s3_secret_key.clone();
+                self.s3_endpoint = Input::new(s3_endpoint.clone());
+                self.s3_bucket = Input::new(s3_bucket.clone());
+                self.s3_region = Input::new(s3_region.clone());
+                self.s3_root = Input::new(s3_root.clone());
+                self.s3_access_key = Input::new(s3_access_key.clone());
+                self.s3_secret_key = Input::new(s3_secret_key.clone());
             }
         }
     }
 
     pub(crate) fn build_profile(&self) -> Profile {
-        let password = self.password.clone();
+        let password = self.password.value().to_string();
         match self.backend_kind {
             BackendKind::Local => Profile::Local {
                 password,
-                local_path: self.local_path.clone(),
+                local_path: self.local_path.value().to_string(),
             },
             BackendKind::Rest => Profile::Rest {
                 password,
-                rest_url: self.rest_url.clone(),
-                rest_user: self.rest_user.clone(),
-                rest_password: self.rest_password.clone(),
+                rest_url: self.rest_url.value().to_string(),
+                rest_user: self.rest_user.value().to_string(),
+                rest_password: self.rest_password.value().to_string(),
             },
             BackendKind::S3 => Profile::S3 {
                 password,
-                s3_endpoint: self.s3_endpoint.clone(),
-                s3_bucket: self.s3_bucket.clone(),
-                s3_region: if self.s3_region.is_empty() {
+                s3_endpoint: self.s3_endpoint.value().to_string(),
+                s3_bucket: self.s3_bucket.value().to_string(),
+                s3_region: if self.s3_region.value().is_empty() {
                     "us-east-1".into()
                 } else {
-                    self.s3_region.clone()
+                    self.s3_region.value().to_string()
                 },
-                s3_root: self.s3_root.clone(),
-                s3_access_key: self.s3_access_key.clone(),
-                s3_secret_key: self.s3_secret_key.clone(),
+                s3_root: self.s3_root.value().to_string(),
+                s3_access_key: self.s3_access_key.value().to_string(),
+                s3_secret_key: self.s3_secret_key.value().to_string(),
             },
         }
     }
@@ -285,7 +345,7 @@ impl App {
 
     pub(crate) fn commit_profile(&mut self) {
         let profile = self.build_profile();
-        let name = self.new_profile_name.clone();
+        let name = self.new_profile_name.value().to_string();
 
         if self.editing_original_name.is_none() && self.config.has_profile(&name) {
             self.screen = Screen::Error(format!(
@@ -333,6 +393,40 @@ impl App {
                 self.screen = Screen::Error(format!("Saving config failed: {e:#}"));
             }
         }
+    }
+
+    // Indices into `self.snapshots` for rows that pass the current filter,
+    // preserving the underlying time-desc order.
+    pub(crate) fn visible_snapshot_indices(&self) -> Vec<usize> {
+        match &self.snapshot_filter {
+            None => (0..self.snapshots.len()).collect(),
+            Some(f) => self
+                .snapshots
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| f.matches(r))
+                .map(|(i, _)| i)
+                .collect(),
+        }
+    }
+
+    fn enter_snapshots_from_filter(&mut self) {
+        let visible = self.visible_snapshot_indices().len();
+        self.list_state
+            .select(if visible == 0 { None } else { Some(0) });
+        self.screen = Screen::Snapshots;
+    }
+
+    fn open_filter_value_picker(&mut self, kind: FilterKind) {
+        let values = distinct_values(&self.snapshots, kind);
+        if values.is_empty() {
+            return;
+        }
+        self.filter_values = values;
+        self.filter_pending_kind = Some(kind);
+        self.filter_picker_state = ListState::default();
+        self.filter_picker_state.select(Some(0));
+        self.screen = Screen::SnapshotFilterValue;
     }
 
     fn go_up(&mut self) {
@@ -443,7 +537,7 @@ impl App {
                         .unwrap_or(0)
                         .min(self.config.profiles.len() - 1);
                     self.load_profile_into_scratch(idx);
-                    self.editing_original_name = Some(self.new_profile_name.clone());
+                    self.editing_original_name = Some(self.new_profile_name.value().to_string());
                     self.field_focus = 0;
                     self.screen = match self.backend_kind {
                         BackendKind::Local => Screen::LocalPath,
@@ -466,19 +560,23 @@ impl App {
             Screen::Snapshots => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
                     self.snapshots.clear();
+                    self.snapshot_filter = None;
                     self.enter_home();
                 }
                 KeyCode::Down | KeyCode::Char('j') => self.list_state.select_next(),
                 KeyCode::Up | KeyCode::Char('k') => self.list_state.select_previous(),
                 KeyCode::Home | KeyCode::Char('g') => self.list_state.select(Some(0)),
                 KeyCode::End | KeyCode::Char('G') => {
-                    if !self.snapshots.is_empty() {
-                        self.list_state.select(Some(self.snapshots.len() - 1));
+                    let visible = self.visible_snapshot_indices();
+                    if !visible.is_empty() {
+                        self.list_state.select(Some(visible.len() - 1));
                     }
                 }
                 KeyCode::Enter => {
-                    if let Some(idx) = self.list_state.selected()
-                        && let Some(s) = self.snapshots.get(idx)
+                    let visible = self.visible_snapshot_indices();
+                    if let Some(pos) = self.list_state.selected()
+                        && let Some(&abs) = visible.get(pos)
+                        && let Some(s) = self.snapshots.get(abs)
                     {
                         self.browse_snapshot_id = s.short_id.clone();
                         self.pending_refresh_path = None;
@@ -487,7 +585,72 @@ impl App {
                 }
                 KeyCode::Char('r') => {
                     self.snapshots.clear();
+                    self.snapshot_filter = None;
                     self.screen = Screen::Loading;
+                }
+                KeyCode::Char('f') => {
+                    self.filter_picker_state = ListState::default();
+                    self.filter_picker_state.select(Some(0));
+                    self.filter_pending_kind = None;
+                    self.screen = Screen::SnapshotFilterDim;
+                }
+                _ => {}
+            },
+
+            Screen::SnapshotFilterDim => match key.code {
+                KeyCode::Down | KeyCode::Char('j') => self.filter_picker_state.select_next(),
+                KeyCode::Up | KeyCode::Char('k') => self.filter_picker_state.select_previous(),
+                KeyCode::Esc | KeyCode::Char('q') => self.screen = Screen::Snapshots,
+                KeyCode::Enter => {
+                    let entries = filter_dim_entries(self.snapshot_filter.is_some());
+                    let idx = self
+                        .filter_picker_state
+                        .selected()
+                        .unwrap_or(0)
+                        .min(entries.len().saturating_sub(1));
+                    match entries.get(idx) {
+                        Some(FilterDimEntry::Clear) => {
+                            self.snapshot_filter = None;
+                            self.enter_snapshots_from_filter();
+                        }
+                        Some(FilterDimEntry::Kind(k)) => {
+                            self.open_filter_value_picker(*k);
+                        }
+                        None => {}
+                    }
+                }
+                _ => {}
+            },
+
+            Screen::SnapshotFilterValue => match key.code {
+                KeyCode::Down | KeyCode::Char('j') => self.filter_picker_state.select_next(),
+                KeyCode::Up | KeyCode::Char('k') => self.filter_picker_state.select_previous(),
+                KeyCode::Home | KeyCode::Char('g') => self.filter_picker_state.select(Some(0)),
+                KeyCode::End | KeyCode::Char('G') => {
+                    if !self.filter_values.is_empty() {
+                        self.filter_picker_state
+                            .select(Some(self.filter_values.len() - 1));
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.filter_pending_kind = None;
+                    self.filter_picker_state = ListState::default();
+                    self.filter_picker_state.select(Some(0));
+                    self.screen = Screen::SnapshotFilterDim;
+                }
+                KeyCode::Enter => {
+                    if let (Some(kind), Some(idx)) =
+                        (self.filter_pending_kind, self.filter_picker_state.selected())
+                        && let Some(value) = self.filter_values.get(idx).cloned()
+                    {
+                        self.snapshot_filter = Some(match kind {
+                            FilterKind::Host => SnapshotFilter::Host(value),
+                            FilterKind::Tag => SnapshotFilter::Tag(value),
+                            FilterKind::Path => SnapshotFilter::Path(value),
+                        });
+                        self.filter_pending_kind = None;
+                        self.enter_snapshots_from_filter();
+                    }
                 }
                 _ => {}
             },
@@ -559,9 +722,9 @@ impl App {
 
             Screen::OpeningSnapshot | Screen::LoadingDir => {}
 
-            Screen::CreateProfileName => match text_input(&mut self.new_profile_name, key) {
-                TextAction::Submit => {
-                    let name = self.new_profile_name.trim().to_string();
+            Screen::CreateProfileName => match key.code {
+                KeyCode::Enter => {
+                    let name = self.new_profile_name.value().trim().to_string();
                     if name.is_empty() {
                         return;
                     }
@@ -571,12 +734,14 @@ impl App {
                         ));
                         return;
                     }
-                    self.new_profile_name = name;
+                    self.new_profile_name = Input::new(name);
                     self.backend_list.select(Some(0));
                     self.screen = Screen::BackendChoice;
                 }
-                TextAction::Cancel => self.enter_home(),
-                _ => {}
+                KeyCode::Esc => self.enter_home(),
+                _ => {
+                    self.new_profile_name.handle_event(&Event::Key(key));
+                }
             },
 
             Screen::BackendChoice => match key.code {
@@ -600,13 +765,16 @@ impl App {
                 _ => {}
             },
 
-            Screen::LocalPath => match text_input(&mut self.local_path, key) {
-                TextAction::Submit if !self.local_path.trim().is_empty() => {
-                    self.local_path = self.local_path.trim().to_string();
+            Screen::LocalPath => match key.code {
+                KeyCode::Enter if !self.local_path.value().trim().is_empty() => {
+                    let trimmed = self.local_path.value().trim().to_string();
+                    self.local_path = Input::new(trimmed);
                     self.screen = Screen::Password;
                 }
-                TextAction::Cancel => self.cancel_from_first_backend_input(),
-                _ => {}
+                KeyCode::Esc => self.cancel_from_first_backend_input(),
+                _ => {
+                    self.local_path.handle_event(&Event::Key(key));
+                }
             },
 
             Screen::RestConfig => {
@@ -620,19 +788,19 @@ impl App {
                     }
                     KeyCode::Esc => self.cancel_from_first_backend_input(),
                     KeyCode::Enter => {
-                        self.rest_url = self.rest_url.trim().to_string();
-                        self.rest_user = self.rest_user.trim().to_string();
-                        if !self.rest_url.is_empty() {
+                        self.rest_url = Input::new(self.rest_url.value().trim().to_string());
+                        self.rest_user = Input::new(self.rest_user.value().trim().to_string());
+                        if !self.rest_url.value().is_empty() {
                             self.screen = Screen::Password;
                         }
                     }
                     _ => {
-                        let buf: &mut String = match self.field_focus {
+                        let buf: &mut Input = match self.field_focus {
                             0 => &mut self.rest_url,
                             1 => &mut self.rest_user,
                             _ => &mut self.rest_password,
                         };
-                        let _ = text_input(buf, key);
+                        buf.handle_event(&Event::Key(key));
                     }
                 }
             }
@@ -648,23 +816,24 @@ impl App {
                     }
                     KeyCode::Esc => self.cancel_from_first_backend_input(),
                     KeyCode::Enter => {
-                        self.s3_endpoint = self.s3_endpoint.trim().to_string();
-                        self.s3_bucket = self.s3_bucket.trim().to_string();
-                        self.s3_region = self.s3_region.trim().to_string();
-                        self.s3_root = self.s3_root.trim().to_string();
-                        if !self.s3_bucket.is_empty() {
+                        self.s3_endpoint =
+                            Input::new(self.s3_endpoint.value().trim().to_string());
+                        self.s3_bucket = Input::new(self.s3_bucket.value().trim().to_string());
+                        self.s3_region = Input::new(self.s3_region.value().trim().to_string());
+                        self.s3_root = Input::new(self.s3_root.value().trim().to_string());
+                        if !self.s3_bucket.value().is_empty() {
                             self.field_focus = 0;
                             self.screen = Screen::S3Credentials;
                         }
                     }
                     _ => {
-                        let buf: &mut String = match self.field_focus {
+                        let buf: &mut Input = match self.field_focus {
                             0 => &mut self.s3_endpoint,
                             1 => &mut self.s3_bucket,
                             2 => &mut self.s3_region,
                             _ => &mut self.s3_root,
                         };
-                        let _ = text_input(buf, key);
+                        buf.handle_event(&Event::Key(key));
                     }
                 }
             }
@@ -683,28 +852,32 @@ impl App {
                         self.screen = Screen::S3Location;
                     }
                     KeyCode::Enter => {
-                        self.s3_access_key = self.s3_access_key.trim().to_string();
-                        self.s3_secret_key = self.s3_secret_key.trim().to_string();
-                        if !self.s3_access_key.is_empty() && !self.s3_secret_key.is_empty() {
+                        self.s3_access_key =
+                            Input::new(self.s3_access_key.value().trim().to_string());
+                        self.s3_secret_key =
+                            Input::new(self.s3_secret_key.value().trim().to_string());
+                        if !self.s3_access_key.value().is_empty()
+                            && !self.s3_secret_key.value().is_empty()
+                        {
                             self.screen = Screen::Password;
                         }
                     }
                     _ => {
-                        let buf: &mut String = match self.field_focus {
+                        let buf: &mut Input = match self.field_focus {
                             0 => &mut self.s3_access_key,
                             _ => &mut self.s3_secret_key,
                         };
-                        let _ = text_input(buf, key);
+                        buf.handle_event(&Event::Key(key));
                     }
                 }
             }
 
-            Screen::Password => match text_input(&mut self.password, key) {
-                TextAction::Submit if !self.password.is_empty() => {
+            Screen::Password => match key.code {
+                KeyCode::Enter if !self.password.value().is_empty() => {
                     self.screen = Screen::Verifying;
                 }
-                TextAction::Cancel => {
-                    self.password.clear();
+                KeyCode::Esc => {
+                    self.password.reset();
                     self.field_focus = 0;
                     self.screen = match self.backend_kind {
                         BackendKind::Local => Screen::LocalPath,
@@ -712,7 +885,9 @@ impl App {
                         BackendKind::S3 => Screen::S3Credentials,
                     };
                 }
-                _ => {}
+                _ => {
+                    self.password.handle_event(&Event::Key(key));
+                }
             },
 
             Screen::ConfirmDelete => match key.code {
@@ -773,24 +948,108 @@ impl App {
     }
 }
 
-enum TextAction {
-    None,
-    Submit,
-    Cancel,
+#[derive(Clone, Copy)]
+pub(crate) enum FilterDimEntry {
+    Kind(FilterKind),
+    Clear,
 }
 
-fn text_input(buf: &mut String, key: KeyEvent) -> TextAction {
-    match key.code {
-        KeyCode::Enter => TextAction::Submit,
-        KeyCode::Esc => TextAction::Cancel,
-        KeyCode::Backspace => {
-            buf.pop();
-            TextAction::None
+impl FilterDimEntry {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            FilterDimEntry::Kind(FilterKind::Host) => "Host",
+            FilterDimEntry::Kind(FilterKind::Tag) => "Tag",
+            FilterDimEntry::Kind(FilterKind::Path) => "Path",
+            FilterDimEntry::Clear => "Clear filter",
         }
-        KeyCode::Char(c) => {
-            buf.push(c);
-            TextAction::None
+    }
+}
+
+pub(crate) fn filter_dim_entries(has_active: bool) -> Vec<FilterDimEntry> {
+    let mut v = vec![
+        FilterDimEntry::Kind(FilterKind::Host),
+        FilterDimEntry::Kind(FilterKind::Tag),
+        FilterDimEntry::Kind(FilterKind::Path),
+    ];
+    if has_active {
+        v.push(FilterDimEntry::Clear);
+    }
+    v
+}
+
+// Distinct values present in `rows` for the given dimension, sorted ascending.
+// Tags and paths are flattened (a snapshot with multiple tags contributes each).
+pub(crate) fn distinct_values(rows: &[SnapshotRow], kind: FilterKind) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut set: BTreeSet<String> = BTreeSet::new();
+    for r in rows {
+        match kind {
+            FilterKind::Host => {
+                if !r.host.is_empty() {
+                    set.insert(r.host.clone());
+                }
+            }
+            FilterKind::Tag => {
+                for t in &r.tags {
+                    if !t.is_empty() {
+                        set.insert(t.clone());
+                    }
+                }
+            }
+            FilterKind::Path => {
+                for p in &r.paths {
+                    if !p.is_empty() {
+                        set.insert(p.clone());
+                    }
+                }
+            }
         }
-        _ => TextAction::None,
+    }
+    set.into_iter().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(host: &str, tags: &[&str], paths: &[&str]) -> SnapshotRow {
+        SnapshotRow {
+            short_id: "0".into(),
+            time: String::new(),
+            host: host.into(),
+            tags: tags.iter().map(|s| (*s).to_string()).collect(),
+            paths: paths.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn distinct_values_dedupe_and_sort() {
+        let rows = vec![
+            row("laptop", &["weekly", "auto"], &["/home", "/etc"]),
+            row("server", &["auto"], &["/etc"]),
+            row("laptop", &[], &["/home"]),
+        ];
+        assert_eq!(distinct_values(&rows, FilterKind::Host), vec!["laptop", "server"]);
+        assert_eq!(distinct_values(&rows, FilterKind::Tag), vec!["auto", "weekly"]);
+        assert_eq!(distinct_values(&rows, FilterKind::Path), vec!["/etc", "/home"]);
+    }
+
+    #[test]
+    fn filter_matches() {
+        let r = row("laptop", &["weekly"], &["/home", "/etc"]);
+        assert!(SnapshotFilter::Host("laptop".into()).matches(&r));
+        assert!(!SnapshotFilter::Host("server".into()).matches(&r));
+        assert!(SnapshotFilter::Tag("weekly".into()).matches(&r));
+        assert!(!SnapshotFilter::Tag("daily".into()).matches(&r));
+        assert!(SnapshotFilter::Path("/etc".into()).matches(&r));
+        assert!(!SnapshotFilter::Path("/var".into()).matches(&r));
+    }
+
+    #[test]
+    fn dim_entries_include_clear_only_when_active() {
+        assert_eq!(filter_dim_entries(false).len(), 3);
+        let entries = filter_dim_entries(true);
+        assert_eq!(entries.len(), 4);
+        assert!(matches!(entries.last(), Some(FilterDimEntry::Clear)));
     }
 }

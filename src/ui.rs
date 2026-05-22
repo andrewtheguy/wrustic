@@ -4,8 +4,9 @@ use ratatui::{
     style::{Color, Modifier, Style},
     widgets::{Block, List, ListItem, Paragraph, Wrap},
 };
+use tui_input::Input;
 
-use crate::app::{App, BACKEND_ORDER, FIRST_RUN_MENU, Screen};
+use crate::app::{App, BACKEND_ORDER, FIRST_RUN_MENU, Screen, filter_dim_entries};
 use crate::repo::ContentKind;
 
 pub(crate) fn render(frame: &mut Frame, app: &mut App) {
@@ -48,7 +49,11 @@ fn bottom_bar_text(screen: &Screen) -> &'static str {
         Screen::RestoreKeyWait => "Enter retry  Esc back",
         Screen::KeyCreated => "Enter continue  Esc quit",
         Screen::Home => "j/k move  Enter open  n new  e edit  d delete  q quit",
-        Screen::Snapshots => "j/k move  g/G top/bottom  Enter browse  r refresh  q/Esc back",
+        Screen::Snapshots => {
+            "j/k move  g/G top/bottom  Enter browse  f filter  r refresh  q/Esc back"
+        }
+        Screen::SnapshotFilterDim => "j/k move  Enter pick  Esc back",
+        Screen::SnapshotFilterValue => "j/k move  g/G top/bottom  Enter pick  Esc back",
         Screen::SnapshotContents => {
             "j/k move  g/G top/bottom  Enter open  Backspace up  r reload  q/Esc back"
         }
@@ -79,6 +84,7 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
             area,
             "Profile name",
             &app.new_profile_name,
+            false,
             "Give this profile a short name, e.g. 'laptop-local'",
         ),
         Screen::BackendChoice => render_backend_choice(frame, app, area),
@@ -87,18 +93,19 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
             area,
             &profile_title("Local repository path", app),
             &app.local_path,
+            false,
             "Filesystem path, e.g. /tmp/wrustic-test-repo",
         ),
         Screen::RestConfig => render_rest_config(frame, app, area),
         Screen::S3Location => render_s3_location(frame, app, area),
         Screen::S3Credentials => render_s3_credentials(frame, app, area),
         Screen::Password => {
-            let masked = "*".repeat(app.password.chars().count());
             render_input(
                 frame,
                 area,
                 &profile_title("Repository password", app),
-                &masked,
+                &app.password,
+                true,
                 "Restic repository password",
             );
         }
@@ -136,6 +143,8 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
             frame.render_widget(para, area);
         }
         Screen::Snapshots => render_snapshots(frame, app, area),
+        Screen::SnapshotFilterDim => render_filter_dim(frame, app, area),
+        Screen::SnapshotFilterValue => render_filter_value(frame, app, area),
         Screen::OpeningSnapshot => {
             let para = Paragraph::new("Opening snapshot — reading root tree…")
                 .block(Block::bordered().title("Loading"));
@@ -225,10 +234,11 @@ fn selection_highlight() -> Style {
 // Decorate a creation/edit screen title with the in-progress profile name so
 // the user can always see which profile they are editing.
 fn profile_title(base: &str, app: &App) -> String {
-    if app.new_profile_name.is_empty() {
+    let name = app.new_profile_name.value();
+    if name.is_empty() {
         base.to_string()
     } else {
-        format!("{base} — profile '{}'", app.new_profile_name)
+        format!("{base} — profile '{name}'")
     }
 }
 
@@ -264,10 +274,11 @@ fn render_backend_choice(frame: &mut Frame, app: &mut App, area: Rect) {
         .map(|k| ListItem::new(k.label()))
         .collect();
 
-    let title = if app.new_profile_name.is_empty() {
+    let name = app.new_profile_name.value();
+    let title = if name.is_empty() {
         "Choose backend".to_string()
     } else {
-        format!("Choose backend for '{}'", app.new_profile_name)
+        format!("Choose backend for '{name}'")
     };
 
     let list = List::new(items)
@@ -278,7 +289,14 @@ fn render_backend_choice(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_stateful_widget(list, area, &mut app.backend_list);
 }
 
-fn render_input(frame: &mut Frame, area: Rect, title: &str, value: &str, help: &str) {
+fn render_input(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    input: &Input,
+    masked: bool,
+    help: &str,
+) {
     let [_top, input_area, help_area, _bottom] = Layout::vertical([
         Constraint::Fill(1),
         Constraint::Length(3),
@@ -287,8 +305,7 @@ fn render_input(frame: &mut Frame, area: Rect, title: &str, value: &str, help: &
     ])
     .areas(area);
 
-    let input = Paragraph::new(format!("{value}_")).block(Block::bordered().title(title));
-    frame.render_widget(input, input_area);
+    draw_input_field(frame, input_area, title, input, masked, true);
 
     let help = Paragraph::new(help).style(Style::new().fg(Color::DarkGray));
     frame.render_widget(help, help_area);
@@ -298,7 +315,7 @@ fn render_grouped_input(
     frame: &mut Frame,
     area: Rect,
     title: &str,
-    fields: &[(&str, &str, bool)],
+    fields: &[(&str, &Input, bool)],
     focus: usize,
     help: &str,
 ) {
@@ -311,35 +328,68 @@ fn render_grouped_input(
     constraints.push(Constraint::Fill(1));
     let areas = Layout::vertical(constraints).split(inner_area);
 
-    for (i, (label, value, masked)) in fields.iter().enumerate() {
-        let display: String = if *masked {
-            "*".repeat(value.chars().count())
-        } else {
-            (*value).to_string()
-        };
-        let value_str = if i == focus {
-            format!("{display}_")
-        } else {
-            display
-        };
-        let mut block = Block::bordered().title(*label);
-        if i == focus {
-            block = block.border_style(Style::new().fg(Color::Yellow));
-        }
-        let para = Paragraph::new(value_str).block(block);
-        frame.render_widget(para, areas[i]);
+    for (i, (label, input, masked)) in fields.iter().enumerate() {
+        draw_input_field(frame, areas[i], label, input, *masked, i == focus);
     }
 
     let help_para = Paragraph::new(help).style(Style::new().fg(Color::DarkGray));
     frame.render_widget(help_para, areas[fields.len()]);
 }
 
+// Render a single bordered input box. When `focused`, paints a yellow border
+// and places the terminal cursor at the input's column position, scrolling
+// horizontally so the cursor stays visible.
+fn draw_input_field(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    input: &Input,
+    masked: bool,
+    focused: bool,
+) {
+    let value = input.value();
+    let display: String = if masked {
+        "*".repeat(value.chars().count())
+    } else {
+        value.to_string()
+    };
+
+    // For masked fields every char is a single column, so cursor and scroll
+    // are simple codepoint math. For non-masked fields use the Input's own
+    // grapheme-aware visual computation.
+    let inner_width = area.width.saturating_sub(2);
+    let (cursor_col, scroll) = if masked {
+        let cur = input.cursor();
+        let w = inner_width as usize;
+        let scroll = if w == 0 { 0 } else { cur.saturating_sub(w - 1) };
+        (cur, scroll)
+    } else {
+        let w = inner_width.max(1) as usize;
+        let scroll = input.visual_scroll(w);
+        (input.visual_cursor(), scroll)
+    };
+
+    let mut block = Block::bordered().title(title);
+    if focused {
+        block = block.border_style(Style::new().fg(Color::Yellow));
+    }
+    let para = Paragraph::new(display)
+        .scroll((0, scroll as u16))
+        .block(block);
+    frame.render_widget(para, area);
+
+    if focused {
+        let visible_col = cursor_col.saturating_sub(scroll) as u16;
+        frame.set_cursor_position((area.x + 1 + visible_col, area.y + 1));
+    }
+}
+
 fn render_rest_config(frame: &mut Frame, app: &App, area: Rect) {
     let title = profile_title("REST backend", app);
     let fields = [
-        ("URL (required)", app.rest_url.as_str(), false),
-        ("Username (optional)", app.rest_user.as_str(), false),
-        ("Password (optional)", app.rest_password.as_str(), true),
+        ("URL (required)", &app.rest_url, false),
+        ("Username (optional)", &app.rest_user, false),
+        ("Password (optional)", &app.rest_password, true),
     ];
     render_grouped_input(
         frame,
@@ -354,22 +404,14 @@ fn render_rest_config(frame: &mut Frame, app: &App, area: Rect) {
 fn render_s3_location(frame: &mut Frame, app: &App, area: Rect) {
     let title = profile_title("S3 location", app);
     let fields = [
-        (
-            "Endpoint (optional)",
-            app.s3_endpoint.as_str(),
-            false,
-        ),
-        ("Bucket (required)", app.s3_bucket.as_str(), false),
+        ("Endpoint (optional)", &app.s3_endpoint, false),
+        ("Bucket (required)", &app.s3_bucket, false),
         (
             "Region (optional, defaults to us-east-1)",
-            app.s3_region.as_str(),
+            &app.s3_region,
             false,
         ),
-        (
-            "Path within bucket (optional)",
-            app.s3_root.as_str(),
-            false,
-        ),
+        ("Path within bucket (optional)", &app.s3_root, false),
     ];
     render_grouped_input(
         frame,
@@ -384,8 +426,8 @@ fn render_s3_location(frame: &mut Frame, app: &App, area: Rect) {
 fn render_s3_credentials(frame: &mut Frame, app: &App, area: Rect) {
     let title = profile_title("S3 credentials", app);
     let fields = [
-        ("Access key ID", app.s3_access_key.as_str(), false),
-        ("Secret access key", app.s3_secret_key.as_str(), true),
+        ("Access key ID", &app.s3_access_key, false),
+        ("Secret access key", &app.s3_secret_key, true),
     ];
     render_grouped_input(
         frame,
@@ -398,19 +440,35 @@ fn render_s3_credentials(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_snapshots(frame: &mut Frame, app: &mut App, area: Rect) {
-    let title = format!("Snapshots ({})", app.snapshots.len());
-    let items: Vec<ListItem> = app
-        .snapshots
+    let visible = app.visible_snapshot_indices();
+    let total = app.snapshots.len();
+    let title = match &app.snapshot_filter {
+        None => format!("Snapshots ({total})"),
+        Some(f) => format!(
+            "Snapshots ({} of {}, {}={})",
+            visible.len(),
+            total,
+            f.kind().label(),
+            f.value()
+        ),
+    };
+
+    let items: Vec<ListItem> = visible
         .iter()
+        .map(|&i| &app.snapshots[i])
         .map(|s| {
             let tags = if s.tags.is_empty() {
                 String::new()
             } else {
-                format!("[{}]", s.tags)
+                format!("[{}]", s.tags.join(","))
             };
             ListItem::new(format!(
                 "{:<8}  {:<19}  {:<20}  {:<20}  {}",
-                s.short_id, s.time, s.host, tags, s.paths
+                s.short_id,
+                s.time,
+                s.host,
+                tags,
+                s.paths.join(",")
             ))
         })
         .collect();
@@ -421,6 +479,37 @@ fn render_snapshots(frame: &mut Frame, app: &mut App, area: Rect) {
         .highlight_symbol(">> ");
 
     frame.render_stateful_widget(list, area, &mut app.list_state);
+}
+
+fn render_filter_dim(frame: &mut Frame, app: &mut App, area: Rect) {
+    let entries = filter_dim_entries(app.snapshot_filter.is_some());
+    let items: Vec<ListItem> = entries
+        .iter()
+        .map(|e| ListItem::new(e.label()))
+        .collect();
+    let list = List::new(items)
+        .block(Block::bordered().title("Filter snapshots by"))
+        .highlight_style(selection_highlight())
+        .highlight_symbol(">> ");
+    frame.render_stateful_widget(list, area, &mut app.filter_picker_state);
+}
+
+fn render_filter_value(frame: &mut Frame, app: &mut App, area: Rect) {
+    let kind_label = app
+        .filter_pending_kind
+        .map(|k| k.label())
+        .unwrap_or("value");
+    let title = format!("Pick {} ({})", kind_label, app.filter_values.len());
+    let items: Vec<ListItem> = app
+        .filter_values
+        .iter()
+        .map(|v| ListItem::new(v.as_str()))
+        .collect();
+    let list = List::new(items)
+        .block(Block::bordered().title(title))
+        .highlight_style(selection_highlight())
+        .highlight_symbol(">> ");
+    frame.render_stateful_widget(list, area, &mut app.filter_picker_state);
 }
 
 fn render_snapshot_contents(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -452,7 +541,7 @@ fn render_snapshot_contents(frame: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .map(|row| {
             if matches!(row.kind, ContentKind::Parent) {
-                return ListItem::new("^  ..".to_string());
+                return ListItem::new("..".to_string());
             }
             let kind_char = match row.kind {
                 ContentKind::Dir => 'd',
@@ -467,7 +556,7 @@ fn render_snapshot_contents(frame: &mut Frame, app: &mut App, area: Rect) {
                 row.name.clone()
             };
             let size_col = if matches!(row.kind, ContentKind::File) {
-                format!("{:>10}", row.size)
+                format!("{:>10}", human_size(row.size))
             } else {
                 String::from("          ")
             };
@@ -490,4 +579,35 @@ fn render_snapshot_contents(frame: &mut Frame, app: &mut App, area: Rect) {
 fn short_snap_id(id: &str) -> &str {
     let end = id.char_indices().nth(8).map(|(i, _)| i).unwrap_or(id.len());
     &id[..end]
+}
+
+// 1024-based suffixes matching `ls -h` (e.g. "4.2K", "1.7M"). Bytes are shown
+// raw; larger values keep one decimal place.
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "K", "M", "G", "T", "P"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut v = bytes as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    format!("{:.1} {}", v, UNITS[i])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::human_size;
+
+    #[test]
+    fn human_size_formats() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(1023), "1023 B");
+        assert_eq!(human_size(1024), "1.0 K");
+        assert_eq!(human_size(1536), "1.5 K");
+        assert_eq!(human_size(1024 * 1024), "1.0 M");
+        assert_eq!(human_size(3 * 1024 * 1024 * 1024), "3.0 G");
+    }
 }

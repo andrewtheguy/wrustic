@@ -10,8 +10,8 @@ pub(crate) struct SnapshotRow {
     pub(crate) short_id: String,
     pub(crate) time: String,
     pub(crate) host: String,
-    pub(crate) tags: String,
-    pub(crate) paths: String,
+    pub(crate) tags: Vec<String>,
+    pub(crate) paths: Vec<String>,
 }
 
 pub(crate) enum ContentKind {
@@ -117,8 +117,8 @@ pub(crate) fn load_snapshots(profile: &Profile) -> Result<Vec<SnapshotRow>> {
             short_id: s.id.to_string(),
             time: s.time.strftime("%Y-%m-%d %H:%M:%S").to_string(),
             host: s.hostname.clone(),
-            tags: s.tags.to_string(),
-            paths: s.paths.to_string(),
+            tags: s.tags.iter().cloned().collect(),
+            paths: s.paths.iter().cloned().collect(),
         })
         .collect())
 }
