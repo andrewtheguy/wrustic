@@ -14,6 +14,7 @@ use tui_input::backend::crossterm::EventHandler;
 use crate::config::{self, BackendKind, Config, Paths, Profile};
 use crate::repo::{ContentKind, ContentRow, ContentsPreview, FileDetails, SnapshotRow};
 use crate::restic::{self, DiffChange, DiffSummary, ResticError, ResticInfo, SnapshotDetails};
+use crate::share::{self, SHARE_TTL, ShareHandle, ShareTarget};
 
 pub(crate) const BACKEND_ORDER: [BackendKind; 3] =
     [BackendKind::Local, BackendKind::Rest, BackendKind::S3];
@@ -41,6 +42,7 @@ pub(crate) enum Screen {
     LoadingDir,
     LoadingFileDetails,
     FileDetails,
+    ShareUrl,
     SnapshotCompareFirst,
     SnapshotCompareSecond,
     SnapshotCompareLoading,
@@ -227,6 +229,20 @@ pub(crate) struct App {
     pub(crate) pending_file_lookup: Option<(TreeId, String, String)>,
     pub(crate) file_details: Option<FileDetails>,
     pub(crate) file_details_scroll: u16,
+    // What `Screen::ShareUrl` would serve if started. Captured at the moment
+    // 'd' is pressed on FileDetails so we don't need to walk back into the
+    // browse stack later.
+    pub(crate) share_target: Option<ShareTarget>,
+    pub(crate) share_handle: Option<ShareHandle>,
+    // Last minted URL — kept around even after the server is stopped so the
+    // user can still read/copy it; the URL stays cryptographically valid
+    // until its embedded exp passes.
+    pub(crate) share_url: Option<String>,
+    pub(crate) share_short_url: Option<String>,
+    pub(crate) share_exp_unix: Option<u64>,
+    // Inline error for the Share screen (e.g. EADDRINUSE on start) — keeps
+    // the user on the Share screen instead of jumping to the global Error.
+    pub(crate) share_error: Option<String>,
     pub(crate) error_is_fatal: bool,
     pub(crate) quit: bool,
 
@@ -308,6 +324,12 @@ impl App {
             pending_file_lookup: None,
             file_details: None,
             file_details_scroll: 0,
+            share_target: None,
+            share_handle: None,
+            share_url: None,
+            share_short_url: None,
+            share_exp_unix: None,
+            share_error: None,
             error_is_fatal: false,
             quit: false,
             restic_check: None,
@@ -792,8 +814,10 @@ impl App {
                     self.screen = Screen::LoadingDir;
                 }
             }
-            // Files don't activate on Enter/click — use `i` to open details.
-            ContentKind::File | ContentKind::Symlink | ContentKind::Other => {}
+            // Enter on a file (or symlink/other) opens its details screen.
+            ContentKind::File | ContentKind::Symlink | ContentKind::Other => {
+                self.open_selected_file_details();
+            }
         }
     }
 
@@ -825,10 +849,78 @@ impl App {
         } else {
             format!("/{}/{}", dir_path, row.name)
         };
+        self.share_target = Some(ShareTarget {
+            snap_id: self.browse_snapshot_id.clone(),
+            tree_id: f.tree_id,
+            name: row.name.clone(),
+            display_path: full_path.clone(),
+        });
         self.pending_file_lookup = Some((f.tree_id, row.name.clone(), full_path));
         self.file_details_scroll = 0;
         self.screen = Screen::LoadingFileDetails;
     }
+
+    // Tear down any running share server and clear all share-related state.
+    // Called when leaving FileDetails (back to SnapshotContents) and on app
+    // exit — the share server is bound to the lifetime of viewing one file.
+    pub(crate) fn stop_share(&mut self) {
+        self.stop_share_keep_target();
+        self.share_target = None;
+    }
+
+    // Stop the server and drop the minted URL but keep `share_target` so
+    // re-entering the share dialog from FileDetails still has the file
+    // info it needs. Used when leaving the share dialog back to file
+    // details.
+    fn stop_share_keep_target(&mut self) {
+        if let Some(h) = self.share_handle.take() {
+            h.stop();
+        }
+        self.share_url = None;
+        self.share_short_url = None;
+        self.share_exp_unix = None;
+        self.share_error = None;
+    }
+
+    // Start the share server for the currently-loaded file. Called when
+    // entering the Share screen via `d` on FileDetails. No-op if a server
+    // is already running (shouldn't happen — we stop on every Esc — but
+    // defensive). Surfaces start errors inline on the Share screen.
+    fn start_share_server(&mut self) {
+        if self.share_handle.is_some() {
+            return;
+        }
+        let Some(target) = self.share_target.clone() else {
+            self.share_error = Some("No file selected to share.".into());
+            return;
+        };
+        let Some((_, profile)) = self.config.profile_at(self.loading_index) else {
+            self.share_error = Some("Selected profile no longer exists.".into());
+            return;
+        };
+        let profile = profile.clone();
+        let key = match share::derive_signing_key(&self.paths.identity) {
+            Ok(k) => k,
+            Err(e) => {
+                self.share_error = Some(format!("Deriving signing key: {e:#}"));
+                return;
+            }
+        };
+        let port = self.config.server.port;
+        match share::start(port, profile, key, target, SHARE_TTL) {
+            Ok(h) => {
+                self.share_url = Some(h.url.clone());
+                self.share_short_url = Some(h.short_url.clone());
+                self.share_exp_unix = Some(h.exp_unix);
+                self.share_error = None;
+                self.share_handle = Some(h);
+            }
+            Err(e) => {
+                self.share_error = Some(format!("{e:#}"));
+            }
+        }
+    }
+
 
     fn activate_backend(&mut self) {
         let idx = self
@@ -1263,7 +1355,6 @@ impl App {
                     }
                 }
                 KeyCode::Enter => self.activate_snapshot_content(),
-                KeyCode::Char('i') => self.open_selected_file_details(),
                 KeyCode::Backspace => self.go_up(),
                 KeyCode::Char('r') => {
                     let path: Vec<String> = self
@@ -1290,10 +1381,24 @@ impl App {
             | Screen::SnapshotCompareLoading => {}
 
             Screen::FileDetails => match key.code {
-                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Backspace => {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => {
+                    self.stop_share();
                     self.file_details = None;
                     self.file_details_scroll = 0;
                     self.screen = Screen::SnapshotContents;
+                }
+                KeyCode::Char('s') => {
+                    let is_file = self
+                        .file_details
+                        .as_ref()
+                        .map(|d| matches!(d.kind, ContentKind::File))
+                        .unwrap_or(false);
+                    if is_file && self.share_target.is_some() {
+                        // Auto-start the server when entering the share
+                        // screen. Errors stay inline on ShareUrl.
+                        self.start_share_server();
+                        self.screen = Screen::ShareUrl;
+                    }
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.file_details_scroll = self.file_details_scroll.saturating_add(1);
@@ -1311,6 +1416,17 @@ impl App {
                 KeyCode::PageUp => {
                     let step = self.page_step() as u16;
                     self.file_details_scroll = self.file_details_scroll.saturating_sub(step);
+                }
+                _ => {}
+            },
+
+            Screen::ShareUrl => match key.code {
+                KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('q') => {
+                    // Open ↔ server running: pressing `d` starts the
+                    // server and opens this screen; any back key stops it
+                    // and returns to FileDetails.
+                    self.stop_share_keep_target();
+                    self.screen = Screen::FileDetails;
                 }
                 _ => {}
             },

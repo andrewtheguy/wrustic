@@ -1,9 +1,15 @@
 use std::collections::BTreeMap;
+use std::io::{self, Write};
 
 use anyhow::{Context, Result, anyhow, bail};
+use bytes::Bytes;
 use rustic_backend::BackendOptions;
 use rustic_core::repofile::NodeType;
-use rustic_core::{Credentials, IndexedIdsStatus, Repository, RepositoryOptions, TreeId};
+use rustic_core::{
+    Credentials, IndexedFull, IndexedFullStatus, IndexedIdsStatus, Repository, RepositoryOptions,
+    TreeId,
+};
+use tokio::sync::mpsc;
 
 use crate::config::Profile;
 
@@ -165,6 +171,63 @@ pub(crate) fn open_indexed(profile: &Profile) -> Result<Repository<IndexedIdsSta
         .open(&Credentials::password(profile.password()))?
         .to_indexed_ids()?;
     Ok(repo)
+}
+
+// Like open_indexed, but with the full blob index + cache so that file content
+// can be read (Repository::dump). Used by the share-URL server, which needs
+// to stream file contents rather than just metadata.
+pub(crate) fn open_indexed_full(profile: &Profile) -> Result<Repository<IndexedFullStatus>> {
+    let backends = build_backend_opts(profile)?.to_backends()?;
+    let repo = Repository::new(&RepositoryOptions::default(), &backends)?
+        .open(&Credentials::password(profile.password()))?
+        .to_indexed()?;
+    Ok(repo)
+}
+
+// Stream one file's content blob-by-blob into `tx`. Looks up the node by name
+// inside the tree at `tree_id`. Each call to `Repository::dump` writes one
+// blob at a time via `write_all`; our writer wraps each call in a single mpsc
+// send so backpressure flows from the HTTP client through to the repo reader.
+//
+// Designed to be called from `tokio::task::spawn_blocking` — `tx.blocking_send`
+// is used so the rustic_core synchronous calls don't need an async runtime.
+pub(crate) fn stream_file_content<S: IndexedFull>(
+    repo: &Repository<S>,
+    tree_id: TreeId,
+    name: &str,
+    tx: &mpsc::Sender<io::Result<Bytes>>,
+) -> Result<()> {
+    let tree = repo.get_tree(&tree_id)?;
+    let node = tree
+        .nodes
+        .into_iter()
+        .find(|n| n.name().to_string_lossy() == name)
+        .ok_or_else(|| anyhow!("file `{name}` not found in tree"))?;
+    if !matches!(node.node_type, NodeType::File) {
+        bail!("`{name}` is not a regular file");
+    }
+    let mut writer = ChannelWriter { tx };
+    repo.dump(&node, &mut writer)?;
+    Ok(())
+}
+
+struct ChannelWriter<'a> {
+    tx: &'a mpsc::Sender<io::Result<Bytes>>,
+}
+
+impl Write for ChannelWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = buf.len();
+        let bytes = Bytes::copy_from_slice(buf);
+        self.tx
+            .blocking_send(Ok(bytes))
+            .map_err(|_| io::Error::other("client disconnected"))?;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 pub(crate) fn snapshot_root_tree(

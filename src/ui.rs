@@ -55,9 +55,12 @@ fn bottom_bar_text(screen: &Screen) -> &'static str {
         Screen::SnapshotDeleteConfirm => "y confirm delete  n/Esc cancel",
         Screen::SnapshotDeleteError(_) => "any key to continue",
         Screen::SnapshotContents => {
-            "j/k move  PgUp/PgDn page  g/G top/bottom  Enter open dir  i file info  Backspace up  r reload  q/Esc back"
+            "j/k move  PgUp/PgDn page  g/G top/bottom  Enter open  Backspace up  r reload  q/Esc back"
         }
-        Screen::FileDetails => "j/k scroll  PgUp/PgDn page  g top  Enter/Esc/Backspace/q back",
+        Screen::FileDetails => {
+            "j/k scroll  PgUp/PgDn page  g top  s share  Esc/Backspace/q back"
+        }
+        Screen::ShareUrl => "Esc/Backspace/q back (stops the server)",
         Screen::SnapshotCompareFirst => {
             "j/k move  PgUp/PgDn page  g/G top/bottom  Enter pick FIRST  Esc cancel"
         }
@@ -195,6 +198,7 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
         }
         Screen::SnapshotContents => render_snapshot_contents(frame, app, area),
         Screen::FileDetails => render_file_details(frame, app, area),
+        Screen::ShareUrl => render_share_url(frame, app, area),
         Screen::SnapshotCompareFirst => render_compare_first(frame, app, area),
         Screen::SnapshotCompareSecond => render_compare_second(frame, app, area),
         Screen::SnapshotCompareLoading => render_compare_loading(frame, app, area),
@@ -792,15 +796,25 @@ fn render_file_details(frame: &mut Frame, app: &mut App, area: Rect) {
         lines.push_str(&format!("Link target: {t}\n"));
     }
     if !d.content_hashes.is_empty() {
+        // Cap the displayed list so deeply-chunked files don't push the rest
+        // of the metadata off-screen. Show the first MAX hashes; the count
+        // in the header already tells the reader how many are hidden.
+        const MAX: usize = 10;
         lines.push_str(&format!(
             "\nContent blob SHA-256 ({} chunk{}):\n",
             d.content_hashes.len(),
             if d.content_hashes.len() == 1 { "" } else { "s" },
         ));
-        for h in &d.content_hashes {
+        for h in d.content_hashes.iter().take(MAX) {
             lines.push_str("  ");
             lines.push_str(h);
             lines.push('\n');
+        }
+        if d.content_hashes.len() > MAX {
+            lines.push_str(&format!(
+                "  … ({} more)\n",
+                d.content_hashes.len() - MAX
+            ));
         }
     } else if matches!(d.kind, ContentKind::File) {
         lines.push_str("\n(empty file — no content blobs)\n");
@@ -812,6 +826,69 @@ fn render_file_details(frame: &mut Frame, app: &mut App, area: Rect) {
         .block(
             Block::bordered().title(format!("File details — {}", short_path(&d.full_path))),
         );
+    record_list_area(app, area);
+    frame.render_widget(para, area);
+}
+
+fn render_share_url(frame: &mut Frame, app: &mut App, area: Rect) {
+    let port = app.config.server.port;
+    let target_label = app
+        .share_target
+        .as_ref()
+        .map(|t| short_path(&t.display_path))
+        .unwrap_or_else(|| "(no file)".to_string());
+
+    let mut lines = String::new();
+    let running = app.share_handle.is_some();
+    if running {
+        lines.push_str(&format!("Server: listening on 127.0.0.1:{port}\n"));
+    } else {
+        lines.push_str("Server: not running\n");
+    }
+    lines.push('\n');
+
+    match (&app.share_short_url, &app.share_url) {
+        (Some(short), Some(long)) => {
+            lines.push_str("Short URL (302 redirects to the long URL):\n");
+            lines.push_str(short);
+            lines.push_str("\n\n");
+            lines.push_str("Long URL:\n");
+            lines.push_str(long);
+            lines.push_str("\n\n");
+        }
+        _ => {
+            lines.push_str("URL: (none yet — start the server with `s`)\n\n");
+        }
+    }
+
+    if let Some(exp) = app.share_exp_unix {
+        // Absolute timestamp in local time — doesn't need re-rendering as
+        // the clock advances. `exp` is a u64 unix-seconds; convert via i64.
+        let when = jiff::Timestamp::from_second(exp as i64)
+            .and_then(|t| t.in_tz("UTC").map(|z| z.strftime("%Y-%m-%d %H:%M:%S UTC").to_string()))
+            .unwrap_or_else(|_| format!("unix {exp}"));
+        let local = jiff::Timestamp::from_second(exp as i64)
+            .map(|t| t.to_zoned(jiff::tz::TimeZone::system()))
+            .map(|z| z.strftime("%Y-%m-%d %H:%M:%S %Z").to_string())
+            .unwrap_or_default();
+        if local.is_empty() || local == when {
+            lines.push_str(&format!("Expires: {when}\n"));
+        } else {
+            lines.push_str(&format!("Expires: {local}  ({when})\n"));
+        }
+    }
+
+    if let Some(err) = &app.share_error {
+        lines.push_str(&format!("\nError: {err}\n"));
+    }
+
+    lines.push_str(
+        "\nServer is bound to this file only. Leaving this screen stops it.",
+    );
+
+    let para = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .block(Block::bordered().title(format!("Share — {target_label}")));
     record_list_area(app, area);
     frame.render_widget(para, area);
 }

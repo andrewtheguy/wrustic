@@ -83,12 +83,25 @@ impl Profile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerConfig {
+    pub port: u16,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self { port: 7834 }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub recipient: String,
     pub version: u32,
     #[serde(default)]
     pub profiles: BTreeMap<String, Profile>,
+    #[serde(default)]
+    pub server: ServerConfig,
 }
 
 impl Default for Config {
@@ -97,6 +110,7 @@ impl Default for Config {
             recipient: String::new(),
             version: CONFIG_VERSION,
             profiles: BTreeMap::new(),
+            server: ServerConfig::default(),
         }
     }
 }
@@ -420,6 +434,7 @@ mod tests {
             recipient: String::new(),
             version: CONFIG_VERSION,
             profiles,
+            server: ServerConfig::default(),
         };
         save(&cfg, &paths)?;
         assert!(paths.config.exists());
@@ -490,6 +505,7 @@ mod tests {
             recipient: String::new(),
             version: CONFIG_VERSION,
             profiles,
+            server: ServerConfig::default(),
         };
         save(&cfg, &paths)?;
 
@@ -538,6 +554,7 @@ mod tests {
             recipient: String::new(),
             version: CONFIG_VERSION,
             profiles,
+            server: ServerConfig::default(),
         };
         save(&cfg, &paths)?;
 
@@ -601,6 +618,7 @@ mod tests {
             recipient: String::new(),
             version: CONFIG_VERSION,
             profiles,
+            server: ServerConfig::default(),
         };
         save(&cfg, &paths)?;
 
