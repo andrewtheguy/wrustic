@@ -21,12 +21,13 @@ pub(crate) enum ResticError {
 
 impl ResticError {
     pub(crate) fn user_message(&self) -> String {
+        let min = format!("{MIN_MAJOR}.{MIN_MINOR}.{MIN_PATCH}");
         match self {
-            ResticError::NotFound => {
-                "restic not found on PATH. Install restic >= 0.18.1 to delete snapshots.".into()
-            }
+            ResticError::NotFound => format!(
+                "restic not found on PATH. Install restic >= {min} to delete snapshots."
+            ),
             ResticError::TooOld { found } => format!(
-                "restic {found} found on PATH, but >= 0.18.1 is required to delete snapshots."
+                "restic {found} found on PATH, but >= {min} is required to delete snapshots."
             ),
             ResticError::Unparseable { output } => {
                 format!("Could not parse restic version output: {output}")
@@ -103,16 +104,16 @@ pub(crate) fn snapshot_details_json(
 ) -> Result<(SnapshotDetails, String)> {
     let output = spawn(profile, &["snapshots", snapshot_id, "--json"])?;
     let stdout = String::from_utf8_lossy(&output).into_owned();
-    let arr: Vec<SnapshotDetails> = serde_json::from_str(&stdout)
+    let value: serde_json::Value = serde_json::from_str(&stdout)
         .map_err(|e| anyhow!("parsing restic snapshots JSON: {e}\nraw: {stdout}"))?;
-    let one = arr
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("restic returned no snapshot matching `{snapshot_id}`"))?;
-    let parsed_value: serde_json::Value = serde_json::from_str(&stdout)
-        .map_err(|e| anyhow!("re-parsing JSON for pretty-print: {e}"))?;
-    let pretty = serde_json::to_string_pretty(&parsed_value)
+    let pretty = serde_json::to_string_pretty(&value)
         .map_err(|e| anyhow!("pretty-printing JSON: {e}"))?;
+    let first = match value {
+        serde_json::Value::Array(mut arr) if !arr.is_empty() => arr.remove(0),
+        _ => return Err(anyhow!("restic returned no snapshot matching `{snapshot_id}`")),
+    };
+    let one: SnapshotDetails = serde_json::from_value(first)
+        .map_err(|e| anyhow!("converting JSON value to SnapshotDetails: {e}"))?;
     Ok((one, pretty))
 }
 
