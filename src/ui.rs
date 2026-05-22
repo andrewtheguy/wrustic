@@ -27,12 +27,7 @@ fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
         Some(name) => format!(" wrustic — profile: {name}"),
         None => " wrustic".to_string(),
     };
-    let para = Paragraph::new(text).style(
-        Style::new()
-            .fg(Color::Black)
-            .bg(Color::Green)
-            .add_modifier(Modifier::BOLD),
-    );
+    let para = Paragraph::new(text).style(Style::new().fg(Color::Black).bg(Color::Green));
     frame.render_widget(para, area);
 }
 
