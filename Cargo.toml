@@ -9,7 +9,7 @@ anyhow = "1.0.102"
 base64 = "0.22"
 bytes = "1"
 dirs = "5"
-hmac = "0.12"
+hmac = "0.13"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
@@ -19,7 +19,7 @@ rustic_backend = { version = "0.6.1", default-features = false, features = ["res
 rustic_core = { version = "0.11.0", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "macros"] }
 toml = "0.8"
 tui-input = { version = "0.14", default-features = false, features = ["crossterm"] }
