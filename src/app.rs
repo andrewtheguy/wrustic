@@ -778,24 +778,42 @@ impl App {
                     self.screen = Screen::LoadingDir;
                 }
             }
-            ContentKind::File | ContentKind::Symlink | ContentKind::Other => {
-                let dir_path = self
-                    .browse_stack
-                    .iter()
-                    .skip(1)
-                    .map(|fr| fr.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join("/");
-                let full_path = if dir_path.is_empty() {
-                    format!("/{}", row.name)
-                } else {
-                    format!("/{}/{}", dir_path, row.name)
-                };
-                self.pending_file_lookup = Some((f.tree_id, row.name.clone(), full_path));
-                self.file_details_scroll = 0;
-                self.screen = Screen::LoadingFileDetails;
-            }
+            // Files don't activate on Enter/click — use `i` to open details.
+            ContentKind::File | ContentKind::Symlink | ContentKind::Other => {}
         }
+    }
+
+    fn open_selected_file_details(&mut self) {
+        let Some(f) = self.browse_stack.last() else {
+            return;
+        };
+        let Some(idx) = f.list_state.selected() else {
+            return;
+        };
+        let Some(row) = f.items.get(idx) else {
+            return;
+        };
+        if !matches!(
+            row.kind,
+            ContentKind::File | ContentKind::Symlink | ContentKind::Other
+        ) {
+            return;
+        }
+        let dir_path = self
+            .browse_stack
+            .iter()
+            .skip(1)
+            .map(|fr| fr.name.as_str())
+            .collect::<Vec<_>>()
+            .join("/");
+        let full_path = if dir_path.is_empty() {
+            format!("/{}", row.name)
+        } else {
+            format!("/{}/{}", dir_path, row.name)
+        };
+        self.pending_file_lookup = Some((f.tree_id, row.name.clone(), full_path));
+        self.file_details_scroll = 0;
+        self.screen = Screen::LoadingFileDetails;
     }
 
     fn activate_backend(&mut self) {
@@ -1230,6 +1248,7 @@ impl App {
                     }
                 }
                 KeyCode::Enter => self.activate_snapshot_content(),
+                KeyCode::Char('i') => self.open_selected_file_details(),
                 KeyCode::Backspace => self.go_up(),
                 KeyCode::Char('r') => {
                     let path: Vec<String> = self
