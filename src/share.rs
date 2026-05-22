@@ -17,7 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow, bail};
 use bytes::Bytes;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::{Body, Frame};
 use hyper::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE, HeaderValue, LOCATION};
