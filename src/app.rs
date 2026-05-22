@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ratatui::{
@@ -138,19 +139,33 @@ fn click_to_index(
     (idx < len).then_some(idx)
 }
 
-// Jump a list selection by `step` rows in the given direction, clamping to
-// the list bounds. Used by PageUp/PageDown handlers.
-fn page_select(state: &mut ListState, len: usize, forward: bool, step: usize) {
+// Advance the viewport by exactly one page and put the cursor on the first
+// item of the new page. Used by PageUp/PageDown handlers.
+//
+// On PageDown, if a full page can't be advanced (already on the last/partial
+// page), the cursor moves to the last item instead of paging past the end.
+// PageUp mirrors this against the previous page; if already on the first
+// page, it clamps to index 0.
+fn page_select(state: &mut ListState, len: usize, forward: bool, page_size: usize) {
     if len == 0 {
+        state.select(None);
         return;
     }
-    let cur = state.selected().unwrap_or(0);
-    let new = if forward {
-        cur.saturating_add(step).min(len - 1)
+    let page_size = page_size.max(1);
+    let cur_offset = state.offset();
+    if forward {
+        let next_offset = cur_offset.saturating_add(page_size);
+        if next_offset >= len {
+            state.select(Some(len - 1));
+        } else {
+            *state.offset_mut() = next_offset;
+            state.select(Some(next_offset));
+        }
     } else {
-        cur.saturating_sub(step)
-    };
-    state.select(Some(new));
+        let prev_offset = cur_offset.saturating_sub(page_size);
+        *state.offset_mut() = prev_offset;
+        state.select(Some(prev_offset));
+    }
 }
 
 pub(crate) struct BrowseFrame {
@@ -234,7 +249,14 @@ pub(crate) struct App {
     // to translate click coordinates into a row index. Set by the renderer
     // each frame; read by the key/mouse handler on the next event.
     pub(crate) list_area: Option<Rect>,
+
+    // Last left-click on the SnapshotContents list: timestamp + clicked row
+    // index. Used to detect a double-click for opening file info.
+    pub(crate) last_content_click: Option<(Instant, usize)>,
 }
+
+// Two clicks on the same row within this window count as a double-click.
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 impl App {
     pub(crate) fn boot(config_dir: Option<PathBuf>) -> Result<Self> {
@@ -301,6 +323,7 @@ impl App {
             compare_results: None,
             compare_results_state: ListState::default(),
             list_area: None,
+            last_content_click: None,
         };
 
         if !identity_exists {
@@ -495,12 +518,12 @@ impl App {
         }
     }
 
-    // Rows to jump on PageDown/PageUp. One row of overlap with the previous
-    // page keeps a bit of context across the jump.
+    // Inner visible rows of the currently-rendered list/paragraph — one full
+    // page's worth, used by PageDown/PageUp to advance the viewport.
     fn page_step(&self) -> usize {
         let h = self.list_area.map(|r| r.height).unwrap_or(0);
-        // height - 2 (borders) - 1 (overlap), with a floor of 1 row.
-        h.saturating_sub(3).max(1) as usize
+        // height - 2 borders, with a floor of 1 row.
+        h.saturating_sub(2).max(1) as usize
     }
 
     // Indices into `self.snapshots` for rows that pass the current filter,
@@ -618,6 +641,8 @@ impl App {
     }
 
     fn go_up(&mut self) {
+        // Any pending double-click pair belonged to the old frame; drop it.
+        self.last_content_click = None;
         if self.browse_stack.len() > 1 {
             self.browse_stack.pop();
         } else {
@@ -760,28 +785,49 @@ impl App {
             ContentKind::Parent => self.go_up(),
             ContentKind::Dir => {
                 if let Some(subtree) = row.subtree {
+                    // Descending — drop any pending double-click pair so the
+                    // new frame can't inherit a stale match.
+                    self.last_content_click = None;
                     self.pending_descend = Some((subtree, row.name.clone()));
                     self.screen = Screen::LoadingDir;
                 }
             }
-            ContentKind::File | ContentKind::Symlink | ContentKind::Other => {
-                let dir_path = self
-                    .browse_stack
-                    .iter()
-                    .skip(1)
-                    .map(|fr| fr.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join("/");
-                let full_path = if dir_path.is_empty() {
-                    format!("/{}", row.name)
-                } else {
-                    format!("/{}/{}", dir_path, row.name)
-                };
-                self.pending_file_lookup = Some((f.tree_id, row.name.clone(), full_path));
-                self.file_details_scroll = 0;
-                self.screen = Screen::LoadingFileDetails;
-            }
+            // Files don't activate on Enter/click — use `i` to open details.
+            ContentKind::File | ContentKind::Symlink | ContentKind::Other => {}
         }
+    }
+
+    fn open_selected_file_details(&mut self) {
+        let Some(f) = self.browse_stack.last() else {
+            return;
+        };
+        let Some(idx) = f.list_state.selected() else {
+            return;
+        };
+        let Some(row) = f.items.get(idx) else {
+            return;
+        };
+        if !matches!(
+            row.kind,
+            ContentKind::File | ContentKind::Symlink | ContentKind::Other
+        ) {
+            return;
+        }
+        let dir_path = self
+            .browse_stack
+            .iter()
+            .skip(1)
+            .map(|fr| fr.name.as_str())
+            .collect::<Vec<_>>()
+            .join("/");
+        let full_path = if dir_path.is_empty() {
+            format!("/{}", row.name)
+        } else {
+            format!("/{}/{}", dir_path, row.name)
+        };
+        self.pending_file_lookup = Some((f.tree_id, row.name.clone(), full_path));
+        self.file_details_scroll = 0;
+        self.screen = Screen::LoadingFileDetails;
     }
 
     fn activate_backend(&mut self) {
@@ -1179,6 +1225,7 @@ impl App {
                     self.browse_snapshot_id.clear();
                     self.pending_descend = None;
                     self.pending_refresh_path = None;
+                    self.last_content_click = None;
                     self.screen = Screen::Snapshots;
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
@@ -1216,6 +1263,7 @@ impl App {
                     }
                 }
                 KeyCode::Enter => self.activate_snapshot_content(),
+                KeyCode::Char('i') => self.open_selected_file_details(),
                 KeyCode::Backspace => self.go_up(),
                 KeyCode::Char('r') => {
                     let path: Vec<String> = self
@@ -1228,6 +1276,7 @@ impl App {
                     self.repo_session = None;
                     self.browse_stack.clear();
                     self.pending_descend = None;
+                    self.last_content_click = None;
                     self.screen = Screen::OpeningSnapshot;
                 }
                 _ => {}
@@ -1590,7 +1639,18 @@ impl App {
                 let offset = f.list_state.offset();
                 if let Some(idx) = click_to_index(area, offset, len, row, col) {
                     f.list_state.select(Some(idx));
-                    self.activate_snapshot_content();
+                    let now = Instant::now();
+                    let is_double = self
+                        .last_content_click
+                        .is_some_and(|(t, i)| i == idx && now.duration_since(t) < DOUBLE_CLICK);
+                    if is_double {
+                        // Consume the pair so a third click doesn't re-fire.
+                        self.last_content_click = None;
+                        self.open_selected_file_details();
+                    } else {
+                        self.last_content_click = Some((now, idx));
+                        self.activate_snapshot_content();
+                    }
                 }
             }
             // FileDetails has no list; clicks are ignored.
@@ -1884,5 +1944,64 @@ mod tests {
         assert_eq!(click_to_index(area, 0, 3, 4, 5), None);
         // Empty list rejects all clicks.
         assert_eq!(click_to_index(area, 0, 0, 1, 5), None);
+    }
+
+    fn list_state_at(offset: usize, selected: usize) -> ListState {
+        ListState::default().with_offset(offset).with_selected(Some(selected))
+    }
+
+    #[test]
+    fn page_select_forward_advances_viewport_and_selects_top() {
+        // First PageDown from the top: viewport jumps from 0 to page_size,
+        // cursor lands on the first item of the new page.
+        let mut s = list_state_at(0, 0);
+        page_select(&mut s, 25, true, 10);
+        assert_eq!(s.offset(), 10);
+        assert_eq!(s.selected(), Some(10));
+        // Subsequent PageDown advances another full page.
+        page_select(&mut s, 25, true, 10);
+        assert_eq!(s.offset(), 20);
+        assert_eq!(s.selected(), Some(20));
+    }
+
+    #[test]
+    fn page_select_forward_clamps_to_last_item_on_last_page() {
+        // Already on the last (partial) page — can't advance a full page,
+        // so cursor moves to the last item.
+        let mut s = list_state_at(20, 20);
+        page_select(&mut s, 25, true, 10);
+        assert_eq!(s.selected(), Some(24));
+        // Pressing again is a no-op.
+        page_select(&mut s, 25, true, 10);
+        assert_eq!(s.selected(), Some(24));
+    }
+
+    #[test]
+    fn page_select_forward_handles_list_shorter_than_page() {
+        // Whole list fits on one page — first PageDown goes straight to last.
+        let mut s = list_state_at(0, 0);
+        page_select(&mut s, 5, true, 10);
+        assert_eq!(s.selected(), Some(4));
+    }
+
+    #[test]
+    fn page_select_backward_advances_viewport_and_selects_top() {
+        // PageUp from a deep page rewinds the viewport by page_size and
+        // selects the first item of the new viewport.
+        let mut s = list_state_at(15, 24);
+        page_select(&mut s, 25, false, 10);
+        assert_eq!(s.offset(), 5);
+        assert_eq!(s.selected(), Some(5));
+        // Another PageUp clamps to offset 0, cursor on index 0.
+        page_select(&mut s, 25, false, 10);
+        assert_eq!(s.offset(), 0);
+        assert_eq!(s.selected(), Some(0));
+    }
+
+    #[test]
+    fn page_select_handles_empty_list() {
+        let mut s = list_state_at(0, 0);
+        page_select(&mut s, 0, true, 10);
+        assert_eq!(s.selected(), None);
     }
 }

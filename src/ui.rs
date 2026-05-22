@@ -27,12 +27,7 @@ fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
         Some(name) => format!(" wrustic — profile: {name}"),
         None => " wrustic".to_string(),
     };
-    let para = Paragraph::new(text).style(
-        Style::new()
-            .fg(Color::Black)
-            .bg(Color::Green)
-            .add_modifier(Modifier::BOLD),
-    );
+    let para = Paragraph::new(text).style(Style::new().fg(Color::Black).bg(Color::Green));
     frame.render_widget(para, area);
 }
 
@@ -60,7 +55,7 @@ fn bottom_bar_text(screen: &Screen) -> &'static str {
         Screen::SnapshotDeleteConfirm => "y confirm delete  n/Esc cancel",
         Screen::SnapshotDeleteError(_) => "any key to continue",
         Screen::SnapshotContents => {
-            "j/k move  PgUp/PgDn page  g/G top/bottom  Enter open  Backspace up  r reload  q/Esc back"
+            "j/k move  PgUp/PgDn page  g/G top/bottom  Enter open dir  i file info  Backspace up  r reload  q/Esc back"
         }
         Screen::FileDetails => "j/k scroll  PgUp/PgDn page  g top  Enter/Esc/Backspace/q back",
         Screen::SnapshotCompareFirst => {
