@@ -239,7 +239,7 @@ fn render_first_run_choice(frame: &mut Frame, app: &mut App, area: Rect) {
         .block(Block::bordered().title("j/k to move, Enter to pick, Esc to quit"))
         .highlight_style(selection_highlight())
         .highlight_symbol(">> ");
-    record_viewport(app, list_area);
+    record_list_area(app, list_area);
     frame.render_stateful_widget(list, list_area, &mut app.first_run_state);
 }
 
@@ -280,11 +280,13 @@ fn selection_highlight() -> Style {
     Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD)
 }
 
-// Record the inner height of a bordered scroll/list area so PageUp/PageDown
-// can size their jump to the visible page. `area` is the outer rect that
-// gets `Block::bordered()` — subtract 2 rows for the borders.
-fn record_viewport(app: &mut App, area: Rect) {
-    app.viewport_rows = area.height.saturating_sub(2);
+// Stash the outer rect of the currently-rendered scrollable area so the
+// key handler can size PageUp/PageDown jumps and the mouse handler can
+// translate clicks into row indices. `area` is the outer rect that gets
+// `Block::bordered()`; the bordered interior is `area` shrunk by 1 on
+// each side.
+fn record_list_area(app: &mut App, area: Rect) {
+    app.list_area = Some(area);
 }
 
 // Decorate a creation/edit screen title with the in-progress profile name so
@@ -321,7 +323,7 @@ fn render_home(frame: &mut Frame, app: &mut App, area: Rect) {
         .highlight_style(selection_highlight())
         .highlight_symbol(">> ");
 
-    record_viewport(app, area);
+    record_list_area(app, area);
     frame.render_stateful_widget(list, area, &mut app.profile_list_state);
 }
 
@@ -343,7 +345,7 @@ fn render_backend_choice(frame: &mut Frame, app: &mut App, area: Rect) {
         .highlight_style(selection_highlight())
         .highlight_symbol(">> ");
 
-    record_viewport(app, area);
+    record_list_area(app, area);
     frame.render_stateful_widget(list, area, &mut app.backend_list);
 }
 
@@ -511,7 +513,7 @@ fn render_snapshots(frame: &mut Frame, app: &mut App, area: Rect) {
         ),
     };
 
-    record_viewport(app, area);
+    record_list_area(app, area);
     render_snapshot_picker(frame, area, &title, &app.snapshots, &visible, &mut app.list_state);
 }
 
@@ -557,7 +559,7 @@ fn render_snapshot_picker(
 fn render_compare_first(frame: &mut Frame, app: &mut App, area: Rect) {
     let visible = app.visible_snapshot_indices();
     let title = format!("Compare — pick FIRST snapshot ({})", visible.len());
-    record_viewport(app, area);
+    record_list_area(app, area);
     render_snapshot_picker(
         frame,
         area,
@@ -580,7 +582,7 @@ fn render_compare_second(frame: &mut Frame, app: &mut App, area: Rect) {
         "Compare {first_short}.. — pick SECOND snapshot ({}, {scope})",
         visible.len()
     );
-    record_viewport(app, area);
+    record_list_area(app, area);
     render_snapshot_picker(
         frame,
         area,
@@ -649,7 +651,7 @@ fn render_compare_results(frame: &mut Frame, app: &mut App, area: Rect) {
         .block(Block::bordered().title(format!("Changes ({count})")))
         .highlight_style(selection_highlight())
         .highlight_symbol(">> ");
-    record_viewport(app, body);
+    record_list_area(app, body);
     frame.render_stateful_widget(list, body, &mut app.compare_results_state);
 }
 
@@ -663,12 +665,12 @@ fn render_filter_dim(frame: &mut Frame, app: &mut App, area: Rect) {
         .block(Block::bordered().title("Filter snapshots by"))
         .highlight_style(selection_highlight())
         .highlight_symbol(">> ");
-    record_viewport(app, area);
+    record_list_area(app, area);
     frame.render_stateful_widget(list, area, &mut app.filter_picker_state);
 }
 
 fn render_filter_value(frame: &mut Frame, app: &mut App, area: Rect) {
-    record_viewport(app, area);
+    record_list_area(app, area);
     let kind_label = app
         .filter_pending_kind
         .map(|k| k.label())
@@ -746,7 +748,7 @@ fn render_snapshot_contents(frame: &mut Frame, app: &mut App, area: Rect) {
         .highlight_style(selection_highlight())
         .highlight_symbol(">> ");
 
-    record_viewport(app, area);
+    record_list_area(app, area);
     let top_mut = &mut app.browse_stack[frame_idx];
     frame.render_stateful_widget(list, area, &mut top_mut.list_state);
 }
@@ -815,7 +817,7 @@ fn render_file_details(frame: &mut Frame, app: &mut App, area: Rect) {
         .block(
             Block::bordered().title(format!("File details — {}", short_path(&d.full_path))),
         );
-    record_viewport(app, area);
+    record_list_area(app, area);
     frame.render_widget(para, area);
 }
 
