@@ -11,7 +11,7 @@ use tui_input::backend::crossterm::EventHandler;
 
 use crate::config::{self, BackendKind, Config, Paths, Profile};
 use crate::repo::{ContentKind, ContentRow, SnapshotRow};
-use crate::restic::{self, ResticError, ResticInfo, SnapshotDetails};
+use crate::restic::{self, DiffChange, DiffSummary, ResticError, ResticInfo, SnapshotDetails};
 
 pub(crate) const BACKEND_ORDER: [BackendKind; 3] =
     [BackendKind::Local, BackendKind::Rest, BackendKind::S3];
@@ -36,6 +36,10 @@ pub(crate) enum Screen {
     OpeningSnapshot,
     SnapshotContents,
     LoadingDir,
+    SnapshotCompareFirst,
+    SnapshotCompareSecond,
+    SnapshotCompareLoading,
+    SnapshotCompareResults,
     CreateProfileName,
     BackendChoice,
     LocalPath,
@@ -160,6 +164,14 @@ pub(crate) struct App {
     pub(crate) delete_target: Option<String>,
     pub(crate) delete_details_parsed: Option<SnapshotDetails>,
     pub(crate) delete_details_raw: Option<String>,
+
+    pub(crate) compare_first_id: Option<String>,
+    pub(crate) compare_first_row_idx: Option<usize>,
+    pub(crate) compare_second_id: Option<String>,
+    pub(crate) compare_only_related: bool,
+    pub(crate) compare_picker_state: ListState,
+    pub(crate) compare_results: Option<(DiffSummary, Vec<DiffChange>)>,
+    pub(crate) compare_results_state: ListState,
 }
 
 impl App {
@@ -215,6 +227,13 @@ impl App {
             delete_target: None,
             delete_details_parsed: None,
             delete_details_raw: None,
+            compare_first_id: None,
+            compare_first_row_idx: None,
+            compare_second_id: None,
+            compare_only_related: true,
+            compare_picker_state: ListState::default(),
+            compare_results: None,
+            compare_results_state: ListState::default(),
         };
 
         if !identity_exists {
@@ -449,6 +468,48 @@ impl App {
         self.delete_details_raw = None;
     }
 
+    pub(crate) fn clear_compare_scratch(&mut self) {
+        self.compare_first_id = None;
+        self.compare_first_row_idx = None;
+        self.compare_second_id = None;
+        self.compare_only_related = true;
+        self.compare_picker_state = ListState::default();
+        self.compare_results = None;
+        self.compare_results_state = ListState::default();
+    }
+
+    // Indices into `self.snapshots` for step 2 of the compare flow: start from
+    // the active snapshot_filter, exclude the first-picked row, and (when
+    // `compare_only_related` is true) restrict to rows sharing host + paths
+    // with the first pick — restic's incremental parent chain is per
+    // host+paths, so this is the practical "same lineage" proxy.
+    pub(crate) fn compare_second_visible_indices(&self) -> Vec<usize> {
+        let base = self.visible_snapshot_indices();
+        let Some(first_idx) = self.compare_first_row_idx else {
+            return base.into_iter().filter(|&i| Some(i) != self.compare_first_row_idx).collect();
+        };
+        let Some(first) = self.snapshots.get(first_idx) else {
+            return base;
+        };
+        let first_paths: std::collections::BTreeSet<&str> =
+            first.paths.iter().map(String::as_str).collect();
+        base.into_iter()
+            .filter(|&i| i != first_idx)
+            .filter(|&i| {
+                if !self.compare_only_related {
+                    return true;
+                }
+                let r = &self.snapshots[i];
+                if r.host != first.host {
+                    return false;
+                }
+                let other: std::collections::BTreeSet<&str> =
+                    r.paths.iter().map(String::as_str).collect();
+                other == first_paths
+            })
+            .collect()
+    }
+
     // Run version detection lazily (cached) and, if restic is available, fetch
     // the snapshot's `restic snapshots --json` details. On any failure, stash
     // a user-facing message and transition to SnapshotDeleteError. On success,
@@ -655,6 +716,127 @@ impl App {
                         self.begin_delete_flow(id);
                     }
                 }
+                KeyCode::Char('c') => {
+                    // Need at least two snapshots in the current visible set to
+                    // compare anything; otherwise the flow has no second pick.
+                    let visible = self.visible_snapshot_indices();
+                    if visible.len() < 2 {
+                        return;
+                    }
+                    self.clear_compare_scratch();
+                    let start = self.list_state.selected().unwrap_or(0).min(visible.len() - 1);
+                    self.compare_picker_state.select(Some(start));
+                    self.screen = Screen::SnapshotCompareFirst;
+                }
+                _ => {}
+            },
+
+            Screen::SnapshotCompareFirst => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.clear_compare_scratch();
+                    self.screen = Screen::Snapshots;
+                }
+                KeyCode::Down | KeyCode::Char('j') => self.compare_picker_state.select_next(),
+                KeyCode::Up | KeyCode::Char('k') => self.compare_picker_state.select_previous(),
+                KeyCode::Home | KeyCode::Char('g') => {
+                    self.compare_picker_state.select(Some(0));
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    let visible = self.visible_snapshot_indices();
+                    if !visible.is_empty() {
+                        self.compare_picker_state.select(Some(visible.len() - 1));
+                    }
+                }
+                KeyCode::Enter => {
+                    let visible = self.visible_snapshot_indices();
+                    if let Some(pos) = self.compare_picker_state.selected()
+                        && let Some(&abs) = visible.get(pos)
+                        && let Some(s) = self.snapshots.get(abs)
+                    {
+                        self.compare_first_id = Some(s.id.clone());
+                        self.compare_first_row_idx = Some(abs);
+                        self.compare_only_related = true;
+                        // Reset picker selection — index meaning changes with
+                        // the new (related-only) visible set.
+                        self.compare_picker_state = ListState::default();
+                        if !self.compare_second_visible_indices().is_empty() {
+                            self.compare_picker_state.select(Some(0));
+                        }
+                        self.screen = Screen::SnapshotCompareSecond;
+                    }
+                }
+                _ => {}
+            },
+
+            Screen::SnapshotCompareSecond => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.compare_second_id = None;
+                    self.compare_only_related = true;
+                    // Restore picker to first-pick position so user lands where
+                    // they were.
+                    self.compare_picker_state = ListState::default();
+                    if let Some(idx) = self.compare_first_row_idx {
+                        let visible = self.visible_snapshot_indices();
+                        if let Some(pos) = visible.iter().position(|&i| i == idx) {
+                            self.compare_picker_state.select(Some(pos));
+                        }
+                    }
+                    self.compare_first_id = None;
+                    self.compare_first_row_idx = None;
+                    self.screen = Screen::SnapshotCompareFirst;
+                }
+                KeyCode::Down | KeyCode::Char('j') => self.compare_picker_state.select_next(),
+                KeyCode::Up | KeyCode::Char('k') => self.compare_picker_state.select_previous(),
+                KeyCode::Home | KeyCode::Char('g') => {
+                    self.compare_picker_state.select(Some(0));
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    let visible = self.compare_second_visible_indices();
+                    if !visible.is_empty() {
+                        self.compare_picker_state.select(Some(visible.len() - 1));
+                    }
+                }
+                KeyCode::Char('a') => {
+                    self.compare_only_related = !self.compare_only_related;
+                    // Selection index meaning changes with the toggle; reset
+                    // to the top to avoid pointing at a row that fell out of
+                    // (or wasn't in) the new set.
+                    let visible = self.compare_second_visible_indices();
+                    self.compare_picker_state = ListState::default();
+                    if !visible.is_empty() {
+                        self.compare_picker_state.select(Some(0));
+                    }
+                }
+                KeyCode::Enter => {
+                    let visible = self.compare_second_visible_indices();
+                    if let Some(pos) = self.compare_picker_state.selected()
+                        && let Some(&abs) = visible.get(pos)
+                        && let Some(s) = self.snapshots.get(abs)
+                    {
+                        self.compare_second_id = Some(s.id.clone());
+                        self.screen = Screen::SnapshotCompareLoading;
+                    }
+                }
+                _ => {}
+            },
+
+            Screen::SnapshotCompareResults => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.clear_compare_scratch();
+                    self.screen = Screen::Snapshots;
+                }
+                KeyCode::Down | KeyCode::Char('j') => self.compare_results_state.select_next(),
+                KeyCode::Up | KeyCode::Char('k') => self.compare_results_state.select_previous(),
+                KeyCode::Home | KeyCode::Char('g') => {
+                    self.compare_results_state.select(Some(0));
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    if let Some((_, changes)) = &self.compare_results
+                        && !changes.is_empty()
+                    {
+                        self.compare_results_state.select(Some(changes.len() - 1));
+                    }
+                }
                 _ => {}
             },
 
@@ -808,7 +990,10 @@ impl App {
                 _ => {}
             },
 
-            Screen::OpeningSnapshot | Screen::LoadingDir | Screen::SnapshotDeleting => {}
+            Screen::OpeningSnapshot
+            | Screen::LoadingDir
+            | Screen::SnapshotDeleting
+            | Screen::SnapshotCompareLoading => {}
 
             Screen::CreateProfileName => match key.code {
                 KeyCode::Enter => {
@@ -1139,5 +1324,73 @@ mod tests {
         let entries = filter_dim_entries(true);
         assert_eq!(entries.len(), 4);
         assert!(matches!(entries.last(), Some(FilterDimEntry::Clear)));
+    }
+
+    fn boot_app_with_snapshots(snaps: Vec<SnapshotRow>) -> App {
+        let tmp = std::env::temp_dir().join(format!(
+            "wrustic-app-test-{}-{}",
+            std::process::id(),
+            uniq()
+        ));
+        let mut app = App::boot(Some(tmp)).expect("boot");
+        app.snapshots = snaps;
+        app
+    }
+
+    // Cheap monotonic counter for unique config-dir names per test.
+    fn uniq() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        N.fetch_add(1, Ordering::Relaxed)
+    }
+
+    #[test]
+    fn compare_related_filter_matches_host_and_paths() {
+        let mut app = boot_app_with_snapshots(vec![
+            row("laptop", &[], &["/home"]),  // 0 — picked as first
+            row("laptop", &[], &["/home"]),  // 1 — related
+            row("laptop", &[], &["/etc"]),   // 2 — same host, different paths
+            row("server", &[], &["/home"]),  // 3 — different host
+        ]);
+        app.compare_first_row_idx = Some(0);
+        app.compare_only_related = true;
+        assert_eq!(app.compare_second_visible_indices(), vec![1]);
+    }
+
+    #[test]
+    fn compare_related_filter_ignores_path_order() {
+        let mut app = boot_app_with_snapshots(vec![
+            row("laptop", &[], &["/home", "/etc"]),
+            row("laptop", &[], &["/etc", "/home"]),
+        ]);
+        app.compare_first_row_idx = Some(0);
+        app.compare_only_related = true;
+        assert_eq!(app.compare_second_visible_indices(), vec![1]);
+    }
+
+    #[test]
+    fn compare_show_all_includes_everything_except_first() {
+        let mut app = boot_app_with_snapshots(vec![
+            row("laptop", &[], &["/home"]),
+            row("laptop", &[], &["/etc"]),
+            row("server", &[], &["/home"]),
+        ]);
+        app.compare_first_row_idx = Some(0);
+        app.compare_only_related = false;
+        assert_eq!(app.compare_second_visible_indices(), vec![1, 2]);
+    }
+
+    #[test]
+    fn compare_second_respects_active_snapshot_filter() {
+        let mut app = boot_app_with_snapshots(vec![
+            row("laptop", &[], &["/home"]),
+            row("laptop", &[], &["/home"]),
+            row("server", &[], &["/home"]),
+        ]);
+        app.snapshot_filter = Some(SnapshotFilter::Host("laptop".into()));
+        app.compare_first_row_idx = Some(0);
+        app.compare_only_related = false;
+        // Even with related=off, the host filter narrows to laptop rows only.
+        assert_eq!(app.compare_second_visible_indices(), vec![1]);
     }
 }

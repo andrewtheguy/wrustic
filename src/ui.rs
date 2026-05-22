@@ -50,7 +50,7 @@ fn bottom_bar_text(screen: &Screen) -> &'static str {
         Screen::KeyCreated => "Enter continue  Esc quit",
         Screen::Home => "j/k move  Enter open  n new  e edit  d delete  q quit",
         Screen::Snapshots => {
-            "j/k move  g/G top/bottom  Enter browse  f filter  d delete  r refresh  q/Esc back"
+            "j/k move  g/G top/bottom  Enter browse  c compare  f filter  d delete  r refresh  q/Esc back"
         }
         Screen::SnapshotFilterDim => "j/k move  Enter pick  Esc back",
         Screen::SnapshotFilterValue => "j/k move  g/G top/bottom  Enter pick  Esc back",
@@ -60,11 +60,19 @@ fn bottom_bar_text(screen: &Screen) -> &'static str {
         Screen::SnapshotContents => {
             "j/k move  g/G top/bottom  Enter open  Backspace up  r reload  q/Esc back"
         }
+        Screen::SnapshotCompareFirst => {
+            "j/k move  g/G top/bottom  Enter pick FIRST  Esc cancel"
+        }
+        Screen::SnapshotCompareSecond => {
+            "j/k move  g/G top/bottom  Enter pick SECOND  a toggle related/all  Esc back"
+        }
+        Screen::SnapshotCompareResults => "j/k move  g/G top/bottom  q/Esc back",
         Screen::OpeningSnapshot
         | Screen::LoadingDir
         | Screen::Loading
         | Screen::Verifying
-        | Screen::SnapshotDeleting => "working…",
+        | Screen::SnapshotDeleting
+        | Screen::SnapshotCompareLoading => "working…",
         Screen::CreateProfileName => "type  Enter submit  Esc cancel",
         Screen::BackendChoice => "j/k move  Enter pick  Esc back",
         Screen::LocalPath => "type  Enter submit  Esc back",
@@ -176,6 +184,10 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
             frame.render_widget(para, area);
         }
         Screen::SnapshotContents => render_snapshot_contents(frame, app, area),
+        Screen::SnapshotCompareFirst => render_compare_first(frame, app, area),
+        Screen::SnapshotCompareSecond => render_compare_second(frame, app, area),
+        Screen::SnapshotCompareLoading => render_compare_loading(frame, app, area),
+        Screen::SnapshotCompareResults => render_compare_results(frame, app, area),
         Screen::Error(msg) => {
             let title = if app.error_is_fatal {
                 "Error — fatal"
@@ -473,9 +485,23 @@ fn render_snapshots(frame: &mut Frame, app: &mut App, area: Rect) {
         ),
     };
 
+    render_snapshot_picker(frame, area, &title, &app.snapshots, &visible, &mut app.list_state);
+}
+
+// Shared picker rendering for the Snapshots screen and the two compare-flow
+// pick screens. Indices are absolute into `snapshots`; the picker's own
+// `ListState` is positional within `visible`.
+fn render_snapshot_picker(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    snapshots: &[crate::repo::SnapshotRow],
+    visible: &[usize],
+    state: &mut ratatui::widgets::ListState,
+) {
     let items: Vec<ListItem> = visible
         .iter()
-        .map(|&i| &app.snapshots[i])
+        .map(|&i| &snapshots[i])
         .map(|s| {
             let tags = if s.tags.is_empty() {
                 String::new()
@@ -498,7 +524,106 @@ fn render_snapshots(frame: &mut Frame, app: &mut App, area: Rect) {
         .highlight_style(selection_highlight())
         .highlight_symbol(">> ");
 
-    frame.render_stateful_widget(list, area, &mut app.list_state);
+    frame.render_stateful_widget(list, area, state);
+}
+
+fn render_compare_first(frame: &mut Frame, app: &mut App, area: Rect) {
+    let visible = app.visible_snapshot_indices();
+    let title = format!("Compare — pick FIRST snapshot ({})", visible.len());
+    render_snapshot_picker(
+        frame,
+        area,
+        &title,
+        &app.snapshots,
+        &visible,
+        &mut app.compare_picker_state,
+    );
+}
+
+fn render_compare_second(frame: &mut Frame, app: &mut App, area: Rect) {
+    let visible = app.compare_second_visible_indices();
+    let scope = if app.compare_only_related { "related" } else { "all" };
+    let first_short = app
+        .compare_first_id
+        .as_deref()
+        .map(short_snap_id)
+        .unwrap_or("?");
+    let title = format!(
+        "Compare {first_short}.. — pick SECOND snapshot ({}, {scope})",
+        visible.len()
+    );
+    render_snapshot_picker(
+        frame,
+        area,
+        &title,
+        &app.snapshots,
+        &visible,
+        &mut app.compare_picker_state,
+    );
+}
+
+fn render_compare_loading(frame: &mut Frame, app: &App, area: Rect) {
+    let first = app.compare_first_id.as_deref().map(short_snap_id).unwrap_or("?");
+    let second = app.compare_second_id.as_deref().map(short_snap_id).unwrap_or("?");
+    let body = format!("Running `restic diff {first}..{second} --json`…");
+    let para = Paragraph::new(body).block(Block::bordered().title("Computing diff"));
+    frame.render_widget(para, area);
+}
+
+fn render_compare_results(frame: &mut Frame, app: &mut App, area: Rect) {
+    let first = app.compare_first_id.as_deref().map(short_snap_id).unwrap_or("?");
+    let second = app.compare_second_id.as_deref().map(short_snap_id).unwrap_or("?");
+    let title = format!("Diff {first}..{second}");
+
+    let outer = Block::bordered().title(title);
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    let [header, body] = Layout::vertical([Constraint::Length(3), Constraint::Fill(1)]).areas(inner);
+
+    let (summary_text, changes_len) = match &app.compare_results {
+        Some((sum, changes)) => (
+            format!(
+                "+{} files / -{} / M{}  |  +{} / -{}  ({} change{})",
+                sum.added_files,
+                sum.removed_files,
+                sum.changed_files,
+                human_size(sum.added_bytes),
+                human_size(sum.removed_bytes),
+                changes.len(),
+                if changes.len() == 1 { "" } else { "s" },
+            ),
+            changes.len(),
+        ),
+        None => ("(no diff loaded)".to_string(), 0),
+    };
+
+    let summary_para = Paragraph::new(summary_text)
+        .wrap(Wrap { trim: false })
+        .block(Block::bordered().title("Summary"));
+    frame.render_widget(summary_para, header);
+
+    if changes_len == 0 {
+        let para = Paragraph::new("No file-level changes between these snapshots.")
+            .style(Style::new().fg(Color::DarkGray))
+            .block(Block::bordered().title("Changes"));
+        frame.render_widget(para, body);
+        return;
+    }
+
+    let items: Vec<ListItem> = app
+        .compare_results
+        .as_ref()
+        .unwrap()
+        .1
+        .iter()
+        .map(|c| ListItem::new(format!("{}  {}", c.modifier.as_char(), c.path)))
+        .collect();
+    let list = List::new(items)
+        .block(Block::bordered().title(format!("Changes ({changes_len})")))
+        .highlight_style(selection_highlight())
+        .highlight_symbol(">> ");
+    frame.render_stateful_widget(list, body, &mut app.compare_results_state);
 }
 
 fn render_filter_dim(frame: &mut Frame, app: &mut App, area: Rect) {

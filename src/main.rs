@@ -133,6 +133,39 @@ fn run(terminal: &mut DefaultTerminal, config_dir: Option<PathBuf>) -> Result<()
             continue;
         }
 
+        if matches!(app.screen, Screen::SnapshotCompareLoading) {
+            let first = app.compare_first_id.clone();
+            let second = app.compare_second_id.clone();
+            let idx = app.loading_index;
+            let Some((_, profile)) = app.config.profile_at(idx) else {
+                app.clear_compare_scratch();
+                app.screen = Screen::Error("Selected profile no longer exists.".into());
+                continue;
+            };
+            let (Some(first), Some(second)) = (first, second) else {
+                app.clear_compare_scratch();
+                app.screen =
+                    Screen::Error("Compare flow lost a snapshot id mid-flight.".into());
+                continue;
+            };
+            match restic::diff(profile, &first, &second) {
+                Ok((sum, changes)) => {
+                    let has_rows = !changes.is_empty();
+                    app.compare_results = Some((sum, changes));
+                    app.compare_results_state = ratatui::widgets::ListState::default();
+                    if has_rows {
+                        app.compare_results_state.select(Some(0));
+                    }
+                    app.screen = Screen::SnapshotCompareResults;
+                }
+                Err(e) => {
+                    app.clear_compare_scratch();
+                    app.screen = Screen::Error(format!("{e:#}"));
+                }
+            }
+            continue;
+        }
+
         if matches!(app.screen, Screen::LoadingDir) {
             let Some((tree_id, name)) = app.pending_descend.take() else {
                 app.screen = Screen::SnapshotContents;
