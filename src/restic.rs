@@ -138,9 +138,10 @@ pub(crate) fn forget(profile: &Profile, snapshot_id: &str) -> Result<()> {
     Ok(())
 }
 
-// restic/rustic snapshot ids are SHA-256 hashes — 32 bytes = 64 lowercase hex
-// chars. Restic's CLI accepts shorter prefixes, but we refuse them so callers
-// can't accidentally act on the wrong snapshot if a prefix matches multiple.
+// restic/rustic snapshot ids are SHA-256 hashes — 32 bytes = 64 hex chars
+// (either case accepted; hex is case-insensitive). Restic's CLI accepts
+// shorter prefixes, but we refuse them so callers can't accidentally act on
+// the wrong snapshot if a prefix matches multiple.
 fn ensure_full_snapshot_id(id: &str) -> Result<()> {
     if id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
         Ok(())
