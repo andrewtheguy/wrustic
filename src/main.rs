@@ -3,10 +3,10 @@ mod cli;
 mod config;
 mod crypto;
 mod repo;
+mod restic;
 mod ui;
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use anyhow::Result;
 use ratatui::{
@@ -102,6 +102,37 @@ fn run(terminal: &mut DefaultTerminal, config_dir: Option<PathBuf>) -> Result<()
             continue;
         }
 
+        if matches!(app.screen, Screen::SnapshotDeleting) {
+            let Some(snapshot_id) = app.delete_target.take() else {
+                app.screen = Screen::SnapshotDeleteError(
+                    "No snapshot selected for deletion.".into(),
+                );
+                continue;
+            };
+            let idx = app.loading_index;
+            let Some((_, profile)) = app.config.profile_at(idx) else {
+                app.screen = Screen::SnapshotDeleteError(
+                    "Selected profile no longer exists.".into(),
+                );
+                continue;
+            };
+            match restic::forget(profile, &snapshot_id) {
+                Ok(()) => {
+                    app.delete_details_parsed = None;
+                    app.delete_details_raw = None;
+                    app.snapshots.clear();
+                    app.snapshot_filter = None;
+                    app.screen = Screen::Loading;
+                }
+                Err(e) => {
+                    app.delete_details_parsed = None;
+                    app.delete_details_raw = None;
+                    app.screen = Screen::SnapshotDeleteError(format!("{e:#}"));
+                }
+            }
+            continue;
+        }
+
         if matches!(app.screen, Screen::LoadingDir) {
             let Some((tree_id, name)) = app.pending_descend.take() else {
                 app.screen = Screen::SnapshotContents;
@@ -130,11 +161,18 @@ fn run(terminal: &mut DefaultTerminal, config_dir: Option<PathBuf>) -> Result<()
             continue;
         }
 
-        if event::poll(Duration::from_millis(100))?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            app.handle_key(key);
+        // Idle: block on events and only break out (to redraw) for ones
+        // that can change what's on screen. Ignoring focus/mouse/key-release
+        // events keeps the terminal quiet when the app has nothing to do.
+        loop {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    app.handle_key(key);
+                    break;
+                }
+                Event::Resize(_, _) => break,
+                _ => {}
+            }
         }
     }
     Ok(())

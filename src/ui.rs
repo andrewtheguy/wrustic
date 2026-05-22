@@ -50,16 +50,21 @@ fn bottom_bar_text(screen: &Screen) -> &'static str {
         Screen::KeyCreated => "Enter continue  Esc quit",
         Screen::Home => "j/k move  Enter open  n new  e edit  d delete  q quit",
         Screen::Snapshots => {
-            "j/k move  g/G top/bottom  Enter browse  f filter  r refresh  q/Esc back"
+            "j/k move  g/G top/bottom  Enter browse  f filter  d delete  r refresh  q/Esc back"
         }
         Screen::SnapshotFilterDim => "j/k move  Enter pick  Esc back",
         Screen::SnapshotFilterValue => "j/k move  g/G top/bottom  Enter pick  Esc back",
+        Screen::SnapshotDeleteInfo => "y proceed  n/Esc cancel",
+        Screen::SnapshotDeleteConfirm => "y confirm delete  n/Esc cancel",
+        Screen::SnapshotDeleteError(_) => "any key to continue",
         Screen::SnapshotContents => {
             "j/k move  g/G top/bottom  Enter open  Backspace up  r reload  q/Esc back"
         }
-        Screen::OpeningSnapshot | Screen::LoadingDir | Screen::Loading | Screen::Verifying => {
-            "working…"
-        }
+        Screen::OpeningSnapshot
+        | Screen::LoadingDir
+        | Screen::Loading
+        | Screen::Verifying
+        | Screen::SnapshotDeleting => "working…",
         Screen::CreateProfileName => "type  Enter submit  Esc cancel",
         Screen::BackendChoice => "j/k move  Enter pick  Esc back",
         Screen::LocalPath => "type  Enter submit  Esc back",
@@ -145,6 +150,21 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
         Screen::Snapshots => render_snapshots(frame, app, area),
         Screen::SnapshotFilterDim => render_filter_dim(frame, app, area),
         Screen::SnapshotFilterValue => render_filter_value(frame, app, area),
+        Screen::SnapshotDeleteInfo => render_snapshot_delete_info(frame, app, area),
+        Screen::SnapshotDeleteConfirm => render_snapshot_delete_confirm(frame, app, area),
+        Screen::SnapshotDeleting => {
+            let para = Paragraph::new("Running `restic forget`…")
+                .block(Block::bordered().title("Deleting snapshot"));
+            frame.render_widget(para, area);
+        }
+        Screen::SnapshotDeleteError(msg) => {
+            let body = format!("{msg}\n\nPress any key to return to the snapshot list.");
+            let para = Paragraph::new(body)
+                .style(Style::new().fg(Color::Red))
+                .wrap(Wrap { trim: false })
+                .block(Block::bordered().title("Delete unavailable"));
+            frame.render_widget(para, area);
+        }
         Screen::OpeningSnapshot => {
             let para = Paragraph::new("Opening snapshot — reading root tree…")
                 .block(Block::bordered().title("Loading"));
@@ -595,6 +615,106 @@ fn human_size(bytes: u64) -> String {
         i += 1;
     }
     format!("{:.1} {}", v, UNITS[i])
+}
+
+fn render_snapshot_delete_info(frame: &mut Frame, app: &App, area: Rect) {
+    let parsed = app.delete_details_parsed.as_ref();
+    let raw = app.delete_details_raw.as_deref().unwrap_or("(no raw JSON)");
+
+    let mut lines = String::new();
+    if let Some(p) = parsed {
+        lines.push_str(&format!("ID:       {}\n", p.id));
+        if let Some(s) = &p.short_id {
+            lines.push_str(&format!("Short ID: {s}\n"));
+        }
+        if let Some(t) = &p.time {
+            lines.push_str(&format!("Time:     {t}\n"));
+        }
+        if let Some(h) = &p.hostname {
+            lines.push_str(&format!("Host:     {h}\n"));
+        }
+        if let Some(u) = &p.username {
+            lines.push_str(&format!("User:     {u}\n"));
+        }
+        if !p.paths.is_empty() {
+            lines.push_str(&format!("Paths:    {}\n", p.paths.join(", ")));
+        }
+        if !p.tags.is_empty() {
+            lines.push_str(&format!("Tags:     {}\n", p.tags.join(", ")));
+        }
+        if let Some(par) = &p.parent {
+            lines.push_str(&format!("Parent:   {par}\n"));
+        }
+        if let Some(tree) = &p.tree {
+            lines.push_str(&format!("Tree:     {tree}\n"));
+        }
+        if let Some(pv) = &p.program_version {
+            lines.push_str(&format!("Program:  {pv}\n"));
+        }
+        if let Some(sum) = &p.summary {
+            if let Some(n) = sum.total_files_processed {
+                lines.push_str(&format!("Files:    {n}\n"));
+            }
+            if let Some(b) = sum.total_bytes_processed {
+                lines.push_str(&format!("Bytes:    {b}\n"));
+            }
+            if let Some(b) = sum.data_added {
+                lines.push_str(&format!("Added:    {b}\n"));
+            }
+            if let Some(b) = sum.data_added_packed {
+                lines.push_str(&format!("Packed:   {b}\n"));
+            }
+            if let Some(s) = &sum.backup_start {
+                lines.push_str(&format!("Start:    {s}\n"));
+            }
+            if let Some(s) = &sum.backup_end {
+                lines.push_str(&format!("End:      {s}\n"));
+            }
+        }
+    } else {
+        lines.push_str("(no parsed details)\n");
+    }
+
+    let outer = Block::bordered().title("Snapshot details — press y to proceed");
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    // Half parsed, half raw JSON.
+    let [top, bottom] = Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .areas(inner);
+
+    let parsed_para = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .block(Block::bordered().title("Parsed"));
+    frame.render_widget(parsed_para, top);
+
+    let raw_para = Paragraph::new(raw)
+        .wrap(Wrap { trim: false })
+        .block(Block::bordered().title("Raw `restic snapshots --json`"));
+    frame.render_widget(raw_para, bottom);
+}
+
+fn render_snapshot_delete_confirm(frame: &mut Frame, app: &App, area: Rect) {
+    let id = app.delete_target.as_deref().unwrap_or("(unknown)");
+    let paths = app
+        .delete_details_parsed
+        .as_ref()
+        .map(|p| {
+            if p.paths.is_empty() {
+                "(no paths)".to_string()
+            } else {
+                p.paths.join(", ")
+            }
+        })
+        .unwrap_or_else(|| "(unknown)".into());
+    let body = format!(
+        "Delete snapshot {id}?\n\nPaths: {paths}\n\nThis runs `restic forget {id}` (no prune). The snapshot reference will be removed; storage is reclaimed on a separate prune."
+    );
+    let para = Paragraph::new(body)
+        .style(Style::new().fg(Color::Yellow))
+        .wrap(Wrap { trim: false })
+        .block(Block::bordered().title("Confirm snapshot delete"));
+    frame.render_widget(para, area);
 }
 
 #[cfg(test)]
