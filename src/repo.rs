@@ -42,6 +42,18 @@ pub(crate) struct ContentRow {
     pub(crate) subtree: Option<TreeId>,
 }
 
+pub(crate) struct PreviewEntry {
+    pub(crate) path: String,
+    pub(crate) kind: ContentKind,
+    pub(crate) size: u64,
+}
+
+pub(crate) struct ContentsPreview {
+    pub(crate) entries: Vec<PreviewEntry>,
+    pub(crate) truncated: bool,
+    pub(crate) limit: usize,
+}
+
 fn build_backend_opts(profile: &Profile) -> Result<BackendOptions> {
     let mut opts = BackendOptions::default();
     match profile {
@@ -181,4 +193,56 @@ pub(crate) fn list_tree(
         bd.cmp(&ad).then_with(|| a.name.cmp(&b.name))
     });
     Ok(rows)
+}
+
+// DFS-walk the snapshot tree, emitting each entry with its full path until
+// `limit` items are collected. Used to give the user a peek at what they're
+// about to delete — snapshots' top-level often looks like a single
+// path-prefix directory chain (`home/`, `home/x/`, ...) before reaching the
+// actual backed-up files, so a plain root listing isn't very informative.
+pub(crate) fn preview_snapshot_contents(
+    repo: &Repository<IndexedIdsStatus>,
+    snapshot_id: &str,
+    limit: usize,
+) -> Result<ContentsPreview> {
+    let root = snapshot_root_tree(repo, snapshot_id)?;
+    let mut entries = Vec::new();
+    let mut truncated = false;
+    walk_preview(repo, root, "", &mut entries, limit, &mut truncated)?;
+    Ok(ContentsPreview { entries, truncated, limit })
+}
+
+fn walk_preview(
+    repo: &Repository<IndexedIdsStatus>,
+    tree_id: TreeId,
+    prefix: &str,
+    out: &mut Vec<PreviewEntry>,
+    limit: usize,
+    truncated: &mut bool,
+) -> Result<()> {
+    if out.len() >= limit {
+        *truncated = true;
+        return Ok(());
+    }
+    let rows = list_tree(repo, tree_id)?;
+    for row in rows {
+        if out.len() >= limit {
+            *truncated = true;
+            return Ok(());
+        }
+        let path = format!("{prefix}/{}", row.name);
+        let is_dir = matches!(row.kind, ContentKind::Dir);
+        let subtree = row.subtree;
+        out.push(PreviewEntry {
+            path: path.clone(),
+            kind: row.kind,
+            size: row.size,
+        });
+        if is_dir
+            && let Some(sub) = subtree
+        {
+            walk_preview(repo, sub, &path, out, limit, truncated)?;
+        }
+    }
+    Ok(())
 }

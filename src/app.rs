@@ -10,7 +10,7 @@ use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
 use crate::config::{self, BackendKind, Config, Paths, Profile};
-use crate::repo::{ContentKind, ContentRow, SnapshotRow};
+use crate::repo::{ContentKind, ContentRow, ContentsPreview, SnapshotRow};
 use crate::restic::{self, DiffChange, DiffSummary, ResticError, ResticInfo, SnapshotDetails};
 
 pub(crate) const BACKEND_ORDER: [BackendKind; 3] =
@@ -30,6 +30,7 @@ pub(crate) enum Screen {
     SnapshotFilterDim,
     SnapshotFilterValue,
     SnapshotDeleteInfo,
+    SnapshotDeleteContentsLoading,
     SnapshotDeleteConfirm,
     SnapshotDeleting,
     SnapshotDeleteError(String),
@@ -164,6 +165,7 @@ pub(crate) struct App {
     pub(crate) delete_target: Option<String>,
     pub(crate) delete_details_parsed: Option<SnapshotDetails>,
     pub(crate) delete_details_raw: Option<String>,
+    pub(crate) delete_root_listing: Option<ContentsPreview>,
 
     pub(crate) compare_first_id: Option<String>,
     pub(crate) compare_first_row_idx: Option<usize>,
@@ -227,6 +229,7 @@ impl App {
             delete_target: None,
             delete_details_parsed: None,
             delete_details_raw: None,
+            delete_root_listing: None,
             compare_first_id: None,
             compare_first_row_idx: None,
             compare_second_id: None,
@@ -466,6 +469,7 @@ impl App {
         self.delete_target = None;
         self.delete_details_parsed = None;
         self.delete_details_raw = None;
+        self.delete_root_listing = None;
     }
 
     pub(crate) fn clear_compare_scratch(&mut self) {
@@ -900,7 +904,7 @@ impl App {
 
             Screen::SnapshotDeleteInfo => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    self.screen = Screen::SnapshotDeleteConfirm;
+                    self.screen = Screen::SnapshotDeleteContentsLoading;
                 }
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') | KeyCode::Char('N') => {
                     self.clear_delete_scratch();
@@ -993,6 +997,7 @@ impl App {
             Screen::OpeningSnapshot
             | Screen::LoadingDir
             | Screen::SnapshotDeleting
+            | Screen::SnapshotDeleteContentsLoading
             | Screen::SnapshotCompareLoading => {}
 
             Screen::CreateProfileName => match key.code {

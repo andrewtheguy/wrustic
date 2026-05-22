@@ -19,7 +19,8 @@ use ratatui::widgets::ListState;
 use crate::app::{App, BrowseFrame, Screen};
 use crate::cli::{USAGE, parse_cli};
 use crate::repo::{
-    ContentRow, list_tree, load_snapshots, open_indexed, snapshot_root_tree, verify_profile,
+    ContentRow, list_tree, load_snapshots, open_indexed, preview_snapshot_contents,
+    snapshot_root_tree, verify_profile,
 };
 use crate::ui::render;
 
@@ -102,6 +103,41 @@ fn run(terminal: &mut DefaultTerminal, config_dir: Option<PathBuf>) -> Result<()
             continue;
         }
 
+        if matches!(app.screen, Screen::SnapshotDeleteContentsLoading) {
+            let Some(snap_id) = app.delete_target.clone() else {
+                app.screen = Screen::SnapshotDeleteError(
+                    "No snapshot selected for deletion.".into(),
+                );
+                continue;
+            };
+            let idx = app.loading_index;
+            let Some((_, profile)) = app.config.profile_at(idx) else {
+                app.screen = Screen::SnapshotDeleteError(
+                    "Selected profile no longer exists.".into(),
+                );
+                continue;
+            };
+            // 50 entries fits comfortably in a typical terminal and is enough
+            // to see past the path-prefix dirs into a snapshot's actual files.
+            const PREVIEW_LIMIT: usize = 50;
+            let result = (|| {
+                let repo = open_indexed(profile)?;
+                preview_snapshot_contents(&repo, &snap_id, PREVIEW_LIMIT)
+            })();
+            match result {
+                Ok(preview) => {
+                    app.delete_root_listing = Some(preview);
+                    app.screen = Screen::SnapshotDeleteConfirm;
+                }
+                Err(e) => {
+                    app.screen = Screen::SnapshotDeleteError(format!(
+                        "Could not read snapshot contents: {e:#}"
+                    ));
+                }
+            }
+            continue;
+        }
+
         if matches!(app.screen, Screen::SnapshotDeleting) {
             let Some(snapshot_id) = app.delete_target.take() else {
                 app.screen = Screen::SnapshotDeleteError(
@@ -121,7 +157,6 @@ fn run(terminal: &mut DefaultTerminal, config_dir: Option<PathBuf>) -> Result<()
                     app.delete_details_parsed = None;
                     app.delete_details_raw = None;
                     app.snapshots.clear();
-                    app.snapshot_filter = None;
                     app.screen = Screen::Loading;
                 }
                 Err(e) => {
