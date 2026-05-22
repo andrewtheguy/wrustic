@@ -72,6 +72,7 @@ fn bottom_bar_text(screen: &Screen) -> &'static str {
         | Screen::Loading
         | Screen::Verifying
         | Screen::SnapshotDeleting
+        | Screen::SnapshotDeleteContentsLoading
         | Screen::SnapshotCompareLoading => "working…",
         Screen::CreateProfileName => "type  Enter submit  Esc cancel",
         Screen::BackendChoice => "j/k move  Enter pick  Esc back",
@@ -163,6 +164,11 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
         Screen::SnapshotDeleting => {
             let para = Paragraph::new("Running `restic forget`…")
                 .block(Block::bordered().title("Deleting snapshot"));
+            frame.render_widget(para, area);
+        }
+        Screen::SnapshotDeleteContentsLoading => {
+            let para = Paragraph::new("Reading snapshot contents…")
+                .block(Block::bordered().title("Loading"));
             frame.render_widget(para, area);
         }
         Screen::SnapshotDeleteError(msg) => {
@@ -818,9 +824,8 @@ fn render_snapshot_delete_info(frame: &mut Frame, app: &App, area: Rect) {
 
 fn render_snapshot_delete_confirm(frame: &mut Frame, app: &App, area: Rect) {
     let id = app.delete_target.as_deref().unwrap_or("(unknown)");
-    let paths = app
-        .delete_details_parsed
-        .as_ref()
+    let parsed = app.delete_details_parsed.as_ref();
+    let paths = parsed
         .map(|p| {
             if p.paths.is_empty() {
                 "(no paths)".to_string()
@@ -829,14 +834,91 @@ fn render_snapshot_delete_confirm(frame: &mut Frame, app: &App, area: Rect) {
             }
         })
         .unwrap_or_else(|| "(unknown)".into());
-    let body = format!(
-        "Delete snapshot {id}?\n\nPaths: {paths}\n\nThis runs `restic forget {id}` (no prune). The snapshot reference will be removed; storage is reclaimed on a separate prune."
-    );
-    let para = Paragraph::new(body)
+
+    let outer = Block::bordered().title("Confirm snapshot delete");
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    // Header: identification + the file-count/byte summary already fetched from
+    // `restic snapshots --json`, so the user sees "what they're losing" at a
+    // glance. Body: top-level entries from the snapshot tree.
+    let [header, body] = Layout::vertical([Constraint::Length(8), Constraint::Fill(1)]).areas(inner);
+
+    let mut summary = format!("Delete snapshot {id}?\n\nPaths: {paths}");
+    if let Some(sum) = parsed.and_then(|p| p.summary.as_ref()) {
+        let files = sum
+            .total_files_processed
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "?".into());
+        let bytes = sum
+            .total_bytes_processed
+            .map(human_size)
+            .unwrap_or_else(|| "?".into());
+        summary.push_str(&format!("\n\nContents: {files} files, {bytes}"));
+    }
+    summary.push_str(&format!(
+        "\n\nThis runs `restic forget {id}` (no prune)."
+    ));
+    let header_para = Paragraph::new(summary)
         .style(Style::new().fg(Color::Yellow))
-        .wrap(Wrap { trim: false })
-        .block(Block::bordered().title("Confirm snapshot delete"));
-    frame.render_widget(para, area);
+        .wrap(Wrap { trim: false });
+    frame.render_widget(header_para, header);
+
+    let Some(preview) = app.delete_root_listing.as_ref() else {
+        let para = Paragraph::new("(no preview)")
+            .style(Style::new().fg(Color::DarkGray))
+            .block(Block::bordered().title("Contents"));
+        frame.render_widget(para, body);
+        return;
+    };
+    if preview.entries.is_empty() {
+        let para = Paragraph::new("(snapshot is empty)")
+            .style(Style::new().fg(Color::DarkGray))
+            .block(Block::bordered().title("Contents"));
+        frame.render_widget(para, body);
+        return;
+    }
+
+    let mut items: Vec<ListItem> = preview
+        .entries
+        .iter()
+        .map(|row| {
+            let kind_char = match row.kind {
+                ContentKind::Dir => 'd',
+                ContentKind::File => '-',
+                ContentKind::Symlink => 'l',
+                ContentKind::Other => '?',
+                ContentKind::Parent => '^',
+            };
+            let display_path = if matches!(row.kind, ContentKind::Dir) {
+                format!("{}/", row.path)
+            } else {
+                row.path.clone()
+            };
+            let size_col = if matches!(row.kind, ContentKind::File) {
+                format!("{:>10}", human_size(row.size))
+            } else {
+                String::from("          ")
+            };
+            ListItem::new(format!("{}  {}  {}", kind_char, size_col, display_path))
+        })
+        .collect();
+    if preview.truncated {
+        items.push(
+            ListItem::new(format!(
+                "   …recursion stopped after {} entries; more files exist below.",
+                preview.limit
+            ))
+            .style(Style::new().fg(Color::DarkGray)),
+        );
+    }
+    let title = if preview.truncated {
+        format!("Contents (first {} entries)", preview.entries.len())
+    } else {
+        format!("Contents ({} entries)", preview.entries.len())
+    };
+    let list = List::new(items).block(Block::bordered().title(title));
+    frame.render_widget(list, body);
 }
 
 #[cfg(test)]
