@@ -2,20 +2,41 @@ use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 
+pub(crate) const DEFAULT_SERVER_PORT: u16 = 7834;
+
 pub(crate) const USAGE: &str = "\
 Usage: wrustic [OPTIONS]
 
 Options:
-  -c, --config-dir <PATH>  Use <PATH> as the wrustic config directory instead
-                           of the platform default (~/.config/wrustic on Linux).
-                           The directory will be created on first run.
-  -h, --help               Print this help text.
+  -c, --config-dir <PATH>     Use <PATH> as the wrustic config directory instead
+                              of the platform default (~/.config/wrustic on Linux).
+                              The directory will be created on first run.
+  -p, --port <N>              Localhost port for both the file-share dialog and
+                              the experimental passkey ceremony. Default: 7834.
+                              They never run concurrently, so they share a port.
+      --experimental-passkey  EXPERIMENTAL — encrypt config values with a
+                              WebAuthn passkey instead of age. Requires an
+                              explicit --config-dir. Passkey configs are NOT
+                              interoperable with age configs.
+  -h, --help                  Print this help text.
 ";
 
-#[derive(Default)]
 pub(crate) struct Cli {
     pub(crate) config_dir: Option<PathBuf>,
+    pub(crate) port: u16,
+    pub(crate) experimental_passkey: bool,
     pub(crate) show_help: bool,
+}
+
+impl Default for Cli {
+    fn default() -> Self {
+        Self {
+            config_dir: None,
+            port: DEFAULT_SERVER_PORT,
+            experimental_passkey: false,
+            show_help: false,
+        }
+    }
 }
 
 pub(crate) fn parse_cli() -> Result<Cli> {
@@ -24,6 +45,7 @@ pub(crate) fn parse_cli() -> Result<Cli> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => cli.show_help = true,
+            "--experimental-passkey" => cli.experimental_passkey = true,
             "-c" | "--config-dir" => {
                 let value = args
                     .next()
@@ -40,8 +62,33 @@ pub(crate) fn parse_cli() -> Result<Cli> {
                 }
                 cli.config_dir = Some(PathBuf::from(value));
             }
+            "-p" | "--port" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("{arg} requires a port number"))?;
+                cli.port = parse_port(&value, arg.as_str())?;
+            }
+            other if other.starts_with("--port=") => {
+                let value = &other["--port=".len()..];
+                cli.port = parse_port(value, "--port=")?;
+            }
             other => bail!("unknown argument: {other}"),
         }
     }
+    if cli.experimental_passkey && cli.config_dir.is_none() {
+        bail!(
+            "--experimental-passkey requires an explicit --config-dir while the feature is experimental"
+        );
+    }
     Ok(cli)
+}
+
+fn parse_port(value: &str, flag: &str) -> Result<u16> {
+    let n: u16 = value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{flag} expects a port number 1-65535, got `{value}`"))?;
+    if n == 0 {
+        bail!("{flag} cannot be 0");
+    }
+    Ok(n)
 }

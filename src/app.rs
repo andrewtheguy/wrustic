@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -12,6 +13,8 @@ use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
 use crate::config::{self, BackendKind, Config, Paths, Profile};
+use crate::crypto::Cipher;
+use crate::passkey::{self, PasskeyHandle, PasskeyPhase};
 use crate::repo::{ContentKind, ContentRow, ContentsPreview, FileDetails, SnapshotRow};
 use crate::restic::{self, DiffChange, DiffSummary, ResticError, ResticInfo, SnapshotDetails};
 use crate::share::{self, SHARE_TTL, ShareHandle, ShareTarget};
@@ -28,6 +31,7 @@ pub(crate) enum Screen {
     FirstRunChoice,
     RestoreKeyWait,
     KeyCreated,
+    PasskeyUrl,
     Home,
     Snapshots,
     SnapshotFilterDim,
@@ -187,6 +191,21 @@ pub(crate) struct App {
 
     pub(crate) paths: Paths,
     pub(crate) config: Config,
+    /// Active cipher backend. `None` only during the boot ceremony — once the
+    /// app reaches Home, this is always `Some` (and every `config::save` call
+    /// expects it to be).
+    pub(crate) cipher: Option<Cipher>,
+    /// Localhost port for the share dialog and the passkey ceremony. Set
+    /// once from `--port` (default 7834); shared because the two flows are
+    /// never active at the same time.
+    pub(crate) server_port: u16,
+    /// True when launched with `--experimental-passkey`. Persists for the
+    /// session so save flows can choose the right cipher.
+    pub(crate) passkey_mode: bool,
+    pub(crate) passkey_handle: Option<PasskeyHandle>,
+    pub(crate) passkey_url: Option<String>,
+    pub(crate) passkey_short_url: Option<String>,
+    pub(crate) passkey_phase: Option<PasskeyPhase>,
 
     pub(crate) first_run_state: ListState,
     pub(crate) backend_list: ListState,
@@ -275,7 +294,11 @@ pub(crate) struct App {
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 impl App {
-    pub(crate) fn boot(config_dir: Option<PathBuf>) -> Result<Self> {
+    pub(crate) fn boot(
+        config_dir: Option<PathBuf>,
+        server_port: u16,
+        experimental_passkey: bool,
+    ) -> Result<Self> {
         let paths = config::paths(config_dir)?;
         let mut first_run_state = ListState::default();
         first_run_state.select(Some(0));
@@ -287,6 +310,13 @@ impl App {
             screen: Screen::Home,
             paths,
             config: Config::default(),
+            cipher: None,
+            server_port,
+            passkey_mode: experimental_passkey,
+            passkey_handle: None,
+            passkey_url: None,
+            passkey_short_url: None,
+            passkey_phase: None,
             first_run_state,
             backend_list,
             profile_list_state: ListState::default(),
@@ -348,17 +378,49 @@ impl App {
             last_content_click: None,
         };
 
+        if experimental_passkey {
+            app.start_passkey_ceremony();
+            return Ok(app);
+        }
+
         if !identity_exists {
             app.screen = Screen::FirstRunChoice;
             return Ok(app);
         }
 
+        match config::load_age_cipher(&app.paths.identity) {
+            Ok(c) => app.cipher = Some(c),
+            Err(e) => {
+                app.error_is_fatal = true;
+                app.screen = Screen::Error(format!("{e:#}"));
+                return Ok(app);
+            }
+        }
         app.load_config_or_set_fatal();
         Ok(app)
     }
 
     fn load_config_or_set_fatal(&mut self) {
-        match config::load(&self.paths) {
+        // For age mode, lazy-load the cipher here so the FirstRun/Restore
+        // flows that create the identity file just before this call work
+        // without explicit wiring. Passkey mode must already have set
+        // self.cipher via the ceremony.
+        if self.cipher.is_none() && !self.passkey_mode {
+            match config::load_age_cipher(&self.paths.identity) {
+                Ok(c) => self.cipher = Some(c),
+                Err(e) => {
+                    self.error_is_fatal = true;
+                    self.screen = Screen::Error(format!("{e:#}"));
+                    return;
+                }
+            }
+        }
+        let Some(cipher) = self.cipher.as_ref() else {
+            self.error_is_fatal = true;
+            self.screen = Screen::Error("internal: cipher not initialized before config load".into());
+            return;
+        };
+        match config::load(&self.paths, cipher) {
             Ok(cfg) => {
                 self.config = cfg;
                 self.enter_home();
@@ -367,6 +429,87 @@ impl App {
                 self.error_is_fatal = true;
                 self.screen = Screen::Error(format!("{e:#}"));
             }
+        }
+    }
+
+    /// Boot in passkey mode: peek at config.toml to find the embedded
+    /// `[passkey]` block (Unlock) or pick a fresh PRF salt (Setup), start
+    /// the localhost ceremony server, and transition to Screen::PasskeyUrl.
+    /// The main loop drives completion via `try_advance_passkey()`.
+    fn start_passkey_ceremony(&mut self) {
+        let peeked = match config::peek(&self.paths) {
+            Ok(p) => p,
+            Err(e) => {
+                self.error_is_fatal = true;
+                self.screen = Screen::Error(format!("reading config: {e:#}"));
+                return;
+            }
+        };
+        let (phase, existing) = match peeked {
+            None => (PasskeyPhase::Setup, None),
+            Some(cfg) => {
+                if cfg.cipher != config::CIPHER_MARKER_PASSKEY {
+                    self.error_is_fatal = true;
+                    self.screen = Screen::Error(format!(
+                        "{} has cipher = \"{}\"; drop --experimental-passkey to open it",
+                        self.paths.config.display(),
+                        cfg.cipher
+                    ));
+                    return;
+                }
+                match cfg.passkey {
+                    Some(meta) => (PasskeyPhase::Unlock, Some(meta)),
+                    None => {
+                        self.error_is_fatal = true;
+                        self.screen = Screen::Error(format!(
+                            "{} is marked as passkey but has no [passkey] block — \
+                             this config is broken; restore from backup or recreate",
+                            self.paths.config.display()
+                        ));
+                        return;
+                    }
+                }
+            }
+        };
+        match passkey::start(self.server_port, phase, existing) {
+            Ok(h) => {
+                self.passkey_url = Some(h.url.clone());
+                self.passkey_short_url = Some(h.short_url.clone());
+                self.passkey_phase = Some(h.phase);
+                self.passkey_handle = Some(h);
+                self.screen = Screen::PasskeyUrl;
+            }
+            Err(e) => {
+                self.error_is_fatal = true;
+                self.screen = Screen::Error(format!("starting passkey server: {e:#}"));
+            }
+        }
+    }
+
+    /// Non-blocking check for completion of the passkey ceremony. Called
+    /// each tick by the main loop while in Screen::PasskeyUrl. On Ok: stash
+    /// the cipher, stop the server, load config. On Err: show inline error
+    /// but keep the server running so the user can retry in the browser.
+    pub(crate) fn try_advance_passkey(&mut self) {
+        let Some(h) = self.passkey_handle.as_ref() else { return };
+        let outcome = match h.rx.try_recv() {
+            Ok(o) => o,
+            Err(std_mpsc::TryRecvError::Empty) => return,
+            Err(std_mpsc::TryRecvError::Disconnected) => return,
+        };
+        self.cipher = Some(Cipher::Passkey { key: outcome.key });
+        if let Some(h) = self.passkey_handle.take() {
+            h.stop();
+        }
+        self.passkey_url = None;
+        self.passkey_short_url = None;
+        self.passkey_phase = None;
+        self.load_config_or_set_fatal();
+        // Setup ceremony just produced fresh metadata — splice it into the
+        // (empty, default) config so the first save writes the [passkey]
+        // block. Skipped on Unlock because the meta was already there.
+        if let Some(meta) = outcome.new_meta {
+            self.config.passkey = Some(meta);
         }
     }
 
@@ -522,7 +665,21 @@ impl App {
             }
         };
 
-        match config::save(&self.config, &self.paths) {
+        let Some(cipher) = self.cipher.as_ref() else {
+            // Roll back the in-memory mutation so a missing cipher (which
+            // shouldn't be reachable from Home) doesn't strand a profile.
+            match restore {
+                ProfileRollback::Restore(key, old) => {
+                    self.config.profiles.insert(key, old);
+                }
+                ProfileRollback::Remove(key) => {
+                    self.config.profiles.remove(&key);
+                }
+            }
+            self.screen = Screen::Error("internal: no cipher available for save".into());
+            return;
+        };
+        match config::save(&self.config, &self.paths, cipher) {
             Ok(()) => {
                 self.enter_home();
             }
@@ -899,14 +1056,21 @@ impl App {
             return;
         };
         let profile = profile.clone();
-        let key = match share::derive_signing_key(&self.paths.identity) {
-            Ok(k) => k,
-            Err(e) => {
-                self.share_error = Some(format!("Deriving signing key: {e:#}"));
+        let key = match self.cipher.as_ref() {
+            Some(Cipher::Age { .. }) => match share::derive_signing_key(&self.paths.identity) {
+                Ok(k) => k,
+                Err(e) => {
+                    self.share_error = Some(format!("Deriving signing key: {e:#}"));
+                    return;
+                }
+            },
+            Some(Cipher::Passkey { key }) => passkey::derive_share_signing_key(key),
+            None => {
+                self.share_error = Some("internal: cipher not available".into());
                 return;
             }
         };
-        let port = self.config.server.port;
+        let port = self.server_port;
         match share::start(port, profile, key, target, SHARE_TTL) {
             Ok(h) => {
                 self.share_url = Some(h.url.clone());
@@ -995,6 +1159,18 @@ impl App {
                     self.load_config_or_set_fatal();
                 }
                 KeyCode::Esc => self.quit = true,
+                _ => {}
+            },
+
+            Screen::PasskeyUrl => match key.code {
+                // The browser-side ceremony does the real work; only let the
+                // user bail. Stopping the handle on quit cleans up the port.
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    if let Some(h) = self.passkey_handle.take() {
+                        h.stop();
+                    }
+                    self.quit = true;
+                }
                 _ => {}
             },
 
@@ -1604,7 +1780,14 @@ impl App {
                             .profiles
                             .remove(&name)
                             .expect("name_at hit must exist");
-                        match config::save(&self.config, &self.paths) {
+                        let Some(cipher) = self.cipher.as_ref() else {
+                            self.config.profiles.insert(name, removed);
+                            self.screen = Screen::Error(
+                                "internal: no cipher available for save".into(),
+                            );
+                            return;
+                        };
+                        match config::save(&self.config, &self.paths, cipher) {
                             Ok(()) => self.enter_home(),
                             Err(e) => {
                                 self.config.profiles.insert(name, removed);
@@ -1959,7 +2142,7 @@ mod tests {
             std::process::id(),
             uniq()
         ));
-        let mut app = App::boot(Some(tmp)).expect("boot");
+        let mut app = App::boot(Some(tmp), 7834, false).expect("boot");
         app.snapshots = snaps;
         app
     }

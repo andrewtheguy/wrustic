@@ -1,6 +1,6 @@
 [package]
 name = "wrustic"
-version = "0.0.15"
+version = "0.0.16"
 edition = "2024"
 
 [dependencies]
@@ -8,6 +8,7 @@ age = ">=0.11.3, <0.12"
 anyhow = "1.0.102"
 base64 = "0.22"
 bytes = "1"
+chacha20poly1305 = "0.10"
 dirs = "5"
 hmac = "0.13"
 http-body-util = "0.1"

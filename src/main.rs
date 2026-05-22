@@ -2,12 +2,14 @@ mod app;
 mod cli;
 mod config;
 mod crypto;
+mod passkey;
 mod repo;
 mod restic;
 mod share;
 mod ui;
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::Result;
 use ratatui::{
@@ -48,7 +50,7 @@ fn main() -> Result<()> {
     // selection; users can hold Shift to bypass and select text.
     let mouse_enabled =
         crossterm::execute!(std::io::stdout(), EnableMouseCapture).is_ok();
-    let result = run(&mut terminal, cli.config_dir);
+    let result = run(&mut terminal, cli.config_dir, cli.port, cli.experimental_passkey);
     if mouse_enabled {
         let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     }
@@ -56,8 +58,13 @@ fn main() -> Result<()> {
     result
 }
 
-fn run(terminal: &mut DefaultTerminal, config_dir: Option<PathBuf>) -> Result<()> {
-    let mut app = App::boot(config_dir)?;
+fn run(
+    terminal: &mut DefaultTerminal,
+    config_dir: Option<PathBuf>,
+    server_port: u16,
+    experimental_passkey: bool,
+) -> Result<()> {
+    let mut app = App::boot(config_dir, server_port, experimental_passkey)?;
 
     while !app.quit {
         terminal.draw(|f| render(f, &mut app))?;
@@ -260,6 +267,26 @@ fn run(terminal: &mut DefaultTerminal, config_dir: Option<PathBuf>) -> Result<()
                     app.screen = Screen::Error(format!("{e:#}"));
                 }
             }
+            continue;
+        }
+
+        // Passkey screen: the browser-side ceremony fires asynchronously,
+        // so poll for events with a short timeout and check the passkey
+        // channel each tick. Plain blocking event::read() would deadlock
+        // until the user pressed a key.
+        if matches!(app.screen, Screen::PasskeyUrl) {
+            if event::poll(Duration::from_millis(150))?
+                && let Ok(ev) = event::read()
+            {
+                match ev {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        app.handle_key(key);
+                    }
+                    Event::Resize(_, _) => {}
+                    _ => {}
+                }
+            }
+            app.try_advance_passkey();
             continue;
         }
 

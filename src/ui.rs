@@ -7,6 +7,7 @@ use ratatui::{
 use tui_input::Input;
 
 use crate::app::{App, BACKEND_ORDER, FIRST_RUN_MENU, Screen, filter_dim_entries};
+use crate::passkey::PasskeyPhase;
 use crate::repo::ContentKind;
 
 pub(crate) fn render(frame: &mut Frame, app: &mut App) {
@@ -61,6 +62,7 @@ fn bottom_bar_text(screen: &Screen) -> &'static str {
             "j/k scroll  PgUp/PgDn page  g top  s share  Esc/Backspace/q back"
         }
         Screen::ShareUrl => "Esc/Backspace/q back (stops the server)",
+        Screen::PasskeyUrl => "Esc/q quit  (waiting for browser ceremony)",
         Screen::SnapshotCompareFirst => {
             "j/k move  PgUp/PgDn page  g/G top/bottom  Enter pick FIRST  Esc cancel"
         }
@@ -199,6 +201,7 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
         Screen::SnapshotContents => render_snapshot_contents(frame, app, area),
         Screen::FileDetails => render_file_details(frame, app, area),
         Screen::ShareUrl => render_share_url(frame, app, area),
+        Screen::PasskeyUrl => render_passkey_url(frame, app, area),
         Screen::SnapshotCompareFirst => render_compare_first(frame, app, area),
         Screen::SnapshotCompareSecond => render_compare_second(frame, app, area),
         Screen::SnapshotCompareLoading => render_compare_loading(frame, app, area),
@@ -830,8 +833,55 @@ fn render_file_details(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(para, area);
 }
 
+fn render_passkey_url(frame: &mut Frame, app: &mut App, area: Rect) {
+    let phase_label = match app.passkey_phase {
+        Some(PasskeyPhase::Setup) => "Set up",
+        Some(PasskeyPhase::Unlock) => "Unlock",
+        None => "Passkey",
+    };
+    let mut lines = String::new();
+    lines.push_str(&format!(
+        "Experimental passkey mode — {phase_label} ceremony\n\n"
+    ));
+    match (&app.passkey_short_url, &app.passkey_url) {
+        (Some(short), Some(long)) => {
+            lines.push_str("Open this URL in a browser:\n");
+            lines.push_str(short);
+            lines.push_str("\n\n");
+            lines.push_str("(Redirects to: ");
+            lines.push_str(long);
+            lines.push_str(")\n\n");
+        }
+        _ => {
+            lines.push_str("(passkey URL not available)\n\n");
+        }
+    }
+    match app.passkey_phase {
+        Some(PasskeyPhase::Setup) => {
+            lines.push_str(
+                "The browser will prompt you to create a new passkey on this device.\n\
+                 wrustic uses the WebAuthn PRF extension to derive an encryption key from it.\n\
+                 The key never leaves your device.\n\n\
+                 WARNING: losing this passkey means losing access to the config.\n",
+            );
+        }
+        Some(PasskeyPhase::Unlock) => {
+            lines.push_str(
+                "The browser will prompt for the passkey you set up earlier.\n\
+                 Once authenticated, wrustic will decrypt the config and continue.\n",
+            );
+        }
+        None => {}
+    }
+    let para = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .block(Block::bordered().title(format!("Passkey — {phase_label}")));
+    record_list_area(app, area);
+    frame.render_widget(para, area);
+}
+
 fn render_share_url(frame: &mut Frame, app: &mut App, area: Rect) {
-    let port = app.config.server.port;
+    let port = app.server_port;
     let target_label = app
         .share_target
         .as_ref()
