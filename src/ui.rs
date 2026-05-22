@@ -6,7 +6,7 @@ use ratatui::{
 };
 use tui_input::Input;
 
-use crate::app::{App, BACKEND_ORDER, FIRST_RUN_MENU, Screen};
+use crate::app::{App, BACKEND_ORDER, FIRST_RUN_MENU, Screen, filter_dim_entries};
 use crate::repo::ContentKind;
 
 pub(crate) fn render(frame: &mut Frame, app: &mut App) {
@@ -49,7 +49,11 @@ fn bottom_bar_text(screen: &Screen) -> &'static str {
         Screen::RestoreKeyWait => "Enter retry  Esc back",
         Screen::KeyCreated => "Enter continue  Esc quit",
         Screen::Home => "j/k move  Enter open  n new  e edit  d delete  q quit",
-        Screen::Snapshots => "j/k move  g/G top/bottom  Enter browse  r refresh  q/Esc back",
+        Screen::Snapshots => {
+            "j/k move  g/G top/bottom  Enter browse  f filter  r refresh  q/Esc back"
+        }
+        Screen::SnapshotFilterDim => "j/k move  Enter pick  Esc back",
+        Screen::SnapshotFilterValue => "j/k move  g/G top/bottom  Enter pick  Esc back",
         Screen::SnapshotContents => {
             "j/k move  g/G top/bottom  Enter open  Backspace up  r reload  q/Esc back"
         }
@@ -139,6 +143,8 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
             frame.render_widget(para, area);
         }
         Screen::Snapshots => render_snapshots(frame, app, area),
+        Screen::SnapshotFilterDim => render_filter_dim(frame, app, area),
+        Screen::SnapshotFilterValue => render_filter_value(frame, app, area),
         Screen::OpeningSnapshot => {
             let para = Paragraph::new("Opening snapshot — reading root tree…")
                 .block(Block::bordered().title("Loading"));
@@ -434,19 +440,35 @@ fn render_s3_credentials(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_snapshots(frame: &mut Frame, app: &mut App, area: Rect) {
-    let title = format!("Snapshots ({})", app.snapshots.len());
-    let items: Vec<ListItem> = app
-        .snapshots
+    let visible = app.visible_snapshot_indices();
+    let total = app.snapshots.len();
+    let title = match &app.snapshot_filter {
+        None => format!("Snapshots ({total})"),
+        Some(f) => format!(
+            "Snapshots ({} of {}, {}={})",
+            visible.len(),
+            total,
+            f.kind().label(),
+            f.value()
+        ),
+    };
+
+    let items: Vec<ListItem> = visible
         .iter()
+        .map(|&i| &app.snapshots[i])
         .map(|s| {
             let tags = if s.tags.is_empty() {
                 String::new()
             } else {
-                format!("[{}]", s.tags)
+                format!("[{}]", s.tags.join(","))
             };
             ListItem::new(format!(
                 "{:<8}  {:<19}  {:<20}  {:<20}  {}",
-                s.short_id, s.time, s.host, tags, s.paths
+                s.short_id,
+                s.time,
+                s.host,
+                tags,
+                s.paths.join(",")
             ))
         })
         .collect();
@@ -457,6 +479,37 @@ fn render_snapshots(frame: &mut Frame, app: &mut App, area: Rect) {
         .highlight_symbol(">> ");
 
     frame.render_stateful_widget(list, area, &mut app.list_state);
+}
+
+fn render_filter_dim(frame: &mut Frame, app: &mut App, area: Rect) {
+    let entries = filter_dim_entries(app.snapshot_filter.is_some());
+    let items: Vec<ListItem> = entries
+        .iter()
+        .map(|e| ListItem::new(e.label()))
+        .collect();
+    let list = List::new(items)
+        .block(Block::bordered().title("Filter snapshots by"))
+        .highlight_style(selection_highlight())
+        .highlight_symbol(">> ");
+    frame.render_stateful_widget(list, area, &mut app.filter_picker_state);
+}
+
+fn render_filter_value(frame: &mut Frame, app: &mut App, area: Rect) {
+    let kind_label = app
+        .filter_pending_kind
+        .map(|k| k.label())
+        .unwrap_or("value");
+    let title = format!("Pick {} ({})", kind_label, app.filter_values.len());
+    let items: Vec<ListItem> = app
+        .filter_values
+        .iter()
+        .map(|v| ListItem::new(v.as_str()))
+        .collect();
+    let list = List::new(items)
+        .block(Block::bordered().title(title))
+        .highlight_style(selection_highlight())
+        .highlight_symbol(">> ");
+    frame.render_stateful_widget(list, area, &mut app.filter_picker_state);
 }
 
 fn render_snapshot_contents(frame: &mut Frame, app: &mut App, area: Rect) {

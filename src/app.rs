@@ -26,6 +26,8 @@ pub(crate) enum Screen {
     KeyCreated,
     Home,
     Snapshots,
+    SnapshotFilterDim,
+    SnapshotFilterValue,
     OpeningSnapshot,
     SnapshotContents,
     LoadingDir,
@@ -41,6 +43,54 @@ pub(crate) enum Screen {
     Verifying,
     VerifyFailed(String),
     Error(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FilterKind {
+    Host,
+    Tag,
+    Path,
+}
+
+impl FilterKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            FilterKind::Host => "host",
+            FilterKind::Tag => "tag",
+            FilterKind::Path => "path",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum SnapshotFilter {
+    Host(String),
+    Tag(String),
+    Path(String),
+}
+
+impl SnapshotFilter {
+    pub(crate) fn kind(&self) -> FilterKind {
+        match self {
+            SnapshotFilter::Host(_) => FilterKind::Host,
+            SnapshotFilter::Tag(_) => FilterKind::Tag,
+            SnapshotFilter::Path(_) => FilterKind::Path,
+        }
+    }
+
+    pub(crate) fn value(&self) -> &str {
+        match self {
+            SnapshotFilter::Host(v) | SnapshotFilter::Tag(v) | SnapshotFilter::Path(v) => v,
+        }
+    }
+
+    pub(crate) fn matches(&self, row: &SnapshotRow) -> bool {
+        match self {
+            SnapshotFilter::Host(h) => &row.host == h,
+            SnapshotFilter::Tag(t) => row.tags.iter().any(|x| x == t),
+            SnapshotFilter::Path(p) => row.paths.iter().any(|x| x == p),
+        }
+    }
 }
 
 pub(crate) struct BrowseFrame {
@@ -88,6 +138,10 @@ pub(crate) struct App {
     pub(crate) created_pubkey: String,
 
     pub(crate) snapshots: Vec<SnapshotRow>,
+    pub(crate) snapshot_filter: Option<SnapshotFilter>,
+    pub(crate) filter_picker_state: ListState,
+    pub(crate) filter_values: Vec<String>,
+    pub(crate) filter_pending_kind: Option<FilterKind>,
     pub(crate) active_profile_name: Option<String>,
     pub(crate) repo_session: Option<Repository<IndexedIdsStatus>>,
     pub(crate) browse_snapshot_id: String,
@@ -135,6 +189,10 @@ impl App {
             restore_error: None,
             created_pubkey: String::new(),
             snapshots: Vec::new(),
+            snapshot_filter: None,
+            filter_picker_state: ListState::default(),
+            filter_values: Vec::new(),
+            filter_pending_kind: None,
             active_profile_name: None,
             repo_session: None,
             browse_snapshot_id: String::new(),
@@ -337,6 +395,40 @@ impl App {
         }
     }
 
+    // Indices into `self.snapshots` for rows that pass the current filter,
+    // preserving the underlying time-desc order.
+    pub(crate) fn visible_snapshot_indices(&self) -> Vec<usize> {
+        match &self.snapshot_filter {
+            None => (0..self.snapshots.len()).collect(),
+            Some(f) => self
+                .snapshots
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| f.matches(r))
+                .map(|(i, _)| i)
+                .collect(),
+        }
+    }
+
+    fn enter_snapshots_from_filter(&mut self) {
+        let visible = self.visible_snapshot_indices().len();
+        self.list_state
+            .select(if visible == 0 { None } else { Some(0) });
+        self.screen = Screen::Snapshots;
+    }
+
+    fn open_filter_value_picker(&mut self, kind: FilterKind) {
+        let values = distinct_values(&self.snapshots, kind);
+        if values.is_empty() {
+            return;
+        }
+        self.filter_values = values;
+        self.filter_pending_kind = Some(kind);
+        self.filter_picker_state = ListState::default();
+        self.filter_picker_state.select(Some(0));
+        self.screen = Screen::SnapshotFilterValue;
+    }
+
     fn go_up(&mut self) {
         if self.browse_stack.len() > 1 {
             self.browse_stack.pop();
@@ -468,19 +560,23 @@ impl App {
             Screen::Snapshots => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
                     self.snapshots.clear();
+                    self.snapshot_filter = None;
                     self.enter_home();
                 }
                 KeyCode::Down | KeyCode::Char('j') => self.list_state.select_next(),
                 KeyCode::Up | KeyCode::Char('k') => self.list_state.select_previous(),
                 KeyCode::Home | KeyCode::Char('g') => self.list_state.select(Some(0)),
                 KeyCode::End | KeyCode::Char('G') => {
-                    if !self.snapshots.is_empty() {
-                        self.list_state.select(Some(self.snapshots.len() - 1));
+                    let visible = self.visible_snapshot_indices();
+                    if !visible.is_empty() {
+                        self.list_state.select(Some(visible.len() - 1));
                     }
                 }
                 KeyCode::Enter => {
-                    if let Some(idx) = self.list_state.selected()
-                        && let Some(s) = self.snapshots.get(idx)
+                    let visible = self.visible_snapshot_indices();
+                    if let Some(pos) = self.list_state.selected()
+                        && let Some(&abs) = visible.get(pos)
+                        && let Some(s) = self.snapshots.get(abs)
                     {
                         self.browse_snapshot_id = s.short_id.clone();
                         self.pending_refresh_path = None;
@@ -489,7 +585,72 @@ impl App {
                 }
                 KeyCode::Char('r') => {
                     self.snapshots.clear();
+                    self.snapshot_filter = None;
                     self.screen = Screen::Loading;
+                }
+                KeyCode::Char('f') => {
+                    self.filter_picker_state = ListState::default();
+                    self.filter_picker_state.select(Some(0));
+                    self.filter_pending_kind = None;
+                    self.screen = Screen::SnapshotFilterDim;
+                }
+                _ => {}
+            },
+
+            Screen::SnapshotFilterDim => match key.code {
+                KeyCode::Down | KeyCode::Char('j') => self.filter_picker_state.select_next(),
+                KeyCode::Up | KeyCode::Char('k') => self.filter_picker_state.select_previous(),
+                KeyCode::Esc | KeyCode::Char('q') => self.screen = Screen::Snapshots,
+                KeyCode::Enter => {
+                    let entries = filter_dim_entries(self.snapshot_filter.is_some());
+                    let idx = self
+                        .filter_picker_state
+                        .selected()
+                        .unwrap_or(0)
+                        .min(entries.len().saturating_sub(1));
+                    match entries.get(idx) {
+                        Some(FilterDimEntry::Clear) => {
+                            self.snapshot_filter = None;
+                            self.enter_snapshots_from_filter();
+                        }
+                        Some(FilterDimEntry::Kind(k)) => {
+                            self.open_filter_value_picker(*k);
+                        }
+                        None => {}
+                    }
+                }
+                _ => {}
+            },
+
+            Screen::SnapshotFilterValue => match key.code {
+                KeyCode::Down | KeyCode::Char('j') => self.filter_picker_state.select_next(),
+                KeyCode::Up | KeyCode::Char('k') => self.filter_picker_state.select_previous(),
+                KeyCode::Home | KeyCode::Char('g') => self.filter_picker_state.select(Some(0)),
+                KeyCode::End | KeyCode::Char('G') => {
+                    if !self.filter_values.is_empty() {
+                        self.filter_picker_state
+                            .select(Some(self.filter_values.len() - 1));
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.filter_pending_kind = None;
+                    self.filter_picker_state = ListState::default();
+                    self.filter_picker_state.select(Some(0));
+                    self.screen = Screen::SnapshotFilterDim;
+                }
+                KeyCode::Enter => {
+                    if let (Some(kind), Some(idx)) =
+                        (self.filter_pending_kind, self.filter_picker_state.selected())
+                        && let Some(value) = self.filter_values.get(idx).cloned()
+                    {
+                        self.snapshot_filter = Some(match kind {
+                            FilterKind::Host => SnapshotFilter::Host(value),
+                            FilterKind::Tag => SnapshotFilter::Tag(value),
+                            FilterKind::Path => SnapshotFilter::Path(value),
+                        });
+                        self.filter_pending_kind = None;
+                        self.enter_snapshots_from_filter();
+                    }
                 }
                 _ => {}
             },
@@ -787,3 +948,104 @@ impl App {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum FilterDimEntry {
+    Kind(FilterKind),
+    Clear,
+}
+
+impl FilterDimEntry {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            FilterDimEntry::Kind(FilterKind::Host) => "Host",
+            FilterDimEntry::Kind(FilterKind::Tag) => "Tag",
+            FilterDimEntry::Kind(FilterKind::Path) => "Path",
+            FilterDimEntry::Clear => "Clear filter",
+        }
+    }
+}
+
+pub(crate) fn filter_dim_entries(has_active: bool) -> Vec<FilterDimEntry> {
+    let mut v = vec![
+        FilterDimEntry::Kind(FilterKind::Host),
+        FilterDimEntry::Kind(FilterKind::Tag),
+        FilterDimEntry::Kind(FilterKind::Path),
+    ];
+    if has_active {
+        v.push(FilterDimEntry::Clear);
+    }
+    v
+}
+
+// Distinct values present in `rows` for the given dimension, sorted ascending.
+// Tags and paths are flattened (a snapshot with multiple tags contributes each).
+pub(crate) fn distinct_values(rows: &[SnapshotRow], kind: FilterKind) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut set: BTreeSet<String> = BTreeSet::new();
+    for r in rows {
+        match kind {
+            FilterKind::Host => {
+                if !r.host.is_empty() {
+                    set.insert(r.host.clone());
+                }
+            }
+            FilterKind::Tag => {
+                for t in &r.tags {
+                    set.insert(t.clone());
+                }
+            }
+            FilterKind::Path => {
+                for p in &r.paths {
+                    set.insert(p.clone());
+                }
+            }
+        }
+    }
+    set.into_iter().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(host: &str, tags: &[&str], paths: &[&str]) -> SnapshotRow {
+        SnapshotRow {
+            short_id: "0".into(),
+            time: String::new(),
+            host: host.into(),
+            tags: tags.iter().map(|s| (*s).to_string()).collect(),
+            paths: paths.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn distinct_values_dedupe_and_sort() {
+        let rows = vec![
+            row("laptop", &["weekly", "auto"], &["/home", "/etc"]),
+            row("server", &["auto"], &["/etc"]),
+            row("laptop", &[], &["/home"]),
+        ];
+        assert_eq!(distinct_values(&rows, FilterKind::Host), vec!["laptop", "server"]);
+        assert_eq!(distinct_values(&rows, FilterKind::Tag), vec!["auto", "weekly"]);
+        assert_eq!(distinct_values(&rows, FilterKind::Path), vec!["/etc", "/home"]);
+    }
+
+    #[test]
+    fn filter_matches() {
+        let r = row("laptop", &["weekly"], &["/home", "/etc"]);
+        assert!(SnapshotFilter::Host("laptop".into()).matches(&r));
+        assert!(!SnapshotFilter::Host("server".into()).matches(&r));
+        assert!(SnapshotFilter::Tag("weekly".into()).matches(&r));
+        assert!(!SnapshotFilter::Tag("daily".into()).matches(&r));
+        assert!(SnapshotFilter::Path("/etc".into()).matches(&r));
+        assert!(!SnapshotFilter::Path("/var".into()).matches(&r));
+    }
+
+    #[test]
+    fn dim_entries_include_clear_only_when_active() {
+        assert_eq!(filter_dim_entries(false).len(), 3);
+        let entries = filter_dim_entries(true);
+        assert_eq!(entries.len(), 4);
+        assert!(matches!(entries.last(), Some(FilterDimEntry::Clear)));
+    }
+}
