@@ -1028,7 +1028,7 @@ impl App {
             | Screen::SnapshotCompareLoading => {}
 
             Screen::FileDetails => match key.code {
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Backspace => {
                     self.file_details = None;
                     self.file_details_scroll = 0;
                     self.screen = Screen::SnapshotContents;

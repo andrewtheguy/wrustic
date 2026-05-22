@@ -60,7 +60,7 @@ fn bottom_bar_text(screen: &Screen) -> &'static str {
         Screen::SnapshotContents => {
             "j/k move  g/G top/bottom  Enter open  Backspace up  r reload  q/Esc back"
         }
-        Screen::FileDetails => "j/k scroll  g top  Esc/Backspace/q back",
+        Screen::FileDetails => "j/k scroll  g top  Enter/Esc/Backspace/q back",
         Screen::SnapshotCompareFirst => {
             "j/k move  g/G top/bottom  Enter pick FIRST  Esc cancel"
         }
