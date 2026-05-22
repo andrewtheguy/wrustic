@@ -412,10 +412,9 @@ async fn handle(
 
     let body = ChannelBody { rx, done: false }.boxed();
     let mut resp = Response::new(body);
-    resp.headers_mut().insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static("application/octet-stream"),
-    );
+    let ct = mime_for(&ctx.display_path);
+    resp.headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static(ct));
     // No caching: the URL is single-purpose and short-lived, and we don't
     // want browsers/proxies to hand back stale bytes if the user reuses it.
     resp.headers_mut()
@@ -465,6 +464,57 @@ impl Body for ChannelBody {
 
 fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
+}
+
+// Small lookup table keyed on the lowercased file extension. Falls back to
+// application/octet-stream when nothing matches. The browser uses this with
+// `Content-Disposition: inline` to decide whether to render in-place — so
+// the goal is to cover the common previewable types (images, text, PDF,
+// audio/video), not to be exhaustive.
+fn mime_for(display_path: &str) -> &'static str {
+    let name = basename(display_path);
+    let ext = name.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+    let ext_lower = ext.to_ascii_lowercase();
+    match ext_lower.as_str() {
+        // text
+        "txt" | "log" => "text/plain; charset=utf-8",
+        "md" | "markdown" => "text/markdown; charset=utf-8",
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "csv" => "text/csv; charset=utf-8",
+        "xml" => "application/xml; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        // images
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "bmp" => "image/bmp",
+        "avif" => "image/avif",
+        // documents
+        "pdf" => "application/pdf",
+        // audio
+        "mp3" => "audio/mpeg",
+        "ogg" | "oga" => "audio/ogg",
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
+        "m4a" => "audio/mp4",
+        // video
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mkv" => "video/x-matroska",
+        // archives
+        "zip" => "application/zip",
+        "gz" | "tgz" => "application/gzip",
+        "tar" => "application/x-tar",
+        "7z" => "application/x-7z-compressed",
+        "bz2" => "application/x-bzip2",
+        "xz" => "application/x-xz",
+        _ => "application/octet-stream",
+    }
 }
 
 // Keep only printable ASCII without quotes or control bytes — anything else
@@ -592,6 +642,24 @@ mod tests {
         assert_eq!(basename("foo/bar/baz.txt"), "baz.txt");
         assert_eq!(basename("just-a-name"), "just-a-name");
         assert_eq!(basename(""), "");
+    }
+
+    #[test]
+    fn mime_for_known_extensions() {
+        assert_eq!(mime_for("/x/y.png"), "image/png");
+        assert_eq!(mime_for("Photo.JPG"), "image/jpeg");
+        assert_eq!(mime_for("a/b/c.html"), "text/html; charset=utf-8");
+        assert_eq!(mime_for("data.json"), "application/json; charset=utf-8");
+        assert_eq!(mime_for("doc.pdf"), "application/pdf");
+        assert_eq!(mime_for("clip.MP4"), "video/mp4");
+        assert_eq!(mime_for("archive.tar.gz"), "application/gzip");
+    }
+
+    #[test]
+    fn mime_for_unknown_falls_back() {
+        assert_eq!(mime_for("Makefile"), "application/octet-stream");
+        assert_eq!(mime_for("no-extension"), "application/octet-stream");
+        assert_eq!(mime_for("weird.qqqq"), "application/octet-stream");
     }
 
     // End-to-end smoke test against a real local restic repo prepared under
