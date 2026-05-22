@@ -786,7 +786,7 @@ fn render_file_details(frame: &mut Frame, app: &App, area: Rect) {
             lines.push_str(h);
             lines.push('\n');
         }
-    } else if matches!(d.kind_label.as_str(), "file") {
+    } else if matches!(d.kind, ContentKind::File) {
         lines.push_str("\n(empty file — no content blobs)\n");
     }
 
@@ -801,14 +801,23 @@ fn render_file_details(frame: &mut Frame, app: &App, area: Rect) {
 
 // Truncate a path for a title — keep the tail since the basename is usually
 // the most identifying piece. Returns the full path if it already fits.
+// Operates on character counts (not bytes) so multi-byte filenames don't
+// panic from slicing inside a codepoint.
 fn short_path(p: &str) -> String {
-    const MAX: usize = 60;
-    if p.len() <= MAX {
-        p.to_string()
-    } else {
-        let tail_start = p.len() - (MAX - 1);
-        format!("…{}", &p[tail_start..])
+    const MAX_CHARS: usize = 60;
+    let nchars = p.chars().count();
+    if nchars <= MAX_CHARS {
+        return p.to_string();
     }
+    // Keep the trailing (MAX_CHARS - 1) chars; the leading "…" takes the
+    // remaining char-width, so total displayed width stays at MAX_CHARS.
+    let skip = nchars - (MAX_CHARS - 1);
+    let byte_offset = p
+        .char_indices()
+        .nth(skip)
+        .map(|(i, _)| i)
+        .unwrap_or(p.len());
+    format!("…{}", &p[byte_offset..])
 }
 
 fn short_snap_id(id: &str) -> &str {
@@ -1010,7 +1019,7 @@ fn render_snapshot_delete_confirm(frame: &mut Frame, app: &App, area: Rect) {
 
 #[cfg(test)]
 mod tests {
-    use super::human_size;
+    use super::{human_size, short_path};
 
     #[test]
     fn human_size_formats() {
@@ -1020,5 +1029,29 @@ mod tests {
         assert_eq!(human_size(1536), "1.5 K");
         assert_eq!(human_size(1024 * 1024), "1.0 M");
         assert_eq!(human_size(3 * 1024 * 1024 * 1024), "3.0 G");
+    }
+
+    #[test]
+    fn short_path_passes_short_inputs_through() {
+        let s = "/home/x/foo.txt";
+        assert_eq!(short_path(s), s);
+    }
+
+    #[test]
+    fn short_path_truncates_long_paths_from_the_head() {
+        let s: String = std::iter::repeat_n('a', 120).collect();
+        let out = short_path(&s);
+        assert_eq!(out.chars().count(), 60);
+        assert!(out.starts_with('…'));
+    }
+
+    #[test]
+    fn short_path_handles_multibyte_chars_without_panicking() {
+        // 80 emoji (4 bytes each in UTF-8) — the previous byte-indexed slice
+        // would land mid-codepoint and panic.
+        let s: String = std::iter::repeat_n('🦀', 80).collect();
+        let out = short_path(&s);
+        assert_eq!(out.chars().count(), 60);
+        assert!(out.starts_with('…'));
     }
 }

@@ -58,6 +58,7 @@ pub(crate) struct ContentsPreview {
 pub(crate) struct FileDetails {
     pub(crate) name: String,
     pub(crate) full_path: String,
+    pub(crate) kind: ContentKind,
     pub(crate) kind_label: String,
     pub(crate) size: u64,
     pub(crate) mode: Option<u32>,
@@ -246,13 +247,15 @@ pub(crate) fn get_file_details(
         .find(|n| n.name().to_string_lossy() == file_name)
         .ok_or_else(|| anyhow!("file `{file_name}` not found in tree"))?;
 
-    let (kind_label, linktarget) = match &node.node_type {
-        NodeType::File => ("file".to_string(), None),
-        NodeType::Dir => ("directory".to_string(), None),
-        NodeType::Symlink { linktarget, .. } => {
-            (format!("symlink → {linktarget}"), Some(linktarget.clone()))
-        }
-        other => (other.to_string(), None),
+    let (kind, kind_label, linktarget) = match &node.node_type {
+        NodeType::File => (ContentKind::File, "file".to_string(), None),
+        NodeType::Dir => (ContentKind::Dir, "directory".to_string(), None),
+        NodeType::Symlink { linktarget, .. } => (
+            ContentKind::Symlink,
+            format!("symlink → {linktarget}"),
+            Some(linktarget.clone()),
+        ),
+        other => (ContentKind::Other, other.to_string(), None),
     };
 
     let content_hashes = node
@@ -267,6 +270,7 @@ pub(crate) fn get_file_details(
     Ok(FileDetails {
         name: file_name.to_string(),
         full_path,
+        kind,
         kind_label,
         size: node.meta.size,
         mode: node.meta.mode,
