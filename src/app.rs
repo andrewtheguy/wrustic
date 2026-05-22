@@ -629,7 +629,7 @@ impl App {
                         && let Some(&abs) = visible.get(pos)
                         && let Some(s) = self.snapshots.get(abs)
                     {
-                        self.browse_snapshot_id = s.short_id.clone();
+                        self.browse_snapshot_id = s.id.clone();
                         self.pending_refresh_path = None;
                         self.screen = Screen::OpeningSnapshot;
                     }
@@ -651,7 +651,7 @@ impl App {
                         && let Some(&abs) = visible.get(pos)
                         && let Some(s) = self.snapshots.get(abs)
                     {
-                        let id = s.short_id.clone();
+                        let id = s.id.clone();
                         self.begin_delete_flow(id);
                     }
                 }
@@ -1102,7 +1102,7 @@ mod tests {
 
     fn row(host: &str, tags: &[&str], paths: &[&str]) -> SnapshotRow {
         SnapshotRow {
-            short_id: "0".into(),
+            id: "0".into(),
             time: String::new(),
             host: host.into(),
             tags: tags.iter().map(|s| (*s).to_string()).collect(),

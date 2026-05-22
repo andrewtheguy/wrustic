@@ -7,7 +7,7 @@ use rustic_core::{Credentials, IndexedIdsStatus, Repository, RepositoryOptions, 
 use crate::config::Profile;
 
 pub(crate) struct SnapshotRow {
-    pub(crate) short_id: String,
+    pub(crate) id: String,
     pub(crate) time: String,
     pub(crate) host: String,
     pub(crate) tags: Vec<String>,
@@ -114,7 +114,7 @@ pub(crate) fn load_snapshots(profile: &Profile) -> Result<Vec<SnapshotRow>> {
     Ok(snaps
         .into_iter()
         .map(|s| SnapshotRow {
-            short_id: s.id.to_string(),
+            id: s.id.to_string(),
             time: s.time.strftime("%Y-%m-%d %H:%M:%S").to_string(),
             host: s.hostname.clone(),
             tags: s.tags.iter().cloned().collect(),
