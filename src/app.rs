@@ -814,8 +814,10 @@ impl App {
                     self.screen = Screen::LoadingDir;
                 }
             }
-            // Files don't activate on Enter/click — use `i` to open details.
-            ContentKind::File | ContentKind::Symlink | ContentKind::Other => {}
+            // Enter on a file (or symlink/other) opens its details screen.
+            ContentKind::File | ContentKind::Symlink | ContentKind::Other => {
+                self.open_selected_file_details();
+            }
         }
     }
 
@@ -1353,7 +1355,6 @@ impl App {
                     }
                 }
                 KeyCode::Enter => self.activate_snapshot_content(),
-                KeyCode::Char('i') => self.open_selected_file_details(),
                 KeyCode::Backspace => self.go_up(),
                 KeyCode::Char('r') => {
                     let path: Vec<String> = self
@@ -1386,7 +1387,7 @@ impl App {
                     self.file_details_scroll = 0;
                     self.screen = Screen::SnapshotContents;
                 }
-                KeyCode::Char('d') => {
+                KeyCode::Char('s') => {
                     let is_file = self
                         .file_details
                         .as_ref()

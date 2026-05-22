@@ -55,10 +55,10 @@ fn bottom_bar_text(screen: &Screen) -> &'static str {
         Screen::SnapshotDeleteConfirm => "y confirm delete  n/Esc cancel",
         Screen::SnapshotDeleteError(_) => "any key to continue",
         Screen::SnapshotContents => {
-            "j/k move  PgUp/PgDn page  g/G top/bottom  Enter open dir  i file info  Backspace up  r reload  q/Esc back"
+            "j/k move  PgUp/PgDn page  g/G top/bottom  Enter open  Backspace up  r reload  q/Esc back"
         }
         Screen::FileDetails => {
-            "j/k scroll  PgUp/PgDn page  g top  d share  Enter/Esc/Backspace/q back"
+            "j/k scroll  PgUp/PgDn page  g top  s share  Enter/Esc/Backspace/q back"
         }
         Screen::ShareUrl => "Esc/Backspace/q back (stops the server)",
         Screen::SnapshotCompareFirst => {
