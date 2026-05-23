@@ -9,7 +9,7 @@ use std::io::Read;
 use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
@@ -31,6 +31,13 @@ pub(crate) enum PasskeyPhase {
     Unlock,
 }
 
+/// Hard wall-clock cap on a single passkey ceremony — if the user leaves the
+/// browser tab open for this long the server still answers but with 403 on
+/// every route, and the TUI surfaces an "expired" line. Kept separate from
+/// the share dialog's TTL because the threat models differ (share serves
+/// snapshot bytes, passkey gates the entire config decryption).
+pub(crate) const PASSKEY_TTL: Duration = Duration::from_secs(30 * 60);
+
 /// Result handed back to App when the browser completes the ceremony.
 /// The 32-byte key is the WebAuthn PRF output (used as the AEAD key in
 /// `Cipher::Passkey`); `new_meta` is `Some` only on Setup so the App can
@@ -49,6 +56,10 @@ pub(crate) struct PasskeyHandle {
     pub(crate) short_url: String,
     pub(crate) phase: PasskeyPhase,
     pub(crate) rx: std_mpsc::Receiver<PasskeyOutcome>,
+    /// Wall-clock instant at which the server stops accepting any route
+    /// (returns 403 for everything). Surfaced to the TUI so a stale screen
+    /// can show an "expired" line without polling the server.
+    pub(crate) deadline: Instant,
     shutdown_tx: Option<oneshot::Sender<()>>,
     join_handle: Option<thread::JoinHandle<()>>,
 }
@@ -61,6 +72,10 @@ impl PasskeyHandle {
         if let Some(jh) = self.join_handle.take() {
             let _ = jh.join();
         }
+    }
+
+    pub(crate) fn is_expired(&self) -> bool {
+        Instant::now() >= self.deadline
     }
 }
 
@@ -115,6 +130,8 @@ struct Ctx {
     credential_id_b64: String,
     // Send the PRF output (or an error) back to the App, exactly once.
     outcome_tx: std::sync::Mutex<Option<std_mpsc::Sender<PasskeyOutcome>>>,
+    // Wall-clock cap. Once now >= deadline, every route returns 403.
+    deadline: Instant,
 }
 
 impl Ctx {
@@ -165,6 +182,7 @@ pub(crate) fn start(
     let url = format!("http://localhost:{port}/");
 
     let (outcome_tx, outcome_rx) = std_mpsc::channel::<PasskeyOutcome>();
+    let deadline = Instant::now() + PASSKEY_TTL;
 
     let ctx = Arc::new(Ctx {
         phase,
@@ -172,6 +190,7 @@ pub(crate) fn start(
         prf_salt_b64,
         credential_id_b64,
         outcome_tx: std::sync::Mutex::new(Some(outcome_tx)),
+        deadline,
     });
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -203,6 +222,7 @@ pub(crate) fn start(
         short_url,
         phase,
         rx: outcome_rx,
+        deadline,
         shutdown_tx: Some(shutdown_tx),
         join_handle: Some(join),
     })
@@ -261,6 +281,19 @@ async fn handle(
     req: Request<hyper::body::Incoming>,
     ctx: Arc<Ctx>,
 ) -> Result<Response<RespBody>, Infallible> {
+    // Safety-net expiry: after PASSKEY_TTL the server keeps accepting
+    // connections (so a stale browser tab gets a clear error instead of a
+    // confusing "connection refused") but every route 403s. The TUI checks
+    // the same deadline via PasskeyHandle::is_expired() and shows a matching
+    // message — no flow rework, the user just quits + restarts.
+    if Instant::now() >= ctx.deadline {
+        return Ok(text(
+            StatusCode::FORBIDDEN,
+            "Passkey ceremony expired (30 minute cap). \
+             Quit wrustic in the terminal and relaunch to start a new ceremony.",
+        ));
+    }
+
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 
@@ -706,6 +739,7 @@ mod tests {
             prf_salt_b64: "U0FMVA==".into(),
             credential_id_b64: String::new(),
             outcome_tx: std::sync::Mutex::new(None),
+            deadline: Instant::now() + PASSKEY_TTL,
         };
         let html = render_html(&ctx);
         assert!(html.contains("Set up a passkey"));
@@ -732,6 +766,7 @@ mod tests {
             prf_salt_b64: "U0FMVA==".into(),
             credential_id_b64: "Q1JFRA==".into(),
             outcome_tx: std::sync::Mutex::new(None),
+            deadline: Instant::now() + PASSKEY_TTL,
         };
         let html = render_html(&ctx);
         assert!(html.contains("Unlock wrustic"));
@@ -749,5 +784,40 @@ mod tests {
     fn handle_is_send() {
         // PasskeyHandle crosses thread boundaries (held inside App).
         assert_send::<PasskeyHandle>();
+    }
+
+    // The HTTP route guard at the top of handle() is the one-liner
+    // `Instant::now() >= ctx.deadline`. We don't fabricate a hyper
+    // Incoming body for an integration test; instead verify the same
+    // predicate via PasskeyHandle::is_expired(), and trust the guard.
+    #[test]
+    fn is_expired_predicate() {
+        // Mock a handle with an already-past deadline. The other fields
+        // need to be valid enough to construct PasskeyHandle.
+        let (_tx, rx) = std_mpsc::channel::<PasskeyOutcome>();
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel::<()>();
+        let h = PasskeyHandle {
+            url: String::new(),
+            short_url: String::new(),
+            phase: PasskeyPhase::Setup,
+            rx,
+            deadline: Instant::now() - Duration::from_secs(1),
+            shutdown_tx: Some(shutdown_tx),
+            join_handle: None,
+        };
+        assert!(h.is_expired());
+
+        let (_tx, rx) = std_mpsc::channel::<PasskeyOutcome>();
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel::<()>();
+        let h2 = PasskeyHandle {
+            url: String::new(),
+            short_url: String::new(),
+            phase: PasskeyPhase::Setup,
+            rx,
+            deadline: Instant::now() + Duration::from_secs(60),
+            shutdown_tx: Some(shutdown_tx),
+            join_handle: None,
+        };
+        assert!(!h2.is_expired());
     }
 }

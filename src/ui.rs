@@ -839,6 +839,11 @@ fn render_passkey_url(frame: &mut Frame, app: &mut App, area: Rect) {
         Some(PasskeyPhase::Unlock) => "Unlock",
         None => "Passkey",
     };
+    let expired = app
+        .passkey_handle
+        .as_ref()
+        .map(|h| h.is_expired())
+        .unwrap_or(false);
     let mut lines = String::new();
     lines.push_str(&format!(
         "Experimental passkey mode — {phase_label} ceremony\n\n"
@@ -856,24 +861,41 @@ fn render_passkey_url(frame: &mut Frame, app: &mut App, area: Rect) {
             lines.push_str("(passkey URL not available)\n\n");
         }
     }
-    match app.passkey_phase {
-        Some(PasskeyPhase::Setup) => {
-            lines.push_str(
-                "The browser will prompt you to create a new passkey on this device.\n\
-                 wrustic uses the WebAuthn PRF extension to derive an encryption key from it.\n\
-                 The key never leaves your device.\n\n\
-                 WARNING: losing this passkey means losing access to the config.\n",
-            );
+    if expired {
+        // 30-min safety cap fired. Server still answers but only with 403,
+        // so any further click in the browser will show an error. The user
+        // must quit + relaunch to restart the ceremony.
+        lines.push_str(
+            "SESSION EXPIRED — passkey ceremony timed out after 30 minutes.\n\
+             The server now returns 403 for every request.\n\
+             Press Esc/q to quit, then relaunch wrustic to try again.\n\n",
+        );
+    } else {
+        match app.passkey_phase {
+            Some(PasskeyPhase::Setup) => {
+                lines.push_str(
+                    "The browser will prompt you to create a new passkey on this device.\n\
+                     wrustic uses the WebAuthn PRF extension to derive an encryption key from it.\n\
+                     The key never leaves your device.\n\n\
+                     WARNING: losing this passkey means losing access to the config.\n",
+                );
+            }
+            Some(PasskeyPhase::Unlock) => {
+                lines.push_str(
+                    "The browser will prompt for the passkey you set up earlier.\n\
+                     Once authenticated, wrustic will decrypt the config and continue.\n",
+                );
+            }
+            None => {}
         }
-        Some(PasskeyPhase::Unlock) => {
-            lines.push_str(
-                "The browser will prompt for the passkey you set up earlier.\n\
-                 Once authenticated, wrustic will decrypt the config and continue.\n",
-            );
-        }
-        None => {}
     }
+    let style = if expired {
+        Style::new().fg(Color::Red)
+    } else {
+        Style::default()
+    };
     let para = Paragraph::new(lines)
+        .style(style)
         .wrap(Wrap { trim: false })
         .block(Block::bordered().title(format!("Passkey — {phase_label}")));
     record_list_area(app, area);
