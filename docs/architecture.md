@@ -25,23 +25,6 @@ It is intentionally **not** a restic replacement:
   `restic` CLI rather than reimplementing them. Anything more complex (backup,
   prune, init, key add) is out of scope — use the `restic` CLI for those.
 
-## Module layout (`src/*.rs`)
-
-| Module | Lines | Role |
-|---|---:|---|
-| `main.rs` | ~370 | Entry point, terminal setup, event loop, async-screen driving |
-| `app.rs` | ~2300 | `App` state, `Screen` enum, all key/mouse handlers, save flow |
-| `ui.rs` | ~1220 | ratatui renderer — one `render_*` fn per screen, no logic |
-| `cli.rs` | ~95 | Hand-rolled flag parser (`--config-dir`, `--port`, `--experimental-passkey`) |
-| `config.rs` | ~990 | TOML schema, atomic save, peek (no-decrypt), cipher marker check |
-| `crypto.rs` | ~225 | `Cipher` enum: age x25519 and passkey ChaCha20-Poly1305; per-value AEAD |
-| `repo.rs` | ~385 | `rustic_core` wrappers: open, snapshots, list tree, file details, stream |
-| `restic.rs` | ~740 | `restic` CLI shell-outs: detect, snapshot details JSON, forget, diff |
-| `share.rs` | ~870 | Localhost server that serves one file via HMAC-signed URL |
-| `passkey.rs` | ~950 | Localhost ceremony server for WebAuthn PRF unlock (experimental) |
-
-The codebase is one binary crate, no library, no workspace.
-
 ## Runtime shape
 
 ```

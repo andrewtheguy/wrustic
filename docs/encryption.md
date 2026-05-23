@@ -746,5 +746,5 @@ Not in scope:
   but this remains a local-browser trust assumption and another reason
   for the single-user scope.
 
-For the surrounding system shape (boot flow, module layout, the share
-dialog, the runtime loop), see [architecture.md](architecture.md).
+For the surrounding system shape (boot flow, the share dialog, the runtime
+loop), see [architecture.md](architecture.md).

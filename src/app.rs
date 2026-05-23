@@ -152,6 +152,23 @@ pub(crate) fn default_passkey_label(paths: &Paths) -> Option<String> {
     }
 }
 
+fn truncate_passkey_label(label: String) -> String {
+    if label.len() <= 64 {
+        return label;
+    }
+    let mut truncated = String::new();
+    let mut bytes = 0usize;
+    for ch in label.chars() {
+        let len = ch.len_utf8();
+        if bytes + len > 64 {
+            break;
+        }
+        truncated.push(ch);
+        bytes += len;
+    }
+    truncated
+}
+
 // Translate a left-click at `(row, col)` (terminal coordinates) into an
 // index into the visible list. Returns None when the click misses the
 // list's bordered interior, when the list is empty, or when the click
@@ -574,11 +591,7 @@ impl App {
         }
         // WebAuthn caps user.name at 64 bytes in the spec; truncate
         // defensively to stay well within tolerance across browsers.
-        let label = if label.len() > 64 {
-            label.chars().take(64).collect()
-        } else {
-            label
-        };
+        let label = truncate_passkey_label(label);
         self.launch_passkey_server(PasskeyPhase::Setup(SetupMode::Create), None, Some(label));
     }
 
@@ -2284,6 +2297,25 @@ mod tests {
             tags: tags.iter().map(|s| (*s).to_string()).collect(),
             paths: paths.iter().map(|s| (*s).to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn truncate_passkey_label_preserves_utf8_boundaries() {
+        let label = "é".repeat(33);
+        let truncated = truncate_passkey_label(label);
+        assert_eq!(truncated.len(), 64);
+        assert_eq!(truncated.chars().count(), 32);
+
+        let mixed = format!("{}é", "a".repeat(63));
+        let truncated = truncate_passkey_label(mixed);
+        assert_eq!(truncated, "a".repeat(63));
+        assert!(truncated.len() <= 64);
+    }
+
+    #[test]
+    fn truncate_passkey_label_leaves_short_labels_unchanged() {
+        let label = "personal-config".to_string();
+        assert_eq!(truncate_passkey_label(label.clone()), label);
     }
 
     #[test]
