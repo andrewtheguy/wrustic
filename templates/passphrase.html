@@ -15,6 +15,7 @@
   .note { background: #f6f6f6; color: #444; }
   .hint { background: #fff7e0; color: #664d03; border-left: 3px solid #d4a017; padding: 0.65rem 0.9rem; margin-top: 0.5rem; line-height: 1.5; border-radius: 3px; }
   .hint strong { color: #5a3d00; }
+  .credential-hint { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); border: 0; white-space: nowrap; }
   small { color: #666; }
 </style>
 </head>
@@ -34,13 +35,19 @@
   Signature: <strong style="color:#222;">{{ instance_sig }}</strong>
 </p>
 {% endif %}
+<div class="credential-hint" aria-hidden="true">
+  <input id="credential-username" name="username" type="text"
+         autocomplete="username" value="wrustic"
+         readonly tabindex="-1">
+</div>
 {% if is_setup %}
 <p>
   <label for="setup-code">
     <strong>Setup code</strong> (printed in your wrustic terminal):
   </label>
   <br>
-  <input id="setup-code" type="text" autocomplete="off"
+  <input id="setup-code" name="setup_code" type="text" autocomplete="one-time-code"
+         data-1p-ignore="true" data-lpignore="true" data-bwignore="true"
          spellcheck="false" autocapitalize="characters"
          maxlength="6"
          pattern="[2-9A-HJKMNP-Za-hjkmnp-z]{6}"
@@ -51,13 +58,13 @@
 {% if is_setup %}
 <p>
   <label for="passphrase"><strong>Passphrase</strong></label><br>
-  <input id="passphrase" type="password" autocomplete="off"
+  <input id="passphrase" name="password" type="password" autocomplete="new-password"
          style="font-size:1rem;width:20rem;padding:0.4rem;"
          placeholder="Enter passphrase">
 </p>
 <p>
   <label for="passphrase-confirm"><strong>Confirm passphrase</strong></label><br>
-  <input id="passphrase-confirm" type="password" autocomplete="off"
+  <input id="passphrase-confirm" name="password_confirmation" type="password" autocomplete="new-password"
          style="font-size:1rem;width:20rem;padding:0.4rem;"
          placeholder="Repeat passphrase">
 </p>
@@ -69,7 +76,7 @@
 {% else %}
 <p>
   <label for="passphrase"><strong>Passphrase</strong></label><br>
-  <input id="passphrase" type="password" autocomplete="off"
+  <input id="passphrase" name="password" type="password" autocomplete="current-password"
          style="font-size:1rem;width:20rem;padding:0.4rem;"
          placeholder="Enter passphrase">
 </p>
