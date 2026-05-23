@@ -1,6 +1,7 @@
 use std::convert::Infallible;
 use std::io::Read;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -34,6 +35,10 @@ pub(crate) enum PassphrasePhase {
 
 pub(crate) const PASSPHRASE_TTL: Duration = Duration::from_secs(30 * 60);
 
+const MAX_SETUP_CODE_ATTEMPTS: u32 = 5;
+const SETUP_CODE_ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+const SETUP_CODE_LEN: usize = 6;
+
 pub(crate) struct PassphraseOutcome {
     pub(crate) key: [u8; 32],
     pub(crate) new_meta: Option<PassphraseMeta>,
@@ -41,6 +46,7 @@ pub(crate) struct PassphraseOutcome {
 
 pub(crate) struct PassphraseHandle {
     pub(crate) short_url: String,
+    pub(crate) setup_code: Option<String>,
     pub(crate) phase: PassphrasePhase,
     pub(crate) rx: std_mpsc::Receiver<PassphraseOutcome>,
     pub(crate) deadline: Instant,
@@ -90,6 +96,30 @@ fn random_bytes(n: usize) -> Result<Vec<u8>> {
     f.read_exact(&mut buf)
         .map_err(|e| anyhow!("reading /dev/urandom: {e}"))?;
     Ok(buf)
+}
+
+fn random_setup_code() -> String {
+    let mut buf = [0u8; SETUP_CODE_LEN];
+    let filled = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .is_ok();
+    if !filled {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id();
+        let mix = (nanos as u64) ^ ((pid as u64) << 32);
+        let mix_bytes = mix.to_le_bytes();
+        for (i, slot) in buf.iter_mut().enumerate() {
+            *slot = mix_bytes[i % mix_bytes.len()];
+        }
+    }
+    let n = SETUP_CODE_ALPHABET.len();
+    buf.iter()
+        .map(|b| SETUP_CODE_ALPHABET[(*b as usize) % n] as char)
+        .collect()
 }
 
 const TRANSPORT_HKDF_INFO: &[u8] = b"wrustic-passphrase-transport-v1";
@@ -180,6 +210,9 @@ struct Ctx {
     salt_b64: String,
     expected_subdomain_sig: Option<String>,
     expected_host: String,
+    setup_code: Option<String>,
+    setup_code_attempts: AtomicU32,
+    killed: AtomicBool,
     outcome_tx: std::sync::Mutex<Option<std_mpsc::Sender<PassphraseOutcome>>>,
     deadline: Instant,
     transport: ServerTransport,
@@ -226,6 +259,11 @@ pub(crate) fn start(
     let short_id = random_short_id()?;
     let short_url = format!("http://{subdomain}.wrustic.localhost:{port}/auth/{short_id}");
 
+    let setup_code = match phase {
+        PassphrasePhase::Setup => Some(random_setup_code()),
+        PassphrasePhase::Unlock => None,
+    };
+
     let (outcome_tx, outcome_rx) = std_mpsc::channel::<PassphraseOutcome>();
     let deadline = Instant::now() + PASSPHRASE_TTL;
     let transport = ServerTransport::generate()?;
@@ -240,6 +278,9 @@ pub(crate) fn start(
         salt_b64,
         expected_subdomain_sig,
         expected_host,
+        setup_code: setup_code.clone(),
+        setup_code_attempts: AtomicU32::new(0),
+        killed: AtomicBool::new(false),
         outcome_tx: std::sync::Mutex::new(Some(outcome_tx)),
         deadline,
         transport,
@@ -273,6 +314,7 @@ pub(crate) fn start(
     let transport_public_b64 = ctx.transport.public_b64.clone();
     Ok(PassphraseHandle {
         short_url,
+        setup_code,
         phase,
         rx: outcome_rx,
         deadline,
@@ -391,10 +433,10 @@ async fn handle(
         return Ok(text(StatusCode::NOT_FOUND, "not found"));
     }
 
-    if Instant::now() >= ctx.deadline {
+    if ctx.killed.load(Ordering::Relaxed) || Instant::now() >= ctx.deadline {
         return Ok(text(
             StatusCode::FORBIDDEN,
-            "Passphrase ceremony expired. \
+            "Passphrase ceremony expired or cancelled. \
              Quit wrustic in the terminal and relaunch to start a new ceremony.",
         ));
     }
@@ -402,6 +444,9 @@ async fn handle(
     let method = req.method().clone();
     match (method, rest) {
         (Method::GET, "") | (Method::GET, "/") => Ok(html_resp(&ctx)),
+        (Method::POST, "/api/check-code") if matches!(ctx.phase, PassphrasePhase::Setup) => {
+            Ok(handle_check_setup_code(req, ctx).await)
+        }
         (Method::POST, "/api/setup") if ctx.phase == PassphrasePhase::Setup => {
             Ok(handle_setup(req, ctx).await)
         }
@@ -424,6 +469,7 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 struct SetupBody {
+    setup_code: String,
     subdomain_sig: [u8; 32],
     config_key: [u8; 32],
 }
@@ -466,16 +512,34 @@ fn decode_config_key(raw: &[u8]) -> Result<[u8; 32], String> {
 }
 
 fn parse_setup_body(inner: &[u8]) -> Result<SetupBody, String> {
-    if inner.len() != 65 {
-        return Err(format!("expected 65-byte setup payload, got {}", inner.len()));
+    // v1: version(1) + code_len(1) + code(N) + subdomain_sig(32) + config_key(32)
+    if inner.len() < 1 + 1 + 32 + 32 {
+        return Err(format!("setup payload too short: {} bytes", inner.len()));
     }
     if inner[0] != 1 {
         return Err(format!("unsupported setup payload version {}", inner[0]));
     }
+    let code_len = inner[1] as usize;
+    let expected = 1 + 1 + code_len + 32 + 32;
+    if inner.len() != expected {
+        return Err(format!(
+            "setup payload size mismatch: expected {expected}, got {}",
+            inner.len()
+        ));
+    }
+    let mut pos = 2;
+    let setup_code = String::from_utf8(inner[pos..pos + code_len].to_vec())
+        .map_err(|e| format!("setup code is not UTF-8: {e}"))?;
+    pos += code_len;
     let mut subdomain_sig = [0u8; 32];
-    subdomain_sig.copy_from_slice(&inner[1..33]);
-    let config_key = decode_config_key(&inner[33..65])?;
-    Ok(SetupBody { subdomain_sig, config_key })
+    subdomain_sig.copy_from_slice(&inner[pos..pos + 32]);
+    pos += 32;
+    let config_key = decode_config_key(&inner[pos..])?;
+    Ok(SetupBody {
+        setup_code,
+        subdomain_sig,
+        config_key,
+    })
 }
 
 fn parse_unlock_body(inner: &[u8]) -> Result<UnlockBody, String> {
@@ -495,6 +559,70 @@ fn verify_subdomain_sig(subdomain: &str, key: &[u8; 32], expected_sig_b64: &str)
     ct_eq(&computed, &expected)
 }
 
+enum CodeCheck {
+    Ok,
+    Wrong(Response<RespBody>),
+}
+
+fn check_setup_code(ctx: &Arc<Ctx>, submitted_raw: &str) -> CodeCheck {
+    let expected = match ctx.setup_code.as_deref() {
+        Some(c) => c,
+        None => {
+            return CodeCheck::Wrong(text(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "setup code not initialized",
+            ));
+        }
+    };
+    let submitted: String = submitted_raw
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(|c| c.to_uppercase())
+        .collect();
+    if !ct_eq(submitted.as_bytes(), expected.as_bytes()) {
+        let prev = ctx.setup_code_attempts.fetch_add(1, Ordering::Relaxed);
+        let used = prev + 1;
+        if used >= MAX_SETUP_CODE_ATTEMPTS {
+            ctx.killed.store(true, Ordering::Relaxed);
+            return CodeCheck::Wrong(text(
+                StatusCode::FORBIDDEN,
+                "Too many wrong setup codes. Ceremony cancelled — quit wrustic and relaunch.",
+            ));
+        }
+        let remaining = MAX_SETUP_CODE_ATTEMPTS - used;
+        return CodeCheck::Wrong(text(
+            StatusCode::UNAUTHORIZED,
+            &format!(
+                "Wrong setup code. {remaining} attempt(s) left before the ceremony is cancelled."
+            ),
+        ));
+    }
+    CodeCheck::Ok
+}
+
+#[derive(Deserialize)]
+struct CheckCodeBody {
+    setup_code: String,
+}
+
+async fn handle_check_setup_code(
+    req: Request<hyper::body::Incoming>,
+    ctx: Arc<Ctx>,
+) -> Response<RespBody> {
+    let inner = match read_and_decrypt(req, &ctx).await {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let parsed: CheckCodeBody = match serde_json::from_slice(&inner) {
+        Ok(v) => v,
+        Err(e) => return text(StatusCode::BAD_REQUEST, &format!("invalid JSON: {e}")),
+    };
+    match check_setup_code(&ctx, &parsed.setup_code) {
+        CodeCheck::Ok => json_ok(),
+        CodeCheck::Wrong(resp) => resp,
+    }
+}
+
 async fn handle_setup(req: Request<hyper::body::Incoming>, ctx: Arc<Ctx>) -> Response<RespBody> {
     let inner = match read_and_decrypt(req, &ctx).await {
         Ok(b) => b,
@@ -504,6 +632,10 @@ async fn handle_setup(req: Request<hyper::body::Incoming>, ctx: Arc<Ctx>) -> Res
         Ok(v) => v,
         Err(e) => return text(StatusCode::BAD_REQUEST, &format!("invalid setup payload: {e}")),
     };
+    match check_setup_code(&ctx, &parsed.setup_code) {
+        CodeCheck::Ok => {}
+        CodeCheck::Wrong(resp) => return resp,
+    }
     let meta = PassphraseMeta {
         subdomain: ctx.subdomain.clone(),
         subdomain_sig: BASE64.encode(parsed.subdomain_sig),
@@ -561,6 +693,25 @@ fn render_html(ctx: &Ctx) -> String {
             "Enter the passphrase you set up earlier to decrypt your config."
         }
     };
+    let setup_code_html = match ctx.phase {
+        PassphrasePhase::Setup => {
+            "<p>\
+              <label for=\"setup-code\">\
+                <strong>Setup code</strong> (printed in your wrustic terminal):\
+              </label>\
+              <br>\
+              <input id=\"setup-code\" type=\"text\" autocomplete=\"off\" \
+                     spellcheck=\"false\" autocapitalize=\"characters\" \
+                     maxlength=\"6\" \
+                     pattern=\"[2-9A-HJKMNP-Za-hjkmnp-z]{6}\" \
+                     style=\"font-size:1.2rem;width:8rem;\
+                            font-family:ui-monospace,monospace;padding:0.4rem;\
+                            text-transform:uppercase;\" \
+                     placeholder=\"ABCDEF\">\
+            </p>"
+        }
+        PassphrasePhase::Unlock => "",
+    };
     let form_html = match ctx.phase {
         PassphrasePhase::Setup => {
             "<p>\
@@ -617,6 +768,7 @@ fn render_html(ctx: &Ctx) -> String {
 <h1>{heading}</h1>
 <div id="status" class="note">Ready. Use the controls below to begin.</div>
 <p>{explanation}</p>
+{setup_code_html}
 {form_html}
 <p><small>This page is served by the wrustic process on localhost. You can close it when finished.</small></p>
 <script nonce="{script_nonce_attr}">
@@ -738,7 +890,35 @@ function checkComplexity(pp) {{
   return null;
 }}
 
+function readSetupCode() {{
+  const el = document.getElementById("setup-code");
+  if (!el) return null;
+  const code = (el.value || "").replace(/\s+/g, "").toUpperCase();
+  if (!/^[2-9A-HJKMNP-Z]{{6}}$/.test(code)) {{
+    throw new Error("Enter the 6-character setup code from your wrustic terminal (letters A-Z and digits 2-9, no 0/1/I/L/O).");
+  }}
+  return code;
+}}
+
+async function encryptJson(payload) {{
+  const plaintext = new TextEncoder().encode(JSON.stringify(payload));
+  try {{
+    return await encryptBytes(plaintext);
+  }} finally {{
+    zeroBytes(plaintext);
+  }}
+}}
+async function postEncryptedJson(path, payload) {{
+  return postEncryptedEnvelope(path, await encryptJson(payload));
+}}
+
+async function precheckSetupCode(code) {{
+  await postEncryptedJson("/api/check-code", {{ setup_code: code }});
+}}
+
 async function doSetup() {{
+  const setupCode = readSetupCode();
+  await precheckSetupCode(setupCode);
   const pp = document.getElementById("passphrase").value;
   const pp2 = document.getElementById("passphrase-confirm").value;
   const err = checkComplexity(pp);
@@ -747,16 +927,21 @@ async function doSetup() {{
   setStatus("Deriving key (this may take a moment)…", "note");
   const configKey = await deriveKey(pp);
   const sig = await computeSubdomainSig(configKey);
-  const payload = new Uint8Array(1 + 32 + 32);
-  payload[0] = 1;
-  payload.set(sig, 1);
-  payload.set(configKey, 33);
+  const codeBytes = new TextEncoder().encode(setupCode);
+  const payload = new Uint8Array(1 + 1 + codeBytes.length + 32 + 32);
+  let p = 0;
+  payload[p++] = 1;
+  payload[p++] = codeBytes.length;
+  payload.set(codeBytes, p); p += codeBytes.length;
+  payload.set(sig, p); p += 32;
+  payload.set(configKey, p);
   try {{
     await postEncryptedBytes("/api/setup", payload);
   }} finally {{
     zeroBytes(configKey);
     zeroBytes(sig);
     zeroBytes(payload);
+    zeroBytes(codeBytes);
   }}
 }}
 
@@ -802,6 +987,7 @@ wireButton("go-unlock", doUnlock);
 "#,
         heading = heading,
         explanation = explanation,
+        setup_code_html = setup_code_html,
         form_html = form_html,
         script_nonce_attr = html_attr(&ctx.script_nonce),
         salt_js = json_string(&ctx.salt_b64),
@@ -892,24 +1078,26 @@ mod tests {
 
     #[test]
     fn parse_setup_body_valid() {
-        let mut payload = vec![1u8];
+        let code = b"AB23KM";
+        let mut payload = vec![1u8, code.len() as u8];
+        payload.extend_from_slice(code);
         payload.extend_from_slice(&[0xAAu8; 32]);
         payload.extend_from_slice(&[0xBBu8; 32]);
         let body = parse_setup_body(&payload).unwrap();
+        assert_eq!(body.setup_code, "AB23KM");
         assert_eq!(body.subdomain_sig, [0xAA; 32]);
         assert_eq!(body.config_key, [0xBB; 32]);
     }
 
     #[test]
     fn parse_setup_body_wrong_size() {
-        assert!(parse_setup_body(&[1u8; 64]).is_err());
-        assert!(parse_setup_body(&[1u8; 66]).is_err());
+        assert!(parse_setup_body(&[1u8; 3]).is_err());
         assert!(parse_setup_body(&[]).is_err());
     }
 
     #[test]
     fn parse_setup_body_wrong_version() {
-        let mut payload = vec![2u8];
+        let mut payload = vec![2u8, 0];
         payload.extend_from_slice(&[0u8; 64]);
         assert!(parse_setup_body(&payload).is_err());
     }
@@ -960,6 +1148,12 @@ mod tests {
             salt_b64: "U0FMVA==".into(),
             expected_subdomain_sig: sig,
             expected_host: "testsite.wrustic.localhost".into(),
+            setup_code: match phase {
+                PassphrasePhase::Setup => Some("AB23KM".into()),
+                PassphrasePhase::Unlock => None,
+            },
+            setup_code_attempts: AtomicU32::new(0),
+            killed: AtomicBool::new(false),
             outcome_tx: std::sync::Mutex::new(None),
             deadline: Instant::now() + PASSPHRASE_TTL,
             transport: ServerTransport::generate().expect("/dev/urandom"),
@@ -978,6 +1172,9 @@ mod tests {
         assert!(!html.contains(r#"id="go-unlock""#));
         assert!(html.contains("at least 12 characters"));
         assert!(html.contains("PBKDF2"));
+        assert!(html.contains(r#"id="setup-code""#));
+        assert!(html.contains("Setup code"));
+        assert!(html.contains("precheckSetupCode"));
     }
 
     #[test]
@@ -989,6 +1186,7 @@ mod tests {
         assert!(!html.contains(r#"id="passphrase-confirm""#));
         assert!(html.contains(r#"id="go-unlock""#));
         assert!(!html.contains(r#"id="go-setup""#));
+        assert!(!html.contains(r#"id="setup-code""#));
     }
 
     #[test]
@@ -1013,6 +1211,7 @@ mod tests {
         let (shutdown_tx, _shutdown_rx) = oneshot::channel::<()>();
         let h = PassphraseHandle {
             short_url: String::new(),
+            setup_code: None,
             phase: PassphrasePhase::Setup,
             rx,
             deadline: Instant::now() - Duration::from_secs(1),
@@ -1026,6 +1225,7 @@ mod tests {
         let (shutdown_tx, _shutdown_rx) = oneshot::channel::<()>();
         let h2 = PassphraseHandle {
             short_url: String::new(),
+            setup_code: None,
             phase: PassphrasePhase::Setup,
             rx,
             deadline: Instant::now() + Duration::from_secs(60),
@@ -1127,9 +1327,12 @@ mod tests {
         raw_post_json_host(port, path, &body, host)
     }
 
-    fn setup_payload(subdomain_sig: &[u8; 32], config_key: &[u8; 32]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(65);
+    fn setup_payload(setup_code: &str, subdomain_sig: &[u8; 32], config_key: &[u8; 32]) -> Vec<u8> {
+        let code = setup_code.as_bytes();
+        let mut out = Vec::with_capacity(2 + code.len() + 64);
         out.push(1);
+        out.push(code.len() as u8);
+        out.extend_from_slice(code);
         out.extend_from_slice(subdomain_sig);
         out.extend_from_slice(config_key);
         out
@@ -1182,10 +1385,11 @@ mod tests {
         let port = ephemeral_port();
         let handle = start(port, PassphrasePhase::Setup, None, "mysite").expect("start server");
         let key = key_from_handle(&handle);
+        let setup_code = handle.setup_code.clone().expect("Setup phase mints a code");
         let path = format!("/auth/{key}/api/setup");
         let config_key = [0x42u8; 32];
         let sig = compute_hmac("mysite", &config_key);
-        let body = setup_payload(&sig, &config_key);
+        let body = setup_payload(&setup_code, &sig, &config_key);
         let r = encrypted_post_bytes(port, &handle.transport_public_b64, &path, &body, MYSITE_HOST);
         assert!(r.contains(" 200 "), "setup should 200, got:\n{r}");
 
@@ -1273,9 +1477,10 @@ mod tests {
         let handle = start(port, PassphrasePhase::Setup, None, "mysite").expect("start server");
         let key = key_from_handle(&handle);
 
+        let setup_code = handle.setup_code.clone().unwrap();
         let config_key = [0u8; 32];
         let sig = compute_hmac("mysite", &config_key);
-        let inner = setup_payload(&sig, &config_key);
+        let inner = setup_payload(&setup_code, &sig, &config_key);
         let mut env: serde_json::Value =
             serde_json::from_str(&encrypt_envelope_bytes(&handle.transport_public_b64, &inner)).unwrap();
         let ct_b64 = env["ciphertext"].as_str().unwrap().to_string();

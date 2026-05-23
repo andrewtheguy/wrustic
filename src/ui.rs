@@ -868,6 +868,14 @@ fn render_passphrase_url(frame: &mut Frame, app: &mut App, area: Rect) {
             lines.push_str("(URL not available)\n\n");
         }
     }
+    if !expired
+        && let Some(code) = &app.passphrase_setup_code
+    {
+        lines.push_str("Setup code (type this in the browser):\n\n");
+        lines.push_str("    ");
+        lines.push_str(code);
+        lines.push_str("\n\n");
+    }
     if expired {
         lines.push_str(
             "SESSION EXPIRED — passphrase ceremony timed out after 30 minutes.\n\

@@ -229,6 +229,7 @@ pub(crate) struct App {
     pub(crate) passphrase_handle: Option<PassphraseHandle>,
     pub(crate) passphrase_subdomain_input: Input,
     pub(crate) passphrase_short_url: Option<String>,
+    pub(crate) passphrase_setup_code: Option<String>,
     pub(crate) passphrase_phase: Option<PassphrasePhase>,
 
     pub(crate) first_run_state: ListState,
@@ -340,6 +341,7 @@ impl App {
             passphrase_handle: None,
             passphrase_subdomain_input: Input::default(),
             passphrase_short_url: None,
+            passphrase_setup_code: None,
             passphrase_phase: None,
             first_run_state,
             backend_list,
@@ -508,6 +510,7 @@ impl App {
         match passphrase::start(self.server_port, phase, existing, subdomain) {
             Ok(h) => {
                 self.passphrase_short_url = Some(h.short_url.clone());
+                self.passphrase_setup_code = h.setup_code.clone();
                 self.passphrase_phase = Some(h.phase);
                 self.passphrase_handle = Some(h);
                 self.screen = Screen::PassphraseUrl;
@@ -541,6 +544,7 @@ impl App {
             h.stop();
         }
         self.passphrase_short_url = None;
+        self.passphrase_setup_code = None;
         self.passphrase_phase = None;
         self.load_config_or_set_fatal();
         if let Some(meta) = outcome.new_meta {
