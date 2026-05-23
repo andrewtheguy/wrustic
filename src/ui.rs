@@ -926,8 +926,10 @@ fn render_passphrase_url(frame: &mut Frame, app: &mut App, area: Rect) {
             None => {}
         }
     }
-    if !expired && app.passphrase_error.is_none() {
-        lines.push_str("\nPress o to open the URL in your browser.\n");
+    if !expired {
+        if app.passphrase_error.is_none() {
+            lines.push_str("\nPress o to open the URL in your browser.\n");
+        }
         lines.push_str("\nWaiting for browser ceremony\u{2026}\n");
     }
     let block = Block::bordered().title(format!("Passphrase \u{2014} {phase_label}"));
