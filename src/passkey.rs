@@ -44,18 +44,17 @@ pub(crate) const PASSKEY_TTL: Duration = Duration::from_secs(30 * 60);
 /// a kill-switch so a typo'd code doesn't tie up the ceremony forever, and
 /// a hostile script that somehow holds the URL can't grind through the
 /// code space under the 30-minute TTL. Five strikes is forgiving for
-/// human typos and combined with the ~56^6 ≈ 3·10^10 code space leaves
-/// the guess probability well under 1e-9.
+/// human typos and combined with the ~31^6 ≈ 8.9·10^8 code space leaves
+/// the guess probability well under 1e-8.
 const MAX_SETUP_CODE_ATTEMPTS: u32 = 5;
 
-/// Alphabet for the Setup-confirmation code. Excludes the well-known
-/// confusables (0/O/o, 1/I/l/L) but keeps both cases of every other
-/// letter, so the displayed code is case-sensitive and the user must
-/// type it as printed. Symbols `-` and `=` are unshifted on US ANSI
-/// and visible (no period — too small to spot reliably). Total 56
-/// characters → 56^6 ≈ 3·10^10 code space.
-const SETUP_CODE_ALPHABET: &[u8] =
-    b"23456789ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz-=";
+/// Alphabet for the Setup-confirmation code. Uppercase letters and
+/// digits only, with the well-known confusables removed (0, 1, I, O,
+/// L). Case-insensitive — the server uppercases the submitted code
+/// before comparing, so users can type either case. Total 31
+/// characters → 31^6 ≈ 8.9·10^8 code space; combined with the
+/// `MAX_SETUP_CODE_ATTEMPTS` strike limit a blind guess is ≈ 5.6·10^-9.
+const SETUP_CODE_ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
 const SETUP_CODE_LEN: usize = 6;
 
 /// Result handed back to App when the browser completes the ceremony.
@@ -138,7 +137,7 @@ fn random_short_id() -> String {
 }
 
 /// 6-character Setup-confirmation code drawn from SETUP_CODE_ALPHABET.
-/// Each character is `byte % 33`, with a negligible modulo bias (≈ 1/256
+/// Each character is `byte % 31`, with a negligible modulo bias (≈ 1/256
 /// per character — irrelevant for an intent-confirmation token). The
 /// fallback path (no /dev/urandom) is intentionally weak; it just keeps
 /// the function infallible.
@@ -503,14 +502,16 @@ fn check_setup_code(ctx: &Arc<Ctx>, submitted_raw: &str) -> CodeCheck {
             ));
         }
     };
-    // Normalize incoming code: strip whitespace only. Case is part of
-    // the code (the alphabet has both upper and lower case letters) so
-    // we compare the bytes verbatim. ct_eq runs in constant time over
-    // the resulting buffers; the whitespace strip operates on attacker-
-    // supplied bytes only and doesn't leak anything about the secret.
+    // Normalize incoming code: strip whitespace and uppercase. The
+    // alphabet is uppercase-only, so case-folding the submitted value
+    // lets users type either case without it being treated as wrong.
+    // ct_eq runs in constant time over the resulting buffers; the
+    // whitespace strip / uppercase operate on attacker-supplied bytes
+    // only and don't leak anything about the secret.
     let submitted: String = submitted_raw
         .chars()
         .filter(|c| !c.is_whitespace())
+        .flat_map(|c| c.to_uppercase())
         .collect();
     if !ct_eq(submitted.as_bytes(), expected.as_bytes()) {
         let prev = ctx.setup_code_attempts.fetch_add(1, Ordering::Relaxed);
@@ -649,27 +650,28 @@ fn render_html(ctx: &Ctx) -> String {
     // understands it starts a fresh encrypted store under a new salt and
     // won't decrypt an existing wrustic config from another machine.
     // Setup-only: a 6-character code input the user must echo from the
-    // TUI. Alphabet matches SETUP_CODE_ALPHABET (digits 2-9, A-Z and a-z
-    // each minus I/L/O / i/l/o, plus `-` and `=`). Case-sensitive — no
-    // text-transform / autocapitalize tweaks. Both Create and Use
-    // Existing flows read the same input and send it along with the
-    // WebAuthn result. No code on Unlock — the existing `[passkey]`
+    // TUI. Alphabet matches SETUP_CODE_ALPHABET (digits 2-9 and A-Z
+    // minus I/L/O — unambiguous uppercase letters and digits). Case-
+    // insensitive on the server, but we still uppercase the display so
+    // the typed value visually matches what the TUI printed. Both Create
+    // and Use Existing flows read the same input and send it along with
+    // the WebAuthn result. No code on Unlock — the existing `[passkey]`
     // block + AEAD tag already prove the user knows the passkey.
     let setup_code_html = match ctx.phase {
         PasskeyPhase::Setup => {
             "<p>\
               <label for=\"setup-code\">\
-                <strong>Setup code</strong> (printed in your wrustic terminal, \
-                copy it exactly — letter case matters):\
+                <strong>Setup code</strong> (printed in your wrustic terminal):\
               </label>\
               <br>\
               <input id=\"setup-code\" type=\"text\" autocomplete=\"off\" \
-                     spellcheck=\"false\" autocapitalize=\"none\" \
+                     spellcheck=\"false\" autocapitalize=\"characters\" \
                      maxlength=\"6\" \
-                     pattern=\"[2-9A-HJKMNP-Za-hjkmnp-z=\\-]{6}\" \
+                     pattern=\"[2-9A-HJKMNP-Za-hjkmnp-z]{6}\" \
                      style=\"font-size:1.2rem;width:8rem;\
-                            font-family:ui-monospace,monospace;padding:0.4rem;\" \
-                     placeholder=\"abcdef\">\
+                            font-family:ui-monospace,monospace;padding:0.4rem;\
+                            text-transform:uppercase;\" \
+                     placeholder=\"ABCDEF\">\
             </p>"
         }
         PasskeyPhase::Unlock => "",
@@ -756,15 +758,16 @@ function setStatus(text, kind) {{
 
 // Setup phase only: read the 6-character code the user typed from the
 // TUI. Throws early (before any authenticator prompt) if it's missing
-// or the wrong shape. Case-sensitive: the alphabet includes both upper
-// and lower case letters, so the server compares the bytes verbatim.
-// We do strip whitespace so a stray space doesn't blow the compare.
+// or the wrong shape. The alphabet is uppercase letters + digits only;
+// we accept either case here and uppercase it so the server sees the
+// canonical form. Strip whitespace so a stray space doesn't blow the
+// compare.
 function readSetupCode() {{
   const el = document.getElementById("setup-code");
   if (!el) return null;
-  const code = (el.value || "").replace(/\s+/g, "");
-  if (!/^[2-9A-HJKMNP-Za-hjkmnp-z=\-]{{6}}$/.test(code)) {{
-    throw new Error("Enter the 6-character setup code from your wrustic terminal (letter case matters).");
+  const code = (el.value || "").replace(/\s+/g, "").toUpperCase();
+  if (!/^[2-9A-HJKMNP-Z]{{6}}$/.test(code)) {{
+    throw new Error("Enter the 6-character setup code from your wrustic terminal (letters A-Z and digits 2-9, no 0/1/I/L/O).");
   }}
   return code;
 }}
@@ -1111,9 +1114,8 @@ mod tests {
             }
         }
         // Sanity-check the alphabet excludes the well-known confusables
-        // and the period (replaced by `=` because periods read poorly in
-        // a TUI font).
-        let bad = b"01ILOilo.";
+        // and every lowercase letter / symbol (uppercase + digits only).
+        let bad = b"01ILOilo.-=abz";
         for b in bad {
             assert!(
                 !SETUP_CODE_ALPHABET.contains(b),
@@ -1121,15 +1123,11 @@ mod tests {
                 *b as char
             );
         }
-        // Spot-check that both `-` and `=` made it in (the symbol set is
-        // exactly these two).
-        assert!(SETUP_CODE_ALPHABET.contains(&b'-'));
-        assert!(SETUP_CODE_ALPHABET.contains(&b'='));
-        // And that both upper and lower case made it in.
+        // Spot-check the corners of the included ranges.
+        assert!(SETUP_CODE_ALPHABET.contains(&b'2'));
+        assert!(SETUP_CODE_ALPHABET.contains(&b'9'));
         assert!(SETUP_CODE_ALPHABET.contains(&b'A'));
-        assert!(SETUP_CODE_ALPHABET.contains(&b'a'));
         assert!(SETUP_CODE_ALPHABET.contains(&b'Z'));
-        assert!(SETUP_CODE_ALPHABET.contains(&b'z'));
     }
 
     fn assert_send<T: Send>() {}
@@ -1388,9 +1386,10 @@ mod tests {
     }
 
     #[test]
-    fn setup_code_case_mismatch_is_rejected() {
-        // A code typed with the wrong case should NOT be accepted — the
-        // alphabet treats upper and lower as distinct.
+    fn setup_code_lowercase_is_accepted() {
+        // The alphabet is uppercase-only and the server case-folds the
+        // submitted code before comparing, so a lowercase-typed code
+        // must be accepted.
         let port = ephemeral_port();
         let handle = start(port, PasskeyPhase::Setup, None, Some("test-label".into())).expect("start server");
         let key = key_from_handle(&handle);
@@ -1398,33 +1397,19 @@ mod tests {
         let path = format!("/auth/{key}/api/setup");
         let prf = dummy_prf_b64();
 
-        // Build a flipped-case version of the real code. If the code has
-        // no letters (purely digits and symbols), skip the assertion —
-        // there's nothing to flip.
-        let flipped: String = setup_code
-            .chars()
-            .map(|c| {
-                if c.is_ascii_uppercase() {
-                    c.to_ascii_lowercase()
-                } else if c.is_ascii_lowercase() {
-                    c.to_ascii_uppercase()
-                } else {
-                    c
-                }
-            })
-            .collect();
-        if flipped == setup_code {
-            // No letters in the code; the case-mismatch test isn't
-            // meaningful. Skip cleanly.
+        let lowered = setup_code.to_ascii_lowercase();
+        // If the code has no letters (purely digits), the assertion is
+        // vacuous — skip cleanly.
+        if lowered == setup_code {
             handle.stop();
             return;
         }
 
         let body = format!(
-            r#"{{"credential_id":"Y3JlZA==","prf":"{prf}","setup_code":"{flipped}"}}"#
+            r#"{{"credential_id":"Y3JlZA==","prf":"{prf}","setup_code":"{lowered}"}}"#
         );
         let r = raw_post_json(port, &path, &body);
-        assert!(r.contains(" 401 "), "case-flipped code should 401, got:\n{r}");
+        assert!(r.contains(" 200 "), "lowercase code should 200, got:\n{r}");
         handle.stop();
     }
 
@@ -1531,7 +1516,7 @@ mod tests {
         let r = raw_post_json(
             port,
             &format!("/auth/{key}/api/check-code"),
-            r#"{"setup_code":"Ab2Rt="}"#,
+            r#"{"setup_code":"AB2RTK"}"#,
         );
         assert!(r.contains(" 404 "), "precheck must 404 in Unlock, got:\n{r}");
         handle.stop();
@@ -1546,14 +1531,13 @@ mod tests {
         let path = format!("/auth/{key}/api/setup");
         let prf = dummy_prf_b64();
 
-        // Use a wrong code that is guaranteed not to equal the real one.
-        // Both "------" and "======" are 6-char strings of in-alphabet
-        // chars; the real code colliding with either is overwhelmingly
-        // unlikely, but be defensive and rotate.
-        let mut wrong = "------".to_string();
-        if wrong == real {
-            wrong = "======".into();
-        }
+        // Use a wrong code that is guaranteed not to equal the real
+        // one. `------` uses characters outside the alphabet so it can
+        // never collide with `real`. The server's check_setup_code only
+        // normalizes (whitespace strip + uppercase) before ct_eq, not
+        // shape-validate, so this is accepted as input and just doesn't
+        // match.
+        let wrong = "------".to_string();
 
         for i in 1..=MAX_SETUP_CODE_ATTEMPTS {
             let body = format!(

@@ -406,30 +406,32 @@ the ceremony past the user. The code is an intent-confirmation
 gesture, like a sudo prompt: "I see this number on my terminal right
 now, here it is."
 
-**Alphabet (56 chars).** Excludes the well-known confusables but keeps
-both letter cases, so the displayed code is case-sensitive:
+**Alphabet (31 chars).** Uppercase letters and digits only, with the
+well-known confusables removed so a misread can't trip a strike:
 
-- Digits `2`–`9` (excludes `0` and `1` — visually collide with `O`/`o`
-  and `I`/`l`/`L`).
+- Digits `2`–`9` (excludes `0` and `1` — visually collide with `O` and
+  `I`/`L`).
 - Uppercase `A`–`Z` excluding `I`, `L`, `O`.
-- Lowercase `a`–`z` excluding `i`, `l`, `o`.
-- Two unshifted symbols: `-` and `=` (period `.` was tried and dropped
-  — too easy to miss in a terminal font).
 
-Code space: `56^6 ≈ 3.08 × 10^10`. Guess probability per attempt:
-`~3.2 × 10^-11`.
+Code space: `31^6 ≈ 8.87 × 10^8`. Guess probability per attempt:
+`~1.13 × 10^-9`. The strike limit (below) caps total guess probability
+per ceremony at `MAX_SETUP_CODE_ATTEMPTS / 31^6 ≈ 5.6 × 10^-9` — still
+many orders of magnitude below anything that would justify a longer
+code or a wider alphabet for an intent-confirmation token.
 
 **Source of truth:** `SETUP_CODE_ALPHABET` and `random_setup_code()`
 in `src/passkey.rs`. The generator pulls 6 bytes from `/dev/urandom`
-and maps each through `byte % 56`; the resulting modulo bias is well
+and maps each through `byte % 31`; the resulting modulo bias is well
 below any security-relevant threshold for an intent-confirmation
 token.
 
 **Input handling.** Both the browser and the server normalize the
-submitted code by stripping whitespace only — letter case is part of
-the code (`Ab2Rt=` and `aB2rt=` are different codes) so it is *not*
-folded on either side. The comparison itself is constant-time
-(`ct_eq`).
+submitted code by stripping whitespace and uppercasing — the alphabet
+is uppercase-only so case folding lets the user type either case
+without it counting as wrong. The comparison itself is constant-time
+(`ct_eq`). The browser input also carries `autocapitalize="characters"`
+and `text-transform: uppercase` so what the user sees while typing
+matches what the TUI printed.
 
 **Pre-flight check.** The browser pre-validates the code with the
 server *before* invoking `navigator.credentials.create()` / `.get()`,
@@ -453,14 +455,13 @@ ceremony exploitable indefinitely under the 30-min TTL), not
 anti-brute-force entropy — the alphabet itself already makes brute
 force impractical within the TTL.
 
-**Display.** The code is printed tight (no inter-character padding,
-since case ambiguity in some fonts would only be made worse by spacing
-the letters out) on the Passkey screen when phase is Setup:
+**Display.** The code is printed tight (no inter-character padding —
+spacing only invites typos) on the Passkey screen when phase is Setup:
 
 ```
-Setup code (type this in the browser — letter case matters):
+Setup code (type this in the browser):
 
-    Ab2Rt=
+    K4M9XR
 ```
 
 It's suppressed when the screen is in its expired state, since there's

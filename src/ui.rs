@@ -870,13 +870,13 @@ fn render_passkey_url(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     // Setup-only intent-confirmation code. Print it prominently so the
     // user knows to copy it into the browser. Suppressed when expired —
-    // there's no ceremony to confirm at that point. Letter case is
-    // significant (the alphabet includes both A-Z and a-z), so we print
-    // it tightly without inter-character padding to avoid misreads.
+    // there's no ceremony to confirm at that point. Printed tightly
+    // without inter-character padding to keep the displayed code visually
+    // intact.
     if !expired
         && let Some(code) = &app.passkey_setup_code
     {
-        lines.push_str("Setup code (type this in the browser — letter case matters):\n\n");
+        lines.push_str("Setup code (type this in the browser):\n\n");
         lines.push_str("    ");
         lines.push_str(code);
         lines.push_str("\n\n");
