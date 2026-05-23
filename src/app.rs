@@ -14,7 +14,7 @@ use tui_input::backend::crossterm::EventHandler;
 
 use crate::config::{self, BackendKind, Config, PasskeyMeta, Paths, Profile};
 use crate::crypto::Cipher;
-use crate::passkey::{self, PasskeyHandle, PasskeyPhase};
+use crate::passkey::{self, PasskeyHandle, PasskeyPhase, SetupMode};
 use crate::repo::{ContentKind, ContentRow, ContentsPreview, FileDetails, SnapshotRow};
 use crate::restic::{self, DiffChange, DiffSummary, ResticError, ResticInfo, SnapshotDetails};
 use crate::share::{self, SHARE_TTL, ShareHandle, ShareTarget};
@@ -26,11 +26,19 @@ pub(crate) const FIRST_RUN_MENU: [&str; 3] = [
     "Restore an existing age key",
     "Quit",
 ];
+/// Setup-phase choice shown before any browser ceremony begins. Create
+/// continues to the label prompt; Import skips it (the existing
+/// credential carries its own label from creation time).
+pub(crate) const PASSKEY_SETUP_MENU: [&str; 2] = [
+    "Create a new passkey",
+    "Use an existing passkey",
+];
 
 pub(crate) enum Screen {
     FirstRunChoice,
     RestoreKeyWait,
     KeyCreated,
+    PasskeySetupChoice,
     PasskeyLabelPrompt,
     PasskeyUrl,
     Home,
@@ -246,6 +254,8 @@ pub(crate) struct App {
     /// the existing [passkey] block + AEAD tag are the gate).
     pub(crate) passkey_setup_code: Option<String>,
     pub(crate) passkey_phase: Option<PasskeyPhase>,
+    /// Selection on `Screen::PasskeySetupChoice` — Create (0) or Import (1).
+    pub(crate) passkey_setup_choice_state: ListState,
 
     pub(crate) first_run_state: ListState,
     pub(crate) backend_list: ListState,
@@ -344,6 +354,8 @@ impl App {
         first_run_state.select(Some(0));
         let mut backend_list = ListState::default();
         backend_list.select(Some(0));
+        let mut passkey_setup_choice_state = ListState::default();
+        passkey_setup_choice_state.select(Some(0));
 
         let identity_exists = paths.identity.exists();
         let mut app = Self {
@@ -358,6 +370,7 @@ impl App {
             passkey_short_url: None,
             passkey_setup_code: None,
             passkey_phase: None,
+            passkey_setup_choice_state,
             first_run_state,
             backend_list,
             profile_list_state: ListState::default(),
@@ -475,11 +488,12 @@ impl App {
 
     /// Boot in passkey mode: peek at config.toml to decide phase. On
     /// Unlock, start the ceremony server directly. On Setup, first
-    /// transition to `Screen::PasskeyLabelPrompt` so the user can name
-    /// this config — the name becomes `user.name` in the WebAuthn
-    /// create() call and lets the browser passkey picker distinguish
-    /// multiple wrustic configs. The label-prompt key handler invokes
-    /// `launch_passkey_server` once the label is accepted.
+    /// transition to `Screen::PasskeySetupChoice` so the user can pick
+    /// Create vs. Import before any browser ceremony begins. Picking
+    /// Create then routes to `Screen::PasskeyLabelPrompt` (label is only
+    /// used by the WebAuthn `create()` call); Import skips the label and
+    /// launches the server directly. Both branches end up in
+    /// `launch_passkey_server`.
     fn start_passkey_ceremony(&mut self) {
         let peeked = match config::peek(&self.paths) {
             Ok(p) => p,
@@ -491,16 +505,10 @@ impl App {
         };
         match peeked {
             None => {
-                // Setup phase: collect a label first. If the config dir's
-                // basename is usable, prefill with it so the user can
-                // usually just hit Enter. Otherwise prefill empty —
-                // `submit_passkey_label` rejects empty input, so the
-                // user is forced to type something rather than silently
-                // accepting a generic default that would defeat the
-                // purpose of having distinct passkey names per config.
-                let default_label = default_passkey_label(&self.paths).unwrap_or_default();
-                self.passkey_label_input = Input::new(default_label);
-                self.screen = Screen::PasskeyLabelPrompt;
+                // Setup phase: ask Create vs. Import first. Default to
+                // Create (the more common path on a fresh machine).
+                self.passkey_setup_choice_state.select(Some(0));
+                self.screen = Screen::PasskeySetupChoice;
             }
             Some(cfg) => {
                 if cfg.cipher != config::CIPHER_MARKER_PASSKEY {
@@ -557,7 +565,7 @@ impl App {
     }
 
     /// Submit the typed label from `Screen::PasskeyLabelPrompt` and
-    /// launch the Setup-phase server. Empty labels are rejected (the
+    /// launch the Setup(Create) server. Empty labels are rejected (the
     /// key handler stays on the screen so the user can retry).
     pub(crate) fn submit_passkey_label(&mut self) {
         let label = self.passkey_label_input.value().trim().to_string();
@@ -571,7 +579,26 @@ impl App {
         } else {
             label
         };
-        self.launch_passkey_server(PasskeyPhase::Setup, None, Some(label));
+        self.launch_passkey_server(PasskeyPhase::Setup(SetupMode::Create), None, Some(label));
+    }
+
+    /// Activate the current selection on `Screen::PasskeySetupChoice`.
+    /// Create routes through `Screen::PasskeyLabelPrompt` (the label is
+    /// only meaningful when `create()` is called); Import launches the
+    /// server straight away with no label.
+    fn activate_passkey_setup_choice(&mut self) {
+        match self.passkey_setup_choice_state.selected().unwrap_or(0) {
+            0 => {
+                // Prefill the label from the config dir's basename if
+                // usable, so the common case is just Enter.
+                let default_label = default_passkey_label(&self.paths).unwrap_or_default();
+                self.passkey_label_input = Input::new(default_label);
+                self.screen = Screen::PasskeyLabelPrompt;
+            }
+            _ => {
+                self.launch_passkey_server(PasskeyPhase::Setup(SetupMode::Import), None, None);
+            }
+        }
     }
 
     /// Non-blocking check for completion of the passkey ceremony. Called
@@ -1260,6 +1287,25 @@ impl App {
                     self.load_config_or_set_fatal();
                 }
                 KeyCode::Esc => self.quit = true,
+                _ => {}
+            },
+
+            Screen::PasskeySetupChoice => match key.code {
+                KeyCode::Down | KeyCode::Char('j') => self.passkey_setup_choice_state.select_next(),
+                KeyCode::Up | KeyCode::Char('k') => self.passkey_setup_choice_state.select_previous(),
+                KeyCode::PageDown => {
+                    let step = self.page_step();
+                    page_select(&mut self.passkey_setup_choice_state, PASSKEY_SETUP_MENU.len(), true, step);
+                }
+                KeyCode::PageUp => {
+                    let step = self.page_step();
+                    page_select(&mut self.passkey_setup_choice_state, PASSKEY_SETUP_MENU.len(), false, step);
+                }
+                // No previous screen to back to — the user launched with
+                // --experimental-passkey on an empty config dir. Match
+                // PasskeyLabelPrompt's behavior and quit on Esc.
+                KeyCode::Esc => self.quit = true,
+                KeyCode::Enter => self.activate_passkey_setup_choice(),
                 _ => {}
             },
 
@@ -1974,6 +2020,18 @@ impl App {
                     self.activate_first_run();
                 }
             }
+            Screen::PasskeySetupChoice => {
+                if let Some(idx) = click_to_index(
+                    area,
+                    self.passkey_setup_choice_state.offset(),
+                    PASSKEY_SETUP_MENU.len(),
+                    row,
+                    col,
+                ) {
+                    self.passkey_setup_choice_state.select(Some(idx));
+                    self.activate_passkey_setup_choice();
+                }
+            }
             Screen::Home => {
                 let len = self.config.profiles.len();
                 if let Some(idx) =
@@ -2082,6 +2140,13 @@ impl App {
                     self.first_run_state.select_next();
                 } else {
                     self.first_run_state.select_previous();
+                }
+            }
+            Screen::PasskeySetupChoice => {
+                if down {
+                    self.passkey_setup_choice_state.select_next();
+                } else {
+                    self.passkey_setup_choice_state.select_previous();
                 }
             }
             Screen::Home => {

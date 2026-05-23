@@ -6,8 +6,8 @@ use ratatui::{
 };
 use tui_input::Input;
 
-use crate::app::{App, BACKEND_ORDER, FIRST_RUN_MENU, Screen, filter_dim_entries};
-use crate::passkey::PasskeyPhase;
+use crate::app::{App, BACKEND_ORDER, FIRST_RUN_MENU, PASSKEY_SETUP_MENU, Screen, filter_dim_entries};
+use crate::passkey::{PasskeyPhase, SetupMode};
 use crate::repo::ContentKind;
 
 pub(crate) fn render(frame: &mut Frame, app: &mut App) {
@@ -62,6 +62,7 @@ fn bottom_bar_text(screen: &Screen) -> &'static str {
             "j/k scroll  PgUp/PgDn page  g top  s share  Esc/Backspace/q back"
         }
         Screen::ShareUrl => "Esc/Backspace/q back (stops the server)",
+        Screen::PasskeySetupChoice => "j/k move  PgUp/PgDn page  Enter pick  Esc quit",
         Screen::PasskeyLabelPrompt => "type  Enter submit  Esc quit",
         Screen::PasskeyUrl => "Esc/q quit  (waiting for browser ceremony)",
         Screen::SnapshotCompareFirst => {
@@ -202,6 +203,7 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
         Screen::SnapshotContents => render_snapshot_contents(frame, app, area),
         Screen::FileDetails => render_file_details(frame, app, area),
         Screen::ShareUrl => render_share_url(frame, app, area),
+        Screen::PasskeySetupChoice => render_passkey_setup_choice(frame, app, area),
         Screen::PasskeyLabelPrompt => render_input(
             frame,
             area,
@@ -229,6 +231,39 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
             frame.render_widget(para, area);
         }
     }
+}
+
+fn render_passkey_setup_choice(frame: &mut Frame, app: &mut App, area: Rect) {
+    let [intro_area, list_area] = Layout::vertical([
+        Constraint::Length(11),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+
+    let intro = Paragraph::new(format!(
+        "No existing wrustic config found at {}, so a new one needs to be \
+         encrypted with a passkey before anything else can happen.\n\n\
+         Pick \"Create\" to mint a brand-new passkey on this device — \
+         you'll be asked to label it (so it shows distinctly in your \
+         password manager).\n\n\
+         Pick \"Use existing\" to wrap a passkey already known to your \
+         browser (e.g. one synced via your password manager). No label \
+         step — the existing credential carries its own. This still \
+         creates a fresh config under a new salt; it won't decrypt a \
+         config from another machine.",
+        app.paths.config.display()
+    ))
+    .wrap(Wrap { trim: false })
+    .block(Block::bordered().title("Experimental passkey mode — Setup"));
+    frame.render_widget(intro, intro_area);
+
+    let items: Vec<ListItem> = PASSKEY_SETUP_MENU.iter().map(|s| ListItem::new(*s)).collect();
+    let list = List::new(items)
+        .block(Block::bordered().title("j/k to move, Enter to pick, Esc to quit"))
+        .highlight_style(selection_highlight())
+        .highlight_symbol(">> ");
+    record_list_area(app, list_area);
+    frame.render_stateful_widget(list, list_area, &mut app.passkey_setup_choice_state);
 }
 
 fn render_first_run_choice(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -845,7 +880,8 @@ fn render_file_details(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn render_passkey_url(frame: &mut Frame, app: &mut App, area: Rect) {
     let phase_label = match app.passkey_phase {
-        Some(PasskeyPhase::Setup) => "Set up",
+        Some(PasskeyPhase::Setup(SetupMode::Create)) => "Create",
+        Some(PasskeyPhase::Setup(SetupMode::Import)) => "Import",
         Some(PasskeyPhase::Unlock) => "Unlock",
         None => "Passkey",
     };
@@ -892,12 +928,22 @@ fn render_passkey_url(frame: &mut Frame, app: &mut App, area: Rect) {
         );
     } else {
         match app.passkey_phase {
-            Some(PasskeyPhase::Setup) => {
+            Some(PasskeyPhase::Setup(SetupMode::Create)) => {
                 lines.push_str(
                     "The browser will prompt you to create a new passkey on this device.\n\
                      wrustic uses the WebAuthn PRF extension to derive an encryption key from it.\n\
                      The key never leaves your device.\n\n\
                      WARNING: losing this passkey means losing access to the config.\n",
+                );
+            }
+            Some(PasskeyPhase::Setup(SetupMode::Import)) => {
+                lines.push_str(
+                    "The browser will let you pick a passkey already known to it (e.g. one\n\
+                     synced from another device via your password manager).\n\
+                     wrustic uses the WebAuthn PRF extension to derive an encryption key from\n\
+                     the passkey you pick. The key never leaves your device.\n\n\
+                     NOTE: this starts a fresh wrustic config under a new salt — it will\n\
+                     not decrypt an existing config from another machine.\n",
                 );
             }
             Some(PasskeyPhase::Unlock) => {

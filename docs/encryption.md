@@ -346,30 +346,43 @@ unauthenticated caller never gets to distinguish "running" from
 The phase is picked at boot by `config::peek`:
 
 - **No `config.toml` (or no `[passkey]` block)** → `PasskeyPhase::Setup`.
-  Before the localhost server is even started, the TUI shows a label
-  prompt (`Screen::PasskeyLabelPrompt`) pre-filled with the config
-  dir's basename. The submitted label is passed into
-  `passkey::start(...)` and embedded in the inline JS as a const
-  (`USER_LABEL`). When the user picks "Create new passkey", the
-  WebAuthn `create()` call uses it as `user.name` and
-  `user.displayName`, so the browser's passkey picker and the user's
-  password manager label the entry distinctively (e.g. "wrustic" RP +
-  "personal" user) instead of N identical "wrustic" entries across
-  configs. The label is purely cosmetic — it has no role in
-  decryption — and is not stored on the wrustic side; only the
-  authenticator keeps it as part of the credential's metadata.
+  Before the localhost server is even started, the TUI asks **Create vs.
+  Import** on `Screen::PasskeySetupChoice`:
 
-  Server then presents two buttons:
-  - *Create new passkey* — `navigator.credentials.create()` with the PRF
-    extension. Some authenticators don't return PRF during `create()`;
-    the page transparently falls back to a follow-up `get()` against
-    the just-created credential.
-  - *Use existing passkey* — `navigator.credentials.get()` with no
-    `allowCredentials`, so the browser presents every passkey valid
-    for `localhost`. The user picks one and the page derives the key
-    from its PRF using a fresh salt. The HTML carries a disclaimer
-    explaining this won't open another machine's existing config (the
-    salt would differ).
+  - **Create** (`PasskeyPhase::Setup(SetupMode::Create)`) — the TUI
+    advances to `Screen::PasskeyLabelPrompt` (pre-filled with the config
+    dir's basename) and the submitted label is passed into
+    `passkey::start(...)`. The label is embedded in the inline JS as a
+    const (`USER_LABEL`); the WebAuthn `create()` call uses it as
+    `user.name` and `user.displayName`, so the browser's passkey picker
+    and the user's password manager label the entry distinctively (e.g.
+    "wrustic" RP + "personal" user) instead of N identical "wrustic"
+    entries across configs. The label is purely cosmetic — it has no
+    role in decryption — and is not stored on the wrustic side; only
+    the authenticator keeps it as part of the credential's metadata.
+    The browser page renders a single *Create new passkey* button that
+    calls `navigator.credentials.create()` with the PRF extension. Some
+    authenticators don't return PRF during `create()`; the page
+    transparently falls back to a follow-up `get()` against the
+    just-created credential.
+
+  - **Import** (`PasskeyPhase::Setup(SetupMode::Import)`) — the TUI
+    skips the label prompt entirely (the existing credential carries
+    its own label from creation time) and launches `passkey::start(...)`
+    with `user_label = None`. The browser page renders a single *Use
+    existing passkey* button that calls `navigator.credentials.get()`
+    with no `allowCredentials`, so the browser presents every passkey
+    valid for `localhost`. The user picks one and the page derives the
+    key from its PRF using a fresh salt. The page carries a disclaimer
+    explaining this still creates a *fresh* wrustic config under a new
+    salt — it won't open another machine's existing config.
+
+  Splitting the choice onto the TUI means the browser page never offers
+  both buttons at once: the user has already committed by the time the
+  ceremony page loads, which keeps the page focused on one flow and
+  avoids the "label irrelevant to Import" awkwardness of asking for a
+  label up front regardless of branch.
+
   - **Both flows are gated by the Setup-confirmation code** (see
     below). The browser refuses to even prompt the authenticator
     until a valid-shape code is in the input box, and the server

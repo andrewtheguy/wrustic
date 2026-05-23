@@ -28,8 +28,20 @@ use crate::config::PasskeyMeta;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PasskeyPhase {
-    Setup,
+    Setup(SetupMode),
     Unlock,
+}
+
+/// Whether the Setup-phase ceremony will create a brand-new passkey on
+/// this device, or pick an existing one already known to the browser /
+/// password manager. Decided on the TUI before the server starts —
+/// keeps the browser page focused on one ceremony at a time, and lets
+/// the TUI skip the label prompt for Import (the existing credential
+/// already carries its own user info from creation time).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SetupMode {
+    Create,
+    Import,
 }
 
 /// Hard wall-clock cap on a single passkey ceremony — if the user leaves the
@@ -185,8 +197,10 @@ struct Ctx {
     // User-chosen label used as `user.name` and `user.displayName` in the
     // WebAuthn `create()` call. Lets multiple wrustic configs show up as
     // distinct entries in the browser/password-manager passkey picker
-    // instead of N identical "wrustic" entries. Some on Setup, None on
-    // Unlock (Unlock uses .get() with allowCredentials — no user info).
+    // instead of N identical "wrustic" entries. Some on Setup(Create);
+    // None on Setup(Import) (the existing credential carries its own
+    // label from creation time) and on Unlock (uses .get() with
+    // allowCredentials — no user info).
     user_label: Option<String>,
     // 6-character Setup-confirmation code. Some on Setup, None on Unlock.
     // The browser must echo it back in POST /api/setup, otherwise the
@@ -234,7 +248,7 @@ pub(crate) fn start(
         .map_err(|e| anyhow!("set_nonblocking: {e}"))?;
 
     let (prf_salt_b64, credential_id_b64) = match phase {
-        PasskeyPhase::Setup => {
+        PasskeyPhase::Setup(_) => {
             // Fresh 16-byte salt; the browser will use this same value on
             // every subsequent unlock so PRF outputs match.
             let salt = random_bytes(16)?;
@@ -260,7 +274,7 @@ pub(crate) fn start(
     // but doesn't prove the user-at-terminal actively wanted to create or
     // import a passkey right now; this does.
     let setup_code = match phase {
-        PasskeyPhase::Setup => Some(random_setup_code()),
+        PasskeyPhase::Setup(_) => Some(random_setup_code()),
         PasskeyPhase::Unlock => None,
     };
 
@@ -409,10 +423,10 @@ async fn handle(
             "text/html; charset=utf-8",
             render_html(&ctx).into_bytes(),
         )),
-        (Method::POST, "/api/check-code") if ctx.phase == PasskeyPhase::Setup => {
+        (Method::POST, "/api/check-code") if matches!(ctx.phase, PasskeyPhase::Setup(_)) => {
             Ok(handle_check_setup_code(req, ctx).await)
         }
-        (Method::POST, "/api/setup") if ctx.phase == PasskeyPhase::Setup => {
+        (Method::POST, "/api/setup") if matches!(ctx.phase, PasskeyPhase::Setup(_)) => {
             Ok(handle_setup(req, ctx).await)
         }
         (Method::POST, "/api/unlock") if ctx.phase == PasskeyPhase::Unlock => {
@@ -626,16 +640,23 @@ async fn handle_unlock(req: Request<hyper::body::Incoming>, ctx: Arc<Ctx>) -> Re
 // or authenticators).
 fn render_html(ctx: &Ctx) -> String {
     let heading = match ctx.phase {
-        PasskeyPhase::Setup => "Set up a passkey for wrustic",
+        PasskeyPhase::Setup(SetupMode::Create) => "Create a new passkey for wrustic",
+        PasskeyPhase::Setup(SetupMode::Import) => "Use an existing passkey for wrustic",
         PasskeyPhase::Unlock => "Unlock wrustic with your passkey",
     };
     let explanation = match ctx.phase {
-        PasskeyPhase::Setup => {
-            "Choose either to create a new passkey on this device, or to use \
-             an existing passkey already known to this browser (e.g. one synced \
-             from another device via your password manager). wrustic uses the \
-             WebAuthn PRF extension to derive an encryption key from whichever \
-             passkey you pick — the key itself never leaves your device."
+        PasskeyPhase::Setup(SetupMode::Create) => {
+            "Your browser will prompt you to create a new passkey on this \
+             device. wrustic uses the WebAuthn PRF extension to derive an \
+             encryption key from that passkey — the key itself never leaves \
+             your device."
+        }
+        PasskeyPhase::Setup(SetupMode::Import) => {
+            "Your browser will let you pick a passkey already known to it \
+             (e.g. one synced from another device via your password manager). \
+             wrustic uses the WebAuthn PRF extension to derive an encryption \
+             key from the passkey you pick — the key itself never leaves \
+             your device."
         }
         PasskeyPhase::Unlock => {
             "Your browser will prompt for the passkey you set up earlier. \
@@ -643,22 +664,16 @@ fn render_html(ctx: &Ctx) -> String {
              decrypt your config."
         }
     };
-    // Setup phase shows two buttons (create vs. use existing); unlock shows
-    // a single one. Each button id is wired to its own handler below, so
-    // adding more options later is just another id+handler pair. The
-    // "Use existing passkey" path carries a disclaimer so the user
-    // understands it starts a fresh encrypted store under a new salt and
-    // won't decrypt an existing wrustic config from another machine.
     // Setup-only: a 6-character code input the user must echo from the
     // TUI. Alphabet matches SETUP_CODE_ALPHABET (digits 2-9 and A-Z
     // minus I/L/O — unambiguous uppercase letters and digits). Case-
     // insensitive on the server, but we still uppercase the display so
     // the typed value visually matches what the TUI printed. Both Create
-    // and Use Existing flows read the same input and send it along with
-    // the WebAuthn result. No code on Unlock — the existing `[passkey]`
+    // and Import flows read the same input and send it along with the
+    // WebAuthn result. No code on Unlock — the existing `[passkey]`
     // block + AEAD tag already prove the user knows the passkey.
     let setup_code_html = match ctx.phase {
-        PasskeyPhase::Setup => {
+        PasskeyPhase::Setup(_) => {
             "<p>\
               <label for=\"setup-code\">\
                 <strong>Setup code</strong> (printed in your wrustic terminal):\
@@ -676,21 +691,24 @@ fn render_html(ctx: &Ctx) -> String {
         }
         PasskeyPhase::Unlock => "",
     };
+    // Each phase renders exactly one CTA — the TUI already asked
+    // Create-vs-Import for Setup, and Unlock has no choice. The Import
+    // flow keeps a disclaimer explaining that picking an existing passkey
+    // still creates a *fresh* wrustic config under a new salt; it does
+    // not import an existing config from another machine.
     let buttons_html = match ctx.phase {
-        PasskeyPhase::Setup => {
-            "<p>\
-              <button id=\"go-create\">Create new passkey</button>\
-              <button id=\"go-import\" style=\"margin-left:0.5rem\">Use existing passkey</button>\
-            </p>\
+        PasskeyPhase::Setup(SetupMode::Create) => {
+            "<p><button id=\"go-create\">Create new passkey</button></p>"
+        }
+        PasskeyPhase::Setup(SetupMode::Import) => {
+            "<p><button id=\"go-import\">Use existing passkey</button></p>\
             <div class=\"hint\">\
-              <strong>About \"Use existing passkey\":</strong> picks a passkey already known to this \
-              browser (e.g. one synced from another device via your password manager) and starts a \
-              <em>fresh</em> wrustic config encrypted under that passkey plus a newly generated salt. \
-              <br><br>\
-              It will <strong>not</strong> decrypt an existing wrustic config you set up on another \
-              machine — the salt would differ. To open an existing config from another machine, quit \
-              wrustic, copy that machine's <code>config.toml</code> into this config dir, then relaunch \
-              — the Unlock flow will use the salt embedded in the file.\
+              <strong>Note:</strong> this starts a <em>fresh</em> wrustic config encrypted under \
+              the passkey you pick plus a newly generated salt. It will <strong>not</strong> \
+              decrypt an existing wrustic config you set up on another machine — the salt would \
+              differ. To open an existing config from another machine, quit wrustic, copy that \
+              machine's <code>config.toml</code> into this config dir, then relaunch — the Unlock \
+              flow will use the salt embedded in the file.\
             </div>"
         }
         PasskeyPhase::Unlock => "<p><button id=\"go-unlock\">Unlock</button></p>",
@@ -1025,11 +1043,11 @@ mod tests {
             prf_salt_b64: "U0FMVA==".into(),
             credential_id_b64: match phase {
                 PasskeyPhase::Unlock => "Q1JFRA==".into(),
-                PasskeyPhase::Setup => String::new(),
+                PasskeyPhase::Setup(_) => String::new(),
             },
             user_label: match phase {
-                PasskeyPhase::Setup => Some("test-label".into()),
-                PasskeyPhase::Unlock => None,
+                PasskeyPhase::Setup(SetupMode::Create) => Some("test-label".into()),
+                PasskeyPhase::Setup(SetupMode::Import) | PasskeyPhase::Unlock => None,
             },
             setup_code: setup_code.map(|s| s.into()),
             setup_code_attempts: AtomicU32::new(0),
@@ -1040,21 +1058,19 @@ mod tests {
     }
 
     #[test]
-    fn html_setup_offers_create_and_import_buttons() {
-        let ctx = test_ctx(PasskeyPhase::Setup, Some("AB-23K"));
+    fn html_setup_create_offers_only_create_button() {
+        let ctx = test_ctx(PasskeyPhase::Setup(SetupMode::Create), Some("AB23KM"));
         let html = render_html(&ctx);
-        assert!(html.contains("Set up a passkey"));
+        assert!(html.contains("Create a new passkey"));
         assert!(html.contains("U0FMVA=="));
         assert!(html.contains(r#"id="go-create""#));
-        assert!(html.contains(r#"id="go-import""#));
+        // Import button + disclaimer must NOT appear in Create — the TUI
+        // already picked Create, so showing Import here would re-open the
+        // very choice we moved to the TUI.
+        assert!(!html.contains(r#"id="go-import""#));
         assert!(!html.contains(r#"id="go-unlock""#));
-        // The disclaimer for "Use existing passkey" must be present in
-        // Setup so the user knows the new salt won't match another
-        // machine's config.
-        assert!(html.contains("Use existing passkey"));
-        assert!(html.contains("class=\"hint\""));
-        assert!(html.contains("salt would differ"));
-        assert!(html.contains("config.toml"));
+        assert!(!html.contains("class=\"hint\""));
+        assert!(!html.contains("Use existing passkey"));
         // Success must disable all CTAs so the user can't re-trigger.
         assert!(html.contains("disableAllCtas"));
         // Setup-code input must be present in Setup phase.
@@ -1063,11 +1079,33 @@ mod tests {
     }
 
     #[test]
-    fn html_setup_embeds_user_label() {
+    fn html_setup_import_offers_only_import_button_with_disclaimer() {
+        let ctx = test_ctx(PasskeyPhase::Setup(SetupMode::Import), Some("AB23KM"));
+        let html = render_html(&ctx);
+        assert!(html.contains("Use an existing passkey"));
+        assert!(html.contains(r#"id="go-import""#));
+        // Create button must NOT appear in Import for the same reason as
+        // above — the choice is already made on the TUI.
+        assert!(!html.contains(r#"id="go-create""#));
+        assert!(!html.contains(r#"id="go-unlock""#));
+        // The disclaimer that picking an existing passkey still creates a
+        // fresh wrustic config (won't decrypt another machine's config)
+        // must show on the Import page.
+        assert!(html.contains("class=\"hint\""));
+        assert!(html.contains("salt would differ"));
+        assert!(html.contains("config.toml"));
+        // Setup-code input must be present.
+        assert!(html.contains(r#"id="setup-code""#));
+    }
+
+    #[test]
+    fn html_setup_create_embeds_user_label() {
         // The label the user types in the TUI should reach the inline JS
         // as a JS string literal, so the browser's passkey picker / the
-        // user's password manager labels the entry distinctively.
-        let ctx = test_ctx(PasskeyPhase::Setup, Some("AB-23K"));
+        // user's password manager labels the entry distinctively. Only
+        // meaningful in the Create flow — Import uses .get() with no user
+        // info, so the label is empty there.
+        let ctx = test_ctx(PasskeyPhase::Setup(SetupMode::Create), Some("AB23KM"));
         let html = render_html(&ctx);
         // The const declaration must carry the supplied label.
         assert!(
@@ -1086,6 +1124,18 @@ mod tests {
     }
 
     #[test]
+    fn html_setup_import_has_empty_user_label() {
+        // Import has no label prompt on the TUI, so user_label is None and
+        // the const should be the empty string. The Create-only `user:`
+        // block still references USER_LABEL textually (it's just inert in
+        // the Import HTML — the create() call isn't reachable here), so
+        // the assertion only checks the const value.
+        let ctx = test_ctx(PasskeyPhase::Setup(SetupMode::Import), Some("AB23KM"));
+        let html = render_html(&ctx);
+        assert!(html.contains("const USER_LABEL = \"\""));
+    }
+
+    #[test]
     fn html_unlock_offers_only_unlock_button() {
         let ctx = test_ctx(PasskeyPhase::Unlock, None);
         let html = render_html(&ctx);
@@ -1094,7 +1144,7 @@ mod tests {
         assert!(html.contains(r#"id="go-unlock""#));
         assert!(!html.contains(r#"id="go-create""#));
         assert!(!html.contains(r#"id="go-import""#));
-        // Disclaimer is Setup-only.
+        // Disclaimer is Setup(Import)-only.
         assert!(!html.contains("class=\"hint\""));
         // Setup-code input must not appear in Unlock phase.
         assert!(!html.contains(r#"id="setup-code""#));
@@ -1151,7 +1201,7 @@ mod tests {
         let h = PasskeyHandle {
             short_url: String::new(),
             setup_code: None,
-            phase: PasskeyPhase::Setup,
+            phase: PasskeyPhase::Setup(SetupMode::Create),
             rx,
             deadline: Instant::now() - Duration::from_secs(1),
             shutdown_tx: Some(shutdown_tx),
@@ -1164,7 +1214,7 @@ mod tests {
         let h2 = PasskeyHandle {
             short_url: String::new(),
             setup_code: None,
-            phase: PasskeyPhase::Setup,
+            phase: PasskeyPhase::Setup(SetupMode::Create),
             rx,
             deadline: Instant::now() + Duration::from_secs(60),
             shutdown_tx: Some(shutdown_tx),
@@ -1234,7 +1284,7 @@ mod tests {
     #[test]
     fn routing_only_serves_under_correct_auth_key() {
         let port = ephemeral_port();
-        let handle = start(port, PasskeyPhase::Setup, None, Some("test-label".into())).expect("start server");
+        let handle = start(port, PasskeyPhase::Setup(SetupMode::Create), None, Some("test-label".into())).expect("start server");
         let key = key_from_handle(&handle);
 
         // Unkeyed paths — every shape gets the same flat 404.
@@ -1304,7 +1354,7 @@ mod tests {
     #[test]
     fn setup_code_wrong_returns_401_and_doesnt_deliver() {
         let port = ephemeral_port();
-        let handle = start(port, PasskeyPhase::Setup, None, Some("test-label".into())).expect("start server");
+        let handle = start(port, PasskeyPhase::Setup(SetupMode::Create), None, Some("test-label".into())).expect("start server");
         let key = key_from_handle(&handle);
         let setup_code = handle.setup_code.clone().expect("Setup phase mints a code");
         let path = format!("/auth/{key}/api/setup");
@@ -1340,7 +1390,7 @@ mod tests {
     #[test]
     fn setup_code_correct_reaches_outcome_delivery() {
         let port = ephemeral_port();
-        let handle = start(port, PasskeyPhase::Setup, None, Some("test-label".into())).expect("start server");
+        let handle = start(port, PasskeyPhase::Setup(SetupMode::Create), None, Some("test-label".into())).expect("start server");
         let key = key_from_handle(&handle);
         let setup_code = handle.setup_code.clone().expect("Setup phase mints a code");
         let path = format!("/auth/{key}/api/setup");
@@ -1362,7 +1412,7 @@ mod tests {
     #[test]
     fn setup_code_accepts_whitespace_padding() {
         let port = ephemeral_port();
-        let handle = start(port, PasskeyPhase::Setup, None, Some("test-label".into())).expect("start server");
+        let handle = start(port, PasskeyPhase::Setup(SetupMode::Create), None, Some("test-label".into())).expect("start server");
         let key = key_from_handle(&handle);
         let setup_code = handle.setup_code.clone().unwrap();
         let path = format!("/auth/{key}/api/setup");
@@ -1391,7 +1441,7 @@ mod tests {
         // submitted code before comparing, so a lowercase-typed code
         // must be accepted.
         let port = ephemeral_port();
-        let handle = start(port, PasskeyPhase::Setup, None, Some("test-label".into())).expect("start server");
+        let handle = start(port, PasskeyPhase::Setup(SetupMode::Create), None, Some("test-label".into())).expect("start server");
         let key = key_from_handle(&handle);
         let setup_code = handle.setup_code.clone().unwrap();
         let path = format!("/auth/{key}/api/setup");
@@ -1416,7 +1466,7 @@ mod tests {
     #[test]
     fn precheck_accepts_correct_code_without_delivering_outcome() {
         let port = ephemeral_port();
-        let handle = start(port, PasskeyPhase::Setup, None, Some("test-label".into())).expect("start server");
+        let handle = start(port, PasskeyPhase::Setup(SetupMode::Create), None, Some("test-label".into())).expect("start server");
         let key = key_from_handle(&handle);
         let setup_code = handle.setup_code.clone().unwrap();
         let path = format!("/auth/{key}/api/check-code");
@@ -1438,7 +1488,7 @@ mod tests {
     #[test]
     fn precheck_wrong_code_returns_401() {
         let port = ephemeral_port();
-        let handle = start(port, PasskeyPhase::Setup, None, Some("test-label".into())).expect("start server");
+        let handle = start(port, PasskeyPhase::Setup(SetupMode::Create), None, Some("test-label".into())).expect("start server");
         let key = key_from_handle(&handle);
         let real = handle.setup_code.clone().unwrap();
         let path = format!("/auth/{key}/api/check-code");
@@ -1466,7 +1516,7 @@ mod tests {
         // counter — important so an attacker can't double the budget by
         // alternating endpoints.
         let port = ephemeral_port();
-        let handle = start(port, PasskeyPhase::Setup, None, Some("test-label".into())).expect("start server");
+        let handle = start(port, PasskeyPhase::Setup(SetupMode::Create), None, Some("test-label".into())).expect("start server");
         let key = key_from_handle(&handle);
         let real = handle.setup_code.clone().unwrap();
         let prf = dummy_prf_b64();
@@ -1525,7 +1575,7 @@ mod tests {
     #[test]
     fn setup_code_five_strikes_kills_ceremony() {
         let port = ephemeral_port();
-        let handle = start(port, PasskeyPhase::Setup, None, Some("test-label".into())).expect("start server");
+        let handle = start(port, PasskeyPhase::Setup(SetupMode::Create), None, Some("test-label".into())).expect("start server");
         let key = key_from_handle(&handle);
         let real = handle.setup_code.clone().unwrap();
         let path = format!("/auth/{key}/api/setup");
