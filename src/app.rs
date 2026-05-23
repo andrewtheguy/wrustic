@@ -626,12 +626,19 @@ impl App {
             Err(std_mpsc::TryRecvError::Empty) => return,
             Err(std_mpsc::TryRecvError::Disconnected) => return,
         };
-        let instance = outcome
+        let Some(instance) = outcome
             .new_meta
             .as_ref()
             .or(self.config.passphrase.as_ref())
             .map(|m| m.instance.clone())
-            .unwrap_or_default();
+            .filter(|s| !s.is_empty())
+        else {
+            self.error_is_fatal = true;
+            self.screen = Screen::Error(
+                "internal: passphrase ceremony completed but no instance name is available".into(),
+            );
+            return;
+        };
         self.cipher = Some(Cipher::new(outcome.key, instance));
         if let Some(h) = self.passphrase_handle.take() {
             h.stop();

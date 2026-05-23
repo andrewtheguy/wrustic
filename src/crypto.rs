@@ -8,7 +8,7 @@ use chacha20poly1305::{
 const HEADER: &str = "$WR;1.0;CHACHA20-POLY1305;";
 
 pub fn is_passphrase_encrypted(value: &str) -> bool {
-    value.trim_start().starts_with(HEADER)
+    value.trim().starts_with(HEADER)
 }
 
 fn encrypt_value(plaintext: &str, key: &[u8; 32], instance: &str) -> Result<String> {

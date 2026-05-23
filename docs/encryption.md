@@ -14,7 +14,7 @@ One cipher is supported:
 
 | Cipher | Prefix | Algorithm | Key source |
 |---|---|---|---|
-| `Cipher` | `$WR;1.0;CHACHA20-POLY1305;` | ChaCha20-Poly1305 AEAD | scrypt-derived config key from user passphrase, never on disk |
+| `Cipher` | `$WR;1.0;CHACHA20-POLY1305;<instance>;` | ChaCha20-Poly1305 AEAD | scrypt-derived config key from user passphrase, never on disk |
 
 Source of truth: `src/crypto.rs`, `src/config.rs`, `src/passphrase.rs`.
 
@@ -50,7 +50,7 @@ cipher  = "passphrase-v1"      # required, no default
 
 [profiles.<name>]
 backend  = "local" | "rest" | "s3"
-password = "$WR;1.0;CHACHA20-POLY1305;…"
+password = "$WR;1.0;CHACHA20-POLY1305;mysite;…"
 # plus backend-specific fields (some encrypted, some not — see table above)
 
 [passphrase]
@@ -178,8 +178,13 @@ of a cryptic AEAD tag failure on the first `$WR;1.0;CHACHA20-POLY1305;` value.
 ### Encrypt / decrypt
 
 ```
-$WR;1.0;CHACHA20-POLY1305;<base64( nonce(12) || ciphertext || tag(16) )>
+$WR;1.0;CHACHA20-POLY1305;<instance>;<base64( nonce(12) || ciphertext || tag(16) )>
 ```
+
+The header fields are semicolon-delimited: app identifier, format
+version, algorithm, and the passphrase instance name. The instance is
+the same DNS-safe label from the `[passphrase]` block, making each
+encrypted value self-documenting about which config it belongs to.
 
 - 12-byte nonce from `OsRng` (chacha20poly1305's `generate_nonce`). Each
   encrypt mints a fresh nonce — there is no nonce reuse window even
@@ -188,9 +193,9 @@ $WR;1.0;CHACHA20-POLY1305;<base64( nonce(12) || ciphertext || tag(16) )>
 - 16-byte Poly1305 tag appended (the AEAD construction does this; the
   encrypted blob's last 16 bytes are the tag).
 
-Decrypt requires `len(payload) >= 28` (12 nonce + 16 tag), splits off the
-nonce, runs `cipher.decrypt`, returns the UTF-8 plaintext. Tag failure =
-hard error.
+Decrypt strips the header and instance field, then requires
+`len(payload) >= 28` (12 nonce + 16 tag), splits off the nonce, runs
+`cipher.decrypt`, returns the UTF-8 plaintext. Tag failure = hard error.
 
 ### Why not whole-file passphrase encryption?
 
