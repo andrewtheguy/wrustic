@@ -386,29 +386,48 @@ async fn handle_unlock(req: Request<hyper::body::Incoming>, ctx: Arc<Ctx>) -> Re
 // up front and surfaces a clear error if PRF isn't returned (older browsers
 // or authenticators).
 fn render_html(ctx: &Ctx) -> String {
-    let phase = match ctx.phase {
-        PasskeyPhase::Setup => "setup",
-        PasskeyPhase::Unlock => "unlock",
-    };
     let heading = match ctx.phase {
         PasskeyPhase::Setup => "Set up a passkey for wrustic",
         PasskeyPhase::Unlock => "Unlock wrustic with your passkey",
     };
-    let action_label = match ctx.phase {
-        PasskeyPhase::Setup => "Create passkey",
-        PasskeyPhase::Unlock => "Unlock",
-    };
     let explanation = match ctx.phase {
         PasskeyPhase::Setup => {
-            "Your browser will prompt you to create a new passkey on this device. \
-             wrustic uses the WebAuthn PRF extension to derive an encryption key \
-             from this passkey — the key itself never leaves your device."
+            "Choose either to create a new passkey on this device, or to use \
+             an existing passkey already known to this browser (e.g. one synced \
+             from another device via your password manager). wrustic uses the \
+             WebAuthn PRF extension to derive an encryption key from whichever \
+             passkey you pick — the key itself never leaves your device."
         }
         PasskeyPhase::Unlock => {
             "Your browser will prompt for the passkey you set up earlier. \
              wrustic re-derives the encryption key from the same passkey to \
              decrypt your config."
         }
+    };
+    // Setup phase shows two buttons (create vs. use existing); unlock shows
+    // a single one. Each button id is wired to its own handler below, so
+    // adding more options later is just another id+handler pair. The
+    // "Use existing passkey" path carries a disclaimer so the user
+    // understands it starts a fresh encrypted store under a new salt and
+    // won't decrypt an existing wrustic config from another machine.
+    let buttons_html = match ctx.phase {
+        PasskeyPhase::Setup => {
+            "<p>\
+              <button id=\"go-create\">Create new passkey</button>\
+              <button id=\"go-import\" style=\"margin-left:0.5rem\">Use existing passkey</button>\
+            </p>\
+            <div class=\"hint\">\
+              <strong>About \"Use existing passkey\":</strong> picks a passkey already known to this \
+              browser (e.g. one synced from another device via your password manager) and starts a \
+              <em>fresh</em> wrustic config encrypted under that passkey plus a newly generated salt. \
+              <br><br>\
+              It will <strong>not</strong> decrypt an existing wrustic config you set up on another \
+              machine — the salt would differ. To open an existing config from another machine, quit \
+              wrustic, copy that machine's <code>config.toml</code> into this config dir, then relaunch \
+              — the Unlock flow will use the salt embedded in the file.\
+            </div>"
+        }
+        PasskeyPhase::Unlock => "<p><button id=\"go-unlock\">Unlock</button></p>",
     };
 
     format!(
@@ -427,17 +446,18 @@ fn render_html(ctx: &Ctx) -> String {
   .ok   {{ background: #e6ffed; color: #006400; }}
   .err  {{ background: #ffecec; color: #800; }}
   .note {{ background: #f6f6f6; color: #444; }}
+  .hint {{ background: #fff7e0; color: #664d03; border-left: 3px solid #d4a017; padding: 0.65rem 0.9rem; margin-top: 0.5rem; line-height: 1.5; border-radius: 3px; }}
+  .hint strong {{ color: #5a3d00; }}
   small {{ color: #666; }}
 </style>
 </head>
 <body>
 <h1>{heading}</h1>
 <p>{explanation}</p>
-<p><button id="go">{action_label}</button></p>
-<div id="status" class="note">Click the button above to begin.</div>
+{buttons_html}
+<div id="status" class="note">Click a button above to begin.</div>
 <p><small>This page is served by the wrustic process on localhost. You can close it when finished.</small></p>
 <script>
-const PHASE = {phase_js};
 const PRF_SALT_B64 = {prf_salt_js};
 const CRED_ID_B64 = {cred_id_js};
 
@@ -459,7 +479,10 @@ function setStatus(text, kind) {{
   el.className = kind || "note";
 }}
 
-async function doSetup() {{
+// Create a brand-new passkey on this device and use its PRF output as the
+// encryption key. Some platform authenticators don't return PRF during
+// create(), so we fall back to a follow-up get() with the same credential.
+async function doCreate() {{
   const prfSalt = b64ToBytes(PRF_SALT_B64);
   const userId = crypto.getRandomValues(new Uint8Array(16));
   const challenge = crypto.getRandomValues(new Uint8Array(32));
@@ -484,9 +507,6 @@ async function doSetup() {{
   let prf = cred.getClientExtensionResults().prf;
   let prfOutput = prf && prf.results && prf.results.first;
   if (!prfOutput) {{
-    // Some authenticators (most platform passkeys) require a second get()
-    // call to actually evaluate PRF. The credential created above is now
-    // discoverable; reuse it.
     const challenge2 = crypto.getRandomValues(new Uint8Array(32));
     const assert = await navigator.credentials.get({{
       publicKey: {{
@@ -502,6 +522,33 @@ async function doSetup() {{
   if (!prfOutput) {{
     throw new Error("Authenticator did not return a PRF output. wrustic's experimental passkey mode requires WebAuthn PRF (hmac-secret) support.");
   }}
+  await postSetup(credId, prfOutput);
+}}
+
+// Reuse an existing passkey already known to the browser (e.g. synced via
+// the user's password manager). No `allowCredentials` so the browser shows
+// the user every passkey valid for this origin and they pick one.
+async function doImportExisting() {{
+  const prfSalt = b64ToBytes(PRF_SALT_B64);
+  const challenge = crypto.getRandomValues(new Uint8Array(32));
+  const assert = await navigator.credentials.get({{
+    publicKey: {{
+      challenge,
+      userVerification: "preferred",
+      extensions: {{ prf: {{ eval: {{ first: prfSalt }} }} }}
+    }}
+  }});
+  if (!assert) throw new Error("Authenticator did not return a credential");
+  const credId = new Uint8Array(assert.rawId);
+  const prf = assert.getClientExtensionResults().prf;
+  const prfOutput = prf && prf.results && prf.results.first;
+  if (!prfOutput) {{
+    throw new Error("The selected passkey did not return a PRF output. wrustic requires a passkey created with WebAuthn PRF (hmac-secret) support.");
+  }}
+  await postSetup(credId, prfOutput);
+}}
+
+async function postSetup(credId, prfOutput) {{
   const r = await fetch("/api/setup", {{
     method: "POST",
     headers: {{ "Content-Type": "application/json" }},
@@ -538,28 +585,33 @@ async function doUnlock() {{
   if (!r.ok) throw new Error("Server: " + (await r.text()));
 }}
 
-document.getElementById("go").addEventListener("click", async () => {{
-  if (!window.PublicKeyCredential) {{
-    setStatus("This browser does not support WebAuthn.", "err");
-    return;
-  }}
-  setStatus("Waiting for the authenticator…", "note");
-  try {{
-    if (PHASE === "setup") await doSetup();
-    else await doUnlock();
-    setStatus("Done. You can close this tab and return to the wrustic terminal.", "ok");
-  }} catch (e) {{
-    setStatus("Error: " + (e && e.message ? e.message : e), "err");
-  }}
-}});
+function wireButton(id, fn) {{
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.addEventListener("click", async () => {{
+    if (!window.PublicKeyCredential) {{
+      setStatus("This browser does not support WebAuthn.", "err");
+      return;
+    }}
+    setStatus("Waiting for the authenticator…", "note");
+    try {{
+      await fn();
+      setStatus("Done. You can close this tab and return to the wrustic terminal.", "ok");
+    }} catch (e) {{
+      setStatus("Error: " + (e && e.message ? e.message : e), "err");
+    }}
+  }});
+}}
+wireButton("go-create", doCreate);
+wireButton("go-import", doImportExisting);
+wireButton("go-unlock", doUnlock);
 </script>
 </body>
 </html>
 "#,
         heading = heading,
         explanation = explanation,
-        action_label = action_label,
-        phase_js = json_string(phase),
+        buttons_html = buttons_html,
         prf_salt_js = json_string(&ctx.prf_salt_b64),
         cred_id_js = json_string(&ctx.credential_id_b64),
     )
@@ -633,7 +685,7 @@ mod tests {
     }
 
     #[test]
-    fn html_includes_phase_and_salt_marker() {
+    fn html_setup_offers_create_and_import_buttons() {
         let ctx = Ctx {
             phase: PasskeyPhase::Setup,
             short_id: "abc123".into(),
@@ -644,19 +696,35 @@ mod tests {
         let html = render_html(&ctx);
         assert!(html.contains("Set up a passkey"));
         assert!(html.contains("U0FMVA=="));
-        assert!(html.contains("\"setup\""));
+        assert!(html.contains(r#"id="go-create""#));
+        assert!(html.contains(r#"id="go-import""#));
+        assert!(!html.contains(r#"id="go-unlock""#));
+        // The disclaimer for "Use existing passkey" must be present in
+        // Setup so the user knows the new salt won't match another
+        // machine's config.
+        assert!(html.contains("Use existing passkey"));
+        assert!(html.contains("class=\"hint\""));
+        assert!(html.contains("salt would differ"));
+        assert!(html.contains("config.toml"));
+    }
 
-        let ctx2 = Ctx {
+    #[test]
+    fn html_unlock_offers_only_unlock_button() {
+        let ctx = Ctx {
             phase: PasskeyPhase::Unlock,
             short_id: "abc123".into(),
             prf_salt_b64: "U0FMVA==".into(),
             credential_id_b64: "Q1JFRA==".into(),
             outcome_tx: std::sync::Mutex::new(None),
         };
-        let html2 = render_html(&ctx2);
-        assert!(html2.contains("Unlock"));
-        assert!(html2.contains("Q1JFRA=="));
-        assert!(html2.contains("\"unlock\""));
+        let html = render_html(&ctx);
+        assert!(html.contains("Unlock wrustic"));
+        assert!(html.contains("Q1JFRA=="));
+        assert!(html.contains(r#"id="go-unlock""#));
+        assert!(!html.contains(r#"id="go-create""#));
+        assert!(!html.contains(r#"id="go-import""#));
+        // Disclaimer is Setup-only.
+        assert!(!html.contains("class=\"hint\""));
     }
 
     fn assert_send<T: Send>() {}
