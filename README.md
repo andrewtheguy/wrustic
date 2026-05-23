@@ -13,7 +13,7 @@ keys) are encrypted on disk with a passphrase.
 
 Implemented:
 - Named profiles stored in `~/.config/wrustic/config.toml`; secret fields are
-  encrypted per-value with a passphrase-derived key (ChaCha20-Poly1305)
+  encrypted per-value with a passphrase-derived key (AES-256-GCM)
 - Profile management screens: create new, delete existing (edit comes later)
 - Snapshot listing (short ID, time, host, tags, paths), sorted by time
 - Keyboard navigation (`j`/`k`, arrow keys, Home/End, `g`/`G`) and quit (`q` / Esc / Ctrl-C)
@@ -236,6 +236,6 @@ Caveats:
   virtual-hosted-style addressing.
 - Profiles are persisted in `~/.config/wrustic/config.toml`. Secret fields
   such as the restic password and S3 keys are encrypted per value with
-  ChaCha20-Poly1305 under a passphrase-derived key. The file itself is not a
+  AES-256-GCM under a passphrase-derived key. The file itself is not a
   whole-file encrypted archive; see `docs/encryption.md` for the on-disk schema
   and threat model.
