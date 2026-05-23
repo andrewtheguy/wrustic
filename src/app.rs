@@ -640,7 +640,9 @@ impl App {
                 &config_key,
                 &meta.instance_sig,
             ) {
-                self.passphrase_error = Some("Wrong passphrase.".to_string());
+                self.passphrase_error = Some(
+                    "Wrong passphrase (or config.toml was corrupted).".to_string(),
+                );
                 self.passphrase_input = Input::default();
                 self.screen = Screen::PassphraseUnlock;
                 return;
