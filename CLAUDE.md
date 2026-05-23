@@ -3,4 +3,3 @@
 - use this project root's tmp/ folder for dev/test data and workspace to avoid permission issues
 - run cargo clippy and cargo test after rust code changes, don't run cargo fmt because it affects diff
 - for local testing, use alternative config dir such as cargo run -- --config-dir ./tmp/wrustic-sandbox so that it won't interfere production config in ~/.config/wrustic
-- no cargo fmt because it affects diff
