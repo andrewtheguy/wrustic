@@ -2,7 +2,7 @@ mod app;
 mod cli;
 mod config;
 mod crypto;
-mod passkey;
+mod passphrase;
 mod repo;
 mod restic;
 mod share;
@@ -50,7 +50,7 @@ fn main() -> Result<()> {
     // selection; users can hold Shift to bypass and select text.
     let mouse_enabled =
         crossterm::execute!(std::io::stdout(), EnableMouseCapture).is_ok();
-    let result = run(&mut terminal, cli.config_dir, cli.port, cli.experimental_passkey);
+    let result = run(&mut terminal, cli.config_dir, cli.port, cli.experimental_passphrase);
     if mouse_enabled {
         let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     }
@@ -62,9 +62,9 @@ fn run(
     terminal: &mut DefaultTerminal,
     config_dir: Option<PathBuf>,
     server_port: u16,
-    experimental_passkey: bool,
+    experimental_passphrase: bool,
 ) -> Result<()> {
-    let mut app = App::boot(config_dir, server_port, experimental_passkey)?;
+    let mut app = App::boot(config_dir, server_port, experimental_passphrase)?;
 
     while !app.quit {
         terminal.draw(|f| render(f, &mut app))?;
@@ -270,11 +270,7 @@ fn run(
             continue;
         }
 
-        // Passkey screen: the browser-side ceremony fires asynchronously,
-        // so poll for events with a short timeout and check the passkey
-        // channel each tick. Plain blocking event::read() would deadlock
-        // until the user pressed a key.
-        if matches!(app.screen, Screen::PasskeyUrl) {
+        if matches!(app.screen, Screen::PassphraseUrl) {
             if event::poll(Duration::from_millis(150))?
                 && let Ok(ev) = event::read()
             {
@@ -286,7 +282,7 @@ fn run(
                     _ => {}
                 }
             }
-            app.try_advance_passkey();
+            app.try_advance_passphrase();
             continue;
         }
 
