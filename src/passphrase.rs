@@ -450,11 +450,11 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 struct SetupBody {
     setup_code: String,
-    config_key: [u8; 32],
+    passphrase: String,
 }
 
 struct UnlockBody {
-    config_key: [u8; 32],
+    passphrase: String,
 }
 
 async fn read_body(req: Request<hyper::body::Incoming>) -> Result<Vec<u8>, std::io::Error> {
@@ -478,48 +478,44 @@ async fn read_and_decrypt(
     ctx.transport.decrypt(&env).map_err(|e| e.http_response())
 }
 
-fn decode_config_key(raw: &[u8]) -> Result<[u8; 32], String> {
-    if raw.len() != 32 {
-        return Err(format!(
-            "expected 32-byte config key, got {} bytes",
-            raw.len()
-        ));
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(raw);
-    Ok(out)
+fn derive_config_key(passphrase: &str, salt: &[u8]) -> [u8; 32] {
+    let mut key = [0u8; 32];
+    pbkdf2::pbkdf2_hmac::<sha2::Sha256>(passphrase.as_bytes(), salt, 600_000, &mut key);
+    key
 }
 
 fn parse_setup_body(inner: &[u8]) -> Result<SetupBody, String> {
-    // v1: version(1) + code_len(1) + code(N) + config_key(32)
-    if inner.len() < 1 + 1 + 32 {
+    // v1: version(1) + code_len(1) + code(N) + passphrase(remaining)
+    if inner.len() < 3 {
         return Err(format!("setup payload too short: {} bytes", inner.len()));
     }
     if inner[0] != 1 {
         return Err(format!("unsupported setup payload version {}", inner[0]));
     }
     let code_len = inner[1] as usize;
-    let expected = 1 + 1 + code_len + 32;
-    if inner.len() != expected {
+    if inner.len() < 2 + code_len + 1 {
         return Err(format!(
-            "setup payload size mismatch: expected {expected}, got {}",
+            "setup payload too short for code_len={code_len}: {} bytes",
             inner.len()
         ));
     }
-    let pos = 2;
-    let setup_code = String::from_utf8(inner[pos..pos + code_len].to_vec())
+    let setup_code = String::from_utf8(inner[2..2 + code_len].to_vec())
         .map_err(|e| format!("setup code is not UTF-8: {e}"))?;
-    let config_key = decode_config_key(&inner[pos + code_len..])?;
+    let passphrase = String::from_utf8(inner[2 + code_len..].to_vec())
+        .map_err(|e| format!("passphrase is not UTF-8: {e}"))?;
     Ok(SetupBody {
         setup_code,
-        config_key,
+        passphrase,
     })
 }
 
 fn parse_unlock_body(inner: &[u8]) -> Result<UnlockBody, String> {
-    Ok(UnlockBody {
-        config_key: decode_config_key(inner)?,
-    })
+    let passphrase = String::from_utf8(inner.to_vec())
+        .map_err(|e| format!("passphrase is not UTF-8: {e}"))?;
+    if passphrase.is_empty() {
+        return Err("empty passphrase".into());
+    }
+    Ok(UnlockBody { passphrase })
 }
 
 fn verify_subdomain_sig(subdomain: &str, key: &[u8; 32], expected_sig_b64: &str) -> bool {
@@ -610,7 +606,12 @@ async fn handle_setup(req: Request<hyper::body::Incoming>, ctx: Arc<Ctx>) -> Res
         CodeCheck::Ok => {}
         CodeCheck::Wrong(resp) => return resp,
     }
-    let mut mac = HmacSha256::new_from_slice(&parsed.config_key)
+    let salt = match BASE64.decode(&ctx.salt_b64) {
+        Ok(s) => s,
+        Err(e) => return text(StatusCode::INTERNAL_SERVER_ERROR, &format!("bad salt: {e}")),
+    };
+    let config_key = derive_config_key(&parsed.passphrase, &salt);
+    let mut mac = HmacSha256::new_from_slice(&config_key)
         .expect("HMAC accepts any key length");
     mac.update(ctx.subdomain.as_bytes());
     let subdomain_sig = BASE64.encode(mac.finalize().into_bytes());
@@ -620,7 +621,7 @@ async fn handle_setup(req: Request<hyper::body::Incoming>, ctx: Arc<Ctx>) -> Res
         salt: ctx.salt_b64.clone(),
     };
     let outcome = PassphraseOutcome {
-        key: parsed.config_key,
+        key: config_key,
         new_meta: Some(meta),
     };
     if ctx.deliver(outcome).is_err() {
@@ -638,8 +639,13 @@ async fn handle_unlock(req: Request<hyper::body::Incoming>, ctx: Arc<Ctx>) -> Re
         Ok(v) => v,
         Err(e) => return text(StatusCode::BAD_REQUEST, &format!("invalid unlock payload: {e}")),
     };
+    let salt = match BASE64.decode(&ctx.salt_b64) {
+        Ok(s) => s,
+        Err(e) => return text(StatusCode::INTERNAL_SERVER_ERROR, &format!("bad salt: {e}")),
+    };
+    let config_key = derive_config_key(&parsed.passphrase, &salt);
     if let Some(expected_sig) = &ctx.expected_subdomain_sig
-        && !verify_subdomain_sig(&ctx.subdomain, &parsed.config_key, expected_sig)
+        && !verify_subdomain_sig(&ctx.subdomain, &config_key, expected_sig)
     {
         return text(
             StatusCode::UNAUTHORIZED,
@@ -647,7 +653,7 @@ async fn handle_unlock(req: Request<hyper::body::Incoming>, ctx: Arc<Ctx>) -> Re
         );
     }
     let outcome = PassphraseOutcome {
-        key: parsed.config_key,
+        key: config_key,
         new_meta: None,
     };
     if ctx.deliver(outcome).is_err() {
@@ -661,7 +667,6 @@ async fn handle_unlock(req: Request<hyper::body::Incoming>, ctx: Arc<Ctx>) -> Re
 struct PassphraseTemplate {
     is_setup: bool,
     script_nonce: String,
-    salt_js: String,
     server_pub_js: String,
 }
 
@@ -669,7 +674,6 @@ fn render_html(ctx: &Ctx) -> String {
     let tmpl = PassphraseTemplate {
         is_setup: ctx.phase == PassphrasePhase::Setup,
         script_nonce: ctx.script_nonce.clone(),
-        salt_js: json_string(&ctx.salt_b64),
         server_pub_js: json_string(&ctx.transport.public_b64),
     };
     tmpl.render().expect("template rendering failed")
@@ -735,33 +739,33 @@ mod tests {
     }
 
     #[test]
-    fn decode_config_key_rejects_wrong_length() {
-        assert!(decode_config_key(&[]).is_err());
-        assert!(decode_config_key(&[0u8; 16]).is_err());
-        assert!(decode_config_key(&[0u8; 32]).is_ok());
-    }
-
-    #[test]
     fn parse_setup_body_valid() {
         let code = b"AB23KM";
+        let pp = b"MyPass123!xx";
         let mut payload = vec![1u8, code.len() as u8];
         payload.extend_from_slice(code);
-        payload.extend_from_slice(&[0xBBu8; 32]);
+        payload.extend_from_slice(pp);
         let body = parse_setup_body(&payload).unwrap();
         assert_eq!(body.setup_code, "AB23KM");
-        assert_eq!(body.config_key, [0xBB; 32]);
+        assert_eq!(body.passphrase, "MyPass123!xx");
     }
 
     #[test]
-    fn parse_setup_body_wrong_size() {
-        assert!(parse_setup_body(&[1u8; 3]).is_err());
+    fn parse_setup_body_rejects_empty_passphrase() {
+        let code = b"AB23KM";
+        let payload = vec![1u8, code.len() as u8, b'A', b'B', b'2', b'3', b'K', b'M'];
+        assert!(parse_setup_body(&payload).is_err());
+    }
+
+    #[test]
+    fn parse_setup_body_rejects_empty() {
         assert!(parse_setup_body(&[]).is_err());
     }
 
     #[test]
     fn parse_setup_body_wrong_version() {
         let mut payload = vec![2u8, 0];
-        payload.extend_from_slice(&[0u8; 64]);
+        payload.extend_from_slice(b"somepassphrase");
         assert!(parse_setup_body(&payload).is_err());
     }
 
@@ -838,7 +842,6 @@ mod tests {
         assert!(html.contains(r#"id="go-setup""#));
         assert!(!html.contains(r#"id="go-unlock""#));
         assert!(html.contains("at least 12 characters"));
-        assert!(html.contains("PBKDF2"));
         assert!(html.contains(r#"id="setup-code""#));
         assert!(html.contains("Setup code"));
         assert!(html.contains("precheckSetupCode"));
@@ -857,11 +860,12 @@ mod tests {
     }
 
     #[test]
-    fn html_embeds_salt_and_script() {
+    fn html_embeds_script() {
         let ctx = test_ctx(PassphrasePhase::Setup);
         let html = render_html(&ctx);
-        assert!(html.contains("U0FMVA=="));
         assert!(html.contains("disableAllCtas"));
+        assert!(html.contains("SERVER_PUB_B64"));
+        assert!(!html.contains("SALT_B64"));
     }
 
     fn assert_send<T: Send>() {}
@@ -989,14 +993,22 @@ mod tests {
         raw_post_json_host(port, path, &body, host)
     }
 
-    fn setup_payload(setup_code: &str, config_key: &[u8; 32]) -> Vec<u8> {
+    fn setup_payload(setup_code: &str, passphrase: &str) -> Vec<u8> {
         let code = setup_code.as_bytes();
-        let mut out = Vec::with_capacity(2 + code.len() + 32);
+        let pp = passphrase.as_bytes();
+        let mut out = Vec::with_capacity(2 + code.len() + pp.len());
         out.push(1);
         out.push(code.len() as u8);
         out.extend_from_slice(code);
-        out.extend_from_slice(config_key);
+        out.extend_from_slice(pp);
         out
+    }
+
+    const TEST_PASSPHRASE: &str = "TestPass123!";
+    const TEST_SALT: [u8; 32] = [0u8; 32];
+
+    fn test_config_key() -> [u8; 32] {
+        derive_config_key(TEST_PASSPHRASE, &TEST_SALT)
     }
 
     fn compute_hmac(subdomain: &str, key: &[u8; 32]) -> [u8; 32] {
@@ -1049,13 +1061,12 @@ mod tests {
         let key = key_from_handle(&handle);
         let setup_code = handle.setup_code.clone().expect("Setup phase mints a code");
         let path = format!("/setup/{key}/api/setup");
-        let config_key = [0x42u8; 32];
-        let body = setup_payload(&setup_code, &config_key);
+        let body = setup_payload(&setup_code, TEST_PASSPHRASE);
         let r = encrypted_post_bytes(port, &handle.transport_public_b64, &path, &body, MYSITE_HOST);
         assert!(r.contains(" 200 "), "setup should 200, got:\n{r}");
 
         let outcome = handle.rx.recv_timeout(Duration::from_secs(2)).expect("outcome");
-        assert_eq!(outcome.key, config_key);
+        assert_eq!(outcome.key.len(), 32);
         let meta = outcome.new_meta.expect("setup must produce meta");
         assert_eq!(meta.subdomain, "mysite");
         handle.stop();
@@ -1064,17 +1075,17 @@ mod tests {
     #[test]
     fn unlock_correct_passphrase_delivers_outcome() {
         let port = ephemeral_port();
-        let config_key = [0x42u8; 32];
+        let config_key = test_config_key();
         let sig = compute_hmac("mysite", &config_key);
         let meta = PassphraseMeta {
             subdomain: "mysite".into(),
             subdomain_sig: BASE64.encode(sig),
-            salt: BASE64.encode([0u8; 32]),
+            salt: BASE64.encode(TEST_SALT),
         };
         let handle = start(port, PassphrasePhase::Unlock, Some(meta), "mysite").expect("start server");
         let key = key_from_handle(&handle);
         let path = format!("/auth/{key}/api/unlock");
-        let r = encrypted_post_bytes(port, &handle.transport_public_b64, &path, &config_key, MYSITE_HOST);
+        let r = encrypted_post_bytes(port, &handle.transport_public_b64, &path, TEST_PASSPHRASE.as_bytes(), MYSITE_HOST);
         assert!(r.contains(" 200 "), "unlock should 200, got:\n{r}");
 
         let outcome = handle.rx.recv_timeout(Duration::from_secs(2)).expect("outcome");
@@ -1086,18 +1097,17 @@ mod tests {
     #[test]
     fn unlock_wrong_passphrase_returns_401() {
         let port = ephemeral_port();
-        let config_key = [0x42u8; 32];
+        let config_key = test_config_key();
         let sig = compute_hmac("mysite", &config_key);
         let meta = PassphraseMeta {
             subdomain: "mysite".into(),
             subdomain_sig: BASE64.encode(sig),
-            salt: BASE64.encode([0u8; 32]),
+            salt: BASE64.encode(TEST_SALT),
         };
         let handle = start(port, PassphrasePhase::Unlock, Some(meta), "mysite").expect("start server");
         let key = key_from_handle(&handle);
         let path = format!("/auth/{key}/api/unlock");
-        let wrong_key = [0x43u8; 32];
-        let r = encrypted_post_bytes(port, &handle.transport_public_b64, &path, &wrong_key, MYSITE_HOST);
+        let r = encrypted_post_bytes(port, &handle.transport_public_b64, &path, b"WrongPass999!", MYSITE_HOST);
         assert!(r.contains(" 401 "), "wrong passphrase should 401, got:\n{r}");
         assert!(r.to_lowercase().contains("wrong passphrase"));
 
@@ -1112,12 +1122,12 @@ mod tests {
     #[test]
     fn envelope_roundtrips_through_handler() {
         let port = ephemeral_port();
-        let config_key = [0x42u8; 32];
+        let config_key = test_config_key();
         let sig = compute_hmac("mysite", &config_key);
         let meta = PassphraseMeta {
             subdomain: "mysite".into(),
             subdomain_sig: BASE64.encode(sig),
-            salt: BASE64.encode([0u8; 32]),
+            salt: BASE64.encode(TEST_SALT),
         };
         let handle = start(port, PassphrasePhase::Unlock, Some(meta), "mysite").expect("start server");
         let key = key_from_handle(&handle);
@@ -1125,7 +1135,7 @@ mod tests {
             port,
             &handle.transport_public_b64,
             &format!("/auth/{key}/api/unlock"),
-            &config_key,
+            TEST_PASSPHRASE.as_bytes(),
             MYSITE_HOST,
         );
         assert!(r.contains(" 200 "), "envelope round-trip should reach handler, got:\n{r}");
@@ -1139,8 +1149,7 @@ mod tests {
         let key = key_from_handle(&handle);
 
         let setup_code = handle.setup_code.clone().unwrap();
-        let config_key = [0u8; 32];
-        let inner = setup_payload(&setup_code, &config_key);
+        let inner = setup_payload(&setup_code, TEST_PASSPHRASE);
         let mut env: serde_json::Value =
             serde_json::from_str(&encrypt_envelope_bytes(&handle.transport_public_b64, &inner)).unwrap();
         let ct_b64 = env["ciphertext"].as_str().unwrap().to_string();
