@@ -2,7 +2,8 @@ use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
-    widgets::{Block, List, ListItem, Paragraph, Wrap},
+    text::{Line, Span},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
 };
 use tui_input::Input;
 
@@ -12,9 +13,9 @@ use crate::repo::ContentKind;
 
 pub(crate) fn render(frame: &mut Frame, app: &mut App) {
     let [top, body, bottom] = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(3),
         Constraint::Fill(1),
-        Constraint::Length(1),
+        Constraint::Length(3),
     ])
     .areas(frame.area());
 
@@ -25,18 +26,54 @@ pub(crate) fn render(frame: &mut Frame, app: &mut App) {
 
 fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
     let text = match &app.active_profile_name {
-        Some(name) => format!(" wrustic — profile: {name}"),
-        None => " wrustic".to_string(),
+        Some(name) => format!("wrustic — profile: {name}"),
+        None => "wrustic".to_string(),
     };
-    let para = Paragraph::new(text).style(Style::new().fg(Color::Black).bg(Color::Green));
+    let para = Paragraph::new(text)
+        .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .block(Block::default().borders(Borders::ALL));
     frame.render_widget(para, area);
 }
 
 fn render_bottom_bar(frame: &mut Frame, app: &App, area: Rect) {
     let text = bottom_bar_text(&app.screen);
-    let para = Paragraph::new(format!(" {text}"))
-        .style(Style::new().fg(Color::Black).bg(Color::White));
+    let content_width = area.width.saturating_sub(2) as usize;
+    let segments: Vec<&str> = text.split("  ").collect();
+    let footer_line = build_footer_line(&segments, content_width);
+    let para = Paragraph::new(footer_line)
+        .block(Block::default().borders(Borders::ALL));
     frame.render_widget(para, area);
+}
+
+fn build_footer_line(segments: &[&str], width: usize) -> Line<'static> {
+    let style = Style::default().fg(Color::White);
+
+    if segments.is_empty() {
+        return Line::from(Span::styled("", style));
+    }
+
+    let sep = " | ";
+    let sep_len = sep.len();
+
+    let mut total_width = 0usize;
+    let mut fit_count = 0usize;
+    for (i, seg) in segments.iter().enumerate() {
+        let needed = if i == 0 { seg.len() } else { sep_len + seg.len() };
+        if total_width + needed > width {
+            break;
+        }
+        total_width += needed;
+        fit_count += 1;
+    }
+
+    if fit_count == 0 {
+        let first = segments[0];
+        let truncated: String = first.chars().take(width).collect();
+        return Line::from(Span::styled(truncated, style));
+    }
+
+    let joined = segments[..fit_count].join(sep);
+    Line::from(Span::styled(joined, style))
 }
 
 fn bottom_bar_text(screen: &Screen) -> &'static str {
@@ -213,10 +250,10 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
                 Constraint::Fill(1),
             ])
             .areas(area);
-            let banner_p = Paragraph::new(banner).style(Style::new().fg(Color::DarkGray));
+            let banner_p = Paragraph::new(banner).style(Style::new().fg(Color::White));
             frame.render_widget(banner_p, banner_area);
             draw_input_field(frame, input_area, "Instance name", &app.passphrase_instance_input, false, true);
-            let help_p = Paragraph::new("Lowercase letters, digits, and hyphens (max 32 chars).").style(Style::new().fg(Color::DarkGray));
+            let help_p = Paragraph::new("Lowercase letters, digits, and hyphens (max 32 chars).").style(Style::new().fg(Color::White));
             frame.render_widget(help_p, help_area);
         }
         Screen::AuthMethodChoice => render_auth_method_choice(frame, app, area),
@@ -248,7 +285,9 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn selection_highlight() -> Style {
-    Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+    Style::new()
+        .bg(Color::Rgb(40, 40, 80))
+        .add_modifier(Modifier::BOLD)
 }
 
 // Stash the outer rect of the currently-rendered scrollable area so the
@@ -338,7 +377,7 @@ fn render_input(
 
     draw_input_field(frame, input_area, title, input, masked, true);
 
-    let help = Paragraph::new(help).style(Style::new().fg(Color::DarkGray));
+    let help = Paragraph::new(help).style(Style::new().fg(Color::White));
     frame.render_widget(help, help_area);
 }
 
@@ -363,7 +402,7 @@ fn render_grouped_input(
         draw_input_field(frame, areas[i], label, input, *masked, i == focus);
     }
 
-    let help_para = Paragraph::new(help).style(Style::new().fg(Color::DarkGray));
+    let help_para = Paragraph::new(help).style(Style::new().fg(Color::White));
     frame.render_widget(help_para, areas[fields.len()]);
 }
 
