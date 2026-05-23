@@ -606,6 +606,11 @@ async fn handle_setup(req: Request<hyper::body::Incoming>, ctx: Arc<Ctx>) -> Res
     let meta = PasskeyMeta {
         credential_id: parsed.credential_id,
         prf_salt: ctx.prf_salt_b64.clone(),
+        // Stashed purely so the user can see which passkey this config
+        // was set up against on later Unlock screens. Only set in
+        // Setup(Create) (Import never asks for one). Not used in key
+        // derivation — see PasskeyMeta::label.
+        label: ctx.user_label.clone(),
     };
     let outcome = PasskeyOutcome { key, new_meta: Some(meta) };
     if ctx.deliver(outcome).is_err() {
@@ -1559,6 +1564,7 @@ mod tests {
         let meta = PasskeyMeta {
             credential_id: "Y3JlZA==".into(),
             prf_salt: "U0FMVA==".into(),
+            label: None,
         };
         let handle =
             start(port, PasskeyPhase::Unlock, Some(meta), None).expect("start unlock server");

@@ -165,6 +165,17 @@ pub struct PasskeyMeta {
     /// input. Constant per config so repeat ceremonies yield the same PRF
     /// output.
     pub prf_salt: String,
+    /// Human-readable label the user typed in the Setup(Create) flow,
+    /// stored purely for informational reference (e.g. surfacing on the
+    /// Unlock screen so the user knows which passkey this config expects).
+    /// **Not cryptographically tied to `credential_id`, `prf_salt`, or the
+    /// PRF output** — the authenticator carries the canonical label inside
+    /// the credential, and the encryption key is derived only from
+    /// `HMAC(authenticator hmac-secret, prf_salt)`. `None` for
+    /// Setup(Import) (we never asked the user for a label) and for any
+    /// config written before this field was added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 /// Parse config.toml without touching any encrypted fields. Returns `None`
@@ -912,6 +923,7 @@ mod tests {
             passkey: Some(PasskeyMeta {
                 credential_id: "Y3JlZA==".into(),
                 prf_salt: "c2FsdA==".into(),
+                label: Some("laptop-personal".into()),
             }),
             ..Config::default()
         };
@@ -924,11 +936,48 @@ mod tests {
             "Y3JlZA=="
         );
         assert_eq!(parsed["passkey"]["prf_salt"].as_str().unwrap(), "c2FsdA==");
+        assert_eq!(
+            parsed["passkey"]["label"].as_str().unwrap(),
+            "laptop-personal"
+        );
 
         let loaded = load(&paths, &cipher)?;
         let m = loaded.passkey.expect("[passkey] block must round-trip");
         assert_eq!(m.credential_id, "Y3JlZA==");
         assert_eq!(m.prf_salt, "c2FsdA==");
+        assert_eq!(m.label.as_deref(), Some("laptop-personal"));
+        fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn passkey_block_without_label_round_trips() -> Result<()> {
+        // Import-mode configs (and any future ceremony that doesn't ask
+        // for a label) leave `label` as None; the serialized TOML must
+        // omit the key, and parsing must yield None again.
+        let dir = fresh_dir("pk_inline_nolabel");
+        let paths = test_paths(&dir);
+        let cipher = Cipher::Passkey { key: [0xA5u8; 32] };
+
+        let cfg = Config {
+            passkey: Some(PasskeyMeta {
+                credential_id: "Y3JlZA==".into(),
+                prf_salt: "c2FsdA==".into(),
+                label: None,
+            }),
+            ..Config::default()
+        };
+        save(&cfg, &paths, &cipher)?;
+
+        let raw = fs::read_to_string(&paths.config)?;
+        assert!(
+            !raw.contains("label"),
+            "absent label must not write a key, got: {raw}"
+        );
+
+        let loaded = load(&paths, &cipher)?;
+        let m = loaded.passkey.expect("[passkey] block must round-trip");
+        assert!(m.label.is_none());
         fs::remove_dir_all(&dir).ok();
         Ok(())
     }
@@ -955,6 +1004,7 @@ mod tests {
             passkey: Some(PasskeyMeta {
                 credential_id: "Q0lE".into(),
                 prf_salt: "U0FMVA==".into(),
+                label: Some("peek-test".into()),
             }),
         };
         save(&cfg, &paths, &cipher)?;

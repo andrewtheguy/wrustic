@@ -60,6 +60,7 @@ password = "ageenc:…"        # or "pkenc:…" depending on mode
 [passkey]                    # passkey mode only — public WebAuthn identifiers
 credential_id = "<base64>"
 prf_salt      = "<base64>"
+label         = "<text>"     # optional; informational only, not used in key derivation
 ```
 
 ### Required fields and cross-mode safety
@@ -100,10 +101,12 @@ In passkey mode the field is omitted (`#[serde(skip_serializing_if =
 [passkey]
 credential_id = "<base64 raw_id>"
 prf_salt      = "<base64 16-byte salt>"
+label         = "<text>"          # optional, informational only
 ```
 
-Both fields are **public** WebAuthn identifiers — no key material here.
-They live inline in `config.toml` (rather than a separate file) so:
+`credential_id` and `prf_salt` are **public** WebAuthn identifiers — no key
+material here. They live inline in `config.toml` (rather than a separate
+file) so:
 
 - `config::peek` can read them without decrypting anything, which is what
   lets boot pick Setup vs Unlock before the cipher is even constructed
@@ -111,6 +114,19 @@ They live inline in `config.toml` (rather than a separate file) so:
   ceremony to derive the cipher).
 - Copying `config.toml` between machines that share the same passkey just
   works — the salt rides along.
+
+`label` is the human-readable string the user typed in the Setup(Create)
+flow, persisted so the Unlock screen can echo "this config was set up
+with passkey label: foo" — useful when the user has several wrustic
+passkeys in their password manager. It is **not used in any cryptographic
+operation**: the encryption key is
+`HMAC(authenticator hmac-secret, prf_salt)` only, and the credential is
+addressed by `credential_id`. The authenticator independently stores its
+own canonical copy of the label (as the credential's user.name /
+user.displayName); the field here is just a wrustic-side mirror so the TUI
+doesn't have to ask the authenticator. Absent for Setup(Import) configs
+(we never asked the user) and for any configs written before this field
+existed.
 
 ## Atomic save
 
@@ -141,8 +157,11 @@ The TOML file always exposes, in plaintext:
   `s3_bucket`, `s3_region`, `s3_root`.
 - Schema metadata: `version`, `cipher` marker.
 - Age mode: the `recipient` bech32 public key.
-- Passkey mode: the `[passkey]` block (`credential_id`, `prf_salt`).
-  Both are public WebAuthn identifiers — no key material.
+- Passkey mode: the `[passkey]` block (`credential_id`, `prf_salt`, and
+  optionally `label`). The two id/salt fields are public WebAuthn
+  identifiers — no key material. `label` is the human-readable name the
+  user typed at Setup; it is also non-secret (the authenticator stores its
+  own copy as `user.name`).
 
 Everything else (repo passwords, REST user/password, S3 access/secret
 keys) sits behind `ageenc:` or `pkenc:` and is unreadable without the

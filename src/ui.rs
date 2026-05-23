@@ -947,6 +947,21 @@ fn render_passkey_url(frame: &mut Frame, app: &mut App, area: Rect) {
                 );
             }
             Some(PasskeyPhase::Unlock) => {
+                // If the Setup(Create) ceremony stashed a label in the
+                // config, surface it here so the user knows which passkey
+                // to pick out of their password manager. The label is
+                // informational only — see PasskeyMeta::label.
+                if let Some(label) = app
+                    .config
+                    .passkey
+                    .as_ref()
+                    .and_then(|m| m.label.as_deref())
+                    .filter(|s| !s.is_empty())
+                {
+                    lines.push_str(&format!(
+                        "This config was set up with passkey label: {label}\n\n"
+                    ));
+                }
                 lines.push_str(
                     "The browser will prompt for the passkey you set up earlier.\n\
                      Once authenticated, wrustic will decrypt the config and continue.\n",
