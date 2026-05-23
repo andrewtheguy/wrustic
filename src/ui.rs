@@ -857,6 +857,11 @@ fn render_passphrase_setup(frame: &mut Frame, app: &App, area: Rect) {
         ("Passphrase", &app.passphrase_input, true),
         ("Confirm passphrase", &app.passphrase_confirm, true),
     ];
+    let title = if app.passphrase_instance_value.is_empty() {
+        "Set passphrase".to_string()
+    } else {
+        format!("Set passphrase — {}", app.passphrase_instance_value)
+    };
     let help = app
         .passphrase_error
         .as_deref()
@@ -864,7 +869,7 @@ fn render_passphrase_setup(frame: &mut Frame, app: &App, area: Rect) {
     render_grouped_input(
         frame,
         area,
-        "Set passphrase",
+        &title,
         &fields,
         app.field_focus,
         help,
@@ -872,22 +877,19 @@ fn render_passphrase_setup(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_passphrase_unlock(frame: &mut Frame, app: &App, area: Rect) {
-    let help = app
-        .passphrase_error
-        .as_deref()
-        .unwrap_or("Enter the passphrase to decrypt the config.");
-    let title = if let Some(inst) = app
-        .config
-        .passphrase
-        .as_ref()
-        .map(|m| m.instance.as_str())
-        .filter(|s| !s.is_empty())
-    {
-        format!("Unlock — {inst}")
-    } else {
-        "Unlock".to_string()
+    let meta = app.config.passphrase.as_ref();
+    let title = match meta.map(|m| m.instance.as_str()).filter(|s| !s.is_empty()) {
+        Some(inst) => format!("Unlock — {inst}"),
+        None => "Unlock".to_string(),
     };
-    render_input(frame, area, &title, &app.passphrase_input, true, help);
+    let help = if let Some(err) = &app.passphrase_error {
+        err.clone()
+    } else if let Some(sig) = meta.map(|m| m.instance_sig.as_str()).filter(|s| !s.is_empty()) {
+        format!("Signature: {sig}")
+    } else {
+        "Enter the passphrase to decrypt the config.".to_string()
+    };
+    render_input(frame, area, &title, &app.passphrase_input, true, &help);
 }
 
 fn render_passphrase_url(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -939,14 +941,14 @@ fn render_passphrase_url(frame: &mut Frame, app: &mut App, area: Rect) {
                 );
             }
             Some(PassphrasePhase::Unlock) => {
-                if let Some(inst) = app
-                    .config
-                    .passphrase
-                    .as_ref()
-                    .map(|m| m.instance.as_str())
-                    .filter(|s| !s.is_empty())
-                {
-                    lines.push_str(&format!("Instance: {inst}\n\n"));
+                if let Some(m) = app.config.passphrase.as_ref() {
+                    if !m.instance.is_empty() {
+                        lines.push_str(&format!("Instance: {}\n", m.instance));
+                    }
+                    if !m.instance_sig.is_empty() {
+                        lines.push_str(&format!("Signature: {}\n", m.instance_sig));
+                    }
+                    lines.push('\n');
                 }
                 lines.push_str(
                     "Enter the passphrase you set up earlier to decrypt the config.\n",

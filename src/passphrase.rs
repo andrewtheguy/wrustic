@@ -709,6 +709,8 @@ struct PassphraseTemplate {
     is_setup: bool,
     script_nonce: String,
     server_pub_js: String,
+    instance: String,
+    instance_sig: String,
 }
 
 fn render_html(ctx: &Ctx) -> String {
@@ -716,6 +718,8 @@ fn render_html(ctx: &Ctx) -> String {
         is_setup: ctx.phase == PassphrasePhase::Setup,
         script_nonce: ctx.script_nonce.clone(),
         server_pub_js: json_string(&ctx.transport.public_b64),
+        instance: ctx.instance.clone(),
+        instance_sig: ctx.expected_instance_sig.clone().unwrap_or_default(),
     };
     tmpl.render().expect("template rendering failed")
 }

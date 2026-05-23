@@ -29,6 +29,10 @@
 <p>Enter a strong passphrase to encrypt your wrustic config. The passphrase is encrypted in this browser before being sent to the server, which derives the encryption key with scrypt.</p>
 {% else %}
 <p>Enter the passphrase you set up earlier to decrypt your config.</p>
+<p style="font-family:ui-monospace,monospace;font-size:0.85rem;color:#555;line-height:1.6;">
+  Instance: <strong style="color:#222;">{{ instance }}</strong><br>
+  Signature: <strong style="color:#222;">{{ instance_sig }}</strong>
+</p>
 {% endif %}
 {% if is_setup %}
 <p>
