@@ -234,7 +234,7 @@ The passphrase is not sent in plaintext and is never written to disk. It
 does exist in Rust process memory long enough for scrypt to run. The App
 keeps only the derived 32-byte config key for the session.
 
-### Subdomain signature
+### Instance signature
 
 At Setup, the server computes `HMAC-SHA256(instance, derived_key)` after
 scrypt finishes. This is stored in `[passphrase].instance_sig`.
