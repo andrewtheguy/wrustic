@@ -323,7 +323,7 @@ mod tests {
     fn round_trip_encrypt_decrypt() -> Result<()> {
         let dir = fresh_dir("rt");
         let paths = test_paths(&dir);
-        let cipher = Cipher::new([0x55u8; 32], "test".into());
+        let cipher = Cipher::new([0x55u8; 32], "test".into(), "testsig0");
 
         let empty = load(&paths, &cipher)?;
         assert_eq!(empty.profiles.len(), 0);
@@ -416,7 +416,7 @@ mod tests {
     fn rest_round_trip_with_split_auth() -> Result<()> {
         let dir = fresh_dir("rest_split");
         let paths = test_paths(&dir);
-        let cipher = Cipher::new([0x55u8; 32], "test".into());
+        let cipher = Cipher::new([0x55u8; 32], "test".into(), "testsig0");
 
         let mut profiles = BTreeMap::new();
         profiles.insert(
@@ -467,7 +467,7 @@ mod tests {
     fn empty_string_field_not_encrypted() -> Result<()> {
         let dir = fresh_dir("empty");
         let paths = test_paths(&dir);
-        let cipher = Cipher::new([0x55u8; 32], "test".into());
+        let cipher = Cipher::new([0x55u8; 32], "test".into(), "testsig0");
 
         let mut profiles = BTreeMap::new();
         profiles.insert(
@@ -523,7 +523,7 @@ mod tests {
     fn load_rejects_unknown_version() -> Result<()> {
         let dir = fresh_dir("ver");
         let paths = test_paths(&dir);
-        let cipher = Cipher::new([0x55u8; 32], "test".into());
+        let cipher = Cipher::new([0x55u8; 32], "test".into(), "testsig0");
 
         save(&Config::default(), &paths, &cipher)?;
         let raw = fs::read_to_string(&paths.config)?;
@@ -546,7 +546,7 @@ mod tests {
     fn load_rejects_unsupported_cipher() -> Result<()> {
         let dir = fresh_dir("bad_cipher");
         let paths = test_paths(&dir);
-        let cipher = Cipher::new([0x55u8; 32], "test".into());
+        let cipher = Cipher::new([0x55u8; 32], "test".into(), "testsig0");
         save(&Config::default(), &paths, &cipher)?;
 
         let raw = fs::read_to_string(&paths.config)?;
@@ -565,7 +565,7 @@ mod tests {
     fn passphrase_round_trip_per_value() -> Result<()> {
         let dir = fresh_dir("pp_rt");
         let paths = test_paths(&dir);
-        let cipher = Cipher::new([0x55u8; 32], "test".into());
+        let cipher = Cipher::new([0x55u8; 32], "test".into(), "testsig0");
 
         let mut profiles = BTreeMap::new();
         profiles.insert(
@@ -605,7 +605,7 @@ mod tests {
     fn passphrase_block_round_trips_inline() -> Result<()> {
         let dir = fresh_dir("pp_inline");
         let paths = test_paths(&dir);
-        let cipher = Cipher::new([0xA5u8; 32], "test".into());
+        let cipher = Cipher::new([0xA5u8; 32], "test".into(), "testsig0");
 
         let cfg = Config {
             passphrase: Some(PassphraseMeta {
@@ -636,7 +636,7 @@ mod tests {
     fn peek_reads_passphrase_block_without_decrypting() -> Result<()> {
         let dir = fresh_dir("pp_peek");
         let paths = test_paths(&dir);
-        let cipher = Cipher::new([0xB6u8; 32], "test".into());
+        let cipher = Cipher::new([0xB6u8; 32], "test".into(), "testsig0");
 
         let mut profiles = BTreeMap::new();
         profiles.insert(
