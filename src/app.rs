@@ -451,6 +451,7 @@ impl App {
                     Some(meta) => {
                         if self.browser_auth {
                             let instance = meta.instance.clone();
+                            self.config.passphrase = Some(meta.clone());
                             self.launch_passphrase_server(
                                 PassphrasePhase::Unlock,
                                 Some(meta),
