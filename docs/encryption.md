@@ -326,35 +326,34 @@ Host header receive a flat 404 — indistinguishable from a wrong auth key.
 This mirrors nginx virtual-host matching (hostname only, port ignored)
 and prevents DNS rebinding attacks from reaching the ceremony routes.
 
-### Capability URL: only `/auth/<key>/…`
+### Capability URL
 
-The entire server lives under one prefix:
+The entire server lives under one prefix, chosen by phase:
 
 ```
-http://<subdomain>.wrustic.localhost:<port>/auth/<short_id>
+Setup:  http://<subdomain>.wrustic.localhost:<port>/setup/<short_id>
+Unlock: http://<subdomain>.wrustic.localhost:<port>/auth/<short_id>
 ```
 
 `<short_id>` is a 16-hex-char (64-bit) random id generated at
 `start()`. **It is the auth credential, not a decoration.** Every
 request is gated by a constant-time bytewise compare of the URL's key
 segment against `ctx.short_id` (`ct_eq` in `src/passphrase.rs`). On
-mismatch — including bare `/`, `/auth/`, the wrong key, or any path
-that doesn't start with `/auth/` — the response is a flat 404, no
-information leakage.
+mismatch — including bare `/`, the wrong prefix, the wrong key, or any
+unrecognized path — the response is a flat 404, no information leakage.
 
 This mirrors the share dialog's model: the URL is the capability. A
 port scanner sees the same 404 wall whether the server is live or
 expired.
 
-Routes under the correct key (any other path under the correct key
-still 404s):
+Routes under the correct prefix + key (any other path still 404s):
 
 | Method + path | Response |
 |---|---|
-| `GET /auth/<key>` or `/auth/<key>/` | 200 + the inline ceremony HTML |
-| `POST /auth/<key>/api/check-code` (Setup phase) | encrypted JSON `{setup_code}` → no outcome |
-| `POST /auth/<key>/api/setup` (Setup phase) | encrypted binary `{setup_code, subdomain_sig, config_key}` → deliver outcome |
-| `POST /auth/<key>/api/unlock` (Unlock phase) | encrypted 32-byte `config_key` → deliver outcome (after HMAC verification) |
+| `GET /<prefix>/<key>` or `/<prefix>/<key>/` | 200 + the inline ceremony HTML |
+| `POST /<prefix>/<key>/api/check-code` (Setup phase) | encrypted JSON `{setup_code}` → no outcome |
+| `POST /<prefix>/<key>/api/setup` (Setup phase) | encrypted binary `{setup_code, subdomain_sig, config_key}` → deliver outcome |
+| `POST /<prefix>/<key>/api/unlock` (Unlock phase) | encrypted 32-byte `config_key` → deliver outcome (after HMAC verification) |
 
 The auth-key check runs **before** the expiry check by design: an
 unauthenticated caller never gets to distinguish "running" from

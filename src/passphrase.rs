@@ -206,6 +206,7 @@ impl EnvelopeError {
 struct Ctx {
     phase: PassphrasePhase,
     short_id: String,
+    path_prefix: &'static str,
     subdomain: String,
     salt_b64: String,
     expected_subdomain_sig: Option<String>,
@@ -257,7 +258,11 @@ pub(crate) fn start(
     };
 
     let short_id = random_short_id()?;
-    let short_url = format!("http://{subdomain}.wrustic.localhost:{port}/auth/{short_id}");
+    let path_prefix = match phase {
+        PassphrasePhase::Setup => "setup",
+        PassphrasePhase::Unlock => "auth",
+    };
+    let short_url = format!("http://{subdomain}.wrustic.localhost:{port}/{path_prefix}/{short_id}");
 
     let setup_code = match phase {
         PassphrasePhase::Setup => Some(random_setup_code()),
@@ -274,6 +279,7 @@ pub(crate) fn start(
     let ctx = Arc::new(Ctx {
         phase,
         short_id,
+        path_prefix,
         subdomain: subdomain.to_string(),
         salt_b64,
         expected_subdomain_sig,
@@ -422,7 +428,8 @@ async fn handle(
     }
 
     let path = req.uri().path().to_string();
-    let Some(suffix) = path.strip_prefix("/auth/") else {
+    let expected_prefix = format!("/{}/", ctx.path_prefix);
+    let Some(suffix) = path.strip_prefix(&expected_prefix) else {
         return Ok(text(StatusCode::NOT_FOUND, "not found"));
     };
     let (key, rest) = match suffix.find('/') {
@@ -679,9 +686,15 @@ async fn handle_unlock(req: Request<hyper::body::Incoming>, ctx: Arc<Ctx>) -> Re
 }
 
 fn render_html(ctx: &Ctx) -> String {
-    let heading = match ctx.phase {
-        PassphrasePhase::Setup => "Set up passphrase encryption for wrustic",
-        PassphrasePhase::Unlock => "Unlock wrustic with your passphrase",
+    let (heading, heading_style) = match ctx.phase {
+        PassphrasePhase::Setup => (
+            "Set up passphrase encryption for wrustic",
+            "border-left:4px solid #d4a017;padding-left:0.6rem;color:#5a3d00;",
+        ),
+        PassphrasePhase::Unlock => (
+            "Unlock wrustic with your passphrase",
+            "border-left:4px solid #2563eb;padding-left:0.6rem;color:#1e40af;",
+        ),
     };
     let explanation = match ctx.phase {
         PassphrasePhase::Setup => {
@@ -765,7 +778,7 @@ fn render_html(ctx: &Ctx) -> String {
 </style>
 </head>
 <body>
-<h1>{heading}</h1>
+<h1 style="{heading_style}">{heading}</h1>
 <div id="status" class="note">Ready. Use the controls below to begin.</div>
 <p>{explanation}</p>
 {setup_code_html}
@@ -986,6 +999,7 @@ wireButton("go-unlock", doUnlock);
 </html>
 "#,
         heading = heading,
+        heading_style = heading_style,
         explanation = explanation,
         setup_code_html = setup_code_html,
         form_html = form_html,
@@ -1144,6 +1158,10 @@ mod tests {
         Ctx {
             phase,
             short_id: "abc123".into(),
+            path_prefix: match phase {
+                PassphrasePhase::Setup => "setup",
+                PassphrasePhase::Unlock => "auth",
+            },
             subdomain: "testsite".into(),
             salt_b64: "U0FMVA==".into(),
             expected_subdomain_sig: sig,
@@ -1345,15 +1363,16 @@ mod tests {
     }
 
     #[test]
-    fn routing_only_serves_under_correct_auth_key() {
+    fn routing_only_serves_under_correct_key() {
         let port = ephemeral_port();
         let handle = start(port, PassphrasePhase::Setup, None, "testsite").expect("start server");
         let key = key_from_handle(&handle);
 
         for (m, p) in [
             ("GET", "/"),
-            ("GET", "/auth"),
-            ("GET", "/auth/"),
+            ("GET", "/setup"),
+            ("GET", "/setup/"),
+            ("GET", "/setup/deadbeefdeadbeef"),
             ("GET", "/auth/deadbeefdeadbeef"),
             ("POST", "/api/setup"),
         ] {
@@ -1361,18 +1380,18 @@ mod tests {
             assert!(r.contains(" 404 "), "expected 404 for {m} {p}, got:\n{r}");
         }
 
-        let keyed = format!("/auth/{key}");
+        let keyed = format!("/setup/{key}");
         let r = raw_request(port, "GET", &keyed);
         assert!(r.contains(" 200 "), "GET {keyed} should 200, got:\n{r}");
         assert!(r.contains("<!doctype html>") || r.contains("<!DOCTYPE html>"));
         assert!(r.contains(r#"id="go-setup""#));
         assert!(r.to_lowercase().contains("content-security-policy:"));
 
-        let keyed_slash = format!("/auth/{key}/");
+        let keyed_slash = format!("/setup/{key}/");
         let r = raw_request(port, "GET", &keyed_slash);
         assert!(r.contains(" 200 "), "GET {keyed_slash} should 200, got:\n{r}");
 
-        let r = raw_request(port, "GET", &format!("/auth/{key}/whatever"));
+        let r = raw_request(port, "GET", &format!("/setup/{key}/whatever"));
         assert!(r.contains(" 404 "));
 
         handle.stop();
@@ -1386,7 +1405,7 @@ mod tests {
         let handle = start(port, PassphrasePhase::Setup, None, "mysite").expect("start server");
         let key = key_from_handle(&handle);
         let setup_code = handle.setup_code.clone().expect("Setup phase mints a code");
-        let path = format!("/auth/{key}/api/setup");
+        let path = format!("/setup/{key}/api/setup");
         let config_key = [0x42u8; 32];
         let sig = compute_hmac("mysite", &config_key);
         let body = setup_payload(&setup_code, &sig, &config_key);
@@ -1489,7 +1508,7 @@ mod tests {
         env["ciphertext"] = serde_json::Value::String(BASE64.encode(&ct_bytes));
         let body = serde_json::to_string(&env).unwrap();
 
-        let r = raw_post_json_host(port, &format!("/auth/{key}/api/setup"), &body, MYSITE_HOST);
+        let r = raw_post_json_host(port, &format!("/setup/{key}/api/setup"), &body, MYSITE_HOST);
         assert!(r.contains(" 400 "), "tampered ciphertext should 400, got:\n{r}");
         assert!(r.to_lowercase().contains("transport"));
 
@@ -1502,13 +1521,13 @@ mod tests {
         let handle = start(port, PassphrasePhase::Setup, None, "mysite").expect("start server");
         let key = key_from_handle(&handle);
 
-        let r = raw_request_host(port, "GET", &format!("/auth/{key}"), "evil.example.com");
+        let r = raw_request_host(port, "GET", &format!("/setup/{key}"), "evil.example.com");
         assert!(r.contains(" 404 "), "wrong Host must 404, got:\n{r}");
 
-        let r = raw_request_host(port, "GET", &format!("/auth/{key}"), "127.0.0.1");
+        let r = raw_request_host(port, "GET", &format!("/setup/{key}"), "127.0.0.1");
         assert!(r.contains(" 404 "), "bare IP Host must 404, got:\n{r}");
 
-        let r = raw_request_host(port, "GET", &format!("/auth/{key}"), &format!("mysite.wrustic.localhost:{port}"));
+        let r = raw_request_host(port, "GET", &format!("/setup/{key}"), &format!("mysite.wrustic.localhost:{port}"));
         assert!(r.contains(" 200 "), "correct Host with port should 200, got:\n{r}");
 
         handle.stop();
@@ -1520,7 +1539,7 @@ mod tests {
         let handle = start(port, PassphrasePhase::Setup, None, "mysite").expect("start server");
         let key = key_from_handle(&handle);
 
-        let r = raw_request_host(port, "GET", &format!("/auth/{key}"), "MYSITE.WRUSTIC.LOCALHOST");
+        let r = raw_request_host(port, "GET", &format!("/setup/{key}"), "MYSITE.WRUSTIC.LOCALHOST");
         assert!(r.contains(" 200 "), "uppercase Host should 200, got:\n{r}");
 
         handle.stop();
