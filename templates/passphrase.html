@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>wrustic passphrase</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 3rem auto; padding: 0 1rem; color: #222; }
+  h1 { font-size: 1.4rem; }
+  p  { line-height: 1.5; }
+  button { font-size: 1rem; padding: 0.5rem 1rem; cursor: pointer; }
+  #status { margin-top: 1rem; padding: 0.75rem; border-radius: 4px; font-family: ui-monospace, monospace; white-space: pre-wrap; }
+  .ok   { background: #e6ffed; color: #006400; }
+  .err  { background: #ffecec; color: #800; }
+  .note { background: #f6f6f6; color: #444; }
+  .hint { background: #fff7e0; color: #664d03; border-left: 3px solid #d4a017; padding: 0.65rem 0.9rem; margin-top: 0.5rem; line-height: 1.5; border-radius: 3px; }
+  .hint strong { color: #5a3d00; }
+  small { color: #666; }
+</style>
+</head>
+<body>
+{% if is_setup %}
+<h1 style="border-left:4px solid #d4a017;padding-left:0.6rem;color:#5a3d00;">Set up passphrase encryption for wrustic</h1>
+{% else %}
+<h1 style="border-left:4px solid #2563eb;padding-left:0.6rem;color:#1e40af;">Unlock wrustic with your passphrase</h1>
+{% endif %}
+<div id="status" class="note">Ready. Use the controls below to begin.</div>
+{% if is_setup %}
+<p>Enter a strong passphrase to encrypt your wrustic config. The passphrase is used to derive an encryption key via PBKDF2 in this browser — it is never sent to the server in plaintext.</p>
+{% else %}
+<p>Enter the passphrase you set up earlier to decrypt your config.</p>
+{% endif %}
+{% if is_setup %}
+<p>
+  <label for="setup-code">
+    <strong>Setup code</strong> (printed in your wrustic terminal):
+  </label>
+  <br>
+  <input id="setup-code" type="text" autocomplete="off"
+         spellcheck="false" autocapitalize="characters"
+         maxlength="6"
+         pattern="[2-9A-HJKMNP-Za-hjkmnp-z]{6}"
+         style="font-size:1.2rem;width:8rem;font-family:ui-monospace,monospace;padding:0.4rem;text-transform:uppercase;"
+         placeholder="ABCDEF">
+</p>
+{% endif %}
+{% if is_setup %}
+<p>
+  <label for="passphrase"><strong>Passphrase</strong></label><br>
+  <input id="passphrase" type="password" autocomplete="off"
+         style="font-size:1rem;width:20rem;padding:0.4rem;"
+         placeholder="Enter passphrase">
+</p>
+<p>
+  <label for="passphrase-confirm"><strong>Confirm passphrase</strong></label><br>
+  <input id="passphrase-confirm" type="password" autocomplete="off"
+         style="font-size:1rem;width:20rem;padding:0.4rem;"
+         placeholder="Repeat passphrase">
+</p>
+<p id="complexity-hint" class="hint">
+  <strong>Requirements:</strong> at least 12 characters, including uppercase,
+  lowercase, a digit, and a special character.
+</p>
+<p><button id="go-setup">Set passphrase</button></p>
+{% else %}
+<p>
+  <label for="passphrase"><strong>Passphrase</strong></label><br>
+  <input id="passphrase" type="password" autocomplete="off"
+         style="font-size:1rem;width:20rem;padding:0.4rem;"
+         placeholder="Enter passphrase">
+</p>
+<p><button id="go-unlock">Unlock</button></p>
+{% endif %}
+<p><small>This page is served by the wrustic process on localhost. You can close it when finished.</small></p>
+<script nonce="{{ script_nonce }}">
+const SALT_B64 = {{ salt_js|safe }};
+const SUBDOMAIN = {{ subdomain_js|safe }};
+const SERVER_PUB_B64 = {{ server_pub_js|safe }};
+const TRANSPORT_HKDF_INFO = new TextEncoder().encode("wrustic-passphrase-transport-v1");
+const API_BASE = window.location.pathname.replace(/\/$/, "");
+
+function b64ToBytes(b64) {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+function bytesToB64(bytes) {
+  let bin = "";
+  const arr = new Uint8Array(bytes);
+  for (let i = 0; i < arr.length; i++) bin += String.fromCharCode(arr[i]);
+  return btoa(bin);
+}
+function setStatus(text, kind) {
+  const el = document.getElementById("status");
+  el.textContent = text;
+  el.className = kind || "note";
+}
+function zeroBytes(bytes) {
+  if (bytes && typeof bytes.fill === "function") bytes.fill(0);
+}
+
+async function importServerPub() {
+  return crypto.subtle.importKey(
+    "raw", b64ToBytes(SERVER_PUB_B64),
+    { name: "X25519" }, false, []
+  );
+}
+
+async function deriveTransportKey(serverPub) {
+  const clientPair = await crypto.subtle.generateKey(
+    { name: "X25519" }, false, ["deriveBits", "deriveKey"]
+  );
+  const sharedKey = await crypto.subtle.deriveKey(
+    { name: "X25519", public: serverPub },
+    clientPair.privateKey,
+    { name: "HKDF" },
+    false,
+    ["deriveKey"]
+  );
+  const aesKey = await crypto.subtle.deriveKey(
+    { name: "HKDF", hash: "SHA-256",
+       salt: new Uint8Array(0), info: TRANSPORT_HKDF_INFO },
+    sharedKey,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt"]
+  );
+  const clientPubBytes = new Uint8Array(
+    await crypto.subtle.exportKey("raw", clientPair.publicKey)
+  );
+  return { aesKey, clientPubBytes };
+}
+
+async function encryptBytes(plaintext) {
+  const serverPub = await importServerPub();
+  const { aesKey, clientPubBytes } = await deriveTransportKey(serverPub);
+  const nonce = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv: nonce },
+    aesKey, plaintext
+  ));
+  return {
+    client_pub: bytesToB64(clientPubBytes),
+    nonce: bytesToB64(nonce),
+    ciphertext: bytesToB64(ct)
+  };
+}
+
+async function postEncryptedEnvelope(path, envelope) {
+  const r = await fetch(API_BASE + path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(envelope)
+  });
+  if (!r.ok) throw new Error("Server: " + (await r.text()));
+  return r;
+}
+async function postEncryptedBytes(path, plaintext) {
+  return postEncryptedEnvelope(path, await encryptBytes(plaintext));
+}
+
+async function deriveKey(passphrase) {
+  const enc = new TextEncoder();
+  const saltBytes = b64ToBytes(SALT_B64);
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw", enc.encode(passphrase), "PBKDF2", false, ["deriveBits"]
+  );
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", hash: "SHA-256", salt: saltBytes, iterations: 600000 },
+    keyMaterial, 256
+  );
+  return new Uint8Array(bits);
+}
+
+async function computeSubdomainSig(derivedKey) {
+  const enc = new TextEncoder();
+  const hmacKey = await crypto.subtle.importKey(
+    "raw", derivedKey, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", hmacKey, enc.encode(SUBDOMAIN));
+  return new Uint8Array(sig);
+}
+
+function checkComplexity(pp) {
+  if (pp.length < 12) return "Must be at least 12 characters.";
+  if (!/[a-z]/.test(pp)) return "Must contain a lowercase letter.";
+  if (!/[A-Z]/.test(pp)) return "Must contain an uppercase letter.";
+  if (!/[0-9]/.test(pp)) return "Must contain a digit.";
+  if (!/[^a-zA-Z0-9]/.test(pp)) return "Must contain a special character.";
+  return null;
+}
+
+function readSetupCode() {
+  const el = document.getElementById("setup-code");
+  if (!el) return null;
+  const code = (el.value || "").replace(/\s+/g, "").toUpperCase();
+  if (!/^[2-9A-HJKMNP-Z]{6}$/.test(code)) {
+    throw new Error("Enter the 6-character setup code from your wrustic terminal (letters A-Z and digits 2-9, no 0/1/I/L/O).");
+  }
+  return code;
+}
+
+async function encryptJson(payload) {
+  const plaintext = new TextEncoder().encode(JSON.stringify(payload));
+  try {
+    return await encryptBytes(plaintext);
+  } finally {
+    zeroBytes(plaintext);
+  }
+}
+async function postEncryptedJson(path, payload) {
+  return postEncryptedEnvelope(path, await encryptJson(payload));
+}
+
+async function precheckSetupCode(code) {
+  await postEncryptedJson("/api/check-code", { setup_code: code });
+}
+
+async function doSetup() {
+  const setupCode = readSetupCode();
+  await precheckSetupCode(setupCode);
+  const pp = document.getElementById("passphrase").value;
+  const pp2 = document.getElementById("passphrase-confirm").value;
+  const err = checkComplexity(pp);
+  if (err) throw new Error(err);
+  if (pp !== pp2) throw new Error("Passphrases do not match.");
+  setStatus("Deriving key (this may take a moment)…", "note");
+  const configKey = await deriveKey(pp);
+  const sig = await computeSubdomainSig(configKey);
+  const codeBytes = new TextEncoder().encode(setupCode);
+  const payload = new Uint8Array(1 + 1 + codeBytes.length + 32 + 32);
+  let p = 0;
+  payload[p++] = 1;
+  payload[p++] = codeBytes.length;
+  payload.set(codeBytes, p); p += codeBytes.length;
+  payload.set(sig, p); p += 32;
+  payload.set(configKey, p);
+  try {
+    await postEncryptedBytes("/api/setup", payload);
+  } finally {
+    zeroBytes(configKey);
+    zeroBytes(sig);
+    zeroBytes(payload);
+    zeroBytes(codeBytes);
+  }
+}
+
+async function doUnlock() {
+  const pp = document.getElementById("passphrase").value;
+  if (!pp) throw new Error("Enter your passphrase.");
+  setStatus("Deriving key (this may take a moment)…", "note");
+  const configKey = await deriveKey(pp);
+  try {
+    await postEncryptedBytes("/api/unlock", configKey);
+  } finally {
+    zeroBytes(configKey);
+  }
+}
+
+function disableAllCtas() {
+  document.querySelectorAll("button").forEach(b => {
+    b.disabled = true;
+    b.style.opacity = "0.5";
+    b.style.cursor = "not-allowed";
+  });
+}
+
+function wireButton(id, fn) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.addEventListener("click", async () => {
+    setStatus("Working…", "note");
+    try {
+      await fn();
+      setStatus("Done. You can close this tab and return to the wrustic terminal.", "ok");
+      disableAllCtas();
+    } catch (e) {
+      setStatus("Error: " + (e && e.message ? e.message : e), "err");
+    }
+  });
+}
+wireButton("go-setup", doSetup);
+wireButton("go-unlock", doUnlock);
+</script>
+</body>
+</html>
