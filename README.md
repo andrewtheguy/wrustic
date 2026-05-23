@@ -103,7 +103,9 @@ Then in the TUI:
    Finally type the repository password (masked) and press Enter — the profile
    is encrypted into `config.toml` and you return to the main menu.
 3. **Open a profile**: pick a profile from the list, and the snapshot view
-   opens directly. No re-typing the password; passphrase unlock is the auth gate.
+   opens directly. The repo password (stored encrypted in the profile) is
+   applied automatically — the passphrase you entered at launch is the only
+   credential you type.
 4. **Delete a profile**: press `d` on a profile and confirm with `y`.
 
 ## Relationship to the `restic` binary
