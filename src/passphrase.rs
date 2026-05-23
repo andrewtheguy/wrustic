@@ -504,7 +504,7 @@ pub(crate) fn passphrase_policy_error(passphrase: &str) -> Option<&'static str> 
     if !passphrase.chars().any(|c| c.is_ascii_digit()) {
         return Some("Must contain a digit.");
     }
-    if !passphrase.chars().any(|c| !c.is_ascii_alphanumeric()) {
+    if !passphrase.chars().any(|c| c.is_ascii_punctuation()) {
         return Some("Must contain a special character.");
     }
     None
@@ -649,10 +649,7 @@ async fn handle_setup(req: Request<hyper::body::Incoming>, ctx: Arc<Ctx>) -> Res
         Ok(k) => k,
         Err(e) => return text(StatusCode::INTERNAL_SERVER_ERROR, &format!("key derivation: {e}")),
     };
-    let mut mac = HmacSha256::new_from_slice(&config_key)
-        .expect("HMAC accepts any key length");
-    mac.update(ctx.instance.as_bytes());
-    let instance_sig = BASE64.encode(mac.finalize().into_bytes());
+    let instance_sig = compute_instance_sig(&ctx.instance, &config_key);
     let meta = PassphraseMeta {
         instance: ctx.instance.clone(),
         instance_sig,
@@ -810,6 +807,7 @@ mod tests {
             "missing-special1",
             "MISSINGLOWER1!",
             "missingupper1!",
+            "ValidPass123 ",
         ] {
             let payload = setup_payload("AB23KM", passphrase);
             assert!(
