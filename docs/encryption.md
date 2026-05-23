@@ -14,7 +14,7 @@ One cipher is supported:
 
 | Cipher | Prefix | Algorithm | Key source |
 |---|---|---|---|
-| `Cipher` | `pkenc:` | ChaCha20-Poly1305 AEAD | scrypt-derived config key from user passphrase, never on disk |
+| `Cipher` | `$WR;1.0;CHACHA20-POLY1305;` | ChaCha20-Poly1305 AEAD | scrypt-derived config key from user passphrase, never on disk |
 
 Source of truth: `src/crypto.rs`, `src/config.rs`, `src/passphrase.rs`.
 
@@ -50,7 +50,7 @@ cipher  = "passphrase-v1"      # required, no default
 
 [profiles.<name>]
 backend  = "local" | "rest" | "s3"
-password = "pkenc:…"
+password = "$WR;1.0;CHACHA20-POLY1305;…"
 # plus backend-specific fields (some encrypted, some not — see table above)
 
 [passphrase]
@@ -69,7 +69,7 @@ salt          = "<base64>"   # random 32-byte scrypt salt
    `load` checks the on-disk marker is `"passphrase-v1"`. Mismatch → error.
 
 A *third* implicit check sits at the value level: `Cipher::decrypt` rejects
-any value whose prefix isn't `pkenc:`.
+any value whose prefix isn't `$WR;1.0;CHACHA20-POLY1305;`.
 
 ### `[passphrase]` block
 
@@ -127,7 +127,7 @@ The TOML file always exposes, in plaintext:
   useless without the passphrase.
 
 Everything else (repo passwords, REST user/password, S3 access/secret
-keys) sits behind `pkenc:` and is unreadable without the passphrase.
+keys) sits behind `$WR;1.0;CHACHA20-POLY1305;` and is unreadable without the passphrase.
 
 The key is never on disk; the `[passphrase]` block is metadata, not
 material. An attacker with only `config.toml` would need to brute-force
@@ -173,12 +173,12 @@ scrypt finishes. This is stored in `[passphrase].instance_sig`.
 On Unlock, the server re-computes the HMAC from the derived key and
 compares (constant-time) against the stored signature. A mismatch means
 the passphrase is wrong — the user gets a clear error immediately instead
-of a cryptic AEAD tag failure on the first `pkenc:` value.
+of a cryptic AEAD tag failure on the first `$WR;1.0;CHACHA20-POLY1305;` value.
 
 ### Encrypt / decrypt
 
 ```
-pkenc:<base64( nonce(12) || ciphertext || tag(16) )>
+$WR;1.0;CHACHA20-POLY1305;<base64( nonce(12) || ciphertext || tag(16) )>
 ```
 
 - 12-byte nonce from `OsRng` (chacha20poly1305's `generate_nonce`). Each
@@ -328,7 +328,7 @@ The phase is picked at boot by `config::peek`:
   stored `instance_sig` (constant-time). On mismatch → 401 "Wrong
   passphrase", the user can retry. On match → server delivers
   `PassphraseOutcome { key, new_meta: None }`. App uses the key to
-  decrypt every `pkenc:` value in the config. No setup code on Unlock — the
+  decrypt every `$WR;1.0;CHACHA20-POLY1305;` value in the config. No setup code on Unlock — the
   instance signature verification already gates the path.
 
 ### Setup-confirmation code

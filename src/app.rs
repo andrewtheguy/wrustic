@@ -574,7 +574,7 @@ impl App {
                 instance_sig,
                 salt: base64::engine::general_purpose::STANDARD.encode(&salt),
             };
-            self.cipher = Some(Cipher::new(config_key));
+            self.cipher = Some(Cipher::new(config_key, self.passphrase_instance_value.clone()));
             self.load_config_or_set_fatal();
             self.config.passphrase = Some(meta);
             if let Some(cipher) = self.cipher.as_ref()
@@ -600,7 +600,7 @@ impl App {
                 self.screen = Screen::PassphraseUnlock;
                 return;
             }
-            self.cipher = Some(Cipher::new(config_key));
+            self.cipher = Some(Cipher::new(config_key, meta.instance.clone()));
             self.load_config_or_set_fatal();
         }
         self.clear_passphrase_scratch();
@@ -626,7 +626,13 @@ impl App {
             Err(std_mpsc::TryRecvError::Empty) => return,
             Err(std_mpsc::TryRecvError::Disconnected) => return,
         };
-        self.cipher = Some(Cipher::new(outcome.key));
+        let instance = outcome
+            .new_meta
+            .as_ref()
+            .or(self.config.passphrase.as_ref())
+            .map(|m| m.instance.clone())
+            .unwrap_or_default();
+        self.cipher = Some(Cipher::new(outcome.key, instance));
         if let Some(h) = self.passphrase_handle.take() {
             h.stop();
         }
