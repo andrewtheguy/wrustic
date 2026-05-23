@@ -35,7 +35,7 @@ fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
 fn render_bottom_bar(frame: &mut Frame, app: &App, area: Rect) {
     let text = bottom_bar_text(&app.screen);
     let para = Paragraph::new(format!(" {text}"))
-        .style(Style::new().fg(Color::Black).bg(Color::DarkGray));
+        .style(Style::new().fg(Color::Black).bg(Color::White));
     frame.render_widget(para, area);
 }
 
