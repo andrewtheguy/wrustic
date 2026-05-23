@@ -12,7 +12,7 @@ use rustic_core::{IndexedIdsStatus, Repository, TreeId};
 use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
-use crate::config::{self, BackendKind, Config, Paths, Profile};
+use crate::config::{self, BackendKind, Config, PasskeyMeta, Paths, Profile};
 use crate::crypto::Cipher;
 use crate::passkey::{self, PasskeyHandle, PasskeyPhase};
 use crate::repo::{ContentKind, ContentRow, ContentsPreview, FileDetails, SnapshotRow};
@@ -31,6 +31,7 @@ pub(crate) enum Screen {
     FirstRunChoice,
     RestoreKeyWait,
     KeyCreated,
+    PasskeyLabelPrompt,
     PasskeyUrl,
     Home,
     Snapshots,
@@ -110,6 +111,36 @@ impl SnapshotFilter {
             SnapshotFilter::Tag(t) => row.tags.iter().any(|x| x == t),
             SnapshotFilter::Path(p) => row.paths.iter().any(|x| x == p),
         }
+    }
+}
+
+/// Suggest a passkey label from the config dir's basename — the user
+/// can edit it before submitting on `Screen::PasskeyLabelPrompt`.
+///
+/// Returns `None` (not a silent fallback) when no reasonable default
+/// can be derived: degenerate paths like `--config-dir /`, or anything
+/// whose canonical form has no file_name. The caller prefills the
+/// input with the empty string in that case, which makes
+/// `submit_passkey_label` refuse Enter until the user has actually
+/// typed a label — better than silently re-using "wrustic" and
+/// recreating the very "all passkeys look the same" problem this
+/// feature exists to solve.
+///
+/// Canonicalizes first so `--config-dir .` or `--config-dir ..` get
+/// real directory names instead of `.`/`..` literals.
+pub(crate) fn default_passkey_label(paths: &Paths) -> Option<String> {
+    let parent = paths.config.parent()?;
+    // canonicalize() requires the path to exist on disk — in passkey
+    // Setup that's usually not the case for `<dir>/config.toml`, but
+    // the *parent* dir should exist (we just bound a listener after
+    // resolving paths). Fall back to the raw parent if canonicalize
+    // fails so we still try to extract a basename.
+    let resolved = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+    let basename = resolved.file_name()?.to_string_lossy().trim().to_string();
+    if basename.is_empty() {
+        None
+    } else {
+        Some(basename)
     }
 }
 
@@ -203,6 +234,11 @@ pub(crate) struct App {
     /// session so save flows can choose the right cipher.
     pub(crate) passkey_mode: bool,
     pub(crate) passkey_handle: Option<PasskeyHandle>,
+    /// Input collected on `Screen::PasskeyLabelPrompt`. Used as
+    /// `user.name`/`displayName` in the WebAuthn `create()` call so each
+    /// config gets a distinct entry in the browser's passkey picker.
+    /// Only consulted on Setup phase.
+    pub(crate) passkey_label_input: Input,
     pub(crate) passkey_short_url: Option<String>,
     /// Setup-only confirmation code printed on the TUI. The user must
     /// type this in the browser before either Create or Use Existing
@@ -318,6 +354,7 @@ impl App {
             server_port,
             passkey_mode: experimental_passkey,
             passkey_handle: None,
+            passkey_label_input: Input::default(),
             passkey_short_url: None,
             passkey_setup_code: None,
             passkey_phase: None,
@@ -436,10 +473,13 @@ impl App {
         }
     }
 
-    /// Boot in passkey mode: peek at config.toml to find the embedded
-    /// `[passkey]` block (Unlock) or pick a fresh PRF salt (Setup), start
-    /// the localhost ceremony server, and transition to Screen::PasskeyUrl.
-    /// The main loop drives completion via `try_advance_passkey()`.
+    /// Boot in passkey mode: peek at config.toml to decide phase. On
+    /// Unlock, start the ceremony server directly. On Setup, first
+    /// transition to `Screen::PasskeyLabelPrompt` so the user can name
+    /// this config — the name becomes `user.name` in the WebAuthn
+    /// create() call and lets the browser passkey picker distinguish
+    /// multiple wrustic configs. The label-prompt key handler invokes
+    /// `launch_passkey_server` once the label is accepted.
     fn start_passkey_ceremony(&mut self) {
         let peeked = match config::peek(&self.paths) {
             Ok(p) => p,
@@ -449,8 +489,19 @@ impl App {
                 return;
             }
         };
-        let (phase, existing) = match peeked {
-            None => (PasskeyPhase::Setup, None),
+        match peeked {
+            None => {
+                // Setup phase: collect a label first. If the config dir's
+                // basename is usable, prefill with it so the user can
+                // usually just hit Enter. Otherwise prefill empty —
+                // `submit_passkey_label` rejects empty input, so the
+                // user is forced to type something rather than silently
+                // accepting a generic default that would defeat the
+                // purpose of having distinct passkey names per config.
+                let default_label = default_passkey_label(&self.paths).unwrap_or_default();
+                self.passkey_label_input = Input::new(default_label);
+                self.screen = Screen::PasskeyLabelPrompt;
+            }
             Some(cfg) => {
                 if cfg.cipher != config::CIPHER_MARKER_PASSKEY {
                     self.error_is_fatal = true;
@@ -462,7 +513,11 @@ impl App {
                     return;
                 }
                 match cfg.passkey {
-                    Some(meta) => (PasskeyPhase::Unlock, Some(meta)),
+                    Some(meta) => {
+                        // Unlock phase: no label needed (the existing
+                        // credential carries its own from creation time).
+                        self.launch_passkey_server(PasskeyPhase::Unlock, Some(meta), None);
+                    }
                     None => {
                         self.error_is_fatal = true;
                         self.screen = Screen::Error(format!(
@@ -470,12 +525,23 @@ impl App {
                              this config is broken; restore from backup or recreate",
                             self.paths.config.display()
                         ));
-                        return;
                     }
                 }
             }
-        };
-        match passkey::start(self.server_port, phase, existing) {
+        }
+    }
+
+    /// Start the passkey HTTP server with the given phase, existing meta
+    /// (Unlock only), and optional label (Setup only). Shared by both the
+    /// Unlock branch of `start_passkey_ceremony` and the Setup branch
+    /// once the label-prompt screen accepts a name.
+    fn launch_passkey_server(
+        &mut self,
+        phase: PasskeyPhase,
+        existing: Option<PasskeyMeta>,
+        user_label: Option<String>,
+    ) {
+        match passkey::start(self.server_port, phase, existing, user_label) {
             Ok(h) => {
                 self.passkey_short_url = Some(h.short_url.clone());
                 self.passkey_setup_code = h.setup_code.clone();
@@ -488,6 +554,24 @@ impl App {
                 self.screen = Screen::Error(format!("starting passkey server: {e:#}"));
             }
         }
+    }
+
+    /// Submit the typed label from `Screen::PasskeyLabelPrompt` and
+    /// launch the Setup-phase server. Empty labels are rejected (the
+    /// key handler stays on the screen so the user can retry).
+    pub(crate) fn submit_passkey_label(&mut self) {
+        let label = self.passkey_label_input.value().trim().to_string();
+        if label.is_empty() {
+            return;
+        }
+        // WebAuthn caps user.name at 64 bytes in the spec; truncate
+        // defensively to stay well within tolerance across browsers.
+        let label = if label.len() > 64 {
+            label.chars().take(64).collect()
+        } else {
+            label
+        };
+        self.launch_passkey_server(PasskeyPhase::Setup, None, Some(label));
     }
 
     /// Non-blocking check for completion of the passkey ceremony. Called
@@ -1177,6 +1261,21 @@ impl App {
                 }
                 KeyCode::Esc => self.quit = true,
                 _ => {}
+            },
+
+            Screen::PasskeyLabelPrompt => match key.code {
+                // Enter submits the typed label and launches the Setup
+                // ceremony. Empty input keeps the user on the screen.
+                KeyCode::Enter => self.submit_passkey_label(),
+                // Esc quits — there's no previous screen to back to,
+                // we haven't started the server yet, no cleanup needed.
+                // ('q' would be eaten as input, so don't bind it here.)
+                KeyCode::Esc => {
+                    self.quit = true;
+                }
+                _ => {
+                    self.passkey_label_input.handle_event(&Event::Key(key));
+                }
             },
 
             Screen::PasskeyUrl => match key.code {

@@ -62,6 +62,7 @@ fn bottom_bar_text(screen: &Screen) -> &'static str {
             "j/k scroll  PgUp/PgDn page  g top  s share  Esc/Backspace/q back"
         }
         Screen::ShareUrl => "Esc/Backspace/q back (stops the server)",
+        Screen::PasskeyLabelPrompt => "type  Enter submit  Esc quit",
         Screen::PasskeyUrl => "Esc/q quit  (waiting for browser ceremony)",
         Screen::SnapshotCompareFirst => {
             "j/k move  PgUp/PgDn page  g/G top/bottom  Enter pick FIRST  Esc cancel"
@@ -201,6 +202,15 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
         Screen::SnapshotContents => render_snapshot_contents(frame, app, area),
         Screen::FileDetails => render_file_details(frame, app, area),
         Screen::ShareUrl => render_share_url(frame, app, area),
+        Screen::PasskeyLabelPrompt => render_input(
+            frame,
+            area,
+            "Name this passkey",
+            &app.passkey_label_input,
+            false,
+            "Shown in the browser's passkey picker / password manager. \
+             Default is the config-dir name; edit if you want something else, then Enter.",
+        ),
         Screen::PasskeyUrl => render_passkey_url(frame, app, area),
         Screen::SnapshotCompareFirst => render_compare_first(frame, app, area),
         Screen::SnapshotCompareSecond => render_compare_second(frame, app, area),

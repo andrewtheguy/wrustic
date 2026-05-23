@@ -183,9 +183,15 @@ struct Ctx {
     // Credential id presented to the browser on Unlock so it knows which
     // passkey to use. Empty on Setup (the browser is creating one).
     credential_id_b64: String,
-    // 6-digit Setup-confirmation code. Some on Setup, None on Unlock. The
-    // browser must echo it back in POST /api/setup, otherwise the call is
-    // rejected (no key delivered, no [passkey] block written).
+    // User-chosen label used as `user.name` and `user.displayName` in the
+    // WebAuthn `create()` call. Lets multiple wrustic configs show up as
+    // distinct entries in the browser/password-manager passkey picker
+    // instead of N identical "wrustic" entries. Some on Setup, None on
+    // Unlock (Unlock uses .get() with allowCredentials — no user info).
+    user_label: Option<String>,
+    // 6-character Setup-confirmation code. Some on Setup, None on Unlock.
+    // The browser must echo it back in POST /api/setup, otherwise the
+    // call is rejected (no key delivered, no [passkey] block written).
     setup_code: Option<String>,
     // Setup-code wrong-attempt counter. Crossing MAX_SETUP_CODE_ATTEMPTS
     // flips `killed`, which makes every subsequent route 403 like an
@@ -217,6 +223,7 @@ pub(crate) fn start(
     port: u16,
     phase: PasskeyPhase,
     existing: Option<PasskeyMeta>,
+    user_label: Option<String>,
 ) -> Result<PasskeyHandle> {
     // Shares the localhost port with the file-share dialog (see app.rs::
     // server_port). The two flows can't be active simultaneously, so a
@@ -266,6 +273,7 @@ pub(crate) fn start(
         short_id,
         prf_salt_b64,
         credential_id_b64,
+        user_label,
         setup_code: setup_code.clone(),
         setup_code_attempts: AtomicU32::new(0),
         killed: AtomicBool::new(false),
@@ -717,6 +725,11 @@ fn render_html(ctx: &Ctx) -> String {
 <script>
 const PRF_SALT_B64 = {prf_salt_js};
 const CRED_ID_B64 = {cred_id_js};
+// User-chosen label shown in the browser's passkey picker / password
+// manager (`user.name` and `user.displayName` in WebAuthn.create). Empty
+// string on Unlock — that path uses .get() with allowCredentials and
+// doesn't need user info.
+const USER_LABEL = {user_label_js};
 // The page itself is served at /auth/<key>, so derive the API prefix from
 // the browser's own URL — no template substitution needed, and the entire
 // ceremony stays scoped to this one keyed path. The trailing-slash strip
@@ -787,7 +800,7 @@ async function doCreate() {{
   const cred = await navigator.credentials.create({{
     publicKey: {{
       rp: {{ name: "wrustic" }},
-      user: {{ id: userId, name: "wrustic", displayName: "wrustic" }},
+      user: {{ id: userId, name: USER_LABEL, displayName: USER_LABEL }},
       challenge,
       pubKeyCredParams: [
         {{ type: "public-key", alg: -7 }},
@@ -931,6 +944,7 @@ wireButton("go-unlock", doUnlock);
         buttons_html = buttons_html,
         prf_salt_js = json_string(&ctx.prf_salt_b64),
         cred_id_js = json_string(&ctx.credential_id_b64),
+        user_label_js = json_string(ctx.user_label.as_deref().unwrap_or("")),
     )
 }
 
@@ -1010,6 +1024,10 @@ mod tests {
                 PasskeyPhase::Unlock => "Q1JFRA==".into(),
                 PasskeyPhase::Setup => String::new(),
             },
+            user_label: match phase {
+                PasskeyPhase::Setup => Some("test-label".into()),
+                PasskeyPhase::Unlock => None,
+            },
             setup_code: setup_code.map(|s| s.into()),
             setup_code_attempts: AtomicU32::new(0),
             killed: AtomicBool::new(false),
@@ -1039,6 +1057,29 @@ mod tests {
         // Setup-code input must be present in Setup phase.
         assert!(html.contains(r#"id="setup-code""#));
         assert!(html.contains("Setup code"));
+    }
+
+    #[test]
+    fn html_setup_embeds_user_label() {
+        // The label the user types in the TUI should reach the inline JS
+        // as a JS string literal, so the browser's passkey picker / the
+        // user's password manager labels the entry distinctively.
+        let ctx = test_ctx(PasskeyPhase::Setup, Some("AB-23K"));
+        let html = render_html(&ctx);
+        // The const declaration must carry the supplied label.
+        assert!(
+            html.contains("const USER_LABEL = \"test-label\""),
+            "USER_LABEL const not found, HTML excerpt:\n{}",
+            &html[html.find("USER_LABEL").unwrap_or(0)..]
+                .chars()
+                .take(80)
+                .collect::<String>()
+        );
+        // The `user:` block of credentials.create() must reference the const.
+        assert!(html.contains("name: USER_LABEL"));
+        assert!(html.contains("displayName: USER_LABEL"));
+        // Stale hardcoded label must be gone.
+        assert!(!html.contains(r#"name: "wrustic", displayName: "wrustic""#));
     }
 
     #[test]
@@ -1195,7 +1236,7 @@ mod tests {
     #[test]
     fn routing_only_serves_under_correct_auth_key() {
         let port = ephemeral_port();
-        let handle = start(port, PasskeyPhase::Setup, None).expect("start server");
+        let handle = start(port, PasskeyPhase::Setup, None, Some("test-label".into())).expect("start server");
         let key = key_from_handle(&handle);
 
         // Unkeyed paths — every shape gets the same flat 404.
@@ -1265,7 +1306,7 @@ mod tests {
     #[test]
     fn setup_code_wrong_returns_401_and_doesnt_deliver() {
         let port = ephemeral_port();
-        let handle = start(port, PasskeyPhase::Setup, None).expect("start server");
+        let handle = start(port, PasskeyPhase::Setup, None, Some("test-label".into())).expect("start server");
         let key = key_from_handle(&handle);
         let setup_code = handle.setup_code.clone().expect("Setup phase mints a code");
         let path = format!("/auth/{key}/api/setup");
@@ -1301,7 +1342,7 @@ mod tests {
     #[test]
     fn setup_code_correct_reaches_outcome_delivery() {
         let port = ephemeral_port();
-        let handle = start(port, PasskeyPhase::Setup, None).expect("start server");
+        let handle = start(port, PasskeyPhase::Setup, None, Some("test-label".into())).expect("start server");
         let key = key_from_handle(&handle);
         let setup_code = handle.setup_code.clone().expect("Setup phase mints a code");
         let path = format!("/auth/{key}/api/setup");
@@ -1323,7 +1364,7 @@ mod tests {
     #[test]
     fn setup_code_accepts_whitespace_padding() {
         let port = ephemeral_port();
-        let handle = start(port, PasskeyPhase::Setup, None).expect("start server");
+        let handle = start(port, PasskeyPhase::Setup, None, Some("test-label".into())).expect("start server");
         let key = key_from_handle(&handle);
         let setup_code = handle.setup_code.clone().unwrap();
         let path = format!("/auth/{key}/api/setup");
@@ -1351,7 +1392,7 @@ mod tests {
         // A code typed with the wrong case should NOT be accepted — the
         // alphabet treats upper and lower as distinct.
         let port = ephemeral_port();
-        let handle = start(port, PasskeyPhase::Setup, None).expect("start server");
+        let handle = start(port, PasskeyPhase::Setup, None, Some("test-label".into())).expect("start server");
         let key = key_from_handle(&handle);
         let setup_code = handle.setup_code.clone().unwrap();
         let path = format!("/auth/{key}/api/setup");
@@ -1390,7 +1431,7 @@ mod tests {
     #[test]
     fn precheck_accepts_correct_code_without_delivering_outcome() {
         let port = ephemeral_port();
-        let handle = start(port, PasskeyPhase::Setup, None).expect("start server");
+        let handle = start(port, PasskeyPhase::Setup, None, Some("test-label".into())).expect("start server");
         let key = key_from_handle(&handle);
         let setup_code = handle.setup_code.clone().unwrap();
         let path = format!("/auth/{key}/api/check-code");
@@ -1412,7 +1453,7 @@ mod tests {
     #[test]
     fn precheck_wrong_code_returns_401() {
         let port = ephemeral_port();
-        let handle = start(port, PasskeyPhase::Setup, None).expect("start server");
+        let handle = start(port, PasskeyPhase::Setup, None, Some("test-label".into())).expect("start server");
         let key = key_from_handle(&handle);
         let real = handle.setup_code.clone().unwrap();
         let path = format!("/auth/{key}/api/check-code");
@@ -1440,7 +1481,7 @@ mod tests {
         // counter — important so an attacker can't double the budget by
         // alternating endpoints.
         let port = ephemeral_port();
-        let handle = start(port, PasskeyPhase::Setup, None).expect("start server");
+        let handle = start(port, PasskeyPhase::Setup, None, Some("test-label".into())).expect("start server");
         let key = key_from_handle(&handle);
         let real = handle.setup_code.clone().unwrap();
         let prf = dummy_prf_b64();
@@ -1485,7 +1526,7 @@ mod tests {
             prf_salt: "U0FMVA==".into(),
         };
         let handle =
-            start(port, PasskeyPhase::Unlock, Some(meta)).expect("start unlock server");
+            start(port, PasskeyPhase::Unlock, Some(meta), None).expect("start unlock server");
         let key = key_from_handle(&handle);
         let r = raw_post_json(
             port,
@@ -1499,7 +1540,7 @@ mod tests {
     #[test]
     fn setup_code_five_strikes_kills_ceremony() {
         let port = ephemeral_port();
-        let handle = start(port, PasskeyPhase::Setup, None).expect("start server");
+        let handle = start(port, PasskeyPhase::Setup, None, Some("test-label".into())).expect("start server");
         let key = key_from_handle(&handle);
         let real = handle.setup_code.clone().unwrap();
         let path = format!("/auth/{key}/api/setup");

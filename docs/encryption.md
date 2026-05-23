@@ -346,7 +346,20 @@ unauthenticated caller never gets to distinguish "running" from
 The phase is picked at boot by `config::peek`:
 
 - **No `config.toml` (or no `[passkey]` block)** → `PasskeyPhase::Setup`.
-  Server presents two buttons:
+  Before the localhost server is even started, the TUI shows a label
+  prompt (`Screen::PasskeyLabelPrompt`) pre-filled with the config
+  dir's basename. The submitted label is passed into
+  `passkey::start(...)` and embedded in the inline JS as a const
+  (`USER_LABEL`). When the user picks "Create new passkey", the
+  WebAuthn `create()` call uses it as `user.name` and
+  `user.displayName`, so the browser's passkey picker and the user's
+  password manager label the entry distinctively (e.g. "wrustic" RP +
+  "personal" user) instead of N identical "wrustic" entries across
+  configs. The label is purely cosmetic — it has no role in
+  decryption — and is not stored on the wrustic side; only the
+  authenticator keeps it as part of the credential's metadata.
+
+  Server then presents two buttons:
   - *Create new passkey* — `navigator.credentials.create()` with the PRF
     extension. Some authenticators don't return PRF during `create()`;
     the page transparently falls back to a follow-up `get()` against
