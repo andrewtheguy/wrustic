@@ -848,16 +848,13 @@ fn render_passkey_url(frame: &mut Frame, app: &mut App, area: Rect) {
     lines.push_str(&format!(
         "Experimental passkey mode — {phase_label} ceremony\n\n"
     ));
-    match (&app.passkey_short_url, &app.passkey_url) {
-        (Some(short), Some(long)) => {
+    match &app.passkey_short_url {
+        Some(short) => {
             lines.push_str("Open this URL in a browser:\n");
             lines.push_str(short);
             lines.push_str("\n\n");
-            lines.push_str("(Redirects to: ");
-            lines.push_str(long);
-            lines.push_str(")\n\n");
         }
-        _ => {
+        None => {
             lines.push_str("(passkey URL not available)\n\n");
         }
     }

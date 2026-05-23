@@ -15,7 +15,7 @@ use anyhow::{Result, anyhow};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
-use hyper::header::{CACHE_CONTROL, CONTENT_TYPE, HeaderValue, LOCATION};
+use hyper::header::{CACHE_CONTROL, CONTENT_TYPE, HeaderValue};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
@@ -52,7 +52,9 @@ pub(crate) struct PasskeyOutcome {
 }
 
 pub(crate) struct PasskeyHandle {
-    pub(crate) url: String,
+    /// The only URL that does anything — `http://localhost:<port>/auth/<key>`.
+    /// `<key>` is a 64-bit random hex id; the server treats every other path
+    /// (including bare `/`) as 404, so the URL itself is the capability.
     pub(crate) short_url: String,
     pub(crate) phase: PasskeyPhase,
     pub(crate) rx: std_mpsc::Receiver<PasskeyOutcome>,
@@ -177,9 +179,11 @@ pub(crate) fn start(
 
     let short_id = random_short_id();
     // User-facing host is `localhost` (better browser/authenticator
-    // compatibility); the listener binds to 127.0.0.1 above.
+    // compatibility); the listener binds to 127.0.0.1 above. The 64-bit
+    // hex `short_id` is the actual auth credential — every route below
+    // `/auth/<short_id>` is gated by a constant-time compare against it,
+    // and anything outside that prefix gets a flat 404.
     let short_url = format!("http://localhost:{port}/auth/{short_id}");
-    let url = format!("http://localhost:{port}/");
 
     let (outcome_tx, outcome_rx) = std_mpsc::channel::<PasskeyOutcome>();
     let deadline = Instant::now() + PASSKEY_TTL;
@@ -218,7 +222,6 @@ pub(crate) fn start(
         .map_err(|e| anyhow!("spawning passkey thread: {e}"))?;
 
     Ok(PasskeyHandle {
-        url,
         short_url,
         phase,
         rx: outcome_rx,
@@ -281,11 +284,31 @@ async fn handle(
     req: Request<hyper::body::Incoming>,
     ctx: Arc<Ctx>,
 ) -> Result<Response<RespBody>, Infallible> {
+    // Security gate: the entire server lives under /auth/<short_id>. The
+    // 64-bit hex short_id is the actual auth credential — without it,
+    // every path (including bare `/`) is a flat 404. No info leakage to
+    // a port scanner, no /api/* reachable without first knowing the id.
+    let path = req.uri().path().to_string();
+    let Some(suffix) = path.strip_prefix("/auth/") else {
+        return Ok(text(StatusCode::NOT_FOUND, "not found"));
+    };
+    let (key, rest) = match suffix.find('/') {
+        Some(i) => (&suffix[..i], &suffix[i..]),
+        None => (suffix, ""),
+    };
+    if !ct_eq(key.as_bytes(), ctx.short_id.as_bytes()) {
+        return Ok(text(StatusCode::NOT_FOUND, "not found"));
+    }
+
+    // Auth-key check passes — this is a legitimate caller (the browser the
+    // user pasted the URL into). Only now do we surface the expiry message,
+    // so an unkeyed scanner can't distinguish "running" from "expired".
+    //
     // Safety-net expiry: after PASSKEY_TTL the server keeps accepting
     // connections (so a stale browser tab gets a clear error instead of a
-    // confusing "connection refused") but every route 403s. The TUI checks
-    // the same deadline via PasskeyHandle::is_expired() and shows a matching
-    // message — no flow rework, the user just quits + restarts.
+    // confusing "connection refused") but every keyed route 403s. The TUI
+    // checks the same deadline via PasskeyHandle::is_expired() and shows
+    // a matching message — no flow rework, the user just quits + restarts.
     if Instant::now() >= ctx.deadline {
         return Ok(text(
             StatusCode::FORBIDDEN,
@@ -294,44 +317,36 @@ async fn handle(
         ));
     }
 
-    let path = req.uri().path().to_string();
     let method = req.method().clone();
-
-    // /auth/<short> 302-redirects to / so users can copy a short URL from
-    // the TUI and the browser still lands on the ceremony page. (`/auth/`
-    // distinguishes the passkey path from the share dialog's `/s/` even
-    // though the two flows share the same port and never run together.)
-    if method == Method::GET && let Some(rest) = path.strip_prefix("/auth/") {
-        if rest == ctx.short_id {
-            let body = Full::new(Bytes::from_static(b""))
-                .map_err(|never: Infallible| match never {})
-                .boxed();
-            let mut resp = Response::new(body);
-            *resp.status_mut() = StatusCode::FOUND;
-            resp.headers_mut()
-                .insert(LOCATION, HeaderValue::from_static("/"));
-            return Ok(resp);
-        }
-        return Ok(text(StatusCode::NOT_FOUND, "no such short id"));
-    }
-
-    if method == Method::GET && path == "/" {
-        return Ok(full_resp(
+    match (method, rest) {
+        (Method::GET, "") | (Method::GET, "/") => Ok(full_resp(
             StatusCode::OK,
             "text/html; charset=utf-8",
             render_html(&ctx).into_bytes(),
-        ));
+        )),
+        (Method::POST, "/api/setup") if ctx.phase == PasskeyPhase::Setup => {
+            Ok(handle_setup(req, ctx).await)
+        }
+        (Method::POST, "/api/unlock") if ctx.phase == PasskeyPhase::Unlock => {
+            Ok(handle_unlock(req, ctx).await)
+        }
+        _ => Ok(text(StatusCode::NOT_FOUND, "not found")),
     }
+}
 
-    if method == Method::POST && path == "/api/setup" && ctx.phase == PasskeyPhase::Setup {
-        return Ok(handle_setup(req, ctx).await);
+/// Constant-time bytewise compare. The short_id is only 64 bits and the
+/// server is on localhost, so the practical timing-attack surface is zero;
+/// this is hygiene so a future change (e.g. binding to a non-loopback iface)
+/// can't accidentally turn into a timing oracle.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
     }
-
-    if method == Method::POST && path == "/api/unlock" && ctx.phase == PasskeyPhase::Unlock {
-        return Ok(handle_unlock(req, ctx).await);
+    let mut acc: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        acc |= x ^ y;
     }
-
-    Ok(text(StatusCode::NOT_FOUND, "not found"))
+    acc == 0
 }
 
 #[derive(Deserialize)]
@@ -493,6 +508,11 @@ fn render_html(ctx: &Ctx) -> String {
 <script>
 const PRF_SALT_B64 = {prf_salt_js};
 const CRED_ID_B64 = {cred_id_js};
+// The page itself is served at /auth/<key>, so derive the API prefix from
+// the browser's own URL — no template substitution needed, and the entire
+// ceremony stays scoped to this one keyed path. The trailing-slash strip
+// lets the user accept either /auth/<key> or /auth/<key>/.
+const API_BASE = window.location.pathname.replace(/\/$/, "");
 
 function b64ToBytes(b64) {{
   const bin = atob(b64);
@@ -582,7 +602,7 @@ async function doImportExisting() {{
 }}
 
 async function postSetup(credId, prfOutput) {{
-  const r = await fetch("/api/setup", {{
+  const r = await fetch(API_BASE + "/api/setup", {{
     method: "POST",
     headers: {{ "Content-Type": "application/json" }},
     body: JSON.stringify({{
@@ -610,7 +630,7 @@ async function doUnlock() {{
   if (!prfOutput) {{
     throw new Error("Authenticator did not return a PRF output. The passkey may have been created without PRF support.");
   }}
-  const r = await fetch("/api/unlock", {{
+  const r = await fetch(API_BASE + "/api/unlock", {{
     method: "POST",
     headers: {{ "Content-Type": "application/json" }},
     body: JSON.stringify({{ prf: bytesToB64(prfOutput) }})
@@ -797,7 +817,6 @@ mod tests {
         let (_tx, rx) = std_mpsc::channel::<PasskeyOutcome>();
         let (shutdown_tx, _shutdown_rx) = oneshot::channel::<()>();
         let h = PasskeyHandle {
-            url: String::new(),
             short_url: String::new(),
             phase: PasskeyPhase::Setup,
             rx,
@@ -810,7 +829,6 @@ mod tests {
         let (_tx, rx) = std_mpsc::channel::<PasskeyOutcome>();
         let (shutdown_tx, _shutdown_rx) = oneshot::channel::<()>();
         let h2 = PasskeyHandle {
-            url: String::new(),
             short_url: String::new(),
             phase: PasskeyPhase::Setup,
             rx,
@@ -819,5 +837,111 @@ mod tests {
             join_handle: None,
         };
         assert!(!h2.is_expired());
+    }
+
+    #[test]
+    fn ct_eq_basics() {
+        assert!(ct_eq(b"", b""));
+        assert!(ct_eq(b"abc", b"abc"));
+        assert!(!ct_eq(b"abc", b"abd"));
+        assert!(!ct_eq(b"abc", b"abcd"));
+        assert!(!ct_eq(b"", b"x"));
+    }
+
+    /// Bind to an ephemeral port to avoid colliding with anything on 7834
+    /// while the test runs.
+    fn ephemeral_port() -> u16 {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        port
+    }
+
+    /// Send a raw HTTP/1.0 request (forces connection-close, so
+    /// `read_to_end` won't hang) and return the full response as a string.
+    fn raw_request(port: u16, method: &str, path: &str) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        let mut sock = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        let req = format!(
+            "{method} {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n"
+        );
+        sock.write_all(req.as_bytes()).unwrap();
+        let mut resp = Vec::new();
+        sock.read_to_end(&mut resp).unwrap();
+        String::from_utf8_lossy(&resp).into_owned()
+    }
+
+    /// Pull the 16-hex auth key out of the handle's `http://localhost:<port>/auth/<key>` URL.
+    fn key_from_handle(h: &PasskeyHandle) -> String {
+        h.short_url.rsplit('/').next().unwrap().to_string()
+    }
+
+    /// End-to-end check that the only reachable surface is `/auth/<key>` and
+    /// its `/api/*` children. Everything else — bare `/`, wrong key, right
+    /// key + wrong path, the old unkeyed `/api/*` routes — must 404. The
+    /// keyed root must serve 200 + HTML.
+    #[test]
+    fn routing_only_serves_under_correct_auth_key() {
+        let port = ephemeral_port();
+        let handle = start(port, PasskeyPhase::Setup, None).expect("start server");
+        let key = key_from_handle(&handle);
+
+        // Unkeyed paths — every shape gets the same flat 404.
+        for (m, p) in [
+            ("GET", "/"),
+            ("GET", "/auth"),
+            ("GET", "/auth/"),
+            ("GET", "/auth/deadbeefdeadbeef"),
+            ("GET", "/api/setup"),
+            ("POST", "/api/setup"),
+            ("POST", "/api/unlock"),
+            ("POST", "/auth/deadbeefdeadbeef/api/setup"),
+        ] {
+            let r = raw_request(port, m, p);
+            assert!(r.contains(" 404 "), "expected 404 for {m} {p}, got:\n{r}");
+        }
+
+        // Wrong-key prefixes never reveal whether the API exists: they 404
+        // before even hitting the dispatch table (so an attacker can't
+        // distinguish "wrong key" from "wrong route"). We assert no 302 / 200
+        // ever leaks out for a bad key.
+        let r = raw_request(port, "GET", "/auth/deadbeefdeadbeef");
+        assert!(!r.contains(" 200 "), "wrong key must not 200");
+        assert!(!r.contains(" 302 "), "wrong key must not redirect");
+
+        // Correct key, root → 200 + the inline HTML.
+        let keyed = format!("/auth/{key}");
+        let r = raw_request(port, "GET", &keyed);
+        assert!(r.contains(" 200 "), "GET {keyed} should 200, got:\n{r}");
+        assert!(
+            r.contains("<!doctype html>") || r.contains("<!DOCTYPE html>"),
+            "should contain HTML doctype"
+        );
+        // The HTML must carry the per-page Setup markers (we started in Setup
+        // phase) so we know we're actually serving the ceremony page.
+        assert!(r.contains(r#"id="go-create""#));
+
+        // Correct key with a trailing slash also reaches the HTML (the JS
+        // strips the trailing slash too).
+        let keyed_slash = format!("/auth/{key}/");
+        let r = raw_request(port, "GET", &keyed_slash);
+        assert!(r.contains(" 200 "), "GET {keyed_slash} should 200, got:\n{r}");
+
+        // Correct key + an unknown subpath still 404s.
+        let r = raw_request(port, "GET", &format!("/auth/{key}/whatever"));
+        assert!(r.contains(" 404 "));
+
+        // /api/setup is the right phase route, but Setup expects a body —
+        // we send Content-Length: 0, so the JSON parser inside handle_setup
+        // will reject with 400. The point of this assertion is just that
+        // the gate forwarded the request (i.e. we got past the 404 wall).
+        let r = raw_request(port, "POST", &format!("/auth/{key}/api/setup"));
+        assert!(
+            r.contains(" 400 ") || r.contains(" 200 "),
+            "POST {key}/api/setup should reach the handler (400 from empty body), got:\n{r}"
+        );
+
+        handle.stop();
     }
 }

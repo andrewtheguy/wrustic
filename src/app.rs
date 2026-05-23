@@ -203,7 +203,6 @@ pub(crate) struct App {
     /// session so save flows can choose the right cipher.
     pub(crate) passkey_mode: bool,
     pub(crate) passkey_handle: Option<PasskeyHandle>,
-    pub(crate) passkey_url: Option<String>,
     pub(crate) passkey_short_url: Option<String>,
     pub(crate) passkey_phase: Option<PasskeyPhase>,
 
@@ -314,7 +313,6 @@ impl App {
             server_port,
             passkey_mode: experimental_passkey,
             passkey_handle: None,
-            passkey_url: None,
             passkey_short_url: None,
             passkey_phase: None,
             first_run_state,
@@ -473,7 +471,6 @@ impl App {
         };
         match passkey::start(self.server_port, phase, existing) {
             Ok(h) => {
-                self.passkey_url = Some(h.url.clone());
                 self.passkey_short_url = Some(h.short_url.clone());
                 self.passkey_phase = Some(h.phase);
                 self.passkey_handle = Some(h);
@@ -501,7 +498,6 @@ impl App {
         if let Some(h) = self.passkey_handle.take() {
             h.stop();
         }
-        self.passkey_url = None;
         self.passkey_short_url = None;
         self.passkey_phase = None;
         self.load_config_or_set_fatal();
