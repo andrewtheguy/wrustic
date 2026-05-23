@@ -126,6 +126,61 @@ leaving the device (cloud sync of a config dir, included in a backup,
 copied to another machine) rather than another local account reading it
 in place. Disk encryption is your responsibility.
 
+## Is `config.toml` safe to back up unencrypted?
+
+**Short answer:** the *secret* fields are safe — they're already AEAD-
+encrypted in place. What leaks if the bare file is exposed is the
+*shape* of your setup, plus, in age mode, the public key needed to
+target you.
+
+The TOML file always exposes, in plaintext:
+
+- The profile names (`[profiles.foo]`, `[profiles.bar]`, …).
+- The backend type per profile (`backend = "s3" | "rest" | "local"`).
+- All public backend fields: `local_path`, `rest_url`, `s3_endpoint`,
+  `s3_bucket`, `s3_region`, `s3_root`.
+- Schema metadata: `version`, `cipher` marker.
+- Age mode: the `recipient` bech32 public key.
+- Passkey mode: the `[passkey]` block (`credential_id`, `prf_salt`).
+  Both are public WebAuthn identifiers — no key material.
+
+Everything else (repo passwords, REST user/password, S3 access/secret
+keys) sits behind `ageenc:` or `pkenc:` and is unreadable without the
+matching key.
+
+### Practical guidance per mode
+
+**Age mode** — backing up *just* `config.toml` is safe in the secrets
+sense, but worth noting:
+
+- The `recipient` public key in the file points at the age identity an
+  attacker would need to obtain. If they breach the host where
+  `age.key` lives, they pair the two and recover everything.
+- **Don't back up `age.key` alongside `config.toml` in the same
+  unencrypted blob** — that's equivalent to backing up the secrets in
+  plaintext. The whole point of the encryption falls away. Either keep
+  `age.key` out of the backup, or wrap the backup itself in another
+  layer (e.g. a passphrase-protected restic backup of the config dir).
+
+**Passkey mode** — safer to back up because the key isn't on disk at
+all. The `[passkey]` block is metadata, not material. To restore on
+another machine you also need the passkey itself reachable there —
+typically via your password manager's passkey sync, or a roaming
+hardware authenticator that knows the credential.
+
+### What's still in scope for a config-only leak
+
+Even with the secret fields encrypted, an exfiltrated `config.toml`
+tells an attacker:
+
+- Which storage backends you use and where (S3 buckets, REST endpoints,
+  local paths). That's a target list — they know where to look if they
+  later obtain credentials.
+- Your profile count and naming conventions.
+
+If that metadata is itself sensitive, treat `config.toml` like any
+other secret file and encrypt the backup container.
+
 ## age cipher (`Cipher::Age`)
 
 ### Identity file format
