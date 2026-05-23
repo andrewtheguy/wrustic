@@ -12,19 +12,24 @@ Options:
                               of the platform default (~/.config/wrustic on Linux).
                               The directory will be created on first run.
   -p, --port <N>              Localhost port for both the file-share dialog and
-                              the experimental passkey ceremony. Default: 7834.
+                              the experimental passphrase ceremony. Default: 7834.
                               They never run concurrently, so they share a port.
-      --experimental-passkey  EXPERIMENTAL — encrypt config values with a
-                              WebAuthn passkey instead of age. Requires an
-                              explicit --config-dir. Passkey configs are NOT
+      --experimental-passphrase
+                              EXPERIMENTAL — encrypt config values with a
+                              passphrase instead of age. Requires an explicit
+                              --config-dir. Passphrase configs are NOT
                               interoperable with age configs.
+      --browser-auth          Use a browser-based ceremony for passphrase input
+                              instead of typing the passphrase in the terminal.
+                              Requires --experimental-passphrase.
   -h, --help                  Print this help text.
 ";
 
 pub(crate) struct Cli {
     pub(crate) config_dir: Option<PathBuf>,
     pub(crate) port: u16,
-    pub(crate) experimental_passkey: bool,
+    pub(crate) experimental_passphrase: bool,
+    pub(crate) browser_auth: bool,
     pub(crate) show_help: bool,
 }
 
@@ -33,7 +38,8 @@ impl Default for Cli {
         Self {
             config_dir: None,
             port: DEFAULT_SERVER_PORT,
-            experimental_passkey: false,
+            experimental_passphrase: false,
+            browser_auth: false,
             show_help: false,
         }
     }
@@ -45,7 +51,8 @@ pub(crate) fn parse_cli() -> Result<Cli> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => cli.show_help = true,
-            "--experimental-passkey" => cli.experimental_passkey = true,
+            "--experimental-passphrase" => cli.experimental_passphrase = true,
+            "--browser-auth" => cli.browser_auth = true,
             "-c" | "--config-dir" => {
                 let value = args
                     .next()
@@ -75,10 +82,13 @@ pub(crate) fn parse_cli() -> Result<Cli> {
             other => bail!("unknown argument: {other}"),
         }
     }
-    if cli.experimental_passkey && cli.config_dir.is_none() {
+    if cli.experimental_passphrase && cli.config_dir.is_none() {
         bail!(
-            "--experimental-passkey requires an explicit --config-dir while the feature is experimental"
+            "--experimental-passphrase requires an explicit --config-dir while the feature is experimental"
         );
+    }
+    if cli.browser_auth && !cli.experimental_passphrase {
+        bail!("--browser-auth requires --experimental-passphrase");
     }
     Ok(cli)
 }

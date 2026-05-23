@@ -29,10 +29,10 @@ It is intentionally **not** a restic replacement:
 
 ```
 main()
- └── App::boot(config_dir, port, experimental_passkey)        // app.rs
+ └── App::boot(config_dir, port, experimental_passphrase, browser_auth)  // app.rs
       ├── config::paths(override) → Paths { identity, config }
-      ├── (age mode)     load_age_cipher(age.key) → Cipher::Age
-      ├── (passkey mode) start_passkey_ceremony()              // app.rs + passkey.rs
+      ├── (age mode)        load_age_cipher(age.key) → Cipher::Age
+      ├── (passphrase mode) start_passphrase_ceremony()       // app.rs + passphrase.rs
       └── load_config_or_set_fatal()
             └── config::load(paths, cipher) → Config (with profiles decrypted)
  │
@@ -41,8 +41,9 @@ main()
      │   LoadingDir, LoadingFileDetails, SnapshotDeleteContentsLoading,
      │   SnapshotDeleting, SnapshotCompareLoading) — main.rs runs the
      │   blocking work synchronously and transitions the screen
-     ├── Screen::PasskeyUrl — short timeout poll so try_advance_passkey
-     │   can pick up the mpsc message from passkey.rs without a keypress
+     ├── Screen::PassphraseDerivingKey — runs scrypt synchronously (terminal mode)
+     ├── Screen::PassphraseUrl — short timeout poll so try_advance_passphrase
+     │   can pick up the mpsc message from passphrase.rs without a keypress (browser mode)
      └── otherwise — blocking event::read(), App::handle_key/mouse
 ```
 
@@ -50,15 +51,15 @@ The event loop lives in `main.rs` rather than `App` because some screens need
 to take long-blocking work out of the rendering tick. Each "async-ish" branch
 matches a `Screen::*Loading` variant, runs the blocking call inline, and
 transitions to the next screen — there is no real async/await in the main
-loop. The two localhost servers (share, passkey) are the only true async
+loop. The two localhost servers (share, passphrase) are the only true async
 machinery, each isolated on its own OS thread + tokio current-thread runtime.
 
 ## State: `App` and `Screen`
 
-`Screen` (in `app.rs:30`) is the discriminator for what's on screen. It's
+`Screen` (in `app.rs`) is the discriminator for what's on screen. It's
 about three dozen variants spanning first-run, profile CRUD, snapshot list,
 snapshot delete/compare flows, tree browsing, file details, share dialog,
-and passkey dialog. Every screen is rendered by a corresponding
+and passphrase dialog. Every screen is rendered by a corresponding
 `render_<screen>` function in `ui.rs`.
 
 `App` (in `app.rs`) is a flat struct holding *every* piece of session state.
@@ -71,43 +72,36 @@ struct includes:
 - Snapshot browse state: `snapshots`, `repo_session`, `browse_stack`,
   `pending_descend` / `pending_file_lookup` / `pending_refresh_path`.
 - Share dialog: `share_target`, `share_handle`, `share_url`, etc.
-- Passkey dialog: `passkey_handle`, `passkey_short_url`, `passkey_phase`.
+- Passphrase dialog: `passphrase_input`, `passphrase_confirm`,
+  `passphrase_instance_input`, `passphrase_phase`, `passphrase_error`.
+  Browser mode adds: `passphrase_handle`, `passphrase_short_url`,
+  `passphrase_setup_code`.
 
 Keypress handling is concentrated in `App::handle_key` (single big match on
 `self.screen`); mouse in `App::handle_mouse`.
 
 ## Config + crypto
 
-`src/config.rs` owns the TOML schema (`Config`, `Profile`, `PasskeyMeta`)
-and the atomic save: write `config.toml.tmp` at mode 0600, then `rename(2)`
-over the target.
+`src/config.rs` owns the TOML schema (`Config`, `Profile`,
+`PassphraseMeta`) and the atomic save: write `config.toml.tmp` at mode
+0600, then `rename(2)` over the target.
 
 Two ciphers are supported, per-value (not whole-file) so non-secret edits
-diff cleanly: age x25519 (`ageenc:` prefix, default) and ChaCha20-Poly1305
-keyed from a WebAuthn PRF + HKDF-derived config key (`pkenc:` prefix, behind
-`--experimental-passkey`). The two are deliberately non-interoperable —
-the on-disk `cipher` marker plus a value-level prefix check on every
-decrypt keeps them from ever mixing.
+diff cleanly. For schema details, key derivation, threat model, the
+ceremony server, and the share-server signing-key derivation, see
+[encryption.md](encryption.md).
 
-A `config::peek` helper parses the TOML *without* applying any cipher, so
-the boot code can read the `[passkey]` block before the cipher itself
-exists. That resolves the chicken-and-egg between "need the salt to do
-the ceremony" and "need the ceremony to derive the cipher."
-
-For schema details, key derivation, threat model, and the share-server
-signing-key derivation, see [encryption.md](encryption.md).
-
-## Localhost servers (`share.rs`, `passkey.rs`)
+## Localhost servers (`share.rs`, `passphrase.rs`)
 
 Both servers follow the same shape so the patterns transfer:
 
 - One OS thread per server, one `tokio::runtime::Builder::new_current_thread`
   per thread. No global runtime, no shared executor.
-- Bind on `127.0.0.1:<port>`. User-facing URLs use `localhost` for browser /
-  authenticator compatibility.
+- Bind on `127.0.0.1:<port>`. User-facing URLs use
+  `<instance>.wrustic.localhost` (passphrase, browser mode) or `localhost` (share).
 - The two servers share the **same port** (`--port`, default 7834) because
-  share and passkey dialogs are never simultaneously active.
-- Each returns a handle (`ShareHandle`, `PasskeyHandle`) that owns a
+  share and passphrase dialogs are never simultaneously active.
+- Each returns a handle (`ShareHandle`, `PassphraseHandle`) that owns a
   `oneshot::Sender<()>` for shutdown plus a `JoinHandle`. Drop = stop server.
   Explicit `.stop()` joins the thread (port released by the time it returns).
 - Routes are spelled out as a flat `match` inside one `async fn handle()`;
@@ -119,8 +113,9 @@ Both servers follow the same shape so the patterns transfer:
   A URL minted for file A cannot be replayed against a later server bound to
   file B — the name is part of the HMAC.
 - HMAC signing key is derived from the age identity bytes (age mode) or from
-  the passkey-derived config key (passkey mode, via `passkey::derive_share_signing_key`).
-  Same key per identity → URLs survive across restarts within the TTL.
+  the passphrase-derived config key (passphrase mode, via
+  `passphrase::derive_share_signing_key`). Same key per identity → URLs
+  survive across restarts within the TTL.
 - Routes:
   - `GET /dl?snap=…&tree=…&exp=…&sig=…` — verifies sig + expiry, streams the
     file.
@@ -130,18 +125,23 @@ Both servers follow the same shape so the patterns transfer:
 - TTL: `SHARE_TTL = 1 h` baked into the signed `exp` claim. The server
   enforces expiry independently of any wall-clock state on its end.
 
-### Passkey ceremony (`src/passkey.rs`, experimental)
+### Passphrase (`src/passphrase.rs`, experimental)
 
-This is the other localhost server — same shape as the share dialog (own OS
-thread, current-thread tokio runtime, RAII handle), but bidirectional: the
-browser POSTs the derived config key back to localhost through an encrypted envelope, and the server
-hands it to the App via an mpsc channel that the main loop polls every
-150 ms while `Screen::PasskeyUrl` is up (see `main.rs:277`).
+**Terminal mode (default):** no server is started. `passphrase.rs` exposes
+`derive_config_key`, `verify_instance_sig`, `compute_instance_sig`, and
+`passphrase_policy_error` for direct use by `app.rs`. Key derivation runs
+synchronously on `Screen::PassphraseDerivingKey`.
 
-Auth, routing, the `/auth/<key>` capability URL, Setup vs Unlock phases,
-the 30-minute expiry net, and the cryptographic key derivation all live in
-[encryption.md](encryption.md). The server is in this same `Localhost
-servers` family only as far as the runtime shape goes.
+**Browser mode (`--browser-auth`):** same runtime shape as the share
+dialog (own OS thread, current-thread tokio runtime, RAII handle), but
+bidirectional: the browser POSTs the passphrase back to localhost through
+an encrypted envelope, and the server hands the derived key to the App
+via an mpsc channel that the main loop polls every 150 ms while
+`Screen::PassphraseUrl` is up.
+
+Auth, routing, the capability URL, Setup vs Unlock phases, the 30-minute
+expiry net, host header validation, and the cryptographic key derivation
+all live in [encryption.md](encryption.md).
 
 ## Repository access (`src/repo.rs`, `src/restic.rs`)
 

@@ -6,8 +6,8 @@ use ratatui::{
 };
 use tui_input::Input;
 
-use crate::app::{App, BACKEND_ORDER, FIRST_RUN_MENU, PASSKEY_SETUP_MENU, Screen, filter_dim_entries};
-use crate::passkey::{PasskeyPhase, SetupMode};
+use crate::app::{App, BACKEND_ORDER, FIRST_RUN_MENU, Screen, filter_dim_entries};
+use crate::passphrase::PassphrasePhase;
 use crate::repo::ContentKind;
 
 pub(crate) fn render(frame: &mut Frame, app: &mut App) {
@@ -62,9 +62,11 @@ fn bottom_bar_text(screen: &Screen) -> &'static str {
             "j/k scroll  PgUp/PgDn page  g top  s share  Esc/Backspace/q back"
         }
         Screen::ShareUrl => "Esc/Backspace/q back (stops the server)",
-        Screen::PasskeySetupChoice => "j/k move  PgUp/PgDn page  Enter pick  Esc quit",
-        Screen::PasskeyLabelPrompt => "type  Enter submit  Esc quit",
-        Screen::PasskeyUrl => "Esc/q quit  (waiting for browser ceremony)",
+        Screen::PassphraseInstancePrompt => "type  Enter submit  Esc quit",
+        Screen::PassphraseSetup => "Tab/Shift+Tab field  Enter submit  Esc back",
+        Screen::PassphraseUnlock => "type  Enter submit  Esc quit",
+        Screen::PassphraseDerivingKey => "working…",
+        Screen::PassphraseUrl => "Esc/q quit  (waiting for browser ceremony)",
         Screen::SnapshotCompareFirst => {
             "j/k move  PgUp/PgDn page  g/G top/bottom  Enter pick FIRST  Esc cancel"
         }
@@ -203,17 +205,33 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
         Screen::SnapshotContents => render_snapshot_contents(frame, app, area),
         Screen::FileDetails => render_file_details(frame, app, area),
         Screen::ShareUrl => render_share_url(frame, app, area),
-        Screen::PasskeySetupChoice => render_passkey_setup_choice(frame, app, area),
-        Screen::PasskeyLabelPrompt => render_input(
-            frame,
-            area,
-            "Name this passkey",
-            &app.passkey_label_input,
-            false,
-            "Shown in the browser's passkey picker / password manager. \
-             Default is the config-dir name; edit if you want something else, then Enter.",
-        ),
-        Screen::PasskeyUrl => render_passkey_url(frame, app, area),
+        Screen::PassphraseInstancePrompt => {
+            let banner = format!(
+                "No config found at {}. Setting up a new instance.",
+                app.paths.config.display(),
+            );
+            let [_top, banner_area, input_area, help_area, _bottom] = Layout::vertical([
+                Constraint::Fill(1),
+                Constraint::Length(1),
+                Constraint::Length(3),
+                Constraint::Length(1),
+                Constraint::Fill(1),
+            ])
+            .areas(area);
+            let banner_p = Paragraph::new(banner).style(Style::new().fg(Color::DarkGray));
+            frame.render_widget(banner_p, banner_area);
+            draw_input_field(frame, input_area, "Instance name", &app.passphrase_instance_input, false, true);
+            let help_p = Paragraph::new("Lowercase letters, digits, and hyphens (max 32 chars).").style(Style::new().fg(Color::DarkGray));
+            frame.render_widget(help_p, help_area);
+        }
+        Screen::PassphraseSetup => render_passphrase_setup(frame, app, area),
+        Screen::PassphraseUnlock => render_passphrase_unlock(frame, app, area),
+        Screen::PassphraseDerivingKey => {
+            let para = Paragraph::new("Deriving key…")
+                .block(Block::bordered().title("Passphrase"));
+            frame.render_widget(para, area);
+        }
+        Screen::PassphraseUrl => render_passphrase_url(frame, app, area),
         Screen::SnapshotCompareFirst => render_compare_first(frame, app, area),
         Screen::SnapshotCompareSecond => render_compare_second(frame, app, area),
         Screen::SnapshotCompareLoading => render_compare_loading(frame, app, area),
@@ -231,39 +249,6 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
             frame.render_widget(para, area);
         }
     }
-}
-
-fn render_passkey_setup_choice(frame: &mut Frame, app: &mut App, area: Rect) {
-    let [intro_area, list_area] = Layout::vertical([
-        Constraint::Length(11),
-        Constraint::Fill(1),
-    ])
-    .areas(area);
-
-    let intro = Paragraph::new(format!(
-        "No existing wrustic config found at {}, so a new one needs to be \
-         encrypted with a passkey before anything else can happen.\n\n\
-         Pick \"Create\" to mint a brand-new passkey on this device — \
-         you'll be asked to label it (so it shows distinctly in your \
-         password manager).\n\n\
-         Pick \"Use existing\" to wrap a passkey already known to your \
-         browser (e.g. one synced via your password manager). No label \
-         step — the existing credential carries its own. This still \
-         creates a fresh config under a new salt; it won't decrypt a \
-         config from another machine.",
-        app.paths.config.display()
-    ))
-    .wrap(Wrap { trim: false })
-    .block(Block::bordered().title("Experimental passkey mode — Setup"));
-    frame.render_widget(intro, intro_area);
-
-    let items: Vec<ListItem> = PASSKEY_SETUP_MENU.iter().map(|s| ListItem::new(*s)).collect();
-    let list = List::new(items)
-        .block(Block::bordered().title("j/k to move, Enter to pick, Esc to quit"))
-        .highlight_style(selection_highlight())
-        .highlight_symbol(">> ");
-    record_list_area(app, list_area);
-    frame.render_stateful_widget(list, list_area, &mut app.passkey_setup_choice_state);
 }
 
 fn render_first_run_choice(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -878,39 +863,73 @@ fn render_file_details(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(para, area);
 }
 
-fn render_passkey_url(frame: &mut Frame, app: &mut App, area: Rect) {
-    let phase_label = match app.passkey_phase {
-        Some(PasskeyPhase::Setup(SetupMode::Create)) => "Create",
-        Some(PasskeyPhase::Setup(SetupMode::Import)) => "Import",
-        Some(PasskeyPhase::Unlock) => "Unlock",
-        None => "Passkey",
+fn render_passphrase_setup(frame: &mut Frame, app: &App, area: Rect) {
+    let fields = [
+        ("Passphrase", &app.passphrase_input, true),
+        ("Confirm passphrase", &app.passphrase_confirm, true),
+    ];
+    let title = if app.passphrase_instance_value.is_empty() {
+        "Set passphrase".to_string()
+    } else {
+        format!("Set passphrase — {}", app.passphrase_instance_value)
+    };
+    let help = app
+        .passphrase_error
+        .as_deref()
+        .unwrap_or("Min 12 chars, requires lowercase, uppercase, digit, and special character.");
+    render_grouped_input(
+        frame,
+        area,
+        &title,
+        &fields,
+        app.field_focus,
+        help,
+    );
+}
+
+fn render_passphrase_unlock(frame: &mut Frame, app: &App, area: Rect) {
+    let meta = app.config.passphrase.as_ref();
+    let title = match meta.map(|m| m.instance.as_str()).filter(|s| !s.is_empty()) {
+        Some(inst) => format!("Unlock — {inst}"),
+        None => "Unlock".to_string(),
+    };
+    let help = if let Some(err) = &app.passphrase_error {
+        err.clone()
+    } else if let Some(sig) = meta.map(|m| m.instance_sig.as_str()).filter(|s| !s.is_empty()) {
+        format!("Signature: {sig}")
+    } else {
+        "Enter the passphrase to decrypt the config.".to_string()
+    };
+    render_input(frame, area, &title, &app.passphrase_input, true, &help);
+}
+
+fn render_passphrase_url(frame: &mut Frame, app: &mut App, area: Rect) {
+    let phase_label = match app.passphrase_phase {
+        Some(PassphrasePhase::Setup) => "Setup",
+        Some(PassphrasePhase::Unlock) => "Unlock",
+        None => "Passphrase",
     };
     let expired = app
-        .passkey_handle
+        .passphrase_handle
         .as_ref()
         .map(|h| h.is_expired())
         .unwrap_or(false);
     let mut lines = String::new();
     lines.push_str(&format!(
-        "Experimental passkey mode — {phase_label} ceremony\n\n"
+        "Experimental passphrase mode — {phase_label} ceremony\n\n"
     ));
-    match &app.passkey_short_url {
+    match &app.passphrase_short_url {
         Some(short) => {
             lines.push_str("Open this URL in a browser:\n");
             lines.push_str(short);
             lines.push_str("\n\n");
         }
         None => {
-            lines.push_str("(passkey URL not available)\n\n");
+            lines.push_str("(URL not available)\n\n");
         }
     }
-    // Setup-only intent-confirmation code. Print it prominently so the
-    // user knows to copy it into the browser. Suppressed when expired —
-    // there's no ceremony to confirm at that point. Printed tightly
-    // without inter-character padding to keep the displayed code visually
-    // intact.
     if !expired
-        && let Some(code) = &app.passkey_setup_code
+        && let Some(code) = &app.passphrase_setup_code
     {
         lines.push_str("Setup code (type this in the browser):\n\n");
         lines.push_str("    ");
@@ -918,53 +937,32 @@ fn render_passkey_url(frame: &mut Frame, app: &mut App, area: Rect) {
         lines.push_str("\n\n");
     }
     if expired {
-        // 30-min safety cap fired. Server still answers but only with 403,
-        // so any further click in the browser will show an error. The user
-        // must quit + relaunch to restart the ceremony.
         lines.push_str(
-            "SESSION EXPIRED — passkey ceremony timed out after 30 minutes.\n\
+            "SESSION EXPIRED — passphrase ceremony timed out after 30 minutes.\n\
              The server now returns 403 for every request.\n\
              Press Esc/q to quit, then relaunch wrustic to try again.\n\n",
         );
     } else {
-        match app.passkey_phase {
-            Some(PasskeyPhase::Setup(SetupMode::Create)) => {
+        match app.passphrase_phase {
+            Some(PassphrasePhase::Setup) => {
                 lines.push_str(
-                    "The browser will prompt you to create a new passkey on this device.\n\
-                     wrustic uses the WebAuthn PRF extension to derive an encryption key from it.\n\
-                     The passkey secret never leaves your authenticator.\n\n\
-                     WARNING: losing this passkey means losing access to the config.\n",
+                    "Enter a strong passphrase in the browser to encrypt your config.\n\
+                     The browser encrypts it to the local server, which derives the config key with scrypt.\n\n\
+                     WARNING: forgetting this passphrase means losing access to the config.\n",
                 );
             }
-            Some(PasskeyPhase::Setup(SetupMode::Import)) => {
-                lines.push_str(
-                    "The browser will let you pick a passkey already known to it (e.g. one\n\
-                     synced from another device via your password manager).\n\
-                     wrustic uses the WebAuthn PRF extension to derive an encryption key from\n\
-                     the passkey you pick. The passkey secret never leaves your authenticator.\n\n\
-                     NOTE: this starts a fresh wrustic config under a new salt — it will\n\
-                     not decrypt an existing config from another machine.\n",
-                );
-            }
-            Some(PasskeyPhase::Unlock) => {
-                // If the Setup(Create) ceremony stashed a label in the
-                // config, surface it here so the user knows which passkey
-                // to pick out of their password manager. The label is
-                // informational only — see PasskeyMeta::label.
-                if let Some(label) = app
-                    .config
-                    .passkey
-                    .as_ref()
-                    .and_then(|m| m.label.as_deref())
-                    .filter(|s| !s.is_empty())
-                {
-                    lines.push_str(&format!(
-                        "This config was set up with passkey label: {label}\n\n"
-                    ));
+            Some(PassphrasePhase::Unlock) => {
+                if let Some(m) = app.config.passphrase.as_ref() {
+                    if !m.instance.is_empty() {
+                        lines.push_str(&format!("Instance: {}\n", m.instance));
+                    }
+                    if !m.instance_sig.is_empty() {
+                        lines.push_str(&format!("Signature: {}\n", m.instance_sig));
+                    }
+                    lines.push('\n');
                 }
                 lines.push_str(
-                    "The browser will prompt for the passkey you set up earlier.\n\
-                     Once authenticated, wrustic will decrypt the config and continue.\n",
+                    "Enter the passphrase you set up earlier to decrypt the config.\n",
                 );
             }
             None => {}
@@ -978,7 +976,7 @@ fn render_passkey_url(frame: &mut Frame, app: &mut App, area: Rect) {
     let para = Paragraph::new(lines)
         .style(style)
         .wrap(Wrap { trim: false })
-        .block(Block::bordered().title(format!("Passkey — {phase_label}")));
+        .block(Block::bordered().title(format!("Passphrase — {phase_label}")));
     record_list_area(app, area);
     frame.render_widget(para, area);
 }

@@ -3,6 +3,7 @@ use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use base64::Engine;
 use ratatui::{
     crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
     layout::Rect,
@@ -12,9 +13,9 @@ use rustic_core::{IndexedIdsStatus, Repository, TreeId};
 use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
-use crate::config::{self, BackendKind, Config, PasskeyMeta, Paths, Profile};
+use crate::config::{self, BackendKind, Config, PassphraseMeta, Paths, Profile};
 use crate::crypto::Cipher;
-use crate::passkey::{self, PasskeyHandle, PasskeyPhase, SetupMode};
+use crate::passphrase::{self, PassphraseHandle, PassphrasePhase};
 use crate::repo::{ContentKind, ContentRow, ContentsPreview, FileDetails, SnapshotRow};
 use crate::restic::{self, DiffChange, DiffSummary, ResticError, ResticInfo, SnapshotDetails};
 use crate::share::{self, SHARE_TTL, ShareHandle, ShareTarget};
@@ -26,21 +27,16 @@ pub(crate) const FIRST_RUN_MENU: [&str; 3] = [
     "Restore an existing age key",
     "Quit",
 ];
-/// Setup-phase choice shown before any browser ceremony begins. Create
-/// continues to the label prompt; Import skips it (the existing
-/// credential carries its own label from creation time).
-pub(crate) const PASSKEY_SETUP_MENU: [&str; 2] = [
-    "Create a new passkey",
-    "Use an existing passkey",
-];
 
 pub(crate) enum Screen {
     FirstRunChoice,
     RestoreKeyWait,
     KeyCreated,
-    PasskeySetupChoice,
-    PasskeyLabelPrompt,
-    PasskeyUrl,
+    PassphraseInstancePrompt,
+    PassphraseSetup,
+    PassphraseUnlock,
+    PassphraseDerivingKey,
+    PassphraseUrl,
     Home,
     Snapshots,
     SnapshotFilterDim,
@@ -122,51 +118,33 @@ impl SnapshotFilter {
     }
 }
 
-/// Suggest a passkey label from the config dir's basename — the user
-/// can edit it before submitting on `Screen::PasskeyLabelPrompt`.
-///
-/// Returns `None` (not a silent fallback) when no reasonable default
-/// can be derived: degenerate paths like `--config-dir /`, or anything
-/// whose canonical form has no file_name. The caller prefills the
-/// input with the empty string in that case, which makes
-/// `submit_passkey_label` refuse Enter until the user has actually
-/// typed a label — better than silently re-using "wrustic" and
-/// recreating the very "all passkeys look the same" problem this
-/// feature exists to solve.
-///
-/// Canonicalizes first so `--config-dir .` or `--config-dir ..` get
-/// real directory names instead of `.`/`..` literals.
-pub(crate) fn default_passkey_label(paths: &Paths) -> Option<String> {
-    let parent = paths.config.parent()?;
-    // canonicalize() requires the path to exist on disk — in passkey
-    // Setup that's usually not the case for `<dir>/config.toml`, but
-    // the *parent* dir should exist (we just bound a listener after
-    // resolving paths). Fall back to the raw parent if canonicalize
-    // fails so we still try to extract a basename.
-    let resolved = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
-    let basename = resolved.file_name()?.to_string_lossy().trim().to_string();
-    if basename.is_empty() {
-        None
-    } else {
-        Some(basename)
-    }
+const INSTANCE_ALPHABET: &[u8] = b"2345679abcdefghjkmnpqrstuvwxyz";
+
+pub(crate) fn default_passphrase_instance() -> String {
+    use rand::RngExt;
+    let mut rng = rand::rng();
+    let n = INSTANCE_ALPHABET.len();
+    let suffix: String = (0..6)
+        .map(|_| INSTANCE_ALPHABET[rng.random_range(0..n)] as char)
+        .collect();
+    format!("instance-{suffix}")
 }
 
-fn truncate_passkey_label(label: String) -> String {
-    if label.len() <= 64 {
-        return label;
+fn is_valid_instance(s: &str) -> bool {
+    let len = s.len();
+    if len == 0 || len > 32 {
+        return false;
     }
-    let mut truncated = String::new();
-    let mut bytes = 0usize;
-    for ch in label.chars() {
-        let len = ch.len_utf8();
-        if bytes + len > 64 {
-            break;
-        }
-        truncated.push(ch);
-        bytes += len;
+    let bytes = s.as_bytes();
+    if !bytes[0].is_ascii_lowercase() && !bytes[0].is_ascii_digit() {
+        return false;
     }
-    truncated
+    if len > 1 && !bytes[len - 1].is_ascii_lowercase() && !bytes[len - 1].is_ascii_digit() {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 // Translate a left-click at `(row, col)` (terminal coordinates) into an
@@ -251,28 +229,18 @@ pub(crate) struct App {
     /// app reaches Home, this is always `Some` (and every `config::save` call
     /// expects it to be).
     pub(crate) cipher: Option<Cipher>,
-    /// Localhost port for the share dialog and the passkey ceremony. Set
-    /// once from `--port` (default 7834); shared because the two flows are
-    /// never active at the same time.
     pub(crate) server_port: u16,
-    /// True when launched with `--experimental-passkey`. Persists for the
-    /// session so save flows can choose the right cipher.
-    pub(crate) passkey_mode: bool,
-    pub(crate) passkey_handle: Option<PasskeyHandle>,
-    /// Input collected on `Screen::PasskeyLabelPrompt`. Used as
-    /// `user.name`/`displayName` in the WebAuthn `create()` call so each
-    /// config gets a distinct entry in the browser's passkey picker.
-    /// Only consulted on Setup phase.
-    pub(crate) passkey_label_input: Input,
-    pub(crate) passkey_short_url: Option<String>,
-    /// Setup-only confirmation code printed on the TUI. The user must
-    /// type this in the browser before either Create or Use Existing
-    /// will be accepted. `None` in Unlock (no second factor needed —
-    /// the existing [passkey] block + AEAD tag are the gate).
-    pub(crate) passkey_setup_code: Option<String>,
-    pub(crate) passkey_phase: Option<PasskeyPhase>,
-    /// Selection on `Screen::PasskeySetupChoice` — Create (0) or Import (1).
-    pub(crate) passkey_setup_choice_state: ListState,
+    pub(crate) passphrase_mode: bool,
+    pub(crate) browser_auth: bool,
+    pub(crate) passphrase_handle: Option<PassphraseHandle>,
+    pub(crate) passphrase_instance_input: Input,
+    pub(crate) passphrase_input: Input,
+    pub(crate) passphrase_confirm: Input,
+    pub(crate) passphrase_error: Option<String>,
+    pub(crate) passphrase_instance_value: String,
+    pub(crate) passphrase_short_url: Option<String>,
+    pub(crate) passphrase_setup_code: Option<String>,
+    pub(crate) passphrase_phase: Option<PassphrasePhase>,
 
     pub(crate) first_run_state: ListState,
     pub(crate) backend_list: ListState,
@@ -364,15 +332,14 @@ impl App {
     pub(crate) fn boot(
         config_dir: Option<PathBuf>,
         server_port: u16,
-        experimental_passkey: bool,
+        experimental_passphrase: bool,
+        browser_auth: bool,
     ) -> Result<Self> {
         let paths = config::paths(config_dir)?;
         let mut first_run_state = ListState::default();
         first_run_state.select(Some(0));
         let mut backend_list = ListState::default();
         backend_list.select(Some(0));
-        let mut passkey_setup_choice_state = ListState::default();
-        passkey_setup_choice_state.select(Some(0));
 
         let identity_exists = paths.identity.exists();
         let mut app = Self {
@@ -381,13 +348,17 @@ impl App {
             config: Config::default(),
             cipher: None,
             server_port,
-            passkey_mode: experimental_passkey,
-            passkey_handle: None,
-            passkey_label_input: Input::default(),
-            passkey_short_url: None,
-            passkey_setup_code: None,
-            passkey_phase: None,
-            passkey_setup_choice_state,
+            passphrase_mode: experimental_passphrase,
+            browser_auth,
+            passphrase_handle: None,
+            passphrase_instance_input: Input::default(),
+            passphrase_input: Input::default(),
+            passphrase_confirm: Input::default(),
+            passphrase_error: None,
+            passphrase_instance_value: String::new(),
+            passphrase_short_url: None,
+            passphrase_setup_code: None,
+            passphrase_phase: None,
             first_run_state,
             backend_list,
             profile_list_state: ListState::default(),
@@ -449,8 +420,8 @@ impl App {
             last_content_click: None,
         };
 
-        if experimental_passkey {
-            app.start_passkey_ceremony();
+        if experimental_passphrase {
+            app.start_passphrase_ceremony();
             return Ok(app);
         }
 
@@ -472,11 +443,7 @@ impl App {
     }
 
     fn load_config_or_set_fatal(&mut self) {
-        // For age mode, lazy-load the cipher here so the FirstRun/Restore
-        // flows that create the identity file just before this call work
-        // without explicit wiring. Passkey mode must already have set
-        // self.cipher via the ceremony.
-        if self.cipher.is_none() && !self.passkey_mode {
+        if self.cipher.is_none() && !self.passphrase_mode {
             match config::load_age_cipher(&self.paths.identity) {
                 Ok(c) => self.cipher = Some(c),
                 Err(e) => {
@@ -503,15 +470,7 @@ impl App {
         }
     }
 
-    /// Boot in passkey mode: peek at config.toml to decide phase. On
-    /// Unlock, start the ceremony server directly. On Setup, first
-    /// transition to `Screen::PasskeySetupChoice` so the user can pick
-    /// Create vs. Import before any browser ceremony begins. Picking
-    /// Create then routes to `Screen::PasskeyLabelPrompt` (label is only
-    /// used by the WebAuthn `create()` call); Import skips the label and
-    /// launches the server directly. Both branches end up in
-    /// `launch_passkey_server`.
-    fn start_passkey_ceremony(&mut self) {
+    fn start_passphrase_ceremony(&mut self) {
         let peeked = match config::peek(&self.paths) {
             Ok(p) => p,
             Err(e) => {
@@ -522,31 +481,40 @@ impl App {
         };
         match peeked {
             None => {
-                // Setup phase: ask Create vs. Import first. Default to
-                // Create (the more common path on a fresh machine).
-                self.passkey_setup_choice_state.select(Some(0));
-                self.screen = Screen::PasskeySetupChoice;
+                let default = default_passphrase_instance();
+                self.passphrase_instance_input = Input::new(default);
+                self.screen = Screen::PassphraseInstancePrompt;
             }
             Some(cfg) => {
-                if cfg.cipher != config::CIPHER_MARKER_PASSKEY {
+                if cfg.cipher != config::CIPHER_MARKER_PASSPHRASE {
                     self.error_is_fatal = true;
                     self.screen = Screen::Error(format!(
-                        "{} has cipher = \"{}\"; drop --experimental-passkey to open it",
+                        "{} has cipher = \"{}\"; drop --experimental-passphrase to open it",
                         self.paths.config.display(),
                         cfg.cipher
                     ));
                     return;
                 }
-                match cfg.passkey {
+                match cfg.passphrase {
                     Some(meta) => {
-                        // Unlock phase: no label needed (the existing
-                        // credential carries its own from creation time).
-                        self.launch_passkey_server(PasskeyPhase::Unlock, Some(meta), None);
+                        if self.browser_auth {
+                            let instance = meta.instance.clone();
+                            self.launch_passphrase_server(
+                                PassphrasePhase::Unlock,
+                                Some(meta),
+                                &instance,
+                            );
+                        } else {
+                            self.passphrase_instance_value = meta.instance.clone();
+                            self.config.passphrase = Some(meta);
+                            self.passphrase_phase = Some(PassphrasePhase::Unlock);
+                            self.screen = Screen::PassphraseUnlock;
+                        }
                     }
                     None => {
                         self.error_is_fatal = true;
                         self.screen = Screen::Error(format!(
-                            "{} is marked as passkey but has no [passkey] block — \
+                            "{} is marked as passphrase but has no [passphrase] block — \
                              this config is broken; restore from backup or recreate",
                             self.paths.config.display()
                         ));
@@ -556,91 +524,164 @@ impl App {
         }
     }
 
-    /// Start the passkey HTTP server with the given phase, existing meta
-    /// (Unlock only), and optional label (Setup only). Shared by both the
-    /// Unlock branch of `start_passkey_ceremony` and the Setup branch
-    /// once the label-prompt screen accepts a name.
-    fn launch_passkey_server(
+    fn launch_passphrase_server(
         &mut self,
-        phase: PasskeyPhase,
-        existing: Option<PasskeyMeta>,
-        user_label: Option<String>,
+        phase: PassphrasePhase,
+        existing: Option<PassphraseMeta>,
+        instance: &str,
     ) {
-        match passkey::start(self.server_port, phase, existing, user_label) {
+        match passphrase::start(self.server_port, phase, existing, instance) {
             Ok(h) => {
-                self.passkey_short_url = Some(h.short_url.clone());
-                self.passkey_setup_code = h.setup_code.clone();
-                self.passkey_phase = Some(h.phase);
-                self.passkey_handle = Some(h);
-                self.screen = Screen::PasskeyUrl;
+                self.passphrase_short_url = Some(h.short_url.clone());
+                self.passphrase_setup_code = h.setup_code.clone();
+                self.passphrase_phase = Some(h.phase);
+                self.passphrase_handle = Some(h);
+                self.screen = Screen::PassphraseUrl;
             }
             Err(e) => {
                 self.error_is_fatal = true;
-                self.screen = Screen::Error(format!("starting passkey server: {e:#}"));
+                self.screen = Screen::Error(format!("starting passphrase server: {e:#}"));
             }
         }
     }
 
-    /// Submit the typed label from `Screen::PasskeyLabelPrompt` and
-    /// launch the Setup(Create) server. Empty labels are rejected (the
-    /// key handler stays on the screen so the user can retry).
-    pub(crate) fn submit_passkey_label(&mut self) {
-        let label = self.passkey_label_input.value().trim().to_string();
-        if label.is_empty() {
+    pub(crate) fn submit_passphrase_instance(&mut self) {
+        let instance = self.passphrase_instance_input.value().trim().to_lowercase();
+        if !is_valid_instance(&instance) {
             return;
         }
-        // WebAuthn caps user.name at 64 bytes in the spec; truncate
-        // defensively to stay well within tolerance across browsers.
-        let label = truncate_passkey_label(label);
-        self.launch_passkey_server(PasskeyPhase::Setup(SetupMode::Create), None, Some(label));
-    }
-
-    /// Activate the current selection on `Screen::PasskeySetupChoice`.
-    /// Create routes through `Screen::PasskeyLabelPrompt` (the label is
-    /// only meaningful when `create()` is called); Import launches the
-    /// server straight away with no label.
-    fn activate_passkey_setup_choice(&mut self) {
-        match self.passkey_setup_choice_state.selected().unwrap_or(0) {
-            0 => {
-                // Prefill the label from the config dir's basename if
-                // usable, so the common case is just Enter.
-                let default_label = default_passkey_label(&self.paths).unwrap_or_default();
-                self.passkey_label_input = Input::new(default_label);
-                self.screen = Screen::PasskeyLabelPrompt;
-            }
-            _ => {
-                self.launch_passkey_server(PasskeyPhase::Setup(SetupMode::Import), None, None);
-            }
+        self.passphrase_instance_value = instance.clone();
+        if self.browser_auth {
+            self.launch_passphrase_server(PassphrasePhase::Setup, None, &instance);
+        } else {
+            self.passphrase_phase = Some(PassphrasePhase::Setup);
+            self.field_focus = 0;
+            self.passphrase_input = Input::default();
+            self.passphrase_confirm = Input::default();
+            self.passphrase_error = None;
+            self.screen = Screen::PassphraseSetup;
         }
     }
 
-    /// Non-blocking check for completion of the passkey ceremony. Called
-    /// each tick by the main loop while in Screen::PasskeyUrl. On Ok: stash
-    /// the cipher, stop the server, load config. On Err: show inline error
-    /// but keep the server running so the user can retry in the browser.
-    pub(crate) fn try_advance_passkey(&mut self) {
-        let Some(h) = self.passkey_handle.as_ref() else { return };
+    pub(crate) fn submit_passphrase_setup(&mut self) {
+        let passphrase = self.passphrase_input.value().to_string();
+        let confirm = self.passphrase_confirm.value().to_string();
+        if let Some(err) = passphrase::passphrase_policy_error(&passphrase) {
+            self.passphrase_error = Some(err.to_string());
+            return;
+        }
+        if passphrase != confirm {
+            self.passphrase_error = Some("Passphrases do not match.".to_string());
+            return;
+        }
+        self.passphrase_error = None;
+        self.screen = Screen::PassphraseDerivingKey;
+    }
+
+    pub(crate) fn submit_passphrase_unlock(&mut self) {
+        if self.passphrase_input.value().is_empty() {
+            return;
+        }
+        self.passphrase_error = None;
+        self.screen = Screen::PassphraseDerivingKey;
+    }
+
+    pub(crate) fn derive_passphrase_key(&mut self) {
+        let passphrase = self.passphrase_input.value().to_string();
+        let is_setup = self.passphrase_phase == Some(PassphrasePhase::Setup);
+
+        let salt: Vec<u8> = if is_setup {
+            let s: [u8; 32] = rand::random();
+            s.to_vec()
+        } else {
+            let meta = self.config.passphrase.as_ref().expect("unlock requires meta");
+            match base64::engine::general_purpose::STANDARD.decode(&meta.salt) {
+                Ok(s) => s,
+                Err(e) => {
+                    self.error_is_fatal = true;
+                    self.screen = Screen::Error(format!("bad salt in config: {e}"));
+                    return;
+                }
+            }
+        };
+
+        let config_key = match passphrase::derive_config_key(&passphrase, &salt) {
+            Ok(k) => k,
+            Err(e) => {
+                self.error_is_fatal = true;
+                self.screen = Screen::Error(format!("key derivation: {e}"));
+                return;
+            }
+        };
+
+        if is_setup {
+            let instance_sig =
+                passphrase::compute_instance_sig(&self.passphrase_instance_value, &config_key);
+            let meta = PassphraseMeta {
+                instance: self.passphrase_instance_value.clone(),
+                instance_sig,
+                salt: base64::engine::general_purpose::STANDARD.encode(&salt),
+            };
+            self.cipher = Some(Cipher::Passphrase { key: config_key });
+            self.load_config_or_set_fatal();
+            self.config.passphrase = Some(meta);
+            if let Some(cipher) = self.cipher.as_ref()
+                && let Err(e) = config::save(&self.config, &self.paths, cipher)
+            {
+                self.error_is_fatal = true;
+                self.screen = Screen::Error(format!(
+                    "Setup succeeded but writing {} failed: {e:#}.",
+                    self.paths.config.display()
+                ));
+            }
+        } else {
+            let meta = self.config.passphrase.as_ref().expect("unlock requires meta");
+            if !passphrase::verify_instance_sig(
+                &meta.instance,
+                &config_key,
+                &meta.instance_sig,
+            ) {
+                self.passphrase_error = Some(
+                    "Wrong passphrase (or config.toml was corrupted).".to_string(),
+                );
+                self.passphrase_input = Input::default();
+                self.screen = Screen::PassphraseUnlock;
+                return;
+            }
+            self.cipher = Some(Cipher::Passphrase { key: config_key });
+            self.load_config_or_set_fatal();
+        }
+        self.clear_passphrase_scratch();
+    }
+
+    fn clear_passphrase_scratch(&mut self) {
+        self.passphrase_input = Input::default();
+        self.passphrase_confirm = Input::default();
+        self.passphrase_instance_input = Input::default();
+        self.passphrase_instance_value.clear();
+        self.passphrase_error = None;
+        self.passphrase_short_url = None;
+        self.passphrase_setup_code = None;
+        self.passphrase_phase = None;
+    }
+
+    pub(crate) fn try_advance_passphrase(&mut self) {
+        let Some(h) = self.passphrase_handle.as_ref() else {
+            return;
+        };
         let outcome = match h.rx.try_recv() {
             Ok(o) => o,
             Err(std_mpsc::TryRecvError::Empty) => return,
             Err(std_mpsc::TryRecvError::Disconnected) => return,
         };
-        self.cipher = Some(Cipher::Passkey { key: outcome.key });
-        if let Some(h) = self.passkey_handle.take() {
+        self.cipher = Some(Cipher::Passphrase { key: outcome.key });
+        if let Some(h) = self.passphrase_handle.take() {
             h.stop();
         }
-        self.passkey_short_url = None;
-        self.passkey_setup_code = None;
-        self.passkey_phase = None;
+        self.clear_passphrase_scratch();
         self.load_config_or_set_fatal();
-        // Setup ceremony just produced fresh metadata — splice it into the
-        // (empty, default) config and persist immediately so the next launch
-        // can peek at the [passkey] block and route through Unlock. Without
-        // this save, no config.toml ever lands on disk for a fresh dir, and
-        // the user gets stuck re-running Setup every launch. Skipped on
-        // Unlock because the meta was already there.
         if let Some(meta) = outcome.new_meta {
-            self.config.passkey = Some(meta);
+            self.config.passphrase = Some(meta);
             if let Some(cipher) = self.cipher.as_ref()
                 && let Err(e) = config::save(&self.config, &self.paths, cipher)
             {
@@ -1205,7 +1246,7 @@ impl App {
                     return;
                 }
             },
-            Some(Cipher::Passkey { key }) => passkey::derive_share_signing_key(key),
+            Some(Cipher::Passphrase { key }) => passphrase::derive_share_signing_key(key),
             None => {
                 self.share_error = Some("internal: cipher not available".into());
                 return;
@@ -1303,45 +1344,58 @@ impl App {
                 _ => {}
             },
 
-            Screen::PasskeySetupChoice => match key.code {
-                KeyCode::Down | KeyCode::Char('j') => self.passkey_setup_choice_state.select_next(),
-                KeyCode::Up | KeyCode::Char('k') => self.passkey_setup_choice_state.select_previous(),
-                KeyCode::PageDown => {
-                    let step = self.page_step();
-                    page_select(&mut self.passkey_setup_choice_state, PASSKEY_SETUP_MENU.len(), true, step);
-                }
-                KeyCode::PageUp => {
-                    let step = self.page_step();
-                    page_select(&mut self.passkey_setup_choice_state, PASSKEY_SETUP_MENU.len(), false, step);
-                }
-                // No previous screen to back to — the user launched with
-                // --experimental-passkey on an empty config dir. Match
-                // PasskeyLabelPrompt's behavior and quit on Esc.
-                KeyCode::Esc => self.quit = true,
-                KeyCode::Enter => self.activate_passkey_setup_choice(),
-                _ => {}
-            },
-
-            Screen::PasskeyLabelPrompt => match key.code {
-                // Enter submits the typed label and launches the Setup
-                // ceremony. Empty input keeps the user on the screen.
-                KeyCode::Enter => self.submit_passkey_label(),
-                // Esc quits — there's no previous screen to back to,
-                // we haven't started the server yet, no cleanup needed.
-                // ('q' would be eaten as input, so don't bind it here.)
+            Screen::PassphraseInstancePrompt => match key.code {
+                KeyCode::Enter => self.submit_passphrase_instance(),
                 KeyCode::Esc => {
                     self.quit = true;
                 }
                 _ => {
-                    self.passkey_label_input.handle_event(&Event::Key(key));
+                    self.passphrase_instance_input.handle_event(&Event::Key(key));
                 }
             },
 
-            Screen::PasskeyUrl => match key.code {
-                // The browser-side ceremony does the real work; only let the
-                // user bail. Stopping the handle on quit cleans up the port.
+            Screen::PassphraseSetup => {
+                const N: usize = 2;
+                match key.code {
+                    KeyCode::Tab | KeyCode::Down => {
+                        self.field_focus = (self.field_focus + 1) % N;
+                    }
+                    KeyCode::BackTab | KeyCode::Up => {
+                        self.field_focus = (self.field_focus + N - 1) % N;
+                    }
+                    KeyCode::Enter => self.submit_passphrase_setup(),
+                    KeyCode::Esc => {
+                        self.passphrase_input = Input::default();
+                        self.passphrase_confirm = Input::default();
+                        self.passphrase_error = None;
+                        self.field_focus = 0;
+                        self.screen = Screen::PassphraseInstancePrompt;
+                    }
+                    _ => {
+                        let buf: &mut Input = match self.field_focus {
+                            0 => &mut self.passphrase_input,
+                            _ => &mut self.passphrase_confirm,
+                        };
+                        buf.handle_event(&Event::Key(key));
+                    }
+                }
+            }
+
+            Screen::PassphraseUnlock => match key.code {
+                KeyCode::Enter => self.submit_passphrase_unlock(),
+                KeyCode::Esc => {
+                    self.quit = true;
+                }
+                _ => {
+                    self.passphrase_input.handle_event(&Event::Key(key));
+                }
+            },
+
+            Screen::PassphraseDerivingKey => {}
+
+            Screen::PassphraseUrl => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
-                    if let Some(h) = self.passkey_handle.take() {
+                    if let Some(h) = self.passphrase_handle.take() {
                         h.stop();
                     }
                     self.quit = true;
@@ -2033,18 +2087,6 @@ impl App {
                     self.activate_first_run();
                 }
             }
-            Screen::PasskeySetupChoice => {
-                if let Some(idx) = click_to_index(
-                    area,
-                    self.passkey_setup_choice_state.offset(),
-                    PASSKEY_SETUP_MENU.len(),
-                    row,
-                    col,
-                ) {
-                    self.passkey_setup_choice_state.select(Some(idx));
-                    self.activate_passkey_setup_choice();
-                }
-            }
             Screen::Home => {
                 let len = self.config.profiles.len();
                 if let Some(idx) =
@@ -2153,13 +2195,6 @@ impl App {
                     self.first_run_state.select_next();
                 } else {
                     self.first_run_state.select_previous();
-                }
-            }
-            Screen::PasskeySetupChoice => {
-                if down {
-                    self.passkey_setup_choice_state.select_next();
-                } else {
-                    self.passkey_setup_choice_state.select_previous();
                 }
             }
             Screen::Home => {
@@ -2300,22 +2335,24 @@ mod tests {
     }
 
     #[test]
-    fn truncate_passkey_label_preserves_utf8_boundaries() {
-        let label = "é".repeat(33);
-        let truncated = truncate_passkey_label(label);
-        assert_eq!(truncated.len(), 64);
-        assert_eq!(truncated.chars().count(), 32);
-
-        let mixed = format!("{}é", "a".repeat(63));
-        let truncated = truncate_passkey_label(mixed);
-        assert_eq!(truncated, "a".repeat(63));
-        assert!(truncated.len() <= 64);
+    fn valid_instance() {
+        assert!(is_valid_instance("mysite"));
+        assert!(is_valid_instance("a"));
+        assert!(is_valid_instance("my-site"));
+        assert!(is_valid_instance("a1b2"));
+        assert!(is_valid_instance("a-b-c"));
+        assert!(is_valid_instance("1abc"));
     }
 
     #[test]
-    fn truncate_passkey_label_leaves_short_labels_unchanged() {
-        let label = "personal-config".to_string();
-        assert_eq!(truncate_passkey_label(label.clone()), label);
+    fn invalid_instance() {
+        assert!(!is_valid_instance(""));
+        assert!(!is_valid_instance("-start"));
+        assert!(!is_valid_instance("end-"));
+        assert!(!is_valid_instance("UPPER"));
+        assert!(!is_valid_instance("has space"));
+        assert!(!is_valid_instance("has.dot"));
+        assert!(!is_valid_instance(&"a".repeat(33)));
     }
 
     #[test]
@@ -2355,7 +2392,7 @@ mod tests {
             std::process::id(),
             uniq()
         ));
-        let mut app = App::boot(Some(tmp), 7834, false).expect("boot");
+        let mut app = App::boot(Some(tmp), 7834, false, false).expect("boot");
         app.snapshots = snaps;
         app
     }

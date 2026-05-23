@@ -13,7 +13,7 @@ pub fn is_age_encrypted(value: &str) -> bool {
     value.trim_start().starts_with(AGEENC_PREFIX)
 }
 
-pub fn is_passkey_encrypted(value: &str) -> bool {
+pub fn is_passphrase_encrypted(value: &str) -> bool {
     value.trim_start().starts_with(PKENC_PREFIX)
 }
 
@@ -37,9 +37,9 @@ pub fn decrypt_value(value: &str, identity: &Identity) -> Result<String> {
 }
 
 /// Encrypt a single value with ChaCha20-Poly1305. `key` is the 32-byte AEAD
-/// key (typically the HKDF-derived passkey config key). Output is single-line:
+/// key (typically the passphrase-derived config key). Output is single-line:
 /// `pkenc:base64(nonce(12) || ciphertext || tag(16))`.
-pub fn encrypt_passkey_value(plaintext: &str, key: &[u8; 32]) -> Result<String> {
+pub fn encrypt_passphrase_value(plaintext: &str, key: &[u8; 32]) -> Result<String> {
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
     let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
     let mut blob = cipher
@@ -51,7 +51,7 @@ pub fn encrypt_passkey_value(plaintext: &str, key: &[u8; 32]) -> Result<String> 
     Ok(format!("{PKENC_PREFIX}{}", BASE64.encode(&out)))
 }
 
-pub fn decrypt_passkey_value(value: &str, key: &[u8; 32]) -> Result<String> {
+pub fn decrypt_passphrase_value(value: &str, key: &[u8; 32]) -> Result<String> {
     let encoded = value
         .trim()
         .strip_prefix(PKENC_PREFIX)
@@ -71,14 +71,14 @@ pub fn decrypt_passkey_value(value: &str, key: &[u8; 32]) -> Result<String> {
 }
 
 /// Dispatch backend for per-value encrypt/decrypt. Constructed once on app
-/// boot from either an age identity (default) or a passkey-derived config
-/// key (`--experimental-passkey`), then threaded into `config::load` / `save`.
+/// boot from either an age identity (default) or a passphrase-derived config
+/// key (`--experimental-passphrase`), then threaded into `config::load` / `save`.
 pub enum Cipher {
     Age {
         identity: Identity,
         recipient: Recipient,
     },
-    Passkey {
+    Passphrase {
         key: [u8; 32],
     },
 }
@@ -92,7 +92,7 @@ impl std::fmt::Debug for Cipher {
                 .debug_struct("Cipher::Age")
                 .field("recipient", &recipient.to_string())
                 .finish(),
-            Cipher::Passkey { .. } => f.debug_struct("Cipher::Passkey").finish(),
+            Cipher::Passphrase { .. } => f.debug_struct("Cipher::Passphrase").finish(),
         }
     }
 }
@@ -101,7 +101,7 @@ impl Cipher {
     pub fn encrypt(&self, plaintext: &str) -> Result<String> {
         match self {
             Cipher::Age { recipient, .. } => encrypt_value(plaintext, recipient),
-            Cipher::Passkey { key } => encrypt_passkey_value(plaintext, key),
+            Cipher::Passphrase { key } => encrypt_passphrase_value(plaintext, key),
         }
     }
 
@@ -113,11 +113,11 @@ impl Cipher {
                 }
                 decrypt_value(value, identity)
             }
-            Cipher::Passkey { key } => {
-                if !is_passkey_encrypted(value) {
-                    bail!("expected `{PKENC_PREFIX}` value (this config dir is passkey mode)");
+            Cipher::Passphrase { key } => {
+                if !is_passphrase_encrypted(value) {
+                    bail!("expected `{PKENC_PREFIX}` value (this config dir is passphrase mode)");
                 }
-                decrypt_passkey_value(value, key)
+                decrypt_passphrase_value(value, key)
             }
         }
     }
@@ -127,7 +127,7 @@ impl Cipher {
     pub fn prefix(&self) -> &'static str {
         match self {
             Cipher::Age { .. } => AGEENC_PREFIX,
-            Cipher::Passkey { .. } => PKENC_PREFIX,
+            Cipher::Passphrase { .. } => PKENC_PREFIX,
         }
     }
 }
@@ -160,8 +160,8 @@ mod tests {
         assert!(is_age_encrypted("   ageenc:AAAA"));
         assert!(!is_age_encrypted(""));
         assert!(!is_age_encrypted("plain"));
-        assert!(is_passkey_encrypted("pkenc:AAAA"));
-        assert!(!is_passkey_encrypted("ageenc:AAAA"));
+        assert!(is_passphrase_encrypted("pkenc:AAAA"));
+        assert!(!is_passphrase_encrypted("ageenc:AAAA"));
     }
 
     #[test]
@@ -173,30 +173,30 @@ mod tests {
     #[test]
     fn pkenc_round_trip() {
         let key = [0x42u8; 32];
-        let enc = encrypt_passkey_value("hunter2", &key).unwrap();
+        let enc = encrypt_passphrase_value("hunter2", &key).unwrap();
         assert!(enc.starts_with(PKENC_PREFIX));
         assert!(!enc.contains('\n'));
-        assert_eq!(decrypt_passkey_value(&enc, &key).unwrap(), "hunter2");
+        assert_eq!(decrypt_passphrase_value(&enc, &key).unwrap(), "hunter2");
     }
 
     #[test]
     fn pkenc_wrong_key_fails() {
         let k1 = [0x01u8; 32];
         let k2 = [0x02u8; 32];
-        let enc = encrypt_passkey_value("secret", &k1).unwrap();
-        assert!(decrypt_passkey_value(&enc, &k2).is_err());
+        let enc = encrypt_passphrase_value("secret", &k1).unwrap();
+        assert!(decrypt_passphrase_value(&enc, &k2).is_err());
     }
 
     #[test]
     fn pkenc_tampered_fails() {
         let key = [0x33u8; 32];
-        let mut enc = encrypt_passkey_value("data", &key).unwrap();
+        let mut enc = encrypt_passphrase_value("data", &key).unwrap();
         // Flip a character in the base64 body to corrupt the ciphertext/tag.
         let body_start = PKENC_PREFIX.len();
         let bytes = unsafe { enc.as_bytes_mut() };
         let i = body_start + 5;
         bytes[i] = if bytes[i] == b'A' { b'B' } else { b'A' };
-        assert!(decrypt_passkey_value(&enc, &key).is_err());
+        assert!(decrypt_passphrase_value(&enc, &key).is_err());
     }
 
     #[test]
@@ -213,8 +213,8 @@ mod tests {
     }
 
     #[test]
-    fn cipher_dispatch_passkey() {
-        let cipher = Cipher::Passkey { key: [0x77u8; 32] };
+    fn cipher_dispatch_passphrase() {
+        let cipher = Cipher::Passphrase { key: [0x77u8; 32] };
         let enc = cipher.encrypt("payload").unwrap();
         assert!(enc.starts_with(PKENC_PREFIX));
         assert_eq!(cipher.decrypt(&enc).unwrap(), "payload");
