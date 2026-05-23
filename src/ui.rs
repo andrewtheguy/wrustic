@@ -932,7 +932,7 @@ fn render_passkey_url(frame: &mut Frame, app: &mut App, area: Rect) {
                 lines.push_str(
                     "The browser will prompt you to create a new passkey on this device.\n\
                      wrustic uses the WebAuthn PRF extension to derive an encryption key from it.\n\
-                     The key never leaves your device.\n\n\
+                     The passkey secret never leaves your authenticator.\n\n\
                      WARNING: losing this passkey means losing access to the config.\n",
                 );
             }
@@ -941,7 +941,7 @@ fn render_passkey_url(frame: &mut Frame, app: &mut App, area: Rect) {
                     "The browser will let you pick a passkey already known to it (e.g. one\n\
                      synced from another device via your password manager).\n\
                      wrustic uses the WebAuthn PRF extension to derive an encryption key from\n\
-                     the passkey you pick. The key never leaves your device.\n\n\
+                     the passkey you pick. The passkey secret never leaves your authenticator.\n\n\
                      NOTE: this starts a fresh wrustic config under a new salt — it will\n\
                      not decrypt an existing config from another machine.\n",
                 );

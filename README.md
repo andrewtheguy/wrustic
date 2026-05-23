@@ -59,13 +59,13 @@ cargo run
 ### CLI flags
 
 ```text
-wrustic [-c|--config-dir <PATH>] [-h|--help]
+wrustic [-c|--config-dir <PATH>] [-p|--port <N>] [--experimental-passkey] [-h|--help]
 ```
 
 `--config-dir <PATH>` overrides the default config location
 (`~/.config/wrustic`). The override applies to both the age identity file
 (`<PATH>/age.key`) and the encrypted profile store
-(`<PATH>/config.toml.age`). Useful for keeping separate profile sets, running
+(`<PATH>/config.toml`). Useful for keeping separate profile sets, running
 tests, or driving an automation/CI flow against a throwaway directory:
 
 ```sh
@@ -73,6 +73,11 @@ cargo run -- --config-dir ./tmp/wrustic-sandbox
 ```
 
 The directory is created on first run if it doesn't exist.
+
+`--port <N>` selects the localhost port for the file-share dialog and the
+experimental passkey ceremony. `--experimental-passkey` uses WebAuthn PRF
+passkey encryption instead of age and requires an explicit `--config-dir`
+while it is experimental.
 
 First run: if `<config-dir>/age.key` is missing, the welcome screen asks
 whether to **create a new key** or **restore an existing one** (copy your

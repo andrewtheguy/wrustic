@@ -101,7 +101,7 @@ over the target.
 
 Two ciphers are supported, per-value (not whole-file) so non-secret edits
 diff cleanly: age x25519 (`ageenc:` prefix, default) and ChaCha20-Poly1305
-keyed from a WebAuthn PRF output (`pkenc:` prefix, behind
+keyed from a WebAuthn PRF + HKDF-derived config key (`pkenc:` prefix, behind
 `--experimental-passkey`). The two are deliberately non-interoperable —
 the on-disk `cipher` marker plus a value-level prefix check on every
 decrypt keeps them from ever mixing.
@@ -136,7 +136,7 @@ Both servers follow the same shape so the patterns transfer:
   A URL minted for file A cannot be replayed against a later server bound to
   file B — the name is part of the HMAC.
 - HMAC signing key is derived from the age identity bytes (age mode) or from
-  the passkey PRF output (passkey mode, via `passkey::derive_share_signing_key`).
+  the passkey-derived config key (passkey mode, via `passkey::derive_share_signing_key`).
   Same key per identity → URLs survive across restarts within the TTL.
 - Routes:
   - `GET /dl?snap=…&tree=…&exp=…&sig=…` — verifies sig + expiry, streams the
@@ -151,7 +151,7 @@ Both servers follow the same shape so the patterns transfer:
 
 This is the other localhost server — same shape as the share dialog (own OS
 thread, current-thread tokio runtime, RAII handle), but bidirectional: the
-browser POSTs the WebAuthn PRF output back to localhost, and the server
+browser POSTs the derived config key back to localhost through an encrypted envelope, and the server
 hands it to the App via an mpsc channel that the main loop polls every
 150 ms while `Screen::PasskeyUrl` is up (see `main.rs:277`).
 

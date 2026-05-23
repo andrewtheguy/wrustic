@@ -169,7 +169,7 @@ pub struct PasskeyMeta {
     /// stored purely for informational reference (e.g. surfacing on the
     /// Unlock screen so the user knows which passkey this config expects).
     /// **Not cryptographically tied to `credential_id`, `prf_salt`, or the
-    /// PRF output** — the authenticator carries the canonical label inside
+    /// passkey-derived config key** — the authenticator carries the canonical label inside
     /// the credential, and the encryption key is derived only from
     /// `HMAC(authenticator hmac-secret, prf_salt)`. `None` for
     /// Setup(Import) (we never asked the user for a label) and for any

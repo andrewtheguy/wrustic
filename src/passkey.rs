@@ -18,7 +18,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use bytes::Bytes;
 use hkdf::Hkdf;
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
-use hyper::header::{CACHE_CONTROL, CONTENT_TYPE, HeaderValue};
+use hyper::header::{CACHE_CONTROL, CONTENT_TYPE, HeaderName, HeaderValue};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
@@ -74,9 +74,10 @@ const SETUP_CODE_ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
 const SETUP_CODE_LEN: usize = 6;
 
 /// Result handed back to App when the browser completes the ceremony.
-/// The 32-byte key is the WebAuthn PRF output (used as the AEAD key in
-/// `Cipher::Passkey`); `new_meta` is `Some` only on Setup so the App can
-/// stash the credential id + salt into the next `config::save`.
+/// The 32-byte key is derived in the browser from the WebAuthn PRF output
+/// (used as the AEAD key in `Cipher::Passkey`); `new_meta` is `Some` only
+/// on Setup so the App can stash the credential id + salt into the next
+/// `config::save`.
 ///
 /// The channel only ever carries success; browser-side errors surface as
 /// HTTP error responses on the same page so the user can retry, and don't
@@ -139,26 +140,14 @@ impl Drop for PasskeyHandle {
 }
 
 // 16 hex chars (64 bits) of randomness for the short URL id, same as share.rs.
-fn random_short_id() -> String {
-    let mut buf = [0u8; 8];
-    let filled = std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut buf))
-        .is_ok();
-    if !filled {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
-        let pid = std::process::id();
-        let mix = (nanos as u64) ^ ((pid as u64) << 32);
-        buf.copy_from_slice(&mix.to_le_bytes());
-    }
+fn random_short_id() -> Result<String> {
+    let buf = random_bytes(8)?;
     let mut s = String::with_capacity(16);
     use std::fmt::Write;
     for b in &buf {
         write!(s, "{b:02x}").unwrap();
     }
-    s
+    Ok(s)
 }
 
 /// 6-character Setup-confirmation code drawn from SETUP_CODE_ALPHABET.
@@ -208,8 +197,15 @@ const TRANSPORT_HKDF_INFO: &[u8] = b"wrustic-passkey-transport-v1";
 // AES-GCM defaults to 12 bytes; the AES-GCM spec recommends 12.
 const TRANSPORT_NONCE_LEN: usize = 12;
 
+// Browser-side HKDF info label for turning the WebAuthn PRF output into the
+// 32-byte config AEAD key. The raw PRF output is imported into WebCrypto as a
+// non-extractable HKDF key; only this domain-separated config key is exported
+// at the last possible moment and sent through the encrypted localhost
+// transport so the Rust process can decrypt config.toml.
+const CONFIG_KEY_HKDF_INFO_JS: &str = "wrustic-passkey-config-v1";
+
 /// Hybrid (ECDH + AEAD) transport-encryption layer for the inline JS to
-/// post WebAuthn secrets (notably the PRF output) to the localhost
+/// post WebAuthn-derived secrets (the config key) to the localhost
 /// server without putting them on the wire as plaintext. The threat
 /// model this defends against: a co-tenant on the same machine able to
 /// sniff loopback (CAP_NET_RAW), a malicious browser extension reading
@@ -344,7 +340,7 @@ struct Ctx {
     // Tripped after too many wrong setup codes. Treated by the route
     // dispatcher as equivalent to the deadline having passed.
     killed: AtomicBool,
-    // Send the PRF output (or an error) back to the App, exactly once.
+    // Send the derived config key back to the App, exactly once.
     outcome_tx: std::sync::Mutex<Option<std_mpsc::Sender<PasskeyOutcome>>>,
     // Wall-clock cap. Once now >= deadline, every route returns 403.
     deadline: Instant,
@@ -353,6 +349,10 @@ struct Ctx {
     // key, derives an AES-256-GCM key via HKDF-SHA256, and posts an
     // encrypted envelope on every /api/* route. See `ServerTransport`.
     transport: ServerTransport,
+    // Per-page CSP nonce. This lets the ceremony keep a single inline script
+    // without allowing injected <script> tags if a future template value is
+    // mishandled.
+    script_nonce: String,
 }
 
 impl Ctx {
@@ -386,7 +386,7 @@ pub(crate) fn start(
     let (prf_salt_b64, credential_id_b64) = match phase {
         PasskeyPhase::Setup(_) => {
             // Fresh 16-byte salt; the browser will use this same value on
-            // every subsequent unlock so PRF outputs match.
+            // every subsequent unlock so the derived config key matches.
             let salt = random_bytes(16)?;
             (BASE64.encode(&salt), String::new())
         }
@@ -397,7 +397,7 @@ pub(crate) fn start(
         }
     };
 
-    let short_id = random_short_id();
+    let short_id = random_short_id()?;
     // User-facing host is `localhost` (better browser/authenticator
     // compatibility); the listener binds to 127.0.0.1 above. The 64-bit
     // hex `short_id` is the actual auth credential — every route below
@@ -417,6 +417,7 @@ pub(crate) fn start(
     let (outcome_tx, outcome_rx) = std_mpsc::channel::<PasskeyOutcome>();
     let deadline = Instant::now() + PASSKEY_TTL;
     let transport = ServerTransport::generate()?;
+    let script_nonce = BASE64.encode(random_bytes(16)?);
 
     let ctx = Arc::new(Ctx {
         phase,
@@ -430,6 +431,7 @@ pub(crate) fn start(
         outcome_tx: std::sync::Mutex::new(Some(outcome_tx)),
         deadline,
         transport,
+        script_nonce,
     });
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -518,6 +520,33 @@ fn json_ok() -> Response<RespBody> {
     full_resp(StatusCode::OK, "application/json", b"{\"ok\":true}".to_vec())
 }
 
+fn html_resp(ctx: &Ctx) -> Response<RespBody> {
+    let mut resp = full_resp(
+        StatusCode::OK,
+        "text/html; charset=utf-8",
+        render_html(ctx).into_bytes(),
+    );
+    let csp = format!(
+        "default-src 'none'; \
+         script-src 'nonce-{nonce}'; \
+         style-src 'unsafe-inline'; \
+         connect-src 'self'; \
+         base-uri 'none'; \
+         form-action 'none'; \
+         frame-ancestors 'none'",
+        nonce = ctx.script_nonce,
+    );
+    resp.headers_mut().insert(
+        HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_str(&csp).expect("CSP header is valid ASCII"),
+    );
+    resp.headers_mut().insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    resp
+}
+
 async fn handle(
     req: Request<hyper::body::Incoming>,
     ctx: Arc<Ctx>,
@@ -558,11 +587,7 @@ async fn handle(
 
     let method = req.method().clone();
     match (method, rest) {
-        (Method::GET, "") | (Method::GET, "/") => Ok(full_resp(
-            StatusCode::OK,
-            "text/html; charset=utf-8",
-            render_html(&ctx).into_bytes(),
-        )),
+        (Method::GET, "") | (Method::GET, "/") => Ok(html_resp(&ctx)),
         (Method::POST, "/api/check-code") if matches!(ctx.phase, PasskeyPhase::Setup(_)) => {
             Ok(handle_check_setup_code(req, ctx).await)
         }
@@ -591,19 +616,17 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     acc == 0
 }
 
-#[derive(Deserialize)]
 struct SetupBody {
     credential_id: String,
-    prf: String,
+    config_key: [u8; 32],
     /// 6-digit code printed on the TUI; the user types it in the browser
     /// before either "Create new passkey" or "Use existing passkey" can
     /// complete. Compared constant-time against `ctx.setup_code`.
     setup_code: String,
 }
 
-#[derive(Deserialize)]
 struct UnlockBody {
-    prf: String,
+    config_key: [u8; 32],
 }
 
 async fn read_body(req: Request<hyper::body::Incoming>) -> Result<Vec<u8>, std::io::Error> {
@@ -617,10 +640,10 @@ async fn read_body(req: Request<hyper::body::Incoming>) -> Result<Vec<u8>, std::
 
 /// Shared body-read + envelope-decrypt for every POST /api/* route. The
 /// inline JS wraps each request body in `{client_pub, nonce, ciphertext}`;
-/// this returns the decrypted inner bytes (which are then `serde_json::
-/// from_slice`'d into the route-specific struct) or an HTTP error
-/// response if anything in the envelope is malformed. Pulling the
-/// pattern out keeps every handler one match arm instead of three.
+/// this returns the decrypted inner bytes (which are then parsed by the
+/// route-specific JSON or binary parser) or an HTTP error response if
+/// anything in the envelope is malformed. Pulling the pattern out keeps
+/// every handler one match arm instead of three.
 async fn read_and_decrypt(
     req: Request<hyper::body::Incoming>,
     ctx: &Arc<Ctx>,
@@ -633,17 +656,61 @@ async fn read_and_decrypt(
     ctx.transport.decrypt(&env).map_err(|e| e.http_response())
 }
 
-fn decode_prf(b64: &str) -> Result<[u8; 32], String> {
-    let raw = BASE64.decode(b64).map_err(|e| format!("invalid base64 prf: {e}"))?;
+fn decode_config_key(raw: &[u8]) -> Result<[u8; 32], String> {
     if raw.len() != 32 {
         return Err(format!(
-            "expected 32-byte PRF output, got {} bytes",
+            "expected 32-byte config key, got {} bytes",
             raw.len()
         ));
     }
     let mut out = [0u8; 32];
-    out.copy_from_slice(&raw);
+    out.copy_from_slice(raw);
     Ok(out)
+}
+
+fn parse_setup_body(inner: &[u8]) -> Result<SetupBody, String> {
+    // Binary v1:
+    //   0      : version (1)
+    //   1..3   : credential id length, big-endian u16
+    //   ...    : credential id raw bytes
+    //   next   : setup code length, u8
+    //   ...    : setup code UTF-8
+    //   last 32: HKDF-derived config key
+    if inner.len() < 1 + 2 + 1 + 32 {
+        return Err(format!("setup payload too short: {} bytes", inner.len()));
+    }
+    if inner[0] != 1 {
+        return Err(format!("unsupported setup payload version {}", inner[0]));
+    }
+    let cred_len = u16::from_be_bytes([inner[1], inner[2]]) as usize;
+    let mut pos = 3usize;
+    if inner.len() < pos + cred_len + 1 + 32 {
+        return Err("setup payload credential_id length exceeds body".into());
+    }
+    let credential_id = BASE64.encode(&inner[pos..pos + cred_len]);
+    pos += cred_len;
+
+    let code_len = inner[pos] as usize;
+    pos += 1;
+    if inner.len() != pos + code_len + 32 {
+        return Err("setup payload has trailing or truncated bytes".into());
+    }
+    let setup_code = String::from_utf8(inner[pos..pos + code_len].to_vec())
+        .map_err(|e| format!("setup code is not UTF-8: {e}"))?;
+    pos += code_len;
+    let config_key = decode_config_key(&inner[pos..])?;
+
+    Ok(SetupBody {
+        credential_id,
+        config_key,
+        setup_code,
+    })
+}
+
+fn parse_unlock_body(inner: &[u8]) -> Result<UnlockBody, String> {
+    Ok(UnlockBody {
+        config_key: decode_config_key(inner)?,
+    })
 }
 
 /// Result of a setup-code gate check.
@@ -741,9 +808,9 @@ async fn handle_setup(req: Request<hyper::body::Incoming>, ctx: Arc<Ctx>) -> Res
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let parsed: SetupBody = match serde_json::from_slice(&inner) {
+    let parsed = match parse_setup_body(&inner) {
         Ok(v) => v,
-        Err(e) => return text(StatusCode::BAD_REQUEST, &format!("invalid JSON: {e}")),
+        Err(e) => return text(StatusCode::BAD_REQUEST, &format!("invalid setup payload: {e}")),
     };
     // Setup-code gate: re-checked even though the browser is expected to
     // have already pre-flighted the same code via /api/check-code. The
@@ -757,10 +824,6 @@ async fn handle_setup(req: Request<hyper::body::Incoming>, ctx: Arc<Ctx>) -> Res
     if parsed.credential_id.is_empty() {
         return text(StatusCode::BAD_REQUEST, "credential_id required");
     }
-    let key = match decode_prf(&parsed.prf) {
-        Ok(k) => k,
-        Err(e) => return text(StatusCode::BAD_REQUEST, &e),
-    };
     let meta = PasskeyMeta {
         credential_id: parsed.credential_id,
         prf_salt: ctx.prf_salt_b64.clone(),
@@ -770,7 +833,10 @@ async fn handle_setup(req: Request<hyper::body::Incoming>, ctx: Arc<Ctx>) -> Res
         // derivation — see PasskeyMeta::label.
         label: ctx.user_label.clone(),
     };
-    let outcome = PasskeyOutcome { key, new_meta: Some(meta) };
+    let outcome = PasskeyOutcome {
+        key: parsed.config_key,
+        new_meta: Some(meta),
+    };
     if ctx.deliver(outcome).is_err() {
         return text(StatusCode::CONFLICT, "passkey already provided this session");
     }
@@ -782,15 +848,14 @@ async fn handle_unlock(req: Request<hyper::body::Incoming>, ctx: Arc<Ctx>) -> Re
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let parsed: UnlockBody = match serde_json::from_slice(&inner) {
+    let parsed = match parse_unlock_body(&inner) {
         Ok(v) => v,
-        Err(e) => return text(StatusCode::BAD_REQUEST, &format!("invalid JSON: {e}")),
+        Err(e) => return text(StatusCode::BAD_REQUEST, &format!("invalid unlock payload: {e}")),
     };
-    let key = match decode_prf(&parsed.prf) {
-        Ok(k) => k,
-        Err(e) => return text(StatusCode::BAD_REQUEST, &e),
+    let outcome = PasskeyOutcome {
+        key: parsed.config_key,
+        new_meta: None,
     };
-    let outcome = PasskeyOutcome { key, new_meta: None };
     if ctx.deliver(outcome).is_err() {
         return text(StatusCode::CONFLICT, "passkey already provided this session");
     }
@@ -811,15 +876,15 @@ fn render_html(ctx: &Ctx) -> String {
         PasskeyPhase::Setup(SetupMode::Create) => {
             "Your browser will prompt you to create a new passkey on this \
              device. wrustic uses the WebAuthn PRF extension to derive an \
-             encryption key from that passkey — the key itself never leaves \
-             your device."
+             encryption key from that passkey. The passkey secret never \
+             leaves your authenticator."
         }
         PasskeyPhase::Setup(SetupMode::Import) => {
             "Your browser will let you pick a passkey already known to it \
              (e.g. one synced from another device via your password manager). \
              wrustic uses the WebAuthn PRF extension to derive an encryption \
-             key from the passkey you pick — the key itself never leaves \
-             your device."
+             key from the passkey you pick. The passkey secret never \
+             leaves your authenticator."
         }
         PasskeyPhase::Unlock => {
             "Your browser will prompt for the passkey you set up earlier. \
@@ -905,9 +970,9 @@ fn render_html(ctx: &Ctx) -> String {
 {setup_code_html}
 {buttons_html}
 <p><small>This page is served by the wrustic process on localhost. You can close it when finished.</small></p>
-<script>
-const PRF_SALT_B64 = {prf_salt_js};
-const CRED_ID_B64 = {cred_id_js};
+	<script nonce="{script_nonce_attr}">
+	const PRF_SALT_B64 = {prf_salt_js};
+	const CRED_ID_B64 = {cred_id_js};
 // User-chosen label shown in the browser's passkey picker / password
 // manager (`user.name` and `user.displayName` in WebAuthn.create). Empty
 // string on Unlock — that path uses .get() with allowCredentials and
@@ -917,9 +982,10 @@ const USER_LABEL = {user_label_js};
 // layer (see `ServerTransport` in passkey.rs). The page derives an
 // AES-256-GCM key per request via ECDH+HKDF and ships every POST body
 // inside `{{client_pub, nonce, ciphertext}}` so WebAuthn secrets never
-// hit the loopback wire as plaintext.
-const SERVER_PUB_B64 = {server_pub_js};
-const TRANSPORT_HKDF_INFO = new TextEncoder().encode("wrustic-passkey-transport-v1");
+	// hit the loopback wire as plaintext.
+	const SERVER_PUB_B64 = {server_pub_js};
+	const TRANSPORT_HKDF_INFO = new TextEncoder().encode("wrustic-passkey-transport-v1");
+	const CONFIG_KEY_HKDF_INFO = new TextEncoder().encode({config_key_hkdf_info_js});
 // The page itself is served at /auth/<key>, so derive the API prefix from
 // the browser's own URL — no template substitution needed, and the entire
 // ceremony stays scoped to this one keyed path. The trailing-slash strip
@@ -938,11 +1004,14 @@ function bytesToB64(bytes) {{
   for (let i = 0; i < arr.length; i++) bin += String.fromCharCode(arr[i]);
   return btoa(bin);
 }}
-function setStatus(text, kind) {{
-  const el = document.getElementById("status");
-  el.textContent = text;
-  el.className = kind || "note";
-}}
+	function setStatus(text, kind) {{
+	  const el = document.getElementById("status");
+	  el.textContent = text;
+	  el.className = kind || "note";
+	}}
+	function zeroBytes(bytes) {{
+	  if (bytes && typeof bytes.fill === "function") bytes.fill(0);
+	}}
 
 // Transport encryption: per-request ephemeral X25519 keypair → ECDH with
 // the server's pubkey → HKDF-SHA256 → AES-256-GCM. The derived AES key
@@ -953,31 +1022,31 @@ function setStatus(text, kind) {{
 // always exportable per the WebCrypto spec so we can send it to the
 // server. Requires WebCrypto X25519, broadly available in browsers from
 // 2025 onward (Chrome 133+, Firefox 130+, Safari 18.4+).
-async function importServerPub() {{
-  return crypto.subtle.importKey(
-    "raw", b64ToBytes(SERVER_PUB_B64),
-    {{ name: "X25519" }}, true, []
-  );
-}}
+	async function importServerPub() {{
+	  return crypto.subtle.importKey(
+	    "raw", b64ToBytes(SERVER_PUB_B64),
+	    {{ name: "X25519" }}, false, []
+	  );
+	}}
 
-async function deriveTransportKey(serverPub) {{
-  const clientPair = await crypto.subtle.generateKey(
-    {{ name: "X25519" }}, false, ["deriveBits", "deriveKey"]
-  );
-  const sharedBits = await crypto.subtle.deriveBits(
-    {{ name: "X25519", public: serverPub }},
-    clientPair.privateKey, 256
-  );
-  const ikm = await crypto.subtle.importKey(
-    "raw", sharedBits, {{ name: "HKDF" }}, false, ["deriveKey"]
-  );
-  const aesKey = await crypto.subtle.deriveKey(
-    {{ name: "HKDF", hash: "SHA-256",
-       salt: new Uint8Array(0), info: TRANSPORT_HKDF_INFO }},
-    ikm,
-    {{ name: "AES-GCM", length: 256 }},
-    false,
-    ["encrypt"]
+	async function deriveTransportKey(serverPub) {{
+	  const clientPair = await crypto.subtle.generateKey(
+	    {{ name: "X25519" }}, false, ["deriveBits", "deriveKey"]
+	  );
+	  const sharedKey = await crypto.subtle.deriveKey(
+	    {{ name: "X25519", public: serverPub }},
+	    clientPair.privateKey,
+	    {{ name: "HKDF" }},
+	    false,
+	    ["deriveKey"]
+	  );
+	  const aesKey = await crypto.subtle.deriveKey(
+	    {{ name: "HKDF", hash: "SHA-256",
+	       salt: new Uint8Array(0), info: TRANSPORT_HKDF_INFO }},
+	    sharedKey,
+	    {{ name: "AES-GCM", length: 256 }},
+	    false,
+	    ["encrypt"]
   );
   const clientPubBytes = new Uint8Array(
     await crypto.subtle.exportKey("raw", clientPair.publicKey)
@@ -985,39 +1054,52 @@ async function deriveTransportKey(serverPub) {{
   return {{ aesKey, clientPubBytes }};
 }}
 
-// Encrypt an arbitrary JSON-serializable payload into the envelope the
-// server expects on every /api/* route. Caller uses the returned object
-// directly as the fetch body (after JSON.stringify).
-async function encryptPayload(payload) {{
-  const serverPub = await importServerPub();
-  const {{ aesKey, clientPubBytes }} = await deriveTransportKey(serverPub);
-  const nonce = crypto.getRandomValues(new Uint8Array(12));
-  const plaintext = new TextEncoder().encode(JSON.stringify(payload));
-  const ct = new Uint8Array(await crypto.subtle.encrypt(
-    {{ name: "AES-GCM", iv: nonce }},
-    aesKey, plaintext
+	// Encrypt arbitrary bytes into the envelope the server expects on every
+	// /api/* route. Callers that handle secrets build byte arrays directly so
+	// the temporary buffers can be zeroed after encryption.
+	async function encryptBytes(plaintext) {{
+	  const serverPub = await importServerPub();
+	  const {{ aesKey, clientPubBytes }} = await deriveTransportKey(serverPub);
+	  const nonce = crypto.getRandomValues(new Uint8Array(12));
+	  const ct = new Uint8Array(await crypto.subtle.encrypt(
+	    {{ name: "AES-GCM", iv: nonce }},
+	    aesKey, plaintext
   ));
   return {{
     client_pub: bytesToB64(clientPubBytes),
     nonce: bytesToB64(nonce),
-    ciphertext: bytesToB64(ct)
-  }};
-}}
+	    ciphertext: bytesToB64(ct)
+	  }};
+	}}
+
+	async function encryptJson(payload) {{
+	  const plaintext = new TextEncoder().encode(JSON.stringify(payload));
+	  try {{
+	    return await encryptBytes(plaintext);
+	  }} finally {{
+	    zeroBytes(plaintext);
+	  }}
+	}}
 
 // Encrypt + POST + surface a server error message on non-2xx. The
-// server's error body is plaintext on purpose: errors don't contain
-// secrets, and surfacing them through the encrypted channel would
-// require a response-side decrypt that adds complexity for no gain.
-async function postEncrypted(path, payload) {{
-  const envelope = await encryptPayload(payload);
-  const r = await fetch(API_BASE + path, {{
-    method: "POST",
-    headers: {{ "Content-Type": "application/json" }},
+	// server's error body is plaintext on purpose: errors don't contain
+	// secrets, and surfacing them through the encrypted channel would
+	// require a response-side decrypt that adds complexity for no gain.
+	async function postEncryptedEnvelope(path, envelope) {{
+	  const r = await fetch(API_BASE + path, {{
+	    method: "POST",
+	    headers: {{ "Content-Type": "application/json" }},
     body: JSON.stringify(envelope)
   }});
-  if (!r.ok) throw new Error("Server: " + (await r.text()));
-  return r;
-}}
+	  if (!r.ok) throw new Error("Server: " + (await r.text()));
+	  return r;
+	}}
+	async function postEncryptedJson(path, payload) {{
+	  return postEncryptedEnvelope(path, await encryptJson(payload));
+	}}
+	async function postEncryptedBytes(path, plaintext) {{
+	  return postEncryptedEnvelope(path, await encryptBytes(plaintext));
+	}}
 
 // Setup phase only: read the 6-character code the user typed from the
 // TUI. Throws early (before any authenticator prompt) if it's missing
@@ -1041,12 +1123,53 @@ function readSetupCode() {{
 // authenticator dance to back out of. On match this returns silently
 // and the caller proceeds. The server re-validates the same code on
 // /api/setup as belt-and-braces.
-async function precheckSetupCode(code) {{
-  await postEncrypted("/api/check-code", {{ setup_code: code }});
-}}
+	async function precheckSetupCode(code) {{
+	  await postEncryptedJson("/api/check-code", {{ setup_code: code }});
+	}}
 
-// Create a brand-new passkey on this device and use its PRF output as the
-// encryption key. Some platform authenticators don't return PRF during
+	async function deriveConfigKeyBytes(prfOutput) {{
+	  const prfBytes = new Uint8Array(prfOutput);
+	  try {{
+	    const masterKey = await crypto.subtle.importKey(
+	      "raw",
+	      prfBytes,
+	      "HKDF",
+	      false,
+	      ["deriveKey"]
+	    );
+	    const configKey = await crypto.subtle.deriveKey(
+	      {{ name: "HKDF", hash: "SHA-256",
+	         salt: new Uint8Array(0), info: CONFIG_KEY_HKDF_INFO }},
+	      masterKey,
+	      {{ name: "AES-GCM", length: 256 }},
+	      true,
+	      ["encrypt"]
+	    );
+	    return new Uint8Array(await crypto.subtle.exportKey("raw", configKey));
+	  }} finally {{
+	    zeroBytes(prfBytes);
+	  }}
+	}}
+
+	function buildSetupPayload(credId, configKey, setupCode) {{
+	  const codeBytes = new TextEncoder().encode(setupCode);
+	  if (credId.length > 0xffff) throw new Error("Credential ID is too large");
+	  if (codeBytes.length > 0xff) throw new Error("Setup code is too large");
+	  const out = new Uint8Array(1 + 2 + credId.length + 1 + codeBytes.length + configKey.length);
+	  let p = 0;
+	  out[p++] = 1;
+	  out[p++] = (credId.length >> 8) & 0xff;
+	  out[p++] = credId.length & 0xff;
+	  out.set(credId, p); p += credId.length;
+	  out[p++] = codeBytes.length;
+	  out.set(codeBytes, p); p += codeBytes.length;
+	  out.set(configKey, p);
+	  zeroBytes(codeBytes);
+	  return out;
+	}}
+
+// Create a brand-new passkey on this device and derive the config key from
+// its PRF output. Some platform authenticators don't return PRF during
 // create(), so we fall back to a follow-up get() with the same credential.
 async function doCreate() {{
   // Validate the setup code first — bail before triggering an
@@ -1066,11 +1189,11 @@ async function doCreate() {{
       pubKeyCredParams: [
         {{ type: "public-key", alg: -7 }},
         {{ type: "public-key", alg: -257 }}
-      ],
-      authenticatorSelection: {{
-        residentKey: "preferred",
-        userVerification: "preferred"
-      }},
+	      ],
+	      authenticatorSelection: {{
+	        residentKey: "preferred",
+	        userVerification: "required"
+	      }},
       extensions: {{ prf: {{ eval: {{ first: prfSalt }} }} }}
     }}
   }});
@@ -1082,10 +1205,10 @@ async function doCreate() {{
     const challenge2 = crypto.getRandomValues(new Uint8Array(32));
     const assert = await navigator.credentials.get({{
       publicKey: {{
-        challenge: challenge2,
-        allowCredentials: [{{ type: "public-key", id: credId }}],
-        userVerification: "preferred",
-        extensions: {{ prf: {{ eval: {{ first: prfSalt }} }} }}
+	        challenge: challenge2,
+	        allowCredentials: [{{ type: "public-key", id: credId }}],
+	        userVerification: "required",
+	        extensions: {{ prf: {{ eval: {{ first: prfSalt }} }} }}
       }}
     }});
     prf = assert.getClientExtensionResults().prf;
@@ -1107,10 +1230,10 @@ async function doImportExisting() {{
   const prfSalt = b64ToBytes(PRF_SALT_B64);
   const challenge = crypto.getRandomValues(new Uint8Array(32));
   const assert = await navigator.credentials.get({{
-    publicKey: {{
-      challenge,
-      userVerification: "preferred",
-      extensions: {{ prf: {{ eval: {{ first: prfSalt }} }} }}
+	    publicKey: {{
+	      challenge,
+	      userVerification: "required",
+	      extensions: {{ prf: {{ eval: {{ first: prfSalt }} }} }}
     }}
   }});
   if (!assert) throw new Error("Authenticator did not return a credential");
@@ -1123,13 +1246,17 @@ async function doImportExisting() {{
   await postSetup(credId, prfOutput, setupCode);
 }}
 
-async function postSetup(credId, prfOutput, setupCode) {{
-  await postEncrypted("/api/setup", {{
-    credential_id: bytesToB64(credId),
-    prf: bytesToB64(prfOutput),
-    setup_code: setupCode
-  }});
-}}
+	async function postSetup(credId, prfOutput, setupCode) {{
+	  const configKey = await deriveConfigKeyBytes(prfOutput);
+	  let payload = null;
+	  try {{
+	    payload = buildSetupPayload(credId, configKey, setupCode);
+	    await postEncryptedBytes("/api/setup", payload);
+	  }} finally {{
+	    zeroBytes(configKey);
+	    zeroBytes(payload);
+	  }}
+	}}
 
 async function doUnlock() {{
   const prfSalt = b64ToBytes(PRF_SALT_B64);
@@ -1137,10 +1264,10 @@ async function doUnlock() {{
   const challenge = crypto.getRandomValues(new Uint8Array(32));
   const assert = await navigator.credentials.get({{
     publicKey: {{
-      challenge,
-      allowCredentials: [{{ type: "public-key", id: credId }}],
-      userVerification: "preferred",
-      extensions: {{ prf: {{ eval: {{ first: prfSalt }} }} }}
+	      challenge,
+	      allowCredentials: [{{ type: "public-key", id: credId }}],
+	      userVerification: "required",
+	      extensions: {{ prf: {{ eval: {{ first: prfSalt }} }} }}
     }}
   }});
   const prf = assert.getClientExtensionResults().prf;
@@ -1148,8 +1275,13 @@ async function doUnlock() {{
   if (!prfOutput) {{
     throw new Error("Authenticator did not return a PRF output. The passkey may have been created without PRF support.");
   }}
-  await postEncrypted("/api/unlock", {{ prf: bytesToB64(prfOutput) }});
-}}
+	  const configKey = await deriveConfigKeyBytes(prfOutput);
+	  try {{
+	    await postEncryptedBytes("/api/unlock", configKey);
+	  }} finally {{
+	    zeroBytes(configKey);
+	  }}
+	}}
 
 // After a successful ceremony the server has already received what it
 // needs; a second click would just hit /api/setup or /api/unlock again
@@ -1191,18 +1323,34 @@ wireButton("go-unlock", doUnlock);
 "#,
         heading = heading,
         explanation = explanation,
-        setup_code_html = setup_code_html,
-        buttons_html = buttons_html,
-        prf_salt_js = json_string(&ctx.prf_salt_b64),
-        cred_id_js = json_string(&ctx.credential_id_b64),
-        user_label_js = json_string(ctx.user_label.as_deref().unwrap_or("")),
-        server_pub_js = json_string(&ctx.transport.public_b64),
-    )
+	        setup_code_html = setup_code_html,
+	        buttons_html = buttons_html,
+	        script_nonce_attr = html_attr(&ctx.script_nonce),
+	        prf_salt_js = json_string(&ctx.prf_salt_b64),
+	        cred_id_js = json_string(&ctx.credential_id_b64),
+	        user_label_js = json_string(ctx.user_label.as_deref().unwrap_or("")),
+	        server_pub_js = json_string(&ctx.transport.public_b64),
+	        config_key_hkdf_info_js = json_string(CONFIG_KEY_HKDF_INFO_JS),
+	    )
+	}
+
+fn html_attr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
-// Minimal JSON string escaper for embedding ASCII base64/short identifiers
-// into inline JS. Only escapes the characters that matter for the contexts
-// we use (strings without control bytes or unicode).
+// JSON string escaper for embedding values into inline JS. Escaping `<` is
+// security-relevant: without it, a label containing `</script>` could close
+// the trusted ceremony script before the JS parser ever sees the string.
 fn json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -1213,6 +1361,11 @@ fn json_string(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            '<' => out.push_str("\\u003c"),
+            '>' => out.push_str("\\u003e"),
+            '&' => out.push_str("\\u0026"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
             c if (c as u32) < 0x20 => {
                 use std::fmt::Write;
                 write!(out, "\\u{:04x}", c as u32).unwrap();
@@ -1227,7 +1380,7 @@ fn json_string(s: &str) -> String {
 /// Derive an HMAC-SHA256 signing key (32 bytes) from arbitrary input bytes.
 /// Used for the share dialog in passkey mode — share.rs's HMAC signing key
 /// is normally derived from the age.key file; in passkey mode we don't have
-/// one, so we hash the PRF output instead.
+/// one, so we hash the passkey-derived config key instead.
 pub(crate) fn derive_share_signing_key(seed: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -1246,6 +1399,10 @@ mod tests {
         assert_eq!(json_string("a\"b"), "\"a\\\"b\"");
         assert_eq!(json_string("a\\b"), "\"a\\\\b\"");
         assert_eq!(json_string("a\nb"), "\"a\\nb\"");
+        assert_eq!(
+            json_string("</script><script>alert(1)</script>"),
+            "\"\\u003c/script\\u003e\\u003cscript\\u003ealert(1)\\u003c/script\\u003e\""
+        );
     }
 
     #[test]
@@ -1258,13 +1415,10 @@ mod tests {
     }
 
     #[test]
-    fn decode_prf_rejects_wrong_length() {
-        assert!(decode_prf("AAAA").is_err());
-        // 32 bytes encoded in base64 is 44 chars; 16 bytes is 24 chars.
-        let short = BASE64.encode([0u8; 16]);
-        assert!(decode_prf(&short).is_err());
-        let exact = BASE64.encode([0u8; 32]);
-        assert!(decode_prf(&exact).is_ok());
+    fn decode_config_key_rejects_wrong_length() {
+        assert!(decode_config_key(&[]).is_err());
+        assert!(decode_config_key(&[0u8; 16]).is_err());
+        assert!(decode_config_key(&[0u8; 32]).is_ok());
     }
 
     fn test_ctx(phase: PasskeyPhase, setup_code: Option<&str>) -> Ctx {
@@ -1286,6 +1440,7 @@ mod tests {
             outcome_tx: std::sync::Mutex::new(None),
             deadline: Instant::now() + PASSKEY_TTL,
             transport: ServerTransport::generate().expect("/dev/urandom"),
+            script_nonce: "testnonce".into(),
         }
     }
 
@@ -1351,8 +1506,20 @@ mod tests {
         // The `user:` block of credentials.create() must reference the const.
         assert!(html.contains("name: USER_LABEL"));
         assert!(html.contains("displayName: USER_LABEL"));
+        assert!(html.contains(r#"userVerification: "required""#));
+        assert!(!html.contains(r#"userVerification: "preferred""#));
         // Stale hardcoded label must be gone.
         assert!(!html.contains(r#"name: "wrustic", displayName: "wrustic""#));
+    }
+
+    #[test]
+    fn html_uses_script_safe_label_embedding() {
+        let mut ctx = test_ctx(PasskeyPhase::Setup(SetupMode::Create), Some("AB23KM"));
+        ctx.user_label = Some("</script><script>alert(1)</script>".into());
+        let html = render_html(&ctx);
+        assert!(!html.contains("</script><script>"));
+        assert!(html.contains("\\u003c/script\\u003e\\u003cscript\\u003e"));
+        assert!(html.contains(r#"<script nonce="testnonce">"#));
     }
 
     #[test]
@@ -1511,12 +1678,12 @@ mod tests {
         h.short_url.rsplit('/').next().unwrap().to_string()
     }
 
-    /// Encrypt a plaintext JSON body into the envelope shape every
-    /// /api/* route expects. Mirrors the JS-side `encryptPayload`: fresh
+    /// Encrypt plaintext bytes into the envelope shape every /api/* route
+    /// expects. Mirrors the JS-side `encryptBytes`: fresh
     /// ephemeral X25519 keypair, ECDH against the server's public key,
     /// HKDF-SHA256 with the same `TRANSPORT_HKDF_INFO`, AES-256-GCM with
     /// a random 12-byte nonce. Returns a ready-to-POST JSON body string.
-    fn encrypt_envelope(server_pub_b64: &str, plaintext_json: &str) -> String {
+    fn encrypt_envelope_bytes(server_pub_b64: &str, plaintext: &[u8]) -> String {
         let server_pub_bytes = BASE64.decode(server_pub_b64).expect("server pub b64");
         let server_pub_arr: [u8; 32] = server_pub_bytes.as_slice().try_into().unwrap();
         let server_pub = X25519Public::from(server_pub_arr);
@@ -1536,7 +1703,7 @@ mod tests {
         let mut nonce_bytes = [0u8; TRANSPORT_NONCE_LEN];
         f.read_exact(&mut nonce_bytes).unwrap();
         let nonce = Nonce::from_slice(&nonce_bytes);
-        let ct = cipher.encrypt(nonce, plaintext_json.as_bytes()).unwrap();
+        let ct = cipher.encrypt(nonce, plaintext).unwrap();
 
         format!(
             r#"{{"client_pub":"{cpb}","nonce":"{nb}","ciphertext":"{ctb}"}}"#,
@@ -1546,12 +1713,35 @@ mod tests {
         )
     }
 
+    fn encrypt_envelope(server_pub_b64: &str, plaintext_json: &str) -> String {
+        encrypt_envelope_bytes(server_pub_b64, plaintext_json.as_bytes())
+    }
+
     /// POST a plaintext JSON body to a path, after wrapping it in the
     /// transport envelope. Drop-in replacement for `raw_post_json` plus a
     /// matching server pub key from the handle.
     fn encrypted_post(port: u16, server_pub_b64: &str, path: &str, plaintext_json: &str) -> String {
         let body = encrypt_envelope(server_pub_b64, plaintext_json);
         raw_post_json(port, path, &body)
+    }
+
+    fn encrypted_post_bytes(port: u16, server_pub_b64: &str, path: &str, plaintext: &[u8]) -> String {
+        let body = encrypt_envelope_bytes(server_pub_b64, plaintext);
+        raw_post_json(port, path, &body)
+    }
+
+    fn setup_payload(credential_id: &[u8], config_key: &[u8; 32], setup_code: &str) -> Vec<u8> {
+        let code = setup_code.as_bytes();
+        assert!(credential_id.len() <= u16::MAX as usize);
+        assert!(code.len() <= u8::MAX as usize);
+        let mut out = Vec::with_capacity(1 + 2 + credential_id.len() + 1 + code.len() + 32);
+        out.push(1);
+        out.extend_from_slice(&(credential_id.len() as u16).to_be_bytes());
+        out.extend_from_slice(credential_id);
+        out.push(code.len() as u8);
+        out.extend_from_slice(code);
+        out.extend_from_slice(config_key);
+        out
     }
 
     /// End-to-end check that the only reachable surface is `/auth/<key>` and
@@ -1598,6 +1788,8 @@ mod tests {
         // The HTML must carry the per-page Setup markers (we started in Setup
         // phase) so we know we're actually serving the ceremony page.
         assert!(r.contains(r#"id="go-create""#));
+        assert!(r.to_lowercase().contains("content-security-policy:"));
+        assert!(r.contains("script-src 'nonce-"));
 
         // Correct key with a trailing slash also reaches the HTML (the JS
         // strips the trailing slash too).
@@ -1609,8 +1801,8 @@ mod tests {
         let r = raw_request(port, "GET", &format!("/auth/{key}/whatever"));
         assert!(r.contains(" 404 "));
 
-        // /api/setup is the right phase route, but Setup expects a body —
-        // we send Content-Length: 0, so the JSON parser inside handle_setup
+        // /api/setup is the right phase route, but Setup expects a body.
+        // We send Content-Length: 0, so the setup payload parser
         // will reject with 400. The point of this assertion is just that
         // the gate forwarded the request (i.e. we got past the 404 wall).
         let r = raw_request(port, "POST", &format!("/auth/{key}/api/setup"));
@@ -1622,10 +1814,8 @@ mod tests {
         handle.stop();
     }
 
-    /// 32-byte base64 PRF that's well-formed enough to pass `decode_prf`
-    /// — used as filler so the test reaches the setup_code branch.
-    fn dummy_prf_b64() -> String {
-        BASE64.encode([0u8; 32])
+    fn dummy_config_key() -> [u8; 32] {
+        [0u8; 32]
     }
 
     #[test]
@@ -1635,7 +1825,7 @@ mod tests {
         let key = key_from_handle(&handle);
         let setup_code = handle.setup_code.clone().expect("Setup phase mints a code");
         let path = format!("/auth/{key}/api/setup");
-        let prf = dummy_prf_b64();
+        let config_key = dummy_config_key();
 
         // Wrong code: deliberately mutate the real one so it stays in the
         // alphabet but differs. Flip the first character to the next one
@@ -1648,10 +1838,8 @@ mod tests {
         bad_chars[0] = SETUP_CODE_ALPHABET[(pos + 1) % SETUP_CODE_ALPHABET.len()];
         let bad = String::from_utf8(bad_chars).unwrap();
 
-        let body = format!(
-            r#"{{"credential_id":"Y3JlZA==","prf":"{prf}","setup_code":"{bad}"}}"#
-        );
-        let r = encrypted_post(port, &handle.transport_public_b64, &path, &body);
+        let body = setup_payload(b"cred", &config_key, &bad);
+        let r = encrypted_post_bytes(port, &handle.transport_public_b64, &path, &body);
         assert!(r.contains(" 401 "), "wrong code should 401, got:\n{r}");
         assert!(r.to_lowercase().contains("setup code"));
 
@@ -1671,12 +1859,10 @@ mod tests {
         let key = key_from_handle(&handle);
         let setup_code = handle.setup_code.clone().expect("Setup phase mints a code");
         let path = format!("/auth/{key}/api/setup");
-        let prf = dummy_prf_b64();
+        let config_key = dummy_config_key();
 
-        let body = format!(
-            r#"{{"credential_id":"Y3JlZA==","prf":"{prf}","setup_code":"{setup_code}"}}"#
-        );
-        let r = encrypted_post(port, &handle.transport_public_b64, &path, &body);
+        let body = setup_payload(b"cred", &config_key, &setup_code);
+        let r = encrypted_post_bytes(port, &handle.transport_public_b64, &path, &body);
         // Right code + well-formed body → 200 and outcome delivered.
         assert!(r.contains(" 200 "), "correct code should 200, got:\n{r}");
 
@@ -1693,16 +1879,14 @@ mod tests {
         let key = key_from_handle(&handle);
         let setup_code = handle.setup_code.clone().unwrap();
         let path = format!("/auth/{key}/api/setup");
-        let prf = dummy_prf_b64();
+        let config_key = dummy_config_key();
 
         // Pad with whitespace — server strips it before comparing. Case
         // is also folded (alphabet is uppercase-only) but we keep the
         // code byte-identical here to isolate the whitespace path.
         let munged: String = format!(" {setup_code} ");
-        let body = format!(
-            r#"{{"credential_id":"Y3JlZA==","prf":"{prf}","setup_code":"{munged}"}}"#
-        );
-        let r = encrypted_post(port, &handle.transport_public_b64, &path, &body);
+        let body = setup_payload(b"cred", &config_key, &munged);
+        let r = encrypted_post_bytes(port, &handle.transport_public_b64, &path, &body);
         assert!(
             r.contains(" 200 "),
             "whitespace-tolerant compare should accept, got:\n{r}"
@@ -1722,7 +1906,7 @@ mod tests {
         let key = key_from_handle(&handle);
         let setup_code = handle.setup_code.clone().unwrap();
         let path = format!("/auth/{key}/api/setup");
-        let prf = dummy_prf_b64();
+        let config_key = dummy_config_key();
 
         let lowered = setup_code.to_ascii_lowercase();
         // If the code has no letters (purely digits), the assertion is
@@ -1732,10 +1916,8 @@ mod tests {
             return;
         }
 
-        let body = format!(
-            r#"{{"credential_id":"Y3JlZA==","prf":"{prf}","setup_code":"{lowered}"}}"#
-        );
-        let r = encrypted_post(port, &handle.transport_public_b64, &path, &body);
+        let body = setup_payload(b"cred", &config_key, &lowered);
+        let r = encrypted_post_bytes(port, &handle.transport_public_b64, &path, &body);
         assert!(r.contains(" 200 "), "lowercase code should 200, got:\n{r}");
         handle.stop();
     }
@@ -1796,7 +1978,7 @@ mod tests {
         let handle = start(port, PasskeyPhase::Setup(SetupMode::Create), None, Some("test-label".into())).expect("start server");
         let key = key_from_handle(&handle);
         let real = handle.setup_code.clone().unwrap();
-        let prf = dummy_prf_b64();
+        let config_key = dummy_config_key();
 
         let mut wrong = "------".to_string();
         if wrong == real {
@@ -1816,10 +1998,8 @@ mod tests {
         }
 
         // 5th strike via /api/setup must trip the kill switch.
-        let body = format!(
-            r#"{{"credential_id":"Y3JlZA==","prf":"{prf}","setup_code":"{wrong}"}}"#
-        );
-        let r = encrypted_post(
+        let body = setup_payload(b"cred", &config_key, &wrong);
+        let r = encrypted_post_bytes(
             port,
             &handle.transport_public_b64,
             &format!("/auth/{key}/api/setup"),
@@ -1869,7 +2049,7 @@ mod tests {
         let key = key_from_handle(&handle);
         let real = handle.setup_code.clone().unwrap();
         let path = format!("/auth/{key}/api/setup");
-        let prf = dummy_prf_b64();
+        let config_key = dummy_config_key();
 
         // Use a wrong code that is guaranteed not to equal the real
         // one. `------` uses characters outside the alphabet so it can
@@ -1880,10 +2060,8 @@ mod tests {
         let wrong = "------".to_string();
 
         for i in 1..=MAX_SETUP_CODE_ATTEMPTS {
-            let body = format!(
-                r#"{{"credential_id":"Y3JlZA==","prf":"{prf}","setup_code":"{wrong}"}}"#
-            );
-            let r = encrypted_post(port, &handle.transport_public_b64, &path, &body);
+            let body = setup_payload(b"cred", &config_key, &wrong);
+            let r = encrypted_post_bytes(port, &handle.transport_public_b64, &path, &body);
             if i < MAX_SETUP_CODE_ATTEMPTS {
                 assert!(r.contains(" 401 "), "strike {i} should 401, got:\n{r}");
             } else {
@@ -1897,10 +2075,8 @@ mod tests {
         assert!(r.contains(" 403 "), "post-kill requests must 403, got:\n{r}");
 
         // Even the correct code is no longer accepted.
-        let body = format!(
-            r#"{{"credential_id":"Y3JlZA==","prf":"{prf}","setup_code":"{real}"}}"#
-        );
-        let r = encrypted_post(port, &handle.transport_public_b64, &path, &body);
+        let body = setup_payload(b"cred", &config_key, &real);
+        let r = encrypted_post_bytes(port, &handle.transport_public_b64, &path, &body);
         assert!(r.contains(" 403 "), "correct code post-kill must 403, got:\n{r}");
 
         handle.stop();

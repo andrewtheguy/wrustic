@@ -16,7 +16,7 @@ a config was created with is the one it stays in for its lifetime.
 | Cipher | Prefix | Algorithm | Key source | Status |
 |---|---|---|---|---|
 | `Cipher::Age` | `ageenc:` | age x25519 (single recipient) | `<config-dir>/age.key`, mode 0600 | default |
-| `Cipher::Passkey` | `pkenc:` | ChaCha20-Poly1305 AEAD | WebAuthn PRF output, never on disk | experimental, gated behind `--experimental-passkey` |
+| `Cipher::Passkey` | `pkenc:` | ChaCha20-Poly1305 AEAD | WebAuthn PRF + HKDF-derived config key, never on disk | experimental, gated behind `--experimental-passkey` |
 
 Source of truth: `src/crypto.rs`, `src/config.rs`, `src/passkey.rs`.
 
@@ -232,22 +232,28 @@ up on the boot Error screen.
 
 ### Key derivation
 
-The 32-byte AEAD key comes from the **WebAuthn PRF extension**
-(`hmac-secret`) — the browser/authenticator computes a deterministic HMAC
-of the credential's secret with a salt we provide:
+The 32-byte AEAD key is derived from the **WebAuthn PRF extension**
+(`hmac-secret`). The browser/authenticator computes a deterministic HMAC
+of the credential's secret with a salt we provide, then the ceremony page
+imports that PRF output into WebCrypto as a non-extractable HKDF key and
+derives the config key with a wrustic-specific label:
 
 ```
-prf_output = HMAC_credentialSecret(prf_salt)   // computed by authenticator
-key        = prf_output                        // used directly as ChaCha20-Poly1305 key
+prf_output = HMAC_credentialSecret(prf_salt)       // computed by authenticator
+master     = importKey("HKDF", prf_output, false)  // non-extractable CryptoKey
+key        = HKDF-SHA256(master, info="wrustic-passkey-config-v1", len=32)
 ```
 
 The salt is generated once at Setup (`random_bytes(16)`) and stored in
 `[passkey].prf_salt` so subsequent unlocks regenerate the same key.
 
-The PRF output **never reaches the wire as a key derivative on disk** —
-only the salt and the credential id are persisted. The browser sends the
-raw 32 bytes back to localhost over the keyed `/auth/<key>/api/...` POST,
-and the App keeps them in memory for the session only.
+The authenticator's credential secret never leaves the passkey provider.
+The WebAuthn PRF API does expose `prf.results.first` to page JavaScript as
+an `ArrayBuffer`; wrustic imports those bytes into non-extractable WebCrypto
+key material immediately and zeroes the temporary buffer best-effort. The
+raw PRF output is not sent to the Rust process. Only the derived 32-byte
+config key is exported at the last moment and sent through the encrypted
+localhost transport; the App keeps that key in memory for the session only.
 
 If the same passkey is used with a *different* salt (e.g. someone
 manually edits `prf_salt` or copies a config from another machine without
@@ -264,7 +270,7 @@ pkenc:<base64( nonce(12) || ciphertext || tag(16) )>
 - 12-byte nonce from `OsRng` (chacha20poly1305's `generate_nonce`). Each
   encrypt mints a fresh nonce — there is no nonce reuse window even
   within a single save.
-- ChaCha20-Poly1305 with the 32-byte PRF-derived key.
+- ChaCha20-Poly1305 with the 32-byte HKDF-derived passkey config key.
 - 16-byte Poly1305 tag appended (the AEAD construction does this; the
   encrypted blob's last 16 bytes are the tag).
 
@@ -287,8 +293,8 @@ decrypt everything else with the resulting key.
 The passkey-mode AEAD key comes from a WebAuthn ceremony run by the
 user's browser. wrustic itself can't talk to WebAuthn (it's a terminal
 program), so `src/passkey.rs` stands up a small localhost server, prints
-the URL in the TUI, and waits for the browser to POST the PRF output
-back. This section covers the server's shape; the cryptographic
+the URL in the TUI, and waits for the browser to POST the derived config
+key back through an encrypted localhost envelope. This section covers the server's shape; the cryptographic
 mechanics are in the [Passkey cipher](#passkey-cipher-cipherpasskey)
 section above.
 
@@ -353,8 +359,9 @@ still 404s):
 | Method + path | Response |
 |---|---|
 | `GET /auth/<key>` or `/auth/<key>/` | 200 + the inline ceremony HTML |
-| `POST /auth/<key>/api/setup` (Setup phase) | accept `{credential_id, prf}` → deliver outcome |
-| `POST /auth/<key>/api/unlock` (Unlock phase) | accept `{prf}` → deliver outcome |
+| `POST /auth/<key>/api/check-code` (Setup phase) | encrypted JSON `{setup_code}` → no outcome |
+| `POST /auth/<key>/api/setup` (Setup phase) | encrypted binary `{credential_id, setup_code, config_key}` → deliver outcome |
+| `POST /auth/<key>/api/unlock` (Unlock phase) | encrypted 32-byte `config_key` → deliver outcome |
 
 The auth-key check runs **before** the expiry check by design: an
 unauthenticated caller never gets to distinguish "running" from
@@ -377,8 +384,9 @@ The phase is picked at boot by `config::peek`:
     and the user's password manager label the entry distinctively (e.g.
     "wrustic" RP + "personal" user) instead of N identical "wrustic"
     entries across configs. The label is purely cosmetic — it has no
-    role in decryption — and is not stored on the wrustic side; only
-    the authenticator keeps it as part of the credential's metadata.
+    role in decryption. wrustic stores a copy in `[passkey].label` only so
+    the Unlock screen can remind the user which passkey label to pick; the
+    authenticator keeps its own canonical credential metadata.
     The browser page renders a single *Create new passkey* button that
     calls `navigator.credentials.create()` with the PRF extension. Some
     authenticators don't return PRF during `create()`; the page
@@ -391,8 +399,9 @@ The phase is picked at boot by `config::peek`:
     with `user_label = None`. The browser page renders a single *Use
     existing passkey* button that calls `navigator.credentials.get()`
     with no `allowCredentials`, so the browser presents every passkey
-    valid for `localhost`. The user picks one and the page derives the
-    key from its PRF using a fresh salt. The page carries a disclaimer
+    valid for `localhost`. The user picks one, the browser requires user
+    verification, and the page derives the key from its PRF using a fresh
+    salt. The page carries a disclaimer
     explaining this still creates a *fresh* wrustic config under a new
     salt — it won't open another machine's existing config.
 
@@ -408,16 +417,17 @@ The phase is picked at boot by `config::peek`:
     refuses to deliver the outcome until the code matches.
   - On accepted POST: server delivers
     `PasskeyOutcome { key, new_meta: Some(PasskeyMeta { credential_id,
-    prf_salt }) }`. The App splices the meta into `self.config.passkey`
+    prf_salt, label }) }`. The App splices the meta into `self.config.passkey`
     and immediately calls `config::save` so the `[passkey]` block
     lands on disk — next launch routes into Unlock.
 
 - **`[passkey]` block already present** → `PasskeyPhase::Unlock`. Server
   presents the stored `credential_id` + `prf_salt` to the page, the
-  browser does `.get()` against that exact credential, posts the PRF
-  back. No setup code on Unlock — the existing `[passkey]` block plus
-  the AEAD tag verification at first decrypt already prove the user
-  knows the passkey. Server delivers
+  browser does `.get()` against that exact credential with user verification
+  required, derives the config key, and posts that key through the encrypted
+  localhost transport. No setup code on Unlock — the existing `[passkey]`
+  block plus the AEAD tag verification at first decrypt already prove the
+  user knows the passkey. Server delivers
   `PasskeyOutcome { key, new_meta: None }`. App uses the key to
   decrypt every `pkenc:` value in the config.
 
@@ -533,14 +543,36 @@ The inline `<script>`:
 - Derives `API_BASE` from `window.location.pathname` (with a trailing-
   slash strip) so `fetch` targets stay under `/auth/<key>/api/…`
   without needing the key templated into the HTML.
-- Calls `navigator.credentials.create()` / `.get()` with the PRF
-  extension (`extensions: { prf: { eval: { first: prfSalt } } }`).
+- Calls `navigator.credentials.create()` / `.get()` with
+  `userVerification: "required"` and the PRF extension
+  (`extensions: { prf: { eval: { first: prfSalt } } }`).
+- Imports the PRF output into WebCrypto as a non-extractable HKDF key,
+  derives the wrustic config key with `info =
+  "wrustic-passkey-config-v1"`, zeroes the temporary PRF bytes best-effort,
+  and only exports the derived config key because the Rust process needs it
+  to decrypt `config.toml`.
 - Wraps every `/api/*` POST body in the transport-encryption envelope
-  described below — the PRF output never leaves the JS heap as
-  plaintext on the wire.
+  described below — the derived config key never leaves the browser as
+  plaintext on the wire, and the raw PRF output is not sent at all.
 - Disables all buttons on success so a second click can't re-prompt
   the authenticator (the server would also reject the second POST with
   409 "already provided this session").
+
+The HTML response carries a per-page CSP nonce:
+
+```
+Content-Security-Policy:
+  default-src 'none';
+  script-src 'nonce-…';
+  connect-src 'self';
+  base-uri 'none';
+  form-action 'none';
+  frame-ancestors 'none'
+```
+
+Template values embedded in JavaScript strings escape `<`, `>`, `&`, and
+the usual JSON string characters so a passkey label such as `</script>`
+cannot terminate the trusted inline script.
 
 ### Transport encryption (browser ↔ server)
 
@@ -549,9 +581,9 @@ interface is not perfectly isolated: another local process running as
 root or with `CAP_NET_RAW` can sniff loopback, a malicious browser
 extension can read `fetch` request bodies, and devtools-history /
 proxy-style inspectors capture full requests. To avoid putting the
-WebAuthn PRF output (the actual encryption key) on the wire as
-plaintext, every `/api/*` POST body is wrapped in an authenticated
-encryption envelope under a fresh per-request key.
+derived config key on the wire as plaintext, every `/api/*` POST body is
+wrapped in an authenticated encryption envelope under a fresh per-request
+key.
 
 **Protocol.** At `start()` the server generates an ephemeral X25519
 keypair (`ServerTransport::generate` in `src/passkey.rs`). The private
@@ -560,11 +592,11 @@ base64'd and inlined into the HTML as the JS const `SERVER_PUB_B64`.
 For each request the browser generates its own ephemeral X25519 keypair
 (`crypto.subtle.generateKey({ name: "X25519" }, false, …)` — private
 imported `extractable: false`), does
-`ECDH(server_pub, client_priv)` for a 32-byte shared secret, runs it
-through HKDF-SHA256 with empty salt and
+`ECDH(server_pub, client_priv)` directly into a non-extractable HKDF
+`CryptoKey`, runs it through HKDF-SHA256 with empty salt and
 `info = b"wrustic-passkey-transport-v1"` to derive a 32-byte AES-256-GCM
-key (imported `extractable: false`), and encrypts the JSON body with a
-random 12-byte nonce. The wire format is:
+key (`extractable: false`), and encrypts the route body with a random
+12-byte nonce. The outer wire format is:
 
 ```json
 {
@@ -577,28 +609,28 @@ random 12-byte nonce. The wire format is:
 The server runs the mirror routine in `ServerTransport::decrypt`,
 checks the GCM tag (so a flipped bit in transit is a hard 400, not a
 silent corruption), then hands the inner plaintext to the existing
-per-route deserializer (`CheckCodeBody`, `SetupBody`, `UnlockBody`).
+per-route parser (`CheckCodeBody`, `parse_setup_body`, `parse_unlock_body`).
 Response bodies are plaintext on purpose: errors don't carry secrets,
 and the only success-side leak the threat model worries about is the
-PRF output itself, which lives only in the inbound direction.
+derived config key, which lives only in the inbound direction.
 
-**Non-extractable browser keys.** Both the client's X25519 private key
-and the HKDF-derived AES-GCM key are imported with `extractable: false`,
-so an XSS payload or browser-extension foothold can't `exportKey` the
-raw bytes out of WebCrypto. An attacker could still invoke the
-WebCrypto API to use the keys — but only while sitting inside the
-ceremony page's JS context, and only for that one short-lived
-ceremony. After the page unloads the keys are gone.
+**Non-extractable browser keys.** The client's X25519 private key, the
+transport HKDF key, the transport AES-GCM key, and the imported PRF
+master key are all `extractable: false`. An attacker inside the ceremony
+page can still invoke WebCrypto while the page is alive, but cannot
+`exportKey` those values as raw bytes.
 
 The PRF output itself comes out of WebAuthn as an `ArrayBuffer`, not a
-`CryptoKey`, so it can't be made non-extractable per se — but it's
-encrypted and sent within the same microtask it's received, never
-written to storage, and the server's private key (the only way to
-decrypt it after the fact) is dropped when the ceremony ends.
+`CryptoKey`, so it cannot be non-extractable at the instant the browser
+returns it. wrustic imports it into non-extractable HKDF key material
+immediately, zeroes the temporary buffer best-effort, and does not send
+the raw PRF output to Rust. The derived config key must be exported so
+the Rust process can decrypt `config.toml`; that exported key is placed
+inside the X25519/AES-GCM transport envelope before it crosses localhost.
 
 **What this doesn't defend against.**
 - An attacker who controls the wrustic process itself (they have the
-  server private key by definition).
+  server private key and receive the config key by definition).
 - An attacker who can serve their own HTML at `/auth/<key>` (they'd
   already need to be the wrustic server — there's no separate user
   agent doing TLS to verify the server identity, only the capability
@@ -625,6 +657,10 @@ unchanged ("This browser does not support X25519").
 - Empty HKDF salt: the ECDH shared secret is already uniformly random
   and unique per request; adding a salt would just be ceremony. A
   versioned `info` string handles algorithm cutover instead.
+- The config-key HKDF also uses an empty salt because the WebAuthn PRF
+  output is already high-entropy secret material bound to `[passkey].prf_salt`;
+  the versioned `info = "wrustic-passkey-config-v1"` domain-separates it
+  from any future PRF uses.
 
 **Replay.** Each ceremony has a fresh server keypair (30-min lifespan),
 each request a fresh client keypair, so every shared secret is unique
@@ -634,17 +670,19 @@ or replayed against a future one.
 **No body-size hiding.** The envelope leaks the inner plaintext length
 (≈ ciphertext length minus 16 bytes for the tag). For the routes here
 the lengths are essentially fixed and known a priori (a 6-char setup
-code, a 32-byte PRF, etc.), so padding would add nothing.
+code, a 32-byte config key, etc.), so padding would add nothing.
 
 ### What the server does *not* do
 
 - No webauthn-rs / no attestation verification. The browser is trusted
-  to faithfully run the PRF extension; if it lied, the AEAD tag would
-  fail on the first decrypt and the user would see an error. This is a
-  deliberate simplification for an experimental, single-user feature.
+  to faithfully run the PRF extension and the inline derivation code. On
+  Unlock, a wrong key fails on the first AEAD tag check. On first Setup,
+  this is trust-on-first-use: the setup-code gate and CSP protect against
+  accidental or injected flow confusion, but wrustic does not independently
+  verify an attestation statement.
 - No persistence of PRF output on disk. Only the credential id and the
-  salt are written; the 32-byte key itself only lives in the App's
-  memory for the session.
+  salt are written. The raw PRF output is not sent to Rust; the derived
+  32-byte config key lives in the App's memory for the session.
 - No CORS / no auth header / no cookies. The capability URL is the
   whole auth surface.
 
@@ -657,7 +695,7 @@ the active cipher's material:
 | Mode | Derivation |
 |---|---|
 | age | `derive_signing_key(age.key bytes)` — SHA-256 over the raw key file |
-| passkey | `passkey::derive_share_signing_key(prf_output)` — SHA-256 over `"wrustic-share-v1\0" \|\| prf_output` |
+| passkey | `passkey::derive_share_signing_key(config_key)` — SHA-256 over `"wrustic-share-v1\0" \|\| config_key` |
 
 Same key per identity (no per-session randomness) → share URLs stay valid
 across wrustic restarts within their 1-hour TTL. Different identity →
@@ -701,10 +739,12 @@ Not in scope:
   stores encrypted in the per-profile `password` field) and its own
   at-rest encryption — those handle the repository data.
 - **Authenticator phishing / WebAuthn RP correctness.** wrustic uses
-  `rp.name = "wrustic"` without RP id validation since the origin is
-  `localhost`. Anything that can serve content on the same origin (i.e.
-  anything else the user runs locally) can in principle drive the
-  ceremony — another reason for the single-user scope.
+  the browser's effective RP ID for `localhost`; WebAuthn RP IDs are not
+  port-scoped. Another local web server on `localhost` can ask the browser
+  for passkeys registered to `localhost` if the user approves the prompt.
+  wrustic requires user verification and the setup-code gate for Setup,
+  but this remains a local-browser trust assumption and another reason
+  for the single-user scope.
 
 For the surrounding system shape (boot flow, module layout, the share
 dialog, the runtime loop), see [architecture.md](architecture.md).
