@@ -502,10 +502,23 @@ impl App {
         self.passkey_phase = None;
         self.load_config_or_set_fatal();
         // Setup ceremony just produced fresh metadata — splice it into the
-        // (empty, default) config so the first save writes the [passkey]
-        // block. Skipped on Unlock because the meta was already there.
+        // (empty, default) config and persist immediately so the next launch
+        // can peek at the [passkey] block and route through Unlock. Without
+        // this save, no config.toml ever lands on disk for a fresh dir, and
+        // the user gets stuck re-running Setup every launch. Skipped on
+        // Unlock because the meta was already there.
         if let Some(meta) = outcome.new_meta {
             self.config.passkey = Some(meta);
+            if let Some(cipher) = self.cipher.as_ref()
+                && let Err(e) = config::save(&self.config, &self.paths, cipher)
+            {
+                self.error_is_fatal = true;
+                self.screen = Screen::Error(format!(
+                    "Setup succeeded in the browser but writing {} failed: {e:#}. \
+                     Quit and retry the ceremony.",
+                    self.paths.config.display()
+                ));
+            }
         }
     }
 
