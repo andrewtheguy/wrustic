@@ -281,10 +281,10 @@ async function doUnlock() {
 // success to prevent double-submission.
 
 function disableAllCtas() {
-  document.querySelectorAll("button").forEach(b => {
-    b.disabled = true;
-    b.style.opacity = "0.5";
-    b.style.cursor = "not-allowed";
+  document.querySelectorAll("button, input").forEach(el => {
+    el.disabled = true;
+    el.style.opacity = "0.5";
+    el.style.cursor = "not-allowed";
   });
 }
 
