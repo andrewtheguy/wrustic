@@ -6,7 +6,7 @@ use ratatui::{
 };
 use tui_input::Input;
 
-use crate::app::{App, BACKEND_ORDER, FIRST_RUN_MENU, Screen, filter_dim_entries};
+use crate::app::{App, BACKEND_ORDER, Screen, filter_dim_entries};
 use crate::passphrase::PassphrasePhase;
 use crate::repo::ContentKind;
 
@@ -41,9 +41,6 @@ fn render_bottom_bar(frame: &mut Frame, app: &App, area: Rect) {
 
 fn bottom_bar_text(screen: &Screen) -> &'static str {
     match screen {
-        Screen::FirstRunChoice => "j/k move  PgUp/PgDn page  Enter pick  Esc quit",
-        Screen::RestoreKeyWait => "Enter retry  Esc back",
-        Screen::KeyCreated => "Enter continue  Esc quit",
         Screen::Home => "j/k move  PgUp/PgDn page  Enter open  n new  e edit  d delete  q quit",
         Screen::Snapshots => {
             "j/k move  PgUp/PgDn page  g/G top/bottom  Enter browse  c compare  f filter  d delete  r refresh  q/Esc back"
@@ -97,9 +94,6 @@ fn bottom_bar_text(screen: &Screen) -> &'static str {
 
 fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
     match &app.screen {
-        Screen::FirstRunChoice => render_first_run_choice(frame, app, area),
-        Screen::RestoreKeyWait => render_restore_wait(frame, app, area),
-        Screen::KeyCreated => render_key_created(frame, app, area),
         Screen::Home => render_home(frame, app, area),
         Screen::CreateProfileName => render_input(
             frame,
@@ -249,63 +243,6 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
             frame.render_widget(para, area);
         }
     }
-}
-
-fn render_first_run_choice(frame: &mut Frame, app: &mut App, area: Rect) {
-    let [intro_area, list_area] = Layout::vertical([
-        Constraint::Length(5),
-        Constraint::Fill(1),
-    ])
-    .areas(area);
-
-    let intro = Paragraph::new(format!(
-        "No age identity found at {}.\n\nEither restore an existing key to that path, or create a new one. Without a key, wrustic cannot decrypt or save profiles.",
-        app.paths.identity.display()
-    ))
-    .wrap(Wrap { trim: false })
-    .block(Block::bordered().title("Welcome to wrustic"));
-    frame.render_widget(intro, intro_area);
-
-    let items: Vec<ListItem> = FIRST_RUN_MENU.iter().map(|s| ListItem::new(*s)).collect();
-    let list = List::new(items)
-        .block(Block::bordered().title("j/k to move, Enter to pick, Esc to quit"))
-        .highlight_style(selection_highlight())
-        .highlight_symbol(">> ");
-    record_list_area(app, list_area);
-    frame.render_stateful_widget(list, list_area, &mut app.first_run_state);
-}
-
-fn render_restore_wait(frame: &mut Frame, app: &App, area: Rect) {
-    let mut body = format!(
-        "Place your existing age.key file at:\n\n    {}\n\nMake sure it is mode 0600 (only readable by you). Press Enter once it is in place, or Esc to go back.",
-        app.paths.identity.display()
-    );
-    if let Some(msg) = &app.restore_error {
-        body.push_str("\n\n");
-        body.push_str(msg);
-    }
-    let style = if app.restore_error.is_some() {
-        Style::new().fg(Color::Red)
-    } else {
-        Style::new()
-    };
-    let para = Paragraph::new(body)
-        .style(style)
-        .wrap(Wrap { trim: false })
-        .block(Block::bordered().title("Restore existing age key"));
-    frame.render_widget(para, area);
-}
-
-fn render_key_created(frame: &mut Frame, app: &App, area: Rect) {
-    let body = format!(
-        "A new age key was created.\n\nKey file (back this up now!):\n    {}\n\nPublic key (recipient):\n    {}\n\nIf you lose the key file, every saved profile becomes unrecoverable. Copy it to a safe place before adding profiles.\n\nPress Enter to continue.",
-        app.paths.identity.display(),
-        app.created_pubkey,
-    );
-    let para = Paragraph::new(body)
-        .wrap(Wrap { trim: false })
-        .block(Block::bordered().title("New age key created"));
-    frame.render_widget(para, area);
 }
 
 fn selection_highlight() -> Style {

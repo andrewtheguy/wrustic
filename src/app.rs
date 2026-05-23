@@ -22,16 +22,8 @@ use crate::share::{self, SHARE_TTL, ShareHandle, ShareTarget};
 
 pub(crate) const BACKEND_ORDER: [BackendKind; 3] =
     [BackendKind::Local, BackendKind::Rest, BackendKind::S3];
-pub(crate) const FIRST_RUN_MENU: [&str; 3] = [
-    "Create a new age key",
-    "Restore an existing age key",
-    "Quit",
-];
 
 pub(crate) enum Screen {
-    FirstRunChoice,
-    RestoreKeyWait,
-    KeyCreated,
     PassphraseInstancePrompt,
     PassphraseSetup,
     PassphraseUnlock,
@@ -230,7 +222,6 @@ pub(crate) struct App {
     /// expects it to be).
     pub(crate) cipher: Option<Cipher>,
     pub(crate) server_port: u16,
-    pub(crate) passphrase_mode: bool,
     pub(crate) browser_auth: bool,
     pub(crate) passphrase_handle: Option<PassphraseHandle>,
     pub(crate) passphrase_instance_input: Input,
@@ -242,7 +233,6 @@ pub(crate) struct App {
     pub(crate) passphrase_setup_code: Option<String>,
     pub(crate) passphrase_phase: Option<PassphrasePhase>,
 
-    pub(crate) first_run_state: ListState,
     pub(crate) backend_list: ListState,
     pub(crate) profile_list_state: ListState,
     pub(crate) list_state: ListState,
@@ -265,9 +255,6 @@ pub(crate) struct App {
     pub(crate) pending_delete: Option<usize>,
     pub(crate) editing_original_name: Option<String>,
     pub(crate) field_focus: usize,
-
-    pub(crate) restore_error: Option<String>,
-    pub(crate) created_pubkey: String,
 
     pub(crate) snapshots: Vec<SnapshotRow>,
     pub(crate) snapshot_filter: Option<SnapshotFilter>,
@@ -332,23 +319,18 @@ impl App {
     pub(crate) fn boot(
         config_dir: Option<PathBuf>,
         server_port: u16,
-        experimental_passphrase: bool,
         browser_auth: bool,
     ) -> Result<Self> {
         let paths = config::paths(config_dir)?;
-        let mut first_run_state = ListState::default();
-        first_run_state.select(Some(0));
         let mut backend_list = ListState::default();
         backend_list.select(Some(0));
 
-        let identity_exists = paths.identity.exists();
         let mut app = Self {
             screen: Screen::Home,
             paths,
             config: Config::default(),
             cipher: None,
             server_port,
-            passphrase_mode: experimental_passphrase,
             browser_auth,
             passphrase_handle: None,
             passphrase_instance_input: Input::default(),
@@ -359,7 +341,6 @@ impl App {
             passphrase_short_url: None,
             passphrase_setup_code: None,
             passphrase_phase: None,
-            first_run_state,
             backend_list,
             profile_list_state: ListState::default(),
             list_state: ListState::default(),
@@ -380,8 +361,6 @@ impl App {
             pending_delete: None,
             editing_original_name: None,
             field_focus: 0,
-            restore_error: None,
-            created_pubkey: String::new(),
             snapshots: Vec::new(),
             snapshot_filter: None,
             filter_picker_state: ListState::default(),
@@ -420,39 +399,11 @@ impl App {
             last_content_click: None,
         };
 
-        if experimental_passphrase {
-            app.start_passphrase_ceremony();
-            return Ok(app);
-        }
-
-        if !identity_exists {
-            app.screen = Screen::FirstRunChoice;
-            return Ok(app);
-        }
-
-        match config::load_age_cipher(&app.paths.identity) {
-            Ok(c) => app.cipher = Some(c),
-            Err(e) => {
-                app.error_is_fatal = true;
-                app.screen = Screen::Error(format!("{e:#}"));
-                return Ok(app);
-            }
-        }
-        app.load_config_or_set_fatal();
+        app.start_passphrase_ceremony();
         Ok(app)
     }
 
     fn load_config_or_set_fatal(&mut self) {
-        if self.cipher.is_none() && !self.passphrase_mode {
-            match config::load_age_cipher(&self.paths.identity) {
-                Ok(c) => self.cipher = Some(c),
-                Err(e) => {
-                    self.error_is_fatal = true;
-                    self.screen = Screen::Error(format!("{e:#}"));
-                    return;
-                }
-            }
-        }
         let Some(cipher) = self.cipher.as_ref() else {
             self.error_is_fatal = true;
             self.screen = Screen::Error("internal: cipher not initialized before config load".into());
@@ -489,9 +440,10 @@ impl App {
                 if cfg.cipher != config::CIPHER_MARKER_PASSPHRASE {
                     self.error_is_fatal = true;
                     self.screen = Screen::Error(format!(
-                        "{} has cipher = \"{}\"; drop --experimental-passphrase to open it",
+                        "{} has unsupported cipher = \"{}\"; only \"{}\" is supported",
                         self.paths.config.display(),
-                        cfg.cipher
+                        cfg.cipher,
+                        config::CIPHER_MARKER_PASSPHRASE,
                     ));
                     return;
                 }
@@ -622,7 +574,7 @@ impl App {
                 instance_sig,
                 salt: base64::engine::general_purpose::STANDARD.encode(&salt),
             };
-            self.cipher = Some(Cipher::Passphrase { key: config_key });
+            self.cipher = Some(Cipher::new(config_key));
             self.load_config_or_set_fatal();
             self.config.passphrase = Some(meta);
             if let Some(cipher) = self.cipher.as_ref()
@@ -648,7 +600,7 @@ impl App {
                 self.screen = Screen::PassphraseUnlock;
                 return;
             }
-            self.cipher = Some(Cipher::Passphrase { key: config_key });
+            self.cipher = Some(Cipher::new(config_key));
             self.load_config_or_set_fatal();
         }
         self.clear_passphrase_scratch();
@@ -674,7 +626,7 @@ impl App {
             Err(std_mpsc::TryRecvError::Empty) => return,
             Err(std_mpsc::TryRecvError::Disconnected) => return,
         };
-        self.cipher = Some(Cipher::Passphrase { key: outcome.key });
+        self.cipher = Some(Cipher::new(outcome.key));
         if let Some(h) = self.passphrase_handle.take() {
             h.stop();
         }
@@ -1022,26 +974,6 @@ impl App {
     // code path. The mouse handler updates the relevant selection first,
     // then calls the matching helper.
 
-    fn activate_first_run(&mut self) {
-        match self.first_run_state.selected().unwrap_or(0) {
-            0 => match config::generate_identity(&self.paths.identity) {
-                Ok(pubkey) => {
-                    self.created_pubkey = pubkey;
-                    self.screen = Screen::KeyCreated;
-                }
-                Err(e) => {
-                    self.error_is_fatal = true;
-                    self.screen = Screen::Error(format!("{e:#}"));
-                }
-            },
-            1 => {
-                self.restore_error = None;
-                self.screen = Screen::RestoreKeyWait;
-            }
-            _ => self.quit = true,
-        }
-    }
-
     fn activate_home_profile(&mut self) {
         if self.config.profiles.is_empty() {
             return;
@@ -1239,14 +1171,7 @@ impl App {
         };
         let profile = profile.clone();
         let key = match self.cipher.as_ref() {
-            Some(Cipher::Age { .. }) => match share::derive_signing_key(&self.paths.identity) {
-                Ok(k) => k,
-                Err(e) => {
-                    self.share_error = Some(format!("Deriving signing key: {e:#}"));
-                    return;
-                }
-            },
-            Some(Cipher::Passphrase { key }) => passphrase::derive_share_signing_key(key),
+            Some(c) => passphrase::derive_share_signing_key(c.key()),
             None => {
                 self.share_error = Some("internal: cipher not available".into());
                 return;
@@ -1290,60 +1215,6 @@ impl App {
         }
 
         match &self.screen {
-            Screen::FirstRunChoice => match key.code {
-                KeyCode::Down | KeyCode::Char('j') => self.first_run_state.select_next(),
-                KeyCode::Up | KeyCode::Char('k') => self.first_run_state.select_previous(),
-                KeyCode::PageDown => {
-                    let step = self.page_step();
-                    page_select(&mut self.first_run_state, FIRST_RUN_MENU.len(), true, step);
-                }
-                KeyCode::PageUp => {
-                    let step = self.page_step();
-                    page_select(&mut self.first_run_state, FIRST_RUN_MENU.len(), false, step);
-                }
-                KeyCode::Esc => self.quit = true,
-                KeyCode::Enter => self.activate_first_run(),
-                _ => {}
-            },
-
-            Screen::RestoreKeyWait => match key.code {
-                KeyCode::Esc => {
-                    self.restore_error = None;
-                    self.screen = Screen::FirstRunChoice;
-                }
-                KeyCode::Enter => {
-                    if !self.paths.identity.exists() {
-                        self.restore_error = Some(format!(
-                            "No file found at {}. Place your age.key there, then press Enter.",
-                            self.paths.identity.display()
-                        ));
-                    } else {
-                        match config::validate_identity(&self.paths.identity) {
-                            Ok(_) => {
-                                self.restore_error = None;
-                                self.load_config_or_set_fatal();
-                            }
-                            Err(e) => {
-                                self.restore_error = Some(format!(
-                                    "Could not read identity at {}: {e:#}",
-                                    self.paths.identity.display()
-                                ));
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            },
-
-            Screen::KeyCreated => match key.code {
-                KeyCode::Enter => {
-                    self.created_pubkey.clear();
-                    self.load_config_or_set_fatal();
-                }
-                KeyCode::Esc => self.quit = true,
-                _ => {}
-            },
-
             Screen::PassphraseInstancePrompt => match key.code {
                 KeyCode::Enter => self.submit_passphrase_instance(),
                 KeyCode::Esc => {
@@ -2079,14 +1950,6 @@ impl App {
             return;
         };
         match &self.screen {
-            Screen::FirstRunChoice => {
-                if let Some(idx) =
-                    click_to_index(area, self.first_run_state.offset(), FIRST_RUN_MENU.len(), row, col)
-                {
-                    self.first_run_state.select(Some(idx));
-                    self.activate_first_run();
-                }
-            }
             Screen::Home => {
                 let len = self.config.profiles.len();
                 if let Some(idx) =
@@ -2190,13 +2053,6 @@ impl App {
 
     fn handle_wheel(&mut self, down: bool) {
         match &self.screen {
-            Screen::FirstRunChoice => {
-                if down {
-                    self.first_run_state.select_next();
-                } else {
-                    self.first_run_state.select_previous();
-                }
-            }
             Screen::Home => {
                 if down {
                     self.profile_list_state.select_next();
@@ -2392,7 +2248,7 @@ mod tests {
             std::process::id(),
             uniq()
         ));
-        let mut app = App::boot(Some(tmp), 7834, false, false).expect("boot");
+        let mut app = App::boot(Some(tmp), 7834, false).expect("boot");
         app.snapshots = snaps;
         app
     }

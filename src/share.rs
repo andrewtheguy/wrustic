@@ -7,7 +7,6 @@
 
 use std::convert::Infallible;
 use std::io;
-use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
@@ -24,7 +23,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use rustic_core::{IndexedFullStatus, Repository, TreeId};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 
@@ -73,14 +72,6 @@ impl Drop for ShareHandle {
             let _ = tx.send(());
         }
     }
-}
-
-pub(crate) fn derive_signing_key(identity_path: &Path) -> Result<[u8; 32]> {
-    let bytes = std::fs::read(identity_path)
-        .map_err(|e| anyhow!("reading {}: {e}", identity_path.display()))?;
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    Ok(hasher.finalize().into())
 }
 
 fn random_short_id() -> String {
@@ -597,22 +588,6 @@ mod tests {
     }
 
     #[test]
-    fn derive_signing_key_is_stable() {
-        let dir = std::path::PathBuf::from("tmp").join(format!(
-            "share-derive-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("age.key");
-        std::fs::write(&p, b"some-identity-bytes\nAGE-SECRET-KEY-...\n").unwrap();
-        let a = derive_signing_key(&p).unwrap();
-        let b = derive_signing_key(&p).unwrap();
-        assert_eq!(a, b);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
     fn sanitize_filename_strips_unsafe() {
         assert_eq!(sanitize_filename("ok.txt"), "ok.txt");
         assert_eq!(sanitize_filename("bad\"name\r\n.txt"), "badname.txt");
@@ -704,11 +679,7 @@ mod tests {
         let port = probe.local_addr().unwrap().port();
         drop(probe);
 
-        let id_path = std::path::PathBuf::from("tmp/share-test/wrustic-sandbox/age.key");
-        // Test runs against any 32-byte signing key; fabricate one here
-        // rather than rely on a real age.key being present.
         let key = [0x77u8; 32];
-        let _ = id_path; // silence if unused
 
         let handle = start(port, profile, key, target, SHARE_TTL).expect("start server");
 

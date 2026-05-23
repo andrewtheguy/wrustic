@@ -1,7 +1,7 @@
 # Encryption
 
 Per-value secret encryption for `config.toml`, plus the passphrase ceremony
-server that derives the passphrase-mode key.
+server that derives the key.
 
 **Scope: single-user, single-device.** wrustic is a personal tool — one
 person, one machine. There is no multi-user threat model, no privilege
@@ -10,13 +10,11 @@ account on the same machine. Everything below — file permissions,
 localhost-only servers, in-memory key handling — is sized for that
 scope. If you need a multi-tenant secret store, this isn't it.
 
-Two ciphers are supported and are deliberately non-interoperable; the one
-a config was created with is the one it stays in for its lifetime.
+One cipher is supported:
 
-| Cipher | Prefix | Algorithm | Key source | Status |
-|---|---|---|---|---|
-| `Cipher::Age` | `ageenc:` | age x25519 (single recipient) | `<config-dir>/age.key`, mode 0600 | default |
-| `Cipher::Passphrase` | `pkenc:` | ChaCha20-Poly1305 AEAD | scrypt-derived config key from user passphrase, never on disk | experimental, gated behind `--experimental-passphrase` |
+| Cipher | Prefix | Algorithm | Key source |
+|---|---|---|---|
+| `Cipher` | `pkenc:` | ChaCha20-Poly1305 AEAD | scrypt-derived config key from user passphrase, never on disk |
 
 Source of truth: `src/crypto.rs`, `src/config.rs`, `src/passphrase.rs`.
 
@@ -48,53 +46,32 @@ encrypted into noise.
 
 ```toml
 version = 2
-cipher  = "age-v1"           # or "passphrase-v1" — required, no default
-recipient = "age1…"          # age mode only; omitted in passphrase mode
+cipher  = "passphrase-v1"      # required, no default
 
 [profiles.<name>]
 backend  = "local" | "rest" | "s3"
-password = "ageenc:…"        # or "pkenc:…" depending on mode
+password = "pkenc:…"
 # plus backend-specific fields (some encrypted, some not — see table above)
 
-[passphrase]                 # passphrase mode only
+[passphrase]
 instance     = "<text>"     # DNS-safe instance (max 32 chars)
 instance_sig = "<base64>"   # HMAC-SHA256(instance, derived_key)
 salt          = "<base64>"   # random 32-byte scrypt salt
 ```
 
-### Required fields and cross-mode safety
-
-Two independent safety nets prevent a passphrase config from being opened in
-age mode (or vice versa):
+### Required fields and safety checks
 
 1. **`cipher` is mandatory.** The `Config::cipher` field has no
    `#[serde(default)]`, so a TOML without that key fails to parse — there
-   is no silent fallback. The accepted values are `"age-v1"` and
-   `"passphrase-v1"` (constants in `src/config.rs`).
-2. **`config::load` cross-checks the marker against the active `Cipher`.**
-   Before any field is decrypted, `load` compares the on-disk marker against
-   the `Cipher` variant the caller passed in. Mismatch → error with a hint
-   about which flag to add or drop.
+   is no silent fallback. The only accepted value is `"passphrase-v1"`
+   (constant in `src/config.rs`).
+2. **`config::load` validates the marker.** Before any field is decrypted,
+   `load` checks the on-disk marker is `"passphrase-v1"`. Mismatch → error.
 
 A *third* implicit check sits at the value level: `Cipher::decrypt` rejects
-any value whose prefix doesn't match the active cipher. So even if both
-above were bypassed, a `pkenc:` value would never be fed to age and vice
-versa.
+any value whose prefix isn't `pkenc:`.
 
-### `recipient` field (age mode only)
-
-In age mode `recipient` holds the bech32 public key derived from
-`age.key`. `load` checks it matches the identity file's derived recipient
-before trusting any encrypted value. This catches the case where the
-config and the key file have drifted apart (wrong dir, restored backup
-mismatch, etc.).
-
-In passphrase mode the field is omitted (`#[serde(skip_serializing_if =
-"Option::is_none")]`) — there is no equivalent public key, and the
-instance signature plus the AEAD's integrity tag together cover the
-"correct key?" check at decrypt time.
-
-### `[passphrase]` block (passphrase mode only)
+### `[passphrase]` block
 
 ```toml
 [passphrase]
@@ -136,8 +113,7 @@ in place. Disk encryption is your responsibility.
 
 **Short answer:** the *secret* fields are safe — they're already AEAD-
 encrypted in place. What leaks if the bare file is exposed is the
-*shape* of your setup, plus, in age mode, the public key needed to
-target you.
+*shape* of your setup.
 
 The TOML file always exposes, in plaintext:
 
@@ -146,32 +122,17 @@ The TOML file always exposes, in plaintext:
 - All public backend fields: `local_path`, `rest_url`, `s3_endpoint`,
   `s3_bucket`, `s3_region`, `s3_root`.
 - Schema metadata: `version`, `cipher` marker.
-- Age mode: the `recipient` bech32 public key.
-- Passphrase mode: the `[passphrase]` block (`instance`, `instance_sig`,
+- The `[passphrase]` block (`instance`, `instance_sig`,
   `salt`). The instance is a user-chosen label; the signature and salt are
   useless without the passphrase.
 
 Everything else (repo passwords, REST user/password, S3 access/secret
-keys) sits behind `ageenc:` or `pkenc:` and is unreadable without the
-matching key.
+keys) sits behind `pkenc:` and is unreadable without the passphrase.
 
-### Practical guidance per mode
-
-**Age mode** — backing up *just* `config.toml` is safe in the secrets
-sense, but worth noting:
-
-- The `recipient` public key in the file points at the age identity an
-  attacker would need to obtain. If they breach the host where
-  `age.key` lives, they pair the two and recover everything.
-- **Don't back up `age.key` alongside `config.toml` in the same
-  unencrypted blob** — that's equivalent to backing up the secrets in
-  plaintext. Either keep `age.key` out of the backup, or wrap the backup
-  itself in another layer.
-
-**Passphrase mode** — the key is never on disk; the `[passphrase]` block
-is metadata, not material. An attacker with only `config.toml` would need
-to brute-force the passphrase through wrustic's scrypt parameters and then
-pass the HMAC check.
+The key is never on disk; the `[passphrase]` block is metadata, not
+material. An attacker with only `config.toml` would need to brute-force
+the passphrase through wrustic's scrypt parameters and then pass the
+HMAC check.
 
 ### What's still in scope for a config-only leak
 
@@ -186,37 +147,7 @@ tells an attacker:
 If that metadata is itself sensitive, treat `config.toml` like any
 other secret file and encrypt the backup container.
 
-## age cipher (`Cipher::Age`)
-
-### Identity file format
-
-`age.key` is sops-style: optional `# comment` lines, then exactly one
-`AGE-SECRET-KEY-…` line. wrustic refuses files containing two or more
-identity lines — keeping the recipient unambiguous matters for the
-`recipient` cross-check on load.
-
-`config::generate_identity` writes the file with `O_CREAT|O_EXCL` and
-`mode 0600`, so it can't silently overwrite an existing key. The bech32
-public key is included as a `# public key: …` comment for human readers.
-
-### Encrypt / decrypt
-
-```
-ageenc:<base64( age::encrypt(recipient, plaintext) )>
-```
-
-Each value is encrypted independently with `age::encrypt` (single
-recipient, no passphrase). The age stream header and AEAD body together
-form the base64 payload after the prefix. There is no separate nonce
-field because age generates its own internally.
-
-Decrypt is the inverse: strip prefix, base64-decode, `age::decrypt` with
-the loaded `Identity`. Failure modes bubble up as `anyhow::Error` and end
-up on the boot Error screen.
-
-## Passphrase cipher (`Cipher::Passphrase`)
-
-### Key derivation
+## Key derivation
 
 The 32-byte AEAD key is derived from the user's passphrase with
 **scrypt**. The browser encrypts the passphrase to the localhost server
@@ -275,29 +206,14 @@ decrypt everything else with the resulting key.
 
 ### Two modes: terminal (default) and browser
 
-By default, passphrase mode prompts for input directly in the terminal.
+By default, wrustic prompts for passphrase input directly in the terminal.
 Adding `--browser-auth` switches to a browser-based ceremony where the
 user enters the passphrase on a localhost page instead.
 
 | Mode | Flag | Setup flow | Unlock flow |
 |------|------|-----------|-------------|
-| Terminal (default) | `--experimental-passphrase` | Instance prompt → passphrase + confirm → scrypt | Passphrase prompt → scrypt → HMAC verify |
-| Browser | `--experimental-passphrase --browser-auth` | Instance prompt → browser URL + setup code → scrypt | Browser URL → passphrase → scrypt → HMAC verify |
-
-### Gating
-
-Only available when both flags are present:
-
-- `--experimental-passphrase` opts in.
-- `--config-dir <path>` must also be passed (no default `~/.config/wrustic`
-  fallback while the feature is experimental, so it can't silently
-  shadow a real config).
-- `--browser-auth` optionally activates the browser ceremony (requires
-  `--experimental-passphrase`).
-
-The CLI parser hard-fails if `--experimental-passphrase` is set without
-`--config-dir`, or if `--browser-auth` is set without
-`--experimental-passphrase`.
+| Terminal (default) | (none) | Instance prompt → passphrase + confirm → scrypt | Passphrase prompt → scrypt → HMAC verify |
+| Browser | `--browser-auth` | Instance prompt → browser URL + setup code → scrypt | Browser URL → passphrase → scrypt → HMAC verify |
 
 ### Terminal passphrase input (default)
 
@@ -590,8 +506,7 @@ values as raw bytes.
   extension can still drive the page).
 
 **Browser support.** WebCrypto `X25519` became broadly available in
-2025: Chrome 133+, Firefox 130+, Safari 18.4+. wrustic's passphrase mode
-is flagged `--experimental-passphrase` and targets these versions.
+2025: Chrome 133+, Firefox 130+, Safari 18.4+.
 
 **Algorithm choice.**
 - X25519 over P-256 ECDH: smaller key, single fixed curve, faster, no
@@ -632,17 +547,13 @@ encrypted.
 ## Share dialog signing key
 
 The share server (`src/share.rs`) signs URLs with HMAC-SHA256 over
-`(snap_id, tree_id, name, exp)`. The 32-byte signing key is derived from
-the active cipher's material:
-
-| Mode | Derivation |
-|---|---|
-| age | `derive_signing_key(age.key bytes)` — SHA-256 over the raw key file |
-| passphrase | `passphrase::derive_share_signing_key(config_key)` — SHA-256 over `"wrustic-share-v1\0" \|\| config_key` |
+`(snap_id, tree_id, name, exp)`. The 32-byte signing key is derived via
+`passphrase::derive_share_signing_key(config_key)` — SHA-256 over
+`"wrustic-share-v1\0" || config_key`.
 
 Same key per identity (no per-session randomness) → share URLs stay valid
-across wrustic restarts within their 1-hour TTL. Different identity →
-different key, so URLs minted under one identity cannot be replayed
+across wrustic restarts within their 1-hour TTL. Different passphrase →
+different key, so URLs minted under one passphrase cannot be replayed
 against a server started under another.
 
 This signing key is independent of `Cipher`: a tampered URL fails HMAC
@@ -658,20 +569,16 @@ In scope:
 - **Config exfiltration off-device.** A copy of `config.toml` that ends
   up in cloud sync, a generic file-share, a publicly readable backup,
   or a misconfigured snapshot does not by itself leak the secret
-  fields. The attacker would need the matching `age.key` (age mode) or
-  the passphrase (passphrase mode, subject to scrypt brute-force
-  resistance).
-- **Cross-config mixing.** Passphrase configs cannot be opened in age mode
-  and vice versa; URLs minted under one identity cannot be redeemed
-  under another (covered by the share signing key and the AEAD's tag).
+  fields. The attacker would need the passphrase (subject to scrypt
+  brute-force resistance).
 - **Mid-save corruption.** Atomic rename leaves the previous config
   intact even if the process is killed mid-write.
 
 Not in scope:
 - **Hostile local accounts on the same machine.** wrustic doesn't
   defend against this — single-user scope.
-- **Root / disk-image access.** Anyone with raw disk access or with the
-  key file / passphrase can decrypt the config. Use full-disk
+- **Root / disk-image access.** Anyone with raw disk access or the
+  passphrase can decrypt the config. Use full-disk
   encryption if that matters.
 - **Memory disclosure** (core dumps, ptrace, swap). Cipher key bytes are
   ordinary heap memory — not `mlock`ed, not zeroized on drop.

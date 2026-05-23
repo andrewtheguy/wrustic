@@ -29,10 +29,9 @@ It is intentionally **not** a restic replacement:
 
 ```
 main()
- └── App::boot(config_dir, port, experimental_passphrase, browser_auth)  // app.rs
-      ├── config::paths(override) → Paths { identity, config }
-      ├── (age mode)        load_age_cipher(age.key) → Cipher::Age
-      ├── (passphrase mode) start_passphrase_ceremony()       // app.rs + passphrase.rs
+ └── App::boot(config_dir, port, browser_auth)  // app.rs
+      ├── config::paths(override) → Paths { config }
+      ├── start_passphrase_ceremony()       // app.rs + passphrase.rs
       └── load_config_or_set_fatal()
             └── config::load(paths, cipher) → Config (with profiles decrypted)
  │
@@ -86,9 +85,9 @@ Keypress handling is concentrated in `App::handle_key` (single big match on
 `PassphraseMeta`) and the atomic save: write `config.toml.tmp` at mode
 0600, then `rename(2)` over the target.
 
-Two ciphers are supported, per-value (not whole-file) so non-secret edits
-diff cleanly. For schema details, key derivation, threat model, the
-ceremony server, and the share-server signing-key derivation, see
+Encryption is per-value (not whole-file) so non-secret edits diff cleanly.
+For schema details, key derivation, threat model, the ceremony server, and
+the share-server signing-key derivation, see
 [encryption.md](encryption.md).
 
 ## Localhost servers (`share.rs`, `passphrase.rs`)
@@ -112,9 +111,8 @@ Both servers follow the same shape so the patterns transfer:
 - Per-file: each `start()` call is bound to one `(snap_id, tree_id, name)`.
   A URL minted for file A cannot be replayed against a later server bound to
   file B — the name is part of the HMAC.
-- HMAC signing key is derived from the age identity bytes (age mode) or from
-  the passphrase-derived config key (passphrase mode, via
-  `passphrase::derive_share_signing_key`). Same key per identity → URLs
+- HMAC signing key is derived from the passphrase-derived config key (via
+  `passphrase::derive_share_signing_key`). Same key per passphrase → URLs
   survive across restarts within the TTL.
 - Routes:
   - `GET /dl?snap=…&tree=…&exp=…&sig=…` — verifies sig + expiry, streams the
@@ -125,7 +123,7 @@ Both servers follow the same shape so the patterns transfer:
 - TTL: `SHARE_TTL = 1 h` baked into the signed `exp` claim. The server
   enforces expiry independently of any wall-clock state on its end.
 
-### Passphrase (`src/passphrase.rs`, experimental)
+### Passphrase (`src/passphrase.rs`)
 
 **Terminal mode (default):** no server is started. `passphrase.rs` exposes
 `derive_config_key`, `verify_instance_sig`, `compute_instance_sig`, and
