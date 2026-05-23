@@ -63,7 +63,8 @@ fn bottom_bar_text(screen: &Screen) -> &'static str {
         Screen::PassphraseSetup => "Tab/Shift+Tab field  Enter submit  Esc back",
         Screen::PassphraseUnlock => "type  Enter submit  Esc quit",
         Screen::PassphraseDerivingKey => "working…",
-        Screen::PassphraseUrl => "Esc/q quit  (waiting for browser ceremony)",
+        Screen::AuthMethodChoice => "j/k move  Enter pick  Esc back",
+        Screen::PassphraseUrl => "Esc/q quit",
         Screen::SnapshotCompareFirst => {
             "j/k move  PgUp/PgDn page  g/G top/bottom  Enter pick FIRST  Esc cancel"
         }
@@ -218,6 +219,7 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
             let help_p = Paragraph::new("Lowercase letters, digits, and hyphens (max 32 chars).").style(Style::new().fg(Color::DarkGray));
             frame.render_widget(help_p, help_area);
         }
+        Screen::AuthMethodChoice => render_auth_method_choice(frame, app, area),
         Screen::PassphraseSetup => render_passphrase_setup(frame, app, area),
         Screen::PassphraseUnlock => render_passphrase_unlock(frame, app, area),
         Screen::PassphraseDerivingKey => {
@@ -800,6 +802,25 @@ fn render_file_details(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(para, area);
 }
 
+fn render_auth_method_choice(frame: &mut Frame, app: &mut App, area: Rect) {
+    let items = vec![
+        ListItem::new("Enter passphrase in terminal"),
+        ListItem::new("Enter passphrase in browser"),
+    ];
+    let phase_label = match app.passphrase_phase {
+        Some(PassphrasePhase::Setup) => "Setup",
+        Some(PassphrasePhase::Unlock) => "Unlock",
+        None => "Passphrase",
+    };
+    let title = format!("Choose auth method \u{2014} {phase_label}");
+    let list = List::new(items)
+        .block(Block::bordered().title(title))
+        .highlight_style(selection_highlight())
+        .highlight_symbol(">> ");
+    record_list_area(app, area);
+    frame.render_stateful_widget(list, area, &mut app.auth_method_list);
+}
+
 fn render_passphrase_setup(frame: &mut Frame, app: &App, area: Rect) {
     let fields = [
         ("Passphrase", &app.passphrase_input, true),
@@ -905,17 +926,35 @@ fn render_passphrase_url(frame: &mut Frame, app: &mut App, area: Rect) {
             None => {}
         }
     }
-    let style = if expired {
+    if !expired && app.passphrase_error.is_none() {
+        lines.push_str("\nPress o to open the URL in your browser.\n");
+        lines.push_str("\nWaiting for browser ceremony\u{2026}\n");
+    }
+    let block = Block::bordered().title(format!("Passphrase \u{2014} {phase_label}"));
+    let inner = block.inner(area);
+    record_list_area(app, area);
+    frame.render_widget(block, area);
+    let main_style = if expired {
         Style::new().fg(Color::Red)
     } else {
         Style::default()
     };
-    let para = Paragraph::new(lines)
-        .style(style)
-        .wrap(Wrap { trim: false })
-        .block(Block::bordered().title(format!("Passphrase — {phase_label}")));
-    record_list_area(app, area);
-    frame.render_widget(para, area);
+    if let Some(err) = &app.passphrase_error {
+        let [main_area, err_area] = Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Length(3),
+        ])
+        .areas(inner);
+        let para = Paragraph::new(lines).style(main_style).wrap(Wrap { trim: false });
+        frame.render_widget(para, main_area);
+        let err_para = Paragraph::new(format!("{err}\nCopy and paste the URL manually."))
+            .style(Style::new().fg(Color::Red))
+            .wrap(Wrap { trim: false });
+        frame.render_widget(err_para, err_area);
+    } else {
+        let para = Paragraph::new(lines).style(main_style).wrap(Wrap { trim: false });
+        frame.render_widget(para, inner);
+    }
 }
 
 fn render_share_url(frame: &mut Frame, app: &mut App, area: Rect) {
