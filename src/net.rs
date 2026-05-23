@@ -10,11 +10,10 @@ pub(crate) fn bind_loopback(port: u16) -> Result<(std::net::TcpListener, Option<
     let v6 = {
         use std::net::{Ipv6Addr, SocketAddrV6};
         let addr = SocketAddrV6::new(Ipv6Addr::LOCALHOST, port, 0, 0);
-        std::net::TcpListener::bind(addr).ok()
+        std::net::TcpListener::bind(addr)
+            .ok()
+            .and_then(|l| l.set_nonblocking(true).ok().map(|()| l))
     };
-    if let Some(ref l) = v6 {
-        let _ = l.set_nonblocking(true);
-    }
 
     Ok((v4, v6))
 }

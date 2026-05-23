@@ -58,11 +58,15 @@ pub(crate) struct PassphraseHandle {
     #[allow(dead_code)]
     pub(crate) transport_public_b64: String,
     shutdown_tx: Option<oneshot::Sender<()>>,
+    shutdown_v6_tx: Option<oneshot::Sender<()>>,
     join_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl PassphraseHandle {
     pub(crate) fn stop(mut self) {
+        if let Some(tx) = self.shutdown_v6_tx.take() {
+            let _ = tx.send(());
+        }
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
@@ -78,6 +82,9 @@ impl PassphraseHandle {
 
 impl Drop for PassphraseHandle {
     fn drop(&mut self) {
+        if let Some(tx) = self.shutdown_v6_tx.take() {
+            let _ = tx.send(());
+        }
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
@@ -271,6 +278,7 @@ pub(crate) fn start(
     });
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let (shutdown_v6_tx, shutdown_v6_rx) = oneshot::channel::<()>();
 
     let thread_ctx = ctx.clone();
     let join = thread::Builder::new()
@@ -290,7 +298,7 @@ pub(crate) fn start(
                 {
                     let ctx2 = thread_ctx.clone();
                     tokio::spawn(async move {
-                        accept_v6(v6, ctx2).await;
+                        accept_v6(v6, ctx2, shutdown_v6_rx).await;
                     });
                 }
                 let listener = match TcpListener::from_std(listener_std) {
@@ -311,6 +319,7 @@ pub(crate) fn start(
         deadline,
         transport_public_b64,
         shutdown_tx: Some(shutdown_tx),
+        shutdown_v6_tx: Some(shutdown_v6_tx),
         join_handle: Some(join),
     })
 }
@@ -341,20 +350,25 @@ async fn accept_loop(
     }
 }
 
-async fn accept_v6(listener: TcpListener, ctx: Arc<Ctx>) {
+async fn accept_v6(listener: TcpListener, ctx: Arc<Ctx>, mut shutdown_rx: oneshot::Receiver<()>) {
     loop {
-        let stream = match listener.accept().await {
-            Ok((s, _)) => s,
-            Err(_) => continue,
-        };
-        let ctx = ctx.clone();
-        tokio::spawn(async move {
-            let io = TokioIo::new(stream);
-            let svc = service_fn(move |req| handle(req, ctx.clone()));
-            let _ = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, svc)
-                .await;
-        });
+        tokio::select! {
+            _ = &mut shutdown_rx => break,
+            res = listener.accept() => {
+                let stream = match res {
+                    Ok((s, _)) => s,
+                    Err(_) => continue,
+                };
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let svc = service_fn(move |req| handle(req, ctx.clone()));
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, svc)
+                        .await;
+                });
+            }
+        }
     }
 }
 
@@ -975,6 +989,7 @@ mod tests {
             deadline: Instant::now() - Duration::from_secs(1),
             transport_public_b64: String::new(),
             shutdown_tx: Some(shutdown_tx),
+            shutdown_v6_tx: None,
             join_handle: None,
         };
         assert!(h.is_expired());
@@ -989,6 +1004,7 @@ mod tests {
             deadline: Instant::now() + Duration::from_secs(60),
             transport_public_b64: String::new(),
             shutdown_tx: Some(shutdown_tx),
+            shutdown_v6_tx: None,
             join_handle: None,
         };
         assert!(!h2.is_expired());
