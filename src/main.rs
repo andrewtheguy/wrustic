@@ -48,9 +48,9 @@ fn main() -> Result<()> {
     // Enable mouse reporting after entering raw mode. With capture on,
     // terminals route clicks/scroll to us instead of doing native text
     // selection; users can hold Shift to bypass and select text.
-    let mouse_enabled =
-        crossterm::execute!(std::io::stdout(), EnableMouseCapture).is_ok();
-    let result = run(&mut terminal, cli.config_dir, cli.port, cli.browser_auth);
+    let mouse_enabled = !cli.no_mouse
+        && crossterm::execute!(std::io::stdout(), EnableMouseCapture).is_ok();
+    let result = run(&mut terminal, cli.config_dir, cli.port);
     if mouse_enabled {
         let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     }
@@ -62,9 +62,8 @@ fn run(
     terminal: &mut DefaultTerminal,
     config_dir: Option<PathBuf>,
     server_port: u16,
-    browser_auth: bool,
 ) -> Result<()> {
-    let mut app = App::boot(config_dir, server_port, browser_auth)?;
+    let mut app = App::boot(config_dir, server_port)?;
 
     while !app.quit {
         terminal.draw(|f| render(f, &mut app))?;

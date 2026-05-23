@@ -2,7 +2,8 @@ use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
-    widgets::{Block, List, ListItem, Paragraph, Wrap},
+    text::{Line, Span},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
 };
 use tui_input::Input;
 
@@ -12,9 +13,9 @@ use crate::repo::ContentKind;
 
 pub(crate) fn render(frame: &mut Frame, app: &mut App) {
     let [top, body, bottom] = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(3),
         Constraint::Fill(1),
-        Constraint::Length(1),
+        Constraint::Length(3),
     ])
     .areas(frame.area());
 
@@ -25,18 +26,54 @@ pub(crate) fn render(frame: &mut Frame, app: &mut App) {
 
 fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
     let text = match &app.active_profile_name {
-        Some(name) => format!(" wrustic — profile: {name}"),
-        None => " wrustic".to_string(),
+        Some(name) => format!("wrustic — profile: {name}"),
+        None => "wrustic".to_string(),
     };
-    let para = Paragraph::new(text).style(Style::new().fg(Color::Black).bg(Color::Green));
+    let para = Paragraph::new(text)
+        .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .block(Block::default().borders(Borders::ALL));
     frame.render_widget(para, area);
 }
 
 fn render_bottom_bar(frame: &mut Frame, app: &App, area: Rect) {
     let text = bottom_bar_text(&app.screen);
-    let para = Paragraph::new(format!(" {text}"))
-        .style(Style::new().fg(Color::Black).bg(Color::DarkGray));
+    let content_width = area.width.saturating_sub(2) as usize;
+    let segments: Vec<&str> = text.split("  ").collect();
+    let footer_line = build_footer_line(&segments, content_width);
+    let para = Paragraph::new(footer_line)
+        .block(Block::default().borders(Borders::ALL));
     frame.render_widget(para, area);
+}
+
+fn build_footer_line(segments: &[&str], width: usize) -> Line<'static> {
+    let style = Style::default().fg(Color::White);
+
+    if segments.is_empty() {
+        return Line::from(Span::styled("", style));
+    }
+
+    let sep = " | ";
+    let sep_len = sep.len();
+
+    let mut total_width = 0usize;
+    let mut fit_count = 0usize;
+    for (i, seg) in segments.iter().enumerate() {
+        let needed = if i == 0 { seg.len() } else { sep_len + seg.len() };
+        if total_width + needed > width {
+            break;
+        }
+        total_width += needed;
+        fit_count += 1;
+    }
+
+    if fit_count == 0 {
+        let first = segments[0];
+        let truncated: String = first.chars().take(width).collect();
+        return Line::from(Span::styled(truncated, style));
+    }
+
+    let joined = segments[..fit_count].join(sep);
+    Line::from(Span::styled(joined, style))
 }
 
 fn bottom_bar_text(screen: &Screen) -> &'static str {
@@ -63,7 +100,8 @@ fn bottom_bar_text(screen: &Screen) -> &'static str {
         Screen::PassphraseSetup => "Tab/Shift+Tab field  Enter submit  Esc back",
         Screen::PassphraseUnlock => "type  Enter submit  Esc quit",
         Screen::PassphraseDerivingKey => "working…",
-        Screen::PassphraseUrl => "Esc/q quit  (waiting for browser ceremony)",
+        Screen::AuthMethodChoice => "j/k move  Enter pick  Esc back",
+        Screen::PassphraseUrl => "Esc/q quit",
         Screen::SnapshotCompareFirst => {
             "j/k move  PgUp/PgDn page  g/G top/bottom  Enter pick FIRST  Esc cancel"
         }
@@ -212,12 +250,13 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
                 Constraint::Fill(1),
             ])
             .areas(area);
-            let banner_p = Paragraph::new(banner).style(Style::new().fg(Color::DarkGray));
+            let banner_p = Paragraph::new(banner).style(Style::new().fg(Color::White));
             frame.render_widget(banner_p, banner_area);
             draw_input_field(frame, input_area, "Instance name", &app.passphrase_instance_input, false, true);
-            let help_p = Paragraph::new("Lowercase letters, digits, and hyphens (max 32 chars).").style(Style::new().fg(Color::DarkGray));
+            let help_p = Paragraph::new("Lowercase letters, digits, and hyphens (max 32 chars).").style(Style::new().fg(Color::White));
             frame.render_widget(help_p, help_area);
         }
+        Screen::AuthMethodChoice => render_auth_method_choice(frame, app, area),
         Screen::PassphraseSetup => render_passphrase_setup(frame, app, area),
         Screen::PassphraseUnlock => render_passphrase_unlock(frame, app, area),
         Screen::PassphraseDerivingKey => {
@@ -246,7 +285,9 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn selection_highlight() -> Style {
-    Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+    Style::new()
+        .bg(Color::Rgb(40, 40, 80))
+        .add_modifier(Modifier::BOLD)
 }
 
 // Stash the outer rect of the currently-rendered scrollable area so the
@@ -336,7 +377,7 @@ fn render_input(
 
     draw_input_field(frame, input_area, title, input, masked, true);
 
-    let help = Paragraph::new(help).style(Style::new().fg(Color::DarkGray));
+    let help = Paragraph::new(help).style(Style::new().fg(Color::White));
     frame.render_widget(help, help_area);
 }
 
@@ -361,7 +402,7 @@ fn render_grouped_input(
         draw_input_field(frame, areas[i], label, input, *masked, i == focus);
     }
 
-    let help_para = Paragraph::new(help).style(Style::new().fg(Color::DarkGray));
+    let help_para = Paragraph::new(help).style(Style::new().fg(Color::White));
     frame.render_widget(help_para, areas[fields.len()]);
 }
 
@@ -800,6 +841,25 @@ fn render_file_details(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(para, area);
 }
 
+fn render_auth_method_choice(frame: &mut Frame, app: &mut App, area: Rect) {
+    let items = vec![
+        ListItem::new("Enter passphrase in terminal"),
+        ListItem::new("Enter passphrase in browser"),
+    ];
+    let phase_label = match app.passphrase_phase {
+        Some(PassphrasePhase::Setup) => "Setup",
+        Some(PassphrasePhase::Unlock) => "Unlock",
+        None => "Passphrase",
+    };
+    let title = format!("Choose auth method \u{2014} {phase_label}");
+    let list = List::new(items)
+        .block(Block::bordered().title(title))
+        .highlight_style(selection_highlight())
+        .highlight_symbol(">> ");
+    record_list_area(app, area);
+    frame.render_stateful_widget(list, area, &mut app.auth_method_list);
+}
+
 fn render_passphrase_setup(frame: &mut Frame, app: &App, area: Rect) {
     let fields = [
         ("Passphrase", &app.passphrase_input, true),
@@ -905,17 +965,37 @@ fn render_passphrase_url(frame: &mut Frame, app: &mut App, area: Rect) {
             None => {}
         }
     }
-    let style = if expired {
+    if !expired {
+        if app.passphrase_error.is_none() {
+            lines.push_str("\nPress o to open the URL in your browser.\n");
+        }
+        lines.push_str("\nWaiting for browser ceremony\u{2026}\n");
+    }
+    let block = Block::bordered().title(format!("Passphrase \u{2014} {phase_label}"));
+    let inner = block.inner(area);
+    record_list_area(app, area);
+    frame.render_widget(block, area);
+    let main_style = if expired {
         Style::new().fg(Color::Red)
     } else {
         Style::default()
     };
-    let para = Paragraph::new(lines)
-        .style(style)
-        .wrap(Wrap { trim: false })
-        .block(Block::bordered().title(format!("Passphrase — {phase_label}")));
-    record_list_area(app, area);
-    frame.render_widget(para, area);
+    if let Some(err) = &app.passphrase_error {
+        let [main_area, err_area] = Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Length(3),
+        ])
+        .areas(inner);
+        let para = Paragraph::new(lines).style(main_style).wrap(Wrap { trim: false });
+        frame.render_widget(para, main_area);
+        let err_para = Paragraph::new(format!("{err}\nCopy and paste the URL manually."))
+            .style(Style::new().fg(Color::Red))
+            .wrap(Wrap { trim: false });
+        frame.render_widget(err_para, err_area);
+    } else {
+        let para = Paragraph::new(lines).style(main_style).wrap(Wrap { trim: false });
+        frame.render_widget(para, inner);
+    }
 }
 
 fn render_share_url(frame: &mut Frame, app: &mut App, area: Rect) {

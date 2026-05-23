@@ -1,6 +1,6 @@
 [package]
 name = "wrustic"
-version = "0.0.19"
+version = "0.0.20"
 edition = "2024"
 
 [dependencies]
@@ -16,6 +16,7 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 jiff = "0.2"
+open = "5"
 rand = "0.10.1"
 ratatui = "0.30.0"
 rustic_backend = { version = "0.6.1", default-features = false, features = ["rest", "opendal"] }

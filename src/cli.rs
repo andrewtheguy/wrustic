@@ -14,15 +14,14 @@ Options:
   -p, --port <N>              Localhost port for both the file-share dialog and
                               the passphrase ceremony. Default: 7834.
                               They never run concurrently, so they share a port.
-      --browser-auth          Use a browser-based ceremony for passphrase input
-                              instead of typing the passphrase in the terminal.
+      --no-mouse              Disable mouse reporting (useful for QA / copy-paste).
   -h, --help                  Print this help text.
 ";
 
 pub(crate) struct Cli {
     pub(crate) config_dir: Option<PathBuf>,
     pub(crate) port: u16,
-    pub(crate) browser_auth: bool,
+    pub(crate) no_mouse: bool,
     pub(crate) show_help: bool,
 }
 
@@ -31,7 +30,7 @@ impl Default for Cli {
         Self {
             config_dir: None,
             port: DEFAULT_SERVER_PORT,
-            browser_auth: false,
+            no_mouse: false,
             show_help: false,
         }
     }
@@ -43,7 +42,7 @@ pub(crate) fn parse_cli() -> Result<Cli> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => cli.show_help = true,
-            "--browser-auth" => cli.browser_auth = true,
+            "--no-mouse" => cli.no_mouse = true,
             "-c" | "--config-dir" => {
                 let value = args
                     .next()

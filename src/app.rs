@@ -25,6 +25,7 @@ pub(crate) const BACKEND_ORDER: [BackendKind; 3] =
 
 pub(crate) enum Screen {
     PassphraseInstancePrompt,
+    AuthMethodChoice,
     PassphraseSetup,
     PassphraseUnlock,
     PassphraseDerivingKey,
@@ -222,7 +223,6 @@ pub(crate) struct App {
     /// expects it to be).
     pub(crate) cipher: Option<Cipher>,
     pub(crate) server_port: u16,
-    pub(crate) browser_auth: bool,
     pub(crate) passphrase_handle: Option<PassphraseHandle>,
     pub(crate) passphrase_instance_input: Input,
     pub(crate) passphrase_input: Input,
@@ -233,6 +233,7 @@ pub(crate) struct App {
     pub(crate) passphrase_setup_code: Option<String>,
     pub(crate) passphrase_phase: Option<PassphrasePhase>,
 
+    pub(crate) auth_method_list: ListState,
     pub(crate) backend_list: ListState,
     pub(crate) profile_list_state: ListState,
     pub(crate) list_state: ListState,
@@ -319,9 +320,10 @@ impl App {
     pub(crate) fn boot(
         config_dir: Option<PathBuf>,
         server_port: u16,
-        browser_auth: bool,
     ) -> Result<Self> {
         let paths = config::paths(config_dir)?;
+        let mut auth_method_list = ListState::default();
+        auth_method_list.select(Some(0));
         let mut backend_list = ListState::default();
         backend_list.select(Some(0));
 
@@ -331,7 +333,6 @@ impl App {
             config: Config::default(),
             cipher: None,
             server_port,
-            browser_auth,
             passphrase_handle: None,
             passphrase_instance_input: Input::default(),
             passphrase_input: Input::default(),
@@ -341,6 +342,7 @@ impl App {
             passphrase_short_url: None,
             passphrase_setup_code: None,
             passphrase_phase: None,
+            auth_method_list,
             backend_list,
             profile_list_state: ListState::default(),
             list_state: ListState::default(),
@@ -449,20 +451,11 @@ impl App {
                 }
                 match cfg.passphrase {
                     Some(meta) => {
-                        if self.browser_auth {
-                            let instance = meta.instance.clone();
-                            self.config.passphrase = Some(meta.clone());
-                            self.launch_passphrase_server(
-                                PassphrasePhase::Unlock,
-                                Some(meta),
-                                &instance,
-                            );
-                        } else {
-                            self.passphrase_instance_value = meta.instance.clone();
-                            self.config.passphrase = Some(meta);
-                            self.passphrase_phase = Some(PassphrasePhase::Unlock);
-                            self.screen = Screen::PassphraseUnlock;
-                        }
+                        self.passphrase_instance_value = meta.instance.clone();
+                        self.config.passphrase = Some(meta);
+                        self.passphrase_phase = Some(PassphrasePhase::Unlock);
+                        self.auth_method_list.select(Some(0));
+                        self.screen = Screen::AuthMethodChoice;
                     }
                     None => {
                         self.error_is_fatal = true;
@@ -473,6 +466,35 @@ impl App {
                         ));
                     }
                 }
+            }
+        }
+    }
+
+    fn activate_auth_method(&mut self) {
+        let is_browser = self.auth_method_list.selected().unwrap_or(0) == 1;
+        let phase = self.passphrase_phase.unwrap_or(PassphrasePhase::Setup);
+        match (phase, is_browser) {
+            (PassphrasePhase::Setup, false) => {
+                self.field_focus = 0;
+                self.passphrase_input = Input::default();
+                self.passphrase_confirm = Input::default();
+                self.passphrase_error = None;
+                self.screen = Screen::PassphraseSetup;
+            }
+            (PassphrasePhase::Setup, true) => {
+                let instance = self.passphrase_instance_value.clone();
+                self.launch_passphrase_server(PassphrasePhase::Setup, None, &instance);
+            }
+            (PassphrasePhase::Unlock, false) => {
+                self.screen = Screen::PassphraseUnlock;
+            }
+            (PassphrasePhase::Unlock, true) => {
+                let meta = self.config.passphrase.clone();
+                let instance = meta
+                    .as_ref()
+                    .map(|m| m.instance.clone())
+                    .unwrap_or_default();
+                self.launch_passphrase_server(PassphrasePhase::Unlock, meta, &instance);
             }
         }
     }
@@ -503,17 +525,10 @@ impl App {
         if !is_valid_instance(&instance) {
             return;
         }
-        self.passphrase_instance_value = instance.clone();
-        if self.browser_auth {
-            self.launch_passphrase_server(PassphrasePhase::Setup, None, &instance);
-        } else {
-            self.passphrase_phase = Some(PassphrasePhase::Setup);
-            self.field_focus = 0;
-            self.passphrase_input = Input::default();
-            self.passphrase_confirm = Input::default();
-            self.passphrase_error = None;
-            self.screen = Screen::PassphraseSetup;
-        }
+        self.passphrase_instance_value = instance;
+        self.passphrase_phase = Some(PassphrasePhase::Setup);
+        self.auth_method_list.select(Some(0));
+        self.screen = Screen::AuthMethodChoice;
     }
 
     pub(crate) fn submit_passphrase_setup(&mut self) {
@@ -1277,12 +1292,34 @@ impl App {
 
             Screen::PassphraseDerivingKey => {}
 
+            Screen::AuthMethodChoice => match key.code {
+                KeyCode::Down | KeyCode::Char('j') => self.auth_method_list.select_next(),
+                KeyCode::Up | KeyCode::Char('k') => self.auth_method_list.select_previous(),
+                KeyCode::Enter => self.activate_auth_method(),
+                KeyCode::Esc => {
+                    if self.passphrase_phase == Some(PassphrasePhase::Setup) {
+                        self.screen = Screen::PassphraseInstancePrompt;
+                    } else {
+                        self.quit = true;
+                    }
+                }
+                _ => {}
+            },
+
             Screen::PassphraseUrl => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
                     if let Some(h) = self.passphrase_handle.take() {
                         h.stop();
                     }
                     self.quit = true;
+                }
+                KeyCode::Char('o') if self.passphrase_error.is_none() => {
+                    if let Some(url) = &self.passphrase_short_url
+                        && let Err(e) = open::that(url)
+                    {
+                        self.passphrase_error =
+                            Some(format!("Could not open browser: {e}"));
+                    }
                 }
                 _ => {}
             },
@@ -1972,6 +2009,14 @@ impl App {
                     self.activate_home_profile();
                 }
             }
+            Screen::AuthMethodChoice => {
+                if let Some(idx) =
+                    click_to_index(area, self.auth_method_list.offset(), 2, row, col)
+                {
+                    self.auth_method_list.select(Some(idx));
+                    self.activate_auth_method();
+                }
+            }
             Screen::BackendChoice => {
                 if let Some(idx) =
                     click_to_index(area, self.backend_list.offset(), BACKEND_ORDER.len(), row, col)
@@ -2071,6 +2116,13 @@ impl App {
                     self.profile_list_state.select_next();
                 } else {
                     self.profile_list_state.select_previous();
+                }
+            }
+            Screen::AuthMethodChoice => {
+                if down {
+                    self.auth_method_list.select_next();
+                } else {
+                    self.auth_method_list.select_previous();
                 }
             }
             Screen::BackendChoice => {
@@ -2261,7 +2313,7 @@ mod tests {
             std::process::id(),
             uniq()
         ));
-        let mut app = App::boot(Some(tmp), 7834, false).expect("boot");
+        let mut app = App::boot(Some(tmp), 7834).expect("boot");
         app.snapshots = snaps;
         app
     }
