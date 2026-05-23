@@ -1,11 +1,8 @@
+use aes_gcm::{Aes256Gcm, Nonce, aead::{Aead, AeadCore, KeyInit, OsRng}};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use chacha20poly1305::{
-    ChaCha20Poly1305, Key, Nonce,
-    aead::{Aead, AeadCore, KeyInit, OsRng},
-};
 
-const HEADER: &str = "$WR;1.0;CHACHA20-POLY1305;";
+const HEADER: &str = "$WR;1.0;AES-256-GCM;";
 const SIG_PREFIX_LEN: usize = 8;
 
 pub fn is_passphrase_encrypted(value: &str) -> bool {
@@ -18,11 +15,11 @@ fn encrypt_value(
     instance: &str,
     sig_prefix: &str,
 ) -> Result<String> {
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
-    let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+    let cipher = Aes256Gcm::new(aes_gcm::Key::<Aes256Gcm>::from_slice(key));
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
     let mut blob = cipher
         .encrypt(&nonce, plaintext.as_bytes())
-        .map_err(|e| anyhow!("chacha20poly1305 encrypt: {e}"))?;
+        .map_err(|e| anyhow!("aes-256-gcm encrypt: {e}"))?;
     let mut out = Vec::with_capacity(nonce.len() + blob.len());
     out.extend_from_slice(nonce.as_slice());
     out.append(&mut blob);
@@ -51,10 +48,10 @@ fn decrypt_value(value: &str, key: &[u8; 32]) -> Result<String> {
         bail!("encrypted payload too short ({} bytes)", raw.len());
     }
     let (nonce_bytes, ciphertext) = raw.split_at(12);
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+    let cipher = Aes256Gcm::new(aes_gcm::Key::<Aes256Gcm>::from_slice(key));
     let plaintext = cipher
         .decrypt(Nonce::from_slice(nonce_bytes), ciphertext)
-        .map_err(|e| anyhow!("chacha20poly1305 decrypt: {e}"))?;
+        .map_err(|e| anyhow!("aes-256-gcm decrypt: {e}"))?;
     String::from_utf8(plaintext).context("decrypted value is not valid UTF-8")
 }
 
@@ -109,7 +106,7 @@ mod tests {
     #[test]
     fn prefix_detection() {
         assert!(is_passphrase_encrypted(
-            "$WR;1.0;CHACHA20-POLY1305;mysite;abcd1234;AAAA"
+            "$WR;1.0;AES-256-GCM;mysite;abcd1234;AAAA"
         ));
         assert!(!is_passphrase_encrypted(""));
         assert!(!is_passphrase_encrypted("plain"));
@@ -119,7 +116,7 @@ mod tests {
     fn round_trip() {
         let key = [0x42u8; 32];
         let enc = encrypt_value("hunter2", &key, "test", "abcd1234").unwrap();
-        assert!(enc.starts_with("$WR;1.0;CHACHA20-POLY1305;test;abcd1234;"));
+        assert!(enc.starts_with("$WR;1.0;AES-256-GCM;test;abcd1234;"));
         assert!(!enc.contains('\n'));
         assert_eq!(decrypt_value(&enc, &key).unwrap(), "hunter2");
     }
@@ -148,7 +145,7 @@ mod tests {
     fn cipher_dispatch() {
         let cipher = Cipher::new([0x77u8; 32], "mysite".into(), "wgMS4JCMUouQ");
         let enc = cipher.encrypt("payload").unwrap();
-        assert!(enc.starts_with("$WR;1.0;CHACHA20-POLY1305;mysite;wgMS4JCM;"));
+        assert!(enc.starts_with("$WR;1.0;AES-256-GCM;mysite;wgMS4JCM;"));
         assert_eq!(cipher.decrypt(&enc).unwrap(), "payload");
         assert!(cipher.decrypt("plain").is_err());
     }
