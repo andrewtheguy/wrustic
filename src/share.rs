@@ -7,7 +7,6 @@
 
 use std::convert::Infallible;
 use std::io;
-use std::io::Read;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -84,26 +83,8 @@ pub(crate) fn derive_signing_key(identity_path: &Path) -> Result<[u8; 32]> {
     Ok(hasher.finalize().into())
 }
 
-// 16 hex chars (64 bits) of randomness for the short URL id. Read from
-// /dev/urandom so we never collide with a previous run's id and don't have
-// to guess at the OS rng story. Falls back to mixing process id + nanos if
-// /dev/urandom isn't readable, which is good enough for a localhost alias
-// that's only meant to deter someone shoulder-surfing the terminal.
 fn random_short_id() -> String {
-    let mut buf = [0u8; 8];
-    let filled = std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut buf))
-        .is_ok();
-    if !filled {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
-        let pid = std::process::id();
-        let mix = (nanos as u64) ^ ((pid as u64) << 32);
-        buf.copy_from_slice(&mix.to_le_bytes());
-    }
-    hex_encode(&buf)
+    hex_encode(&rand::random::<[u8; 8]>())
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

@@ -5665,6 +5665,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jiff",
+ "rand 0.10.1",
  "ratatui",
  "rustic_backend",
  "rustic_core",

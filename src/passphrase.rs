@@ -1,5 +1,4 @@
 use std::convert::Infallible;
-use std::io::Read;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc as std_mpsc;
@@ -80,46 +79,22 @@ impl Drop for PassphraseHandle {
     }
 }
 
-fn random_short_id() -> Result<String> {
-    let buf = random_bytes(8)?;
+fn random_short_id() -> String {
+    let buf: [u8; 8] = rand::random();
     let mut s = String::with_capacity(16);
     use std::fmt::Write;
     for b in &buf {
         write!(s, "{b:02x}").unwrap();
     }
-    Ok(s)
-}
-
-fn random_bytes(n: usize) -> Result<Vec<u8>> {
-    let mut buf = vec![0u8; n];
-    let mut f = std::fs::File::open("/dev/urandom")
-        .map_err(|e| anyhow!("opening /dev/urandom: {e}"))?;
-    f.read_exact(&mut buf)
-        .map_err(|e| anyhow!("reading /dev/urandom: {e}"))?;
-    Ok(buf)
+    s
 }
 
 fn random_setup_code() -> String {
-    let mut buf = [0u8; SETUP_CODE_LEN];
-    let filled = std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut buf))
-        .is_ok();
-    if !filled {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
-        let pid = std::process::id();
-        let mix = (nanos as u64) ^ ((pid as u64) << 32);
-        let mix_bytes = mix.to_le_bytes();
-        for (i, slot) in buf.iter_mut().enumerate() {
-            *slot = mix_bytes[i % mix_bytes.len()];
-        }
-    }
+    use rand::RngExt;
     let n = SETUP_CODE_ALPHABET.len();
-    buf.iter()
-        .map(|b| SETUP_CODE_ALPHABET[(*b as usize) % n] as char)
+    let mut rng = rand::rng();
+    (0..SETUP_CODE_LEN)
+        .map(|_| SETUP_CODE_ALPHABET[rng.random_range(0..n)] as char)
         .collect()
 }
 
@@ -132,14 +107,11 @@ struct ServerTransport {
 }
 
 impl ServerTransport {
-    fn generate() -> Result<Self> {
-        let bytes = random_bytes(32)?;
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes);
-        let private = X25519Secret::from(arr);
+    fn generate() -> Self {
+        let private = X25519Secret::from(rand::random::<[u8; 32]>());
         let public = X25519Public::from(&private);
         let public_b64 = BASE64.encode(public.as_bytes());
-        Ok(Self { private, public_b64 })
+        Self { private, public_b64 }
     }
 
     fn decrypt(&self, env: &Envelope) -> Result<Vec<u8>, EnvelopeError> {
@@ -248,8 +220,8 @@ pub(crate) fn start(
 
     let (salt_b64, expected_subdomain_sig) = match phase {
         PassphrasePhase::Setup => {
-            let salt = random_bytes(32)?;
-            (BASE64.encode(&salt), None)
+            let salt: [u8; 32] = rand::random();
+            (BASE64.encode(salt), None)
         }
         PassphrasePhase::Unlock => {
             let meta = existing
@@ -258,7 +230,7 @@ pub(crate) fn start(
         }
     };
 
-    let short_id = random_short_id()?;
+    let short_id = random_short_id();
     let path_prefix = match phase {
         PassphrasePhase::Setup => "setup",
         PassphrasePhase::Unlock => "auth",
@@ -272,8 +244,8 @@ pub(crate) fn start(
 
     let (outcome_tx, outcome_rx) = std_mpsc::channel::<PassphraseOutcome>();
     let deadline = Instant::now() + PASSPHRASE_TTL;
-    let transport = ServerTransport::generate()?;
-    let script_nonce = BASE64.encode(random_bytes(16)?);
+    let transport = ServerTransport::generate();
+    let script_nonce = BASE64.encode(rand::random::<[u8; 16]>());
 
     let expected_host = format!("{subdomain}.wrustic.localhost");
 
@@ -851,7 +823,7 @@ mod tests {
             killed: AtomicBool::new(false),
             outcome_tx: std::sync::Mutex::new(None),
             deadline: Instant::now() + PASSPHRASE_TTL,
-            transport: ServerTransport::generate().expect("/dev/urandom"),
+            transport: ServerTransport::generate(),
             script_nonce: "testnonce".into(),
         }
     }
@@ -991,10 +963,7 @@ mod tests {
         let server_pub_arr: [u8; 32] = server_pub_bytes.as_slice().try_into().unwrap();
         let server_pub = X25519Public::from(server_pub_arr);
 
-        let mut client_priv_bytes = [0u8; 32];
-        let mut f = std::fs::File::open("/dev/urandom").unwrap();
-        f.read_exact(&mut client_priv_bytes).unwrap();
-        let client_priv = X25519Secret::from(client_priv_bytes);
+        let client_priv = X25519Secret::from(rand::random::<[u8; 32]>());
         let client_pub = X25519Public::from(&client_priv);
         let shared = client_priv.diffie_hellman(&server_pub);
 
@@ -1003,8 +972,7 @@ mod tests {
         hk.expand(TRANSPORT_HKDF_INFO, &mut key).unwrap();
         let cipher = Aes256Gcm::new(aes_gcm::Key::<Aes256Gcm>::from_slice(&key));
 
-        let mut nonce_bytes = [0u8; TRANSPORT_NONCE_LEN];
-        f.read_exact(&mut nonce_bytes).unwrap();
+        let nonce_bytes: [u8; TRANSPORT_NONCE_LEN] = rand::random();
         let nonce = Nonce::from_slice(&nonce_bytes);
         let ct = cipher.encrypt(nonce, plaintext).unwrap();
 
