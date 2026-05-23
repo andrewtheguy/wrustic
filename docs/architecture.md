@@ -29,7 +29,7 @@ It is intentionally **not** a restic replacement:
 
 ```
 main()
- └── App::boot(config_dir, port, experimental_passphrase)     // app.rs
+ └── App::boot(config_dir, port, experimental_passphrase, browser_auth)  // app.rs
       ├── config::paths(override) → Paths { identity, config }
       ├── (age mode)        load_age_cipher(age.key) → Cipher::Age
       ├── (passphrase mode) start_passphrase_ceremony()       // app.rs + passphrase.rs
@@ -41,8 +41,9 @@ main()
      │   LoadingDir, LoadingFileDetails, SnapshotDeleteContentsLoading,
      │   SnapshotDeleting, SnapshotCompareLoading) — main.rs runs the
      │   blocking work synchronously and transitions the screen
+     ├── Screen::PassphraseDerivingKey — runs scrypt synchronously (terminal mode)
      ├── Screen::PassphraseUrl — short timeout poll so try_advance_passphrase
-     │   can pick up the mpsc message from passphrase.rs without a keypress
+     │   can pick up the mpsc message from passphrase.rs without a keypress (browser mode)
      └── otherwise — blocking event::read(), App::handle_key/mouse
 ```
 
@@ -71,8 +72,10 @@ struct includes:
 - Snapshot browse state: `snapshots`, `repo_session`, `browse_stack`,
   `pending_descend` / `pending_file_lookup` / `pending_refresh_path`.
 - Share dialog: `share_target`, `share_handle`, `share_url`, etc.
-- Passphrase dialog: `passphrase_handle`, `passphrase_short_url`,
-  `passphrase_phase`, `passphrase_setup_code`.
+- Passphrase dialog: `passphrase_input`, `passphrase_confirm`,
+  `passphrase_instance_input`, `passphrase_phase`, `passphrase_error`.
+  Browser mode adds: `passphrase_handle`, `passphrase_short_url`,
+  `passphrase_setup_code`.
 
 Keypress handling is concentrated in `App::handle_key` (single big match on
 `self.screen`); mouse in `App::handle_mouse`.
@@ -95,7 +98,7 @@ Both servers follow the same shape so the patterns transfer:
 - One OS thread per server, one `tokio::runtime::Builder::new_current_thread`
   per thread. No global runtime, no shared executor.
 - Bind on `127.0.0.1:<port>`. User-facing URLs use
-  `<subdomain>.wrustic.localhost` (passphrase) or `localhost` (share).
+  `<instance>.wrustic.localhost` (passphrase, browser mode) or `localhost` (share).
 - The two servers share the **same port** (`--port`, default 7834) because
   share and passphrase dialogs are never simultaneously active.
 - Each returns a handle (`ShareHandle`, `PassphraseHandle`) that owns a
@@ -122,13 +125,19 @@ Both servers follow the same shape so the patterns transfer:
 - TTL: `SHARE_TTL = 1 h` baked into the signed `exp` claim. The server
   enforces expiry independently of any wall-clock state on its end.
 
-### Passphrase ceremony (`src/passphrase.rs`, experimental)
+### Passphrase (`src/passphrase.rs`, experimental)
 
-Same runtime shape as the share dialog (own OS thread, current-thread tokio
-runtime, RAII handle), but bidirectional: the browser POSTs the derived
-config key back to localhost through an encrypted envelope, and the server
-hands it to the App via an mpsc channel that the main loop polls every
-150 ms while `Screen::PassphraseUrl` is up.
+**Terminal mode (default):** no server is started. `passphrase.rs` exposes
+`derive_config_key`, `verify_instance_sig`, `compute_instance_sig`, and
+`passphrase_policy_error` for direct use by `app.rs`. Key derivation runs
+synchronously on `Screen::PassphraseDerivingKey`.
+
+**Browser mode (`--browser-auth`):** same runtime shape as the share
+dialog (own OS thread, current-thread tokio runtime, RAII handle), but
+bidirectional: the browser POSTs the passphrase back to localhost through
+an encrypted envelope, and the server hands the derived key to the App
+via an mpsc channel that the main loop polls every 150 ms while
+`Screen::PassphraseUrl` is up.
 
 Auth, routing, the capability URL, Setup vs Unlock phases, the 30-minute
 expiry net, host header validation, and the cryptographic key derivation

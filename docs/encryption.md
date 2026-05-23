@@ -271,16 +271,18 @@ impossible without already having unlocked. Per-value lets the boot code
 peek at the `[passphrase]` block first, then pick the right ceremony, then
 decrypt everything else with the resulting key.
 
-## Passphrase ceremony server
+## Passphrase input
 
-The passphrase-mode AEAD key comes from a browser ceremony where the user
-enters their passphrase. wrustic itself can't safely prompt for a
-passphrase in the terminal (clipboard attacks, shoulder surfing on a
-shared screen session), so `src/passphrase.rs` stands up a small localhost
-server, prints the URL in the TUI, and waits for the browser to POST the
-passphrase through an encrypted localhost envelope. This
-section covers the server's shape; the cryptographic mechanics are in the
-[Passphrase cipher](#passphrase-cipher-cipherpassphrase) section above.
+### Two modes: terminal (default) and browser
+
+By default, passphrase mode prompts for input directly in the terminal.
+Adding `--browser-auth` switches to a browser-based ceremony where the
+user enters the passphrase on a localhost page instead.
+
+| Mode | Flag | Setup flow | Unlock flow |
+|------|------|-----------|-------------|
+| Terminal (default) | `--experimental-passphrase` | Instance prompt → passphrase + confirm → scrypt | Passphrase prompt → scrypt → HMAC verify |
+| Browser | `--experimental-passphrase --browser-auth` | Instance prompt → browser URL + setup code → scrypt | Browser URL → passphrase → scrypt → HMAC verify |
 
 ### Gating
 
@@ -290,9 +292,33 @@ Only available when both flags are present:
 - `--config-dir <path>` must also be passed (no default `~/.config/wrustic`
   fallback while the feature is experimental, so it can't silently
   shadow a real config).
+- `--browser-auth` optionally activates the browser ceremony (requires
+  `--experimental-passphrase`).
 
 The CLI parser hard-fails if `--experimental-passphrase` is set without
-`--config-dir`.
+`--config-dir`, or if `--browser-auth` is set without
+`--experimental-passphrase`.
+
+### Terminal passphrase input (default)
+
+**Setup** (`Screen::PassphraseSetup`): after the instance name prompt,
+two masked fields — "Passphrase" and "Confirm passphrase" — are shown in
+a grouped input. The same passphrase policy from the browser flow applies
+(min 12 chars, uppercase, lowercase, digit, special char). On submit,
+scrypt runs synchronously on `Screen::PassphraseDerivingKey` (same
+pattern as `Screen::Verifying`), the HMAC instance signature is computed,
+and the `[passphrase]` block is saved to config.toml.
+
+**Unlock** (`Screen::PassphraseUnlock`): a single masked passphrase
+field. On submit, scrypt derives the key with the stored salt, then
+`verify_instance_sig` checks the HMAC. On mismatch the error says
+"Wrong passphrase (or config.toml was corrupted)." and returns to the
+input. On match, the config is decrypted and the app proceeds to Home.
+
+No setup code is used in terminal mode — the passphrase is entered
+directly by the user at the terminal.
+
+### Browser passphrase ceremony (`--browser-auth`)
 
 ### Runtime shape
 
@@ -358,7 +384,7 @@ The auth-key check runs **before** the expiry check by design: an
 unauthenticated caller never gets to distinguish "running" from
 "expired" — both look like 404.
 
-### Two phases: Setup and Unlock
+### Two phases: Setup and Unlock (browser mode)
 
 The phase is picked at boot by `config::peek`:
 
