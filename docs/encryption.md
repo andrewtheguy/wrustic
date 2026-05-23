@@ -418,14 +418,27 @@ the code (`Ab2Rt=` and `aB2rt=` are different codes) so it is *not*
 folded on either side. The comparison itself is constant-time
 (`ct_eq`).
 
-**Lock-out.** Five wrong codes in one ceremony trip a `killed` flag on
-the server's `Ctx`. From that moment forward every keyed route returns
-403 with the same "expired or cancelled" message used for the 30-min
-TTL; the user has to quit wrustic and relaunch to get a fresh code.
-This is a kill-switch (so a typo'd code doesn't keep the ceremony
-exploitable indefinitely under the 30-min TTL), not anti-brute-force
-entropy — the alphabet itself already makes brute force impractical
-within the TTL.
+**Pre-flight check.** The browser pre-validates the code with the
+server *before* invoking `navigator.credentials.create()` / `.get()`,
+via `POST /auth/<key>/api/check-code` with body `{"setup_code": "..."}`.
+This way a wrong code surfaces immediately instead of after the user
+has just authenticated against their device. The route never delivers
+an outcome — it only succeeds (200) or fails (401 / 403). The
+subsequent `POST /api/setup` re-validates the same code (the server
+never trusts a "I pre-checked it" claim from the client), and both
+routes share the same `check_setup_code` helper and the same strike
+counter — so an attacker can't double the budget by alternating
+endpoints.
+
+**Lock-out.** Five wrong codes in one ceremony — counted across
+**both** `/api/check-code` and `/api/setup` combined — trip a `killed`
+flag on the server's `Ctx`. From that moment forward every keyed route
+returns 403 with the same "expired or cancelled" message used for the
+30-min TTL; the user has to quit wrustic and relaunch to get a fresh
+code. This is a kill-switch (so a typo'd code doesn't keep the
+ceremony exploitable indefinitely under the 30-min TTL), not
+anti-brute-force entropy — the alphabet itself already makes brute
+force impractical within the TTL.
 
 **Display.** The code is printed tight (no inter-character padding,
 since case ambiguity in some fonts would only be made worse by spacing

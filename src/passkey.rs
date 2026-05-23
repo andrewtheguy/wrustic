@@ -402,6 +402,9 @@ async fn handle(
             "text/html; charset=utf-8",
             render_html(&ctx).into_bytes(),
         )),
+        (Method::POST, "/api/check-code") if ctx.phase == PasskeyPhase::Setup => {
+            Ok(handle_check_setup_code(req, ctx).await)
+        }
         (Method::POST, "/api/setup") if ctx.phase == PasskeyPhase::Setup => {
             Ok(handle_setup(req, ctx).await)
         }
@@ -464,6 +467,94 @@ fn decode_prf(b64: &str) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
+/// Result of a setup-code gate check.
+enum CodeCheck {
+    /// Code matched — caller may proceed.
+    Ok,
+    /// Code didn't match (or wasn't initialized). The pre-built response
+    /// already encodes the right status, message, and any kill-switch
+    /// side effects the caller should surface unchanged.
+    Wrong(Response<RespBody>),
+}
+
+/// Shared setup-code gate, used by both the precheck endpoint and the
+/// actual `/api/setup` route. The check is intentionally symmetric: a
+/// wrong code consumes a strike either way, and exhausting the strike
+/// budget trips the same `killed` flag the expiry net uses. Doing the
+/// expensive WebAuthn ceremony before this check is precisely what we
+/// want to avoid, hence the precheck endpoint.
+fn check_setup_code(ctx: &Arc<Ctx>, submitted_raw: &str) -> CodeCheck {
+    let expected = match ctx.setup_code.as_deref() {
+        Some(c) => c,
+        // Shouldn't happen: Setup phase always mints a code. Treat a None
+        // expected code as an internal error rather than auto-accept.
+        None => {
+            return CodeCheck::Wrong(text(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "setup code not initialized",
+            ));
+        }
+    };
+    // Normalize incoming code: strip whitespace only. Case is part of
+    // the code (the alphabet has both upper and lower case letters) so
+    // we compare the bytes verbatim. ct_eq runs in constant time over
+    // the resulting buffers; the whitespace strip operates on attacker-
+    // supplied bytes only and doesn't leak anything about the secret.
+    let submitted: String = submitted_raw
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    if !ct_eq(submitted.as_bytes(), expected.as_bytes()) {
+        let prev = ctx.setup_code_attempts.fetch_add(1, Ordering::Relaxed);
+        let used = prev + 1;
+        if used >= MAX_SETUP_CODE_ATTEMPTS {
+            ctx.killed.store(true, Ordering::Relaxed);
+            return CodeCheck::Wrong(text(
+                StatusCode::FORBIDDEN,
+                "Too many wrong setup codes. Ceremony cancelled — quit wrustic and relaunch.",
+            ));
+        }
+        let remaining = MAX_SETUP_CODE_ATTEMPTS - used;
+        return CodeCheck::Wrong(text(
+            StatusCode::UNAUTHORIZED,
+            &format!(
+                "Wrong setup code. {remaining} attempt(s) left before the ceremony is cancelled."
+            ),
+        ));
+    }
+    CodeCheck::Ok
+}
+
+#[derive(Deserialize)]
+struct CheckCodeBody {
+    setup_code: String,
+}
+
+/// Pre-flight setup-code check: lets the browser surface a "wrong code"
+/// error *before* invoking `navigator.credentials.create()` / `.get()`,
+/// so a typo doesn't waste an authenticator prompt. No outcome is ever
+/// delivered through this route — it only succeeds or fails. The actual
+/// outcome delivery happens through `/api/setup` after the WebAuthn
+/// ceremony, where the same code is re-checked (defense-in-depth: the
+/// server doesn't trust "I pre-checked it" claims).
+async fn handle_check_setup_code(
+    req: Request<hyper::body::Incoming>,
+    ctx: Arc<Ctx>,
+) -> Response<RespBody> {
+    let body = match read_body(req).await {
+        Ok(b) => b,
+        Err(e) => return text(StatusCode::BAD_REQUEST, &format!("body read: {e}")),
+    };
+    let parsed: CheckCodeBody = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return text(StatusCode::BAD_REQUEST, &format!("invalid JSON: {e}")),
+    };
+    match check_setup_code(&ctx, &parsed.setup_code) {
+        CodeCheck::Ok => json_ok(),
+        CodeCheck::Wrong(resp) => resp,
+    }
+}
+
 async fn handle_setup(req: Request<hyper::body::Incoming>, ctx: Arc<Ctx>) -> Response<RespBody> {
     let body = match read_body(req).await {
         Ok(b) => b,
@@ -473,45 +564,14 @@ async fn handle_setup(req: Request<hyper::body::Incoming>, ctx: Arc<Ctx>) -> Res
         Ok(v) => v,
         Err(e) => return text(StatusCode::BAD_REQUEST, &format!("invalid JSON: {e}")),
     };
-    // Setup-code gate: the browser must echo the 6-digit code printed on
-    // the TUI. Wrong code increments the attempt counter; crossing
-    // MAX_SETUP_CODE_ATTEMPTS trips `killed`, which makes every subsequent
-    // request (this route or any other under the auth key) 403 — same kill
-    // switch as the 30-min expiry. The deliver() and meta-write only run
-    // *after* this check passes.
-    let expected = match ctx.setup_code.as_deref() {
-        Some(c) => c,
-        // Shouldn't happen: Setup phase always mints a code. Treat a None
-        // expected code as an internal error rather than auto-accept.
-        None => return text(StatusCode::INTERNAL_SERVER_ERROR, "setup code not initialized"),
-    };
-    // Normalize incoming code: strip whitespace only. Case is part of
-    // the code (the alphabet has both upper and lower case letters) so
-    // we compare the bytes verbatim. ct_eq runs in constant time over
-    // the resulting buffers; the whitespace strip operates on attacker-
-    // supplied bytes only and doesn't leak anything about the secret.
-    let submitted: String = parsed
-        .setup_code
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
-    if !ct_eq(submitted.as_bytes(), expected.as_bytes()) {
-        let prev = ctx.setup_code_attempts.fetch_add(1, Ordering::Relaxed);
-        let used = prev + 1;
-        if used >= MAX_SETUP_CODE_ATTEMPTS {
-            ctx.killed.store(true, Ordering::Relaxed);
-            return text(
-                StatusCode::FORBIDDEN,
-                "Too many wrong setup codes. Ceremony cancelled — quit wrustic and relaunch.",
-            );
-        }
-        let remaining = MAX_SETUP_CODE_ATTEMPTS - used;
-        return text(
-            StatusCode::UNAUTHORIZED,
-            &format!(
-                "Wrong setup code. {remaining} attempt(s) left before the ceremony is cancelled."
-            ),
-        );
+    // Setup-code gate: re-checked even though the browser is expected to
+    // have already pre-flighted the same code via /api/check-code. The
+    // server doesn't trust the client; both routes share `check_setup_code`
+    // so a wrong code through either path consumes a strike from the same
+    // counter, and exhausting them trips the same `killed` flag.
+    match check_setup_code(&ctx, &parsed.setup_code) {
+        CodeCheck::Ok => {}
+        CodeCheck::Wrong(resp) => return resp,
     }
     if parsed.credential_id.is_empty() {
         return text(StatusCode::BAD_REQUEST, "credential_id required");
@@ -696,13 +756,31 @@ function readSetupCode() {{
   return code;
 }}
 
+// Pre-flight the setup code with the server before doing anything that
+// requires user interaction (i.e. the authenticator prompt). On wrong
+// code the user gets the server's error message immediately, with no
+// authenticator dance to back out of. On match this returns silently
+// and the caller proceeds. The server re-validates the same code on
+// /api/setup as belt-and-braces.
+async function precheckSetupCode(code) {{
+  const r = await fetch(API_BASE + "/api/check-code", {{
+    method: "POST",
+    headers: {{ "Content-Type": "application/json" }},
+    body: JSON.stringify({{ setup_code: code }})
+  }});
+  if (!r.ok) throw new Error("Server: " + (await r.text()));
+}}
+
 // Create a brand-new passkey on this device and use its PRF output as the
 // encryption key. Some platform authenticators don't return PRF during
 // create(), so we fall back to a follow-up get() with the same credential.
 async function doCreate() {{
-  // Validate the setup code first — bail before triggering an authenticator
-  // prompt if the user didn't type the code from the TUI.
+  // Validate the setup code first — bail before triggering an
+  // authenticator prompt. Client-side regex check first, then a server
+  // round-trip so a wrong code surfaces immediately (instead of after
+  // the user has authenticated and we're committing the result).
   const setupCode = readSetupCode();
+  await precheckSetupCode(setupCode);
   const prfSalt = b64ToBytes(PRF_SALT_B64);
   const userId = crypto.getRandomValues(new Uint8Array(16));
   const challenge = crypto.getRandomValues(new Uint8Array(32));
@@ -751,6 +829,7 @@ async function doCreate() {{
 async function doImportExisting() {{
   // Validate the setup code first — same reasoning as doCreate().
   const setupCode = readSetupCode();
+  await precheckSetupCode(setupCode);
   const prfSalt = b64ToBytes(PRF_SALT_B64);
   const challenge = crypto.getRandomValues(new Uint8Array(32));
   const assert = await navigator.credentials.get({{
@@ -1305,6 +1384,115 @@ mod tests {
         );
         let r = raw_post_json(port, &path, &body);
         assert!(r.contains(" 401 "), "case-flipped code should 401, got:\n{r}");
+        handle.stop();
+    }
+
+    #[test]
+    fn precheck_accepts_correct_code_without_delivering_outcome() {
+        let port = ephemeral_port();
+        let handle = start(port, PasskeyPhase::Setup, None).expect("start server");
+        let key = key_from_handle(&handle);
+        let setup_code = handle.setup_code.clone().unwrap();
+        let path = format!("/auth/{key}/api/check-code");
+
+        let body = format!(r#"{{"setup_code":"{setup_code}"}}"#);
+        let r = raw_post_json(port, &path, &body);
+        assert!(r.contains(" 200 "), "correct code should 200, got:\n{r}");
+
+        // Precheck must NOT deliver an outcome — that only happens via
+        // /api/setup after the WebAuthn dance.
+        match handle.rx.try_recv() {
+            Err(std_mpsc::TryRecvError::Empty) => {}
+            Ok(_) => panic!("precheck must not deliver an outcome"),
+            Err(other) => panic!("unexpected channel state: {other:?}"),
+        }
+        handle.stop();
+    }
+
+    #[test]
+    fn precheck_wrong_code_returns_401() {
+        let port = ephemeral_port();
+        let handle = start(port, PasskeyPhase::Setup, None).expect("start server");
+        let key = key_from_handle(&handle);
+        let real = handle.setup_code.clone().unwrap();
+        let path = format!("/auth/{key}/api/check-code");
+
+        // Flip first character to a different valid-alphabet char.
+        let mut bad_chars: Vec<u8> = real.as_bytes().to_vec();
+        let pos = SETUP_CODE_ALPHABET
+            .iter()
+            .position(|&b| b == bad_chars[0])
+            .unwrap();
+        bad_chars[0] = SETUP_CODE_ALPHABET[(pos + 1) % SETUP_CODE_ALPHABET.len()];
+        let bad = String::from_utf8(bad_chars).unwrap();
+
+        let body = format!(r#"{{"setup_code":"{bad}"}}"#);
+        let r = raw_post_json(port, &path, &body);
+        assert!(r.contains(" 401 "), "wrong precheck should 401, got:\n{r}");
+        handle.stop();
+    }
+
+    #[test]
+    fn precheck_strikes_share_counter_with_setup() {
+        // Mixed sequence: 4 wrong prechecks plus 1 wrong setup should
+        // total 5 strikes and trip the kill switch. This pins down that
+        // both routes consume from the same `setup_code_attempts`
+        // counter — important so an attacker can't double the budget by
+        // alternating endpoints.
+        let port = ephemeral_port();
+        let handle = start(port, PasskeyPhase::Setup, None).expect("start server");
+        let key = key_from_handle(&handle);
+        let real = handle.setup_code.clone().unwrap();
+        let prf = dummy_prf_b64();
+
+        let mut wrong = "------".to_string();
+        if wrong == real {
+            wrong = "======".into();
+        }
+
+        // 4 wrong prechecks.
+        for _ in 0..4 {
+            let body = format!(r#"{{"setup_code":"{wrong}"}}"#);
+            let r = raw_post_json(port, &format!("/auth/{key}/api/check-code"), &body);
+            assert!(r.contains(" 401 "), "precheck strike should 401, got:\n{r}");
+        }
+
+        // 5th strike via /api/setup must trip the kill switch.
+        let body = format!(
+            r#"{{"credential_id":"Y3JlZA==","prf":"{prf}","setup_code":"{wrong}"}}"#
+        );
+        let r = raw_post_json(port, &format!("/auth/{key}/api/setup"), &body);
+        assert!(r.contains(" 403 "), "5th strike should 403, got:\n{r}");
+
+        // And subsequent requests of any shape stay 403.
+        let r = raw_post_json(
+            port,
+            &format!("/auth/{key}/api/check-code"),
+            &format!(r#"{{"setup_code":"{real}"}}"#),
+        );
+        assert!(r.contains(" 403 "), "post-kill precheck must 403, got:\n{r}");
+
+        handle.stop();
+    }
+
+    #[test]
+    fn precheck_unavailable_in_unlock_phase() {
+        // Unlock has no setup code, so the precheck route must not
+        // exist for it (would 404 just like any non-Setup endpoint).
+        let port = ephemeral_port();
+        let meta = PasskeyMeta {
+            credential_id: "Y3JlZA==".into(),
+            prf_salt: "U0FMVA==".into(),
+        };
+        let handle =
+            start(port, PasskeyPhase::Unlock, Some(meta)).expect("start unlock server");
+        let key = key_from_handle(&handle);
+        let r = raw_post_json(
+            port,
+            &format!("/auth/{key}/api/check-code"),
+            r#"{"setup_code":"Ab2Rt="}"#,
+        );
+        assert!(r.contains(" 404 "), "precheck must 404 in Unlock, got:\n{r}");
         handle.stop();
     }
 
