@@ -650,8 +650,17 @@ impl App {
             self.cipher = Some(Cipher::Passphrase { key: config_key });
             self.load_config_or_set_fatal();
         }
+        self.clear_passphrase_scratch();
+    }
+
+    fn clear_passphrase_scratch(&mut self) {
         self.passphrase_input = Input::default();
         self.passphrase_confirm = Input::default();
+        self.passphrase_instance_input = Input::default();
+        self.passphrase_instance_value.clear();
+        self.passphrase_error = None;
+        self.passphrase_short_url = None;
+        self.passphrase_setup_code = None;
         self.passphrase_phase = None;
     }
 
@@ -668,9 +677,7 @@ impl App {
         if let Some(h) = self.passphrase_handle.take() {
             h.stop();
         }
-        self.passphrase_short_url = None;
-        self.passphrase_setup_code = None;
-        self.passphrase_phase = None;
+        self.clear_passphrase_scratch();
         self.load_config_or_set_fatal();
         if let Some(meta) = outcome.new_meta {
             self.config.passphrase = Some(meta);

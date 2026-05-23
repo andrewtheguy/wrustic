@@ -263,7 +263,7 @@ async function doSetup() {
 }
 
 // Unlock: encrypt the passphrase and send it to the server, which
-// derives the config key via scrypt and verifies the subdomain HMAC.
+// derives the config key via scrypt and verifies the instance HMAC.
 async function doUnlock() {
   const pp = document.getElementById("passphrase").value;
   if (!pp) throw new Error("Enter your passphrase.");
@@ -295,6 +295,7 @@ function wireButton(id, fn) {
     setStatus("Working…", "note");
     try {
       await fn();
+      document.querySelectorAll("input[type=password],input[type=text]").forEach(el => { el.value = ""; });
       setStatus("Done. You can close this tab and return to the wrustic terminal.", "ok");
       disableAllCtas();
     } catch (e) {
