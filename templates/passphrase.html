@@ -111,8 +111,9 @@ function zeroBytes(bytes) {
 
 // ── Transport-layer encryption (browser → server) ──────────────────
 // All payloads are encrypted with an ephemeral X25519 + HKDF + AES-GCM
-// channel so the passphrase-derived key never travels in plaintext,
-// even over localhost.
+// channel so the passphrase never travels in plaintext, even over
+// localhost. All CryptoKey objects holding secret material are created
+// with extractable=false.
 
 // Import the server's X25519 public key from the injected base64
 async function importServerPub() {
@@ -220,8 +221,8 @@ async function postEncryptedJson(path, payload) {
 }
 
 // ── Setup code pre-check ───────────────────────────────────────────
-// Validates the setup code with the server before doing the expensive
-// PBKDF2 derivation, so the user gets fast feedback on a typo.
+// Validates the setup code with the server before submitting the full
+// payload, so the user gets fast feedback on a typo.
 async function precheckSetupCode(code) {
   await postEncryptedJson("/api/check-code", { setup_code: code });
 }
