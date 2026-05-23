@@ -323,7 +323,7 @@ mod tests {
     fn round_trip_encrypt_decrypt() -> Result<()> {
         let dir = fresh_dir("rt");
         let paths = test_paths(&dir);
-        let cipher = Cipher::new([0x55u8; 32]);
+        let cipher = Cipher::new([0x55u8; 32], "test".into(), "testsig0");
 
         let empty = load(&paths, &cipher)?;
         assert_eq!(empty.profiles.len(), 0);
@@ -376,11 +376,11 @@ mod tests {
         for (name, profile) in table {
             let profile = profile.as_table().unwrap();
             let password = profile["password"].as_str().unwrap();
-            assert!(password.starts_with("pkenc:"), "password should be encrypted: {password}");
-            assert!(!password.contains('\n'), "pkenc value must be single-line");
+            assert!(crate::crypto::is_passphrase_encrypted(password), "password should be encrypted: {password}");
+            assert!(!password.contains('\n'), "encrypted value must be single-line");
             assert!(!profile.contains_key("name"), "`name` should not be inside profile `{name}`");
             if profile["backend"].as_str().unwrap() == "local" {
-                assert!(!profile["local_path"].as_str().unwrap().starts_with("pkenc:"));
+                assert!(!crate::crypto::is_passphrase_encrypted(profile["local_path"].as_str().unwrap()));
             }
         }
 
@@ -416,7 +416,7 @@ mod tests {
     fn rest_round_trip_with_split_auth() -> Result<()> {
         let dir = fresh_dir("rest_split");
         let paths = test_paths(&dir);
-        let cipher = Cipher::new([0x55u8; 32]);
+        let cipher = Cipher::new([0x55u8; 32], "test".into(), "testsig0");
 
         let mut profiles = BTreeMap::new();
         profiles.insert(
@@ -440,8 +440,8 @@ mod tests {
         let parsed: toml::Value = toml::from_str(&raw)?;
         let rest = &parsed["profiles"]["rest-auth"];
         assert_eq!(rest["rest_url"].as_str().unwrap(), "https://r.example.com/repo/");
-        assert!(rest["rest_user"].as_str().unwrap().starts_with("pkenc:"));
-        assert!(rest["rest_password"].as_str().unwrap().starts_with("pkenc:"));
+        assert!(crate::crypto::is_passphrase_encrypted(rest["rest_user"].as_str().unwrap()));
+        assert!(crate::crypto::is_passphrase_encrypted(rest["rest_password"].as_str().unwrap()));
 
         let loaded = load(&paths, &cipher)?;
         match loaded.profiles.get("rest-auth") {
@@ -467,7 +467,7 @@ mod tests {
     fn empty_string_field_not_encrypted() -> Result<()> {
         let dir = fresh_dir("empty");
         let paths = test_paths(&dir);
-        let cipher = Cipher::new([0x55u8; 32]);
+        let cipher = Cipher::new([0x55u8; 32], "test".into(), "testsig0");
 
         let mut profiles = BTreeMap::new();
         profiles.insert(
@@ -523,7 +523,7 @@ mod tests {
     fn load_rejects_unknown_version() -> Result<()> {
         let dir = fresh_dir("ver");
         let paths = test_paths(&dir);
-        let cipher = Cipher::new([0x55u8; 32]);
+        let cipher = Cipher::new([0x55u8; 32], "test".into(), "testsig0");
 
         save(&Config::default(), &paths, &cipher)?;
         let raw = fs::read_to_string(&paths.config)?;
@@ -546,7 +546,7 @@ mod tests {
     fn load_rejects_unsupported_cipher() -> Result<()> {
         let dir = fresh_dir("bad_cipher");
         let paths = test_paths(&dir);
-        let cipher = Cipher::new([0x55u8; 32]);
+        let cipher = Cipher::new([0x55u8; 32], "test".into(), "testsig0");
         save(&Config::default(), &paths, &cipher)?;
 
         let raw = fs::read_to_string(&paths.config)?;
@@ -565,7 +565,7 @@ mod tests {
     fn passphrase_round_trip_per_value() -> Result<()> {
         let dir = fresh_dir("pp_rt");
         let paths = test_paths(&dir);
-        let cipher = Cipher::new([0x55u8; 32]);
+        let cipher = Cipher::new([0x55u8; 32], "test".into(), "testsig0");
 
         let mut profiles = BTreeMap::new();
         profiles.insert(
@@ -587,7 +587,7 @@ mod tests {
         let parsed: toml::Value = toml::from_str(&raw)?;
         assert_eq!(parsed["cipher"].as_str().unwrap(), CIPHER_MARKER_PASSPHRASE);
         let pw = parsed["profiles"]["pp-local"]["password"].as_str().unwrap();
-        assert!(pw.starts_with("pkenc:"), "password should be pkenc: prefixed, got {pw}");
+        assert!(crate::crypto::is_passphrase_encrypted(pw), "password should be encrypted, got {pw}");
 
         let loaded = load(&paths, &cipher)?;
         match loaded.profiles.get("pp-local") {
@@ -605,7 +605,7 @@ mod tests {
     fn passphrase_block_round_trips_inline() -> Result<()> {
         let dir = fresh_dir("pp_inline");
         let paths = test_paths(&dir);
-        let cipher = Cipher::new([0xA5u8; 32]);
+        let cipher = Cipher::new([0xA5u8; 32], "test".into(), "testsig0");
 
         let cfg = Config {
             passphrase: Some(PassphraseMeta {
@@ -636,7 +636,7 @@ mod tests {
     fn peek_reads_passphrase_block_without_decrypting() -> Result<()> {
         let dir = fresh_dir("pp_peek");
         let paths = test_paths(&dir);
-        let cipher = Cipher::new([0xB6u8; 32]);
+        let cipher = Cipher::new([0xB6u8; 32], "test".into(), "testsig0");
 
         let mut profiles = BTreeMap::new();
         profiles.insert(
@@ -663,7 +663,7 @@ mod tests {
         assert_eq!(m.instance, "peek");
         match cfg.profiles.get("x") {
             Some(Profile::Local { password, .. }) => {
-                assert!(password.starts_with("pkenc:"));
+                assert!(crate::crypto::is_passphrase_encrypted(password));
             }
             _ => panic!("expected Local"),
         }

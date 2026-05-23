@@ -451,6 +451,7 @@ impl App {
                     Some(meta) => {
                         if self.browser_auth {
                             let instance = meta.instance.clone();
+                            self.config.passphrase = Some(meta.clone());
                             self.launch_passphrase_server(
                                 PassphrasePhase::Unlock,
                                 Some(meta),
@@ -571,10 +572,10 @@ impl App {
                 passphrase::compute_instance_sig(&self.passphrase_instance_value, &config_key);
             let meta = PassphraseMeta {
                 instance: self.passphrase_instance_value.clone(),
-                instance_sig,
+                instance_sig: instance_sig.clone(),
                 salt: base64::engine::general_purpose::STANDARD.encode(&salt),
             };
-            self.cipher = Some(Cipher::new(config_key));
+            self.cipher = Some(Cipher::new(config_key, self.passphrase_instance_value.clone(), &instance_sig));
             self.load_config_or_set_fatal();
             self.config.passphrase = Some(meta);
             if let Some(cipher) = self.cipher.as_ref()
@@ -600,7 +601,7 @@ impl App {
                 self.screen = Screen::PassphraseUnlock;
                 return;
             }
-            self.cipher = Some(Cipher::new(config_key));
+            self.cipher = Some(Cipher::new(config_key, meta.instance.clone(), &meta.instance_sig));
             self.load_config_or_set_fatal();
         }
         self.clear_passphrase_scratch();
@@ -626,7 +627,19 @@ impl App {
             Err(std_mpsc::TryRecvError::Empty) => return,
             Err(std_mpsc::TryRecvError::Disconnected) => return,
         };
-        self.cipher = Some(Cipher::new(outcome.key));
+        let Some(meta_ref) = outcome
+            .new_meta
+            .as_ref()
+            .or(self.config.passphrase.as_ref())
+            .filter(|m| !m.instance.is_empty())
+        else {
+            self.error_is_fatal = true;
+            self.screen = Screen::Error(
+                "internal: passphrase ceremony completed but no instance name is available".into(),
+            );
+            return;
+        };
+        self.cipher = Some(Cipher::new(outcome.key, meta_ref.instance.clone(), &meta_ref.instance_sig));
         if let Some(h) = self.passphrase_handle.take() {
             h.stop();
         }
