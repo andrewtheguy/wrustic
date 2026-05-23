@@ -12,17 +12,21 @@ use std::sync::mpsc as std_mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
 use anyhow::{Result, anyhow};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use bytes::Bytes;
+use hkdf::Hkdf;
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::header::{CACHE_CONTROL, CONTENT_TYPE, HeaderValue};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::Deserialize;
+use sha2::Sha256;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use x25519_dalek::{PublicKey as X25519Public, StaticSecret as X25519Secret};
 
 use crate::config::PasskeyMeta;
 
@@ -98,6 +102,15 @@ pub(crate) struct PasskeyHandle {
     /// (returns 403 for everything). Surfaced to the TUI so a stale screen
     /// can show an "expired" line without polling the server.
     pub(crate) deadline: Instant,
+    /// Base64 of the server's ephemeral X25519 public key for the
+    /// transport-encryption layer. Already embedded in the rendered HTML
+    /// as `SERVER_PUB_B64` and not secret — exposed on the handle so
+    /// integration tests can encrypt request bodies without parsing the
+    /// HTML out of the live response. Allowed to be unread in non-test
+    /// builds because the production path serves the same value through
+    /// the HTML template instead.
+    #[allow(dead_code)]
+    pub(crate) transport_public_b64: String,
     shutdown_tx: Option<oneshot::Sender<()>>,
     join_handle: Option<thread::JoinHandle<()>>,
 }
@@ -185,6 +198,124 @@ fn random_bytes(n: usize) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+// HKDF-SHA256 info label for the ECDH-derived AES-GCM key. Single
+// version-pinned string — both the server (decrypt) and the inline JS
+// (encrypt) must agree on it. Bumping it (e.g. -v2) lets us cut over
+// the protocol atomically if we ever change algorithms.
+const TRANSPORT_HKDF_INFO: &[u8] = b"wrustic-passkey-transport-v1";
+
+// Length of the random nonce passed to AES-256-GCM. WebCrypto's
+// AES-GCM defaults to 12 bytes; the AES-GCM spec recommends 12.
+const TRANSPORT_NONCE_LEN: usize = 12;
+
+/// Hybrid (ECDH + AEAD) transport-encryption layer for the inline JS to
+/// post WebAuthn secrets (notably the PRF output) to the localhost
+/// server without putting them on the wire as plaintext. The threat
+/// model this defends against: a co-tenant on the same machine able to
+/// sniff loopback (CAP_NET_RAW), a malicious browser extension reading
+/// fetch bodies, an inspector / dev-tools history capture. The bulk
+/// safety still comes from the `/auth/<short_id>` capability URL and the
+/// localhost bind — this just removes one more layer of plaintext
+/// exposure.
+///
+/// Per-ceremony: the server generates an ephemeral X25519 keypair at
+/// `start()` (lives in `Ctx` for the lifetime of the ceremony, dropped
+/// when the handle is). Per-request: the browser generates its own
+/// ephemeral X25519 keypair, derives the AES-GCM key via
+/// `HKDF-SHA256(ECDH(server_pub, client_priv), info=…)`, and posts
+/// `{client_pub, nonce, ciphertext}`. The browser-side AES-GCM key is
+/// imported as `extractable: false` so an XSS / extension can't read
+/// the raw key bytes — they'd have to actively use the WebCrypto API,
+/// which is at least observable.
+struct ServerTransport {
+    /// Ephemeral X25519 private key, kept in memory only for the
+    /// ceremony's lifetime. Wrapped in `StaticSecret` (not
+    /// `EphemeralSecret`) because `EphemeralSecret::diffie_hellman`
+    /// consumes self, and we want to reuse the same private key across
+    /// every request in a single ceremony.
+    private: X25519Secret,
+    /// Base64 of the matching public key. Inlined verbatim into the
+    /// HTML as `SERVER_PUB_B64`.
+    public_b64: String,
+}
+
+impl ServerTransport {
+    fn generate() -> Result<Self> {
+        // x25519-dalek's StaticSecret::from clamps the scalar
+        // internally per RFC 7748 §5, so any 32 random bytes are a
+        // valid input.
+        let bytes = random_bytes(32)?;
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        let private = X25519Secret::from(arr);
+        let public = X25519Public::from(&private);
+        let public_b64 = BASE64.encode(public.as_bytes());
+        Ok(Self { private, public_b64 })
+    }
+
+    fn decrypt(&self, env: &Envelope) -> Result<Vec<u8>, EnvelopeError> {
+        let client_pub_bytes = BASE64
+            .decode(&env.client_pub)
+            .map_err(|_| EnvelopeError::BadBase64("client_pub"))?;
+        let client_pub_arr: [u8; 32] = client_pub_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| EnvelopeError::BadLength("client_pub", 32))?;
+        let client_pub = X25519Public::from(client_pub_arr);
+        let shared = self.private.diffie_hellman(&client_pub);
+        // HKDF-SHA256 with empty salt + fixed info → 32-byte AES key.
+        let hkdf = Hkdf::<Sha256>::new(None, shared.as_bytes());
+        let mut key = [0u8; 32];
+        hkdf.expand(TRANSPORT_HKDF_INFO, &mut key)
+            .map_err(|_| EnvelopeError::Hkdf)?;
+        let cipher = Aes256Gcm::new(aes_gcm::Key::<Aes256Gcm>::from_slice(&key));
+        let nonce_bytes = BASE64
+            .decode(&env.nonce)
+            .map_err(|_| EnvelopeError::BadBase64("nonce"))?;
+        if nonce_bytes.len() != TRANSPORT_NONCE_LEN {
+            return Err(EnvelopeError::BadLength("nonce", TRANSPORT_NONCE_LEN));
+        }
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let ct = BASE64
+            .decode(&env.ciphertext)
+            .map_err(|_| EnvelopeError::BadBase64("ciphertext"))?;
+        cipher
+            .decrypt(nonce, ct.as_ref())
+            .map_err(|_| EnvelopeError::Aead)
+    }
+}
+
+#[derive(Deserialize)]
+struct Envelope {
+    client_pub: String,
+    nonce: String,
+    ciphertext: String,
+}
+
+#[derive(Debug)]
+enum EnvelopeError {
+    BadBase64(&'static str),
+    BadLength(&'static str, usize),
+    Hkdf,
+    Aead,
+}
+
+impl EnvelopeError {
+    fn http_response(&self) -> Response<RespBody> {
+        let msg = match self {
+            EnvelopeError::BadBase64(field) => {
+                format!("{field}: invalid base64")
+            }
+            EnvelopeError::BadLength(field, expected) => {
+                format!("{field}: expected {expected} bytes")
+            }
+            EnvelopeError::Hkdf => "transport key derivation failed".into(),
+            EnvelopeError::Aead => "transport decrypt failed (wrong key or tampered ciphertext)".into(),
+        };
+        text(StatusCode::BAD_REQUEST, &msg)
+    }
+}
+
 struct Ctx {
     phase: PasskeyPhase,
     short_id: String,
@@ -217,6 +348,11 @@ struct Ctx {
     outcome_tx: std::sync::Mutex<Option<std_mpsc::Sender<PasskeyOutcome>>>,
     // Wall-clock cap. Once now >= deadline, every route returns 403.
     deadline: Instant,
+    // Per-ceremony X25519 keypair for the request-body transport
+    // encryption layer. Browser does ECDH against the embedded public
+    // key, derives an AES-256-GCM key via HKDF-SHA256, and posts an
+    // encrypted envelope on every /api/* route. See `ServerTransport`.
+    transport: ServerTransport,
 }
 
 impl Ctx {
@@ -280,6 +416,7 @@ pub(crate) fn start(
 
     let (outcome_tx, outcome_rx) = std_mpsc::channel::<PasskeyOutcome>();
     let deadline = Instant::now() + PASSKEY_TTL;
+    let transport = ServerTransport::generate()?;
 
     let ctx = Arc::new(Ctx {
         phase,
@@ -292,6 +429,7 @@ pub(crate) fn start(
         killed: AtomicBool::new(false),
         outcome_tx: std::sync::Mutex::new(Some(outcome_tx)),
         deadline,
+        transport,
     });
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -318,12 +456,14 @@ pub(crate) fn start(
         })
         .map_err(|e| anyhow!("spawning passkey thread: {e}"))?;
 
+    let transport_public_b64 = ctx.transport.public_b64.clone();
     Ok(PasskeyHandle {
         short_url,
         setup_code,
         phase,
         rx: outcome_rx,
         deadline,
+        transport_public_b64,
         shutdown_tx: Some(shutdown_tx),
         join_handle: Some(join),
     })
@@ -475,6 +615,24 @@ async fn read_body(req: Request<hyper::body::Incoming>) -> Result<Vec<u8>, std::
     Ok(collected.to_bytes().to_vec())
 }
 
+/// Shared body-read + envelope-decrypt for every POST /api/* route. The
+/// inline JS wraps each request body in `{client_pub, nonce, ciphertext}`;
+/// this returns the decrypted inner bytes (which are then `serde_json::
+/// from_slice`'d into the route-specific struct) or an HTTP error
+/// response if anything in the envelope is malformed. Pulling the
+/// pattern out keeps every handler one match arm instead of three.
+async fn read_and_decrypt(
+    req: Request<hyper::body::Incoming>,
+    ctx: &Arc<Ctx>,
+) -> Result<Vec<u8>, Response<RespBody>> {
+    let body = read_body(req)
+        .await
+        .map_err(|e| text(StatusCode::BAD_REQUEST, &format!("body read: {e}")))?;
+    let env: Envelope = serde_json::from_slice(&body)
+        .map_err(|e| text(StatusCode::BAD_REQUEST, &format!("invalid envelope JSON: {e}")))?;
+    ctx.transport.decrypt(&env).map_err(|e| e.http_response())
+}
+
 fn decode_prf(b64: &str) -> Result<[u8; 32], String> {
     let raw = BASE64.decode(b64).map_err(|e| format!("invalid base64 prf: {e}"))?;
     if raw.len() != 32 {
@@ -564,11 +722,11 @@ async fn handle_check_setup_code(
     req: Request<hyper::body::Incoming>,
     ctx: Arc<Ctx>,
 ) -> Response<RespBody> {
-    let body = match read_body(req).await {
+    let inner = match read_and_decrypt(req, &ctx).await {
         Ok(b) => b,
-        Err(e) => return text(StatusCode::BAD_REQUEST, &format!("body read: {e}")),
+        Err(resp) => return resp,
     };
-    let parsed: CheckCodeBody = match serde_json::from_slice(&body) {
+    let parsed: CheckCodeBody = match serde_json::from_slice(&inner) {
         Ok(v) => v,
         Err(e) => return text(StatusCode::BAD_REQUEST, &format!("invalid JSON: {e}")),
     };
@@ -579,11 +737,11 @@ async fn handle_check_setup_code(
 }
 
 async fn handle_setup(req: Request<hyper::body::Incoming>, ctx: Arc<Ctx>) -> Response<RespBody> {
-    let body = match read_body(req).await {
+    let inner = match read_and_decrypt(req, &ctx).await {
         Ok(b) => b,
-        Err(e) => return text(StatusCode::BAD_REQUEST, &format!("body read: {e}")),
+        Err(resp) => return resp,
     };
-    let parsed: SetupBody = match serde_json::from_slice(&body) {
+    let parsed: SetupBody = match serde_json::from_slice(&inner) {
         Ok(v) => v,
         Err(e) => return text(StatusCode::BAD_REQUEST, &format!("invalid JSON: {e}")),
     };
@@ -620,11 +778,11 @@ async fn handle_setup(req: Request<hyper::body::Incoming>, ctx: Arc<Ctx>) -> Res
 }
 
 async fn handle_unlock(req: Request<hyper::body::Incoming>, ctx: Arc<Ctx>) -> Response<RespBody> {
-    let body = match read_body(req).await {
+    let inner = match read_and_decrypt(req, &ctx).await {
         Ok(b) => b,
-        Err(e) => return text(StatusCode::BAD_REQUEST, &format!("body read: {e}")),
+        Err(resp) => return resp,
     };
-    let parsed: UnlockBody = match serde_json::from_slice(&body) {
+    let parsed: UnlockBody = match serde_json::from_slice(&inner) {
         Ok(v) => v,
         Err(e) => return text(StatusCode::BAD_REQUEST, &format!("invalid JSON: {e}")),
     };
@@ -755,6 +913,13 @@ const CRED_ID_B64 = {cred_id_js};
 // string on Unlock — that path uses .get() with allowCredentials and
 // doesn't need user info.
 const USER_LABEL = {user_label_js};
+// Server's X25519 public key for the per-ceremony transport-encryption
+// layer (see `ServerTransport` in passkey.rs). The page derives an
+// AES-256-GCM key per request via ECDH+HKDF and ships every POST body
+// inside `{{client_pub, nonce, ciphertext}}` so WebAuthn secrets never
+// hit the loopback wire as plaintext.
+const SERVER_PUB_B64 = {server_pub_js};
+const TRANSPORT_HKDF_INFO = new TextEncoder().encode("wrustic-passkey-transport-v1");
 // The page itself is served at /auth/<key>, so derive the API prefix from
 // the browser's own URL — no template substitution needed, and the entire
 // ceremony stays scoped to this one keyed path. The trailing-slash strip
@@ -777,6 +942,81 @@ function setStatus(text, kind) {{
   const el = document.getElementById("status");
   el.textContent = text;
   el.className = kind || "note";
+}}
+
+// Transport encryption: per-request ephemeral X25519 keypair → ECDH with
+// the server's pubkey → HKDF-SHA256 → AES-256-GCM. The derived AES key
+// is imported with `extractable: false`, so an XSS / browser extension
+// can't read the raw key bytes out of memory — they'd have to actively
+// invoke the WebCrypto API, which is at least observable. The private
+// X25519 key is also generated `extractable: false`; the public side is
+// always exportable per the WebCrypto spec so we can send it to the
+// server. Requires WebCrypto X25519, broadly available in browsers from
+// 2025 onward (Chrome 133+, Firefox 130+, Safari 18.4+).
+async function importServerPub() {{
+  return crypto.subtle.importKey(
+    "raw", b64ToBytes(SERVER_PUB_B64),
+    {{ name: "X25519" }}, true, []
+  );
+}}
+
+async function deriveTransportKey(serverPub) {{
+  const clientPair = await crypto.subtle.generateKey(
+    {{ name: "X25519" }}, false, ["deriveBits", "deriveKey"]
+  );
+  const sharedBits = await crypto.subtle.deriveBits(
+    {{ name: "X25519", public: serverPub }},
+    clientPair.privateKey, 256
+  );
+  const ikm = await crypto.subtle.importKey(
+    "raw", sharedBits, {{ name: "HKDF" }}, false, ["deriveKey"]
+  );
+  const aesKey = await crypto.subtle.deriveKey(
+    {{ name: "HKDF", hash: "SHA-256",
+       salt: new Uint8Array(0), info: TRANSPORT_HKDF_INFO }},
+    ikm,
+    {{ name: "AES-GCM", length: 256 }},
+    false,
+    ["encrypt"]
+  );
+  const clientPubBytes = new Uint8Array(
+    await crypto.subtle.exportKey("raw", clientPair.publicKey)
+  );
+  return {{ aesKey, clientPubBytes }};
+}}
+
+// Encrypt an arbitrary JSON-serializable payload into the envelope the
+// server expects on every /api/* route. Caller uses the returned object
+// directly as the fetch body (after JSON.stringify).
+async function encryptPayload(payload) {{
+  const serverPub = await importServerPub();
+  const {{ aesKey, clientPubBytes }} = await deriveTransportKey(serverPub);
+  const nonce = crypto.getRandomValues(new Uint8Array(12));
+  const plaintext = new TextEncoder().encode(JSON.stringify(payload));
+  const ct = new Uint8Array(await crypto.subtle.encrypt(
+    {{ name: "AES-GCM", iv: nonce }},
+    aesKey, plaintext
+  ));
+  return {{
+    client_pub: bytesToB64(clientPubBytes),
+    nonce: bytesToB64(nonce),
+    ciphertext: bytesToB64(ct)
+  }};
+}}
+
+// Encrypt + POST + surface a server error message on non-2xx. The
+// server's error body is plaintext on purpose: errors don't contain
+// secrets, and surfacing them through the encrypted channel would
+// require a response-side decrypt that adds complexity for no gain.
+async function postEncrypted(path, payload) {{
+  const envelope = await encryptPayload(payload);
+  const r = await fetch(API_BASE + path, {{
+    method: "POST",
+    headers: {{ "Content-Type": "application/json" }},
+    body: JSON.stringify(envelope)
+  }});
+  if (!r.ok) throw new Error("Server: " + (await r.text()));
+  return r;
 }}
 
 // Setup phase only: read the 6-character code the user typed from the
@@ -802,12 +1042,7 @@ function readSetupCode() {{
 // and the caller proceeds. The server re-validates the same code on
 // /api/setup as belt-and-braces.
 async function precheckSetupCode(code) {{
-  const r = await fetch(API_BASE + "/api/check-code", {{
-    method: "POST",
-    headers: {{ "Content-Type": "application/json" }},
-    body: JSON.stringify({{ setup_code: code }})
-  }});
-  if (!r.ok) throw new Error("Server: " + (await r.text()));
+  await postEncrypted("/api/check-code", {{ setup_code: code }});
 }}
 
 // Create a brand-new passkey on this device and use its PRF output as the
@@ -889,16 +1124,11 @@ async function doImportExisting() {{
 }}
 
 async function postSetup(credId, prfOutput, setupCode) {{
-  const r = await fetch(API_BASE + "/api/setup", {{
-    method: "POST",
-    headers: {{ "Content-Type": "application/json" }},
-    body: JSON.stringify({{
-      credential_id: bytesToB64(credId),
-      prf: bytesToB64(prfOutput),
-      setup_code: setupCode
-    }})
+  await postEncrypted("/api/setup", {{
+    credential_id: bytesToB64(credId),
+    prf: bytesToB64(prfOutput),
+    setup_code: setupCode
   }});
-  if (!r.ok) throw new Error("Server: " + (await r.text()));
 }}
 
 async function doUnlock() {{
@@ -918,12 +1148,7 @@ async function doUnlock() {{
   if (!prfOutput) {{
     throw new Error("Authenticator did not return a PRF output. The passkey may have been created without PRF support.");
   }}
-  const r = await fetch(API_BASE + "/api/unlock", {{
-    method: "POST",
-    headers: {{ "Content-Type": "application/json" }},
-    body: JSON.stringify({{ prf: bytesToB64(prfOutput) }})
-  }});
-  if (!r.ok) throw new Error("Server: " + (await r.text()));
+  await postEncrypted("/api/unlock", {{ prf: bytesToB64(prfOutput) }});
 }}
 
 // After a successful ceremony the server has already received what it
@@ -971,6 +1196,7 @@ wireButton("go-unlock", doUnlock);
         prf_salt_js = json_string(&ctx.prf_salt_b64),
         cred_id_js = json_string(&ctx.credential_id_b64),
         user_label_js = json_string(ctx.user_label.as_deref().unwrap_or("")),
+        server_pub_js = json_string(&ctx.transport.public_b64),
     )
 }
 
@@ -1059,6 +1285,7 @@ mod tests {
             killed: AtomicBool::new(false),
             outcome_tx: std::sync::Mutex::new(None),
             deadline: Instant::now() + PASSKEY_TTL,
+            transport: ServerTransport::generate().expect("/dev/urandom"),
         }
     }
 
@@ -1209,6 +1436,7 @@ mod tests {
             phase: PasskeyPhase::Setup(SetupMode::Create),
             rx,
             deadline: Instant::now() - Duration::from_secs(1),
+            transport_public_b64: String::new(),
             shutdown_tx: Some(shutdown_tx),
             join_handle: None,
         };
@@ -1222,6 +1450,7 @@ mod tests {
             phase: PasskeyPhase::Setup(SetupMode::Create),
             rx,
             deadline: Instant::now() + Duration::from_secs(60),
+            transport_public_b64: String::new(),
             shutdown_tx: Some(shutdown_tx),
             join_handle: None,
         };
@@ -1280,6 +1509,49 @@ mod tests {
     /// Pull the 16-hex auth key out of the handle's `http://localhost:<port>/auth/<key>` URL.
     fn key_from_handle(h: &PasskeyHandle) -> String {
         h.short_url.rsplit('/').next().unwrap().to_string()
+    }
+
+    /// Encrypt a plaintext JSON body into the envelope shape every
+    /// /api/* route expects. Mirrors the JS-side `encryptPayload`: fresh
+    /// ephemeral X25519 keypair, ECDH against the server's public key,
+    /// HKDF-SHA256 with the same `TRANSPORT_HKDF_INFO`, AES-256-GCM with
+    /// a random 12-byte nonce. Returns a ready-to-POST JSON body string.
+    fn encrypt_envelope(server_pub_b64: &str, plaintext_json: &str) -> String {
+        let server_pub_bytes = BASE64.decode(server_pub_b64).expect("server pub b64");
+        let server_pub_arr: [u8; 32] = server_pub_bytes.as_slice().try_into().unwrap();
+        let server_pub = X25519Public::from(server_pub_arr);
+
+        let mut client_priv_bytes = [0u8; 32];
+        let mut f = std::fs::File::open("/dev/urandom").unwrap();
+        f.read_exact(&mut client_priv_bytes).unwrap();
+        let client_priv = X25519Secret::from(client_priv_bytes);
+        let client_pub = X25519Public::from(&client_priv);
+        let shared = client_priv.diffie_hellman(&server_pub);
+
+        let hk = Hkdf::<Sha256>::new(None, shared.as_bytes());
+        let mut key = [0u8; 32];
+        hk.expand(TRANSPORT_HKDF_INFO, &mut key).unwrap();
+        let cipher = Aes256Gcm::new(aes_gcm::Key::<Aes256Gcm>::from_slice(&key));
+
+        let mut nonce_bytes = [0u8; TRANSPORT_NONCE_LEN];
+        f.read_exact(&mut nonce_bytes).unwrap();
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let ct = cipher.encrypt(nonce, plaintext_json.as_bytes()).unwrap();
+
+        format!(
+            r#"{{"client_pub":"{cpb}","nonce":"{nb}","ciphertext":"{ctb}"}}"#,
+            cpb = BASE64.encode(client_pub.as_bytes()),
+            nb = BASE64.encode(nonce_bytes),
+            ctb = BASE64.encode(&ct),
+        )
+    }
+
+    /// POST a plaintext JSON body to a path, after wrapping it in the
+    /// transport envelope. Drop-in replacement for `raw_post_json` plus a
+    /// matching server pub key from the handle.
+    fn encrypted_post(port: u16, server_pub_b64: &str, path: &str, plaintext_json: &str) -> String {
+        let body = encrypt_envelope(server_pub_b64, plaintext_json);
+        raw_post_json(port, path, &body)
     }
 
     /// End-to-end check that the only reachable surface is `/auth/<key>` and
@@ -1379,7 +1651,7 @@ mod tests {
         let body = format!(
             r#"{{"credential_id":"Y3JlZA==","prf":"{prf}","setup_code":"{bad}"}}"#
         );
-        let r = raw_post_json(port, &path, &body);
+        let r = encrypted_post(port, &handle.transport_public_b64, &path, &body);
         assert!(r.contains(" 401 "), "wrong code should 401, got:\n{r}");
         assert!(r.to_lowercase().contains("setup code"));
 
@@ -1404,7 +1676,7 @@ mod tests {
         let body = format!(
             r#"{{"credential_id":"Y3JlZA==","prf":"{prf}","setup_code":"{setup_code}"}}"#
         );
-        let r = raw_post_json(port, &path, &body);
+        let r = encrypted_post(port, &handle.transport_public_b64, &path, &body);
         // Right code + well-formed body → 200 and outcome delivered.
         assert!(r.contains(" 200 "), "correct code should 200, got:\n{r}");
 
@@ -1424,13 +1696,13 @@ mod tests {
         let prf = dummy_prf_b64();
 
         // Pad with whitespace — server strips it before comparing. Case
-        // is *not* normalized (the alphabet has both upper and lower)
-        // so we keep the code byte-identical otherwise.
+        // is also folded (alphabet is uppercase-only) but we keep the
+        // code byte-identical here to isolate the whitespace path.
         let munged: String = format!(" {setup_code} ");
         let body = format!(
             r#"{{"credential_id":"Y3JlZA==","prf":"{prf}","setup_code":"{munged}"}}"#
         );
-        let r = raw_post_json(port, &path, &body);
+        let r = encrypted_post(port, &handle.transport_public_b64, &path, &body);
         assert!(
             r.contains(" 200 "),
             "whitespace-tolerant compare should accept, got:\n{r}"
@@ -1463,7 +1735,7 @@ mod tests {
         let body = format!(
             r#"{{"credential_id":"Y3JlZA==","prf":"{prf}","setup_code":"{lowered}"}}"#
         );
-        let r = raw_post_json(port, &path, &body);
+        let r = encrypted_post(port, &handle.transport_public_b64, &path, &body);
         assert!(r.contains(" 200 "), "lowercase code should 200, got:\n{r}");
         handle.stop();
     }
@@ -1477,7 +1749,7 @@ mod tests {
         let path = format!("/auth/{key}/api/check-code");
 
         let body = format!(r#"{{"setup_code":"{setup_code}"}}"#);
-        let r = raw_post_json(port, &path, &body);
+        let r = encrypted_post(port, &handle.transport_public_b64, &path, &body);
         assert!(r.contains(" 200 "), "correct code should 200, got:\n{r}");
 
         // Precheck must NOT deliver an outcome — that only happens via
@@ -1508,7 +1780,7 @@ mod tests {
         let bad = String::from_utf8(bad_chars).unwrap();
 
         let body = format!(r#"{{"setup_code":"{bad}"}}"#);
-        let r = raw_post_json(port, &path, &body);
+        let r = encrypted_post(port, &handle.transport_public_b64, &path, &body);
         assert!(r.contains(" 401 "), "wrong precheck should 401, got:\n{r}");
         handle.stop();
     }
@@ -1534,7 +1806,12 @@ mod tests {
         // 4 wrong prechecks.
         for _ in 0..4 {
             let body = format!(r#"{{"setup_code":"{wrong}"}}"#);
-            let r = raw_post_json(port, &format!("/auth/{key}/api/check-code"), &body);
+            let r = encrypted_post(
+                port,
+                &handle.transport_public_b64,
+                &format!("/auth/{key}/api/check-code"),
+                &body,
+            );
             assert!(r.contains(" 401 "), "precheck strike should 401, got:\n{r}");
         }
 
@@ -1542,12 +1819,18 @@ mod tests {
         let body = format!(
             r#"{{"credential_id":"Y3JlZA==","prf":"{prf}","setup_code":"{wrong}"}}"#
         );
-        let r = raw_post_json(port, &format!("/auth/{key}/api/setup"), &body);
+        let r = encrypted_post(
+            port,
+            &handle.transport_public_b64,
+            &format!("/auth/{key}/api/setup"),
+            &body,
+        );
         assert!(r.contains(" 403 "), "5th strike should 403, got:\n{r}");
 
         // And subsequent requests of any shape stay 403.
-        let r = raw_post_json(
+        let r = encrypted_post(
             port,
+            &handle.transport_public_b64,
             &format!("/auth/{key}/api/check-code"),
             &format!(r#"{{"setup_code":"{real}"}}"#),
         );
@@ -1569,8 +1852,9 @@ mod tests {
         let handle =
             start(port, PasskeyPhase::Unlock, Some(meta), None).expect("start unlock server");
         let key = key_from_handle(&handle);
-        let r = raw_post_json(
+        let r = encrypted_post(
             port,
+            &handle.transport_public_b64,
             &format!("/auth/{key}/api/check-code"),
             r#"{"setup_code":"AB2RTK"}"#,
         );
@@ -1599,7 +1883,7 @@ mod tests {
             let body = format!(
                 r#"{{"credential_id":"Y3JlZA==","prf":"{prf}","setup_code":"{wrong}"}}"#
             );
-            let r = raw_post_json(port, &path, &body);
+            let r = encrypted_post(port, &handle.transport_public_b64, &path, &body);
             if i < MAX_SETUP_CODE_ATTEMPTS {
                 assert!(r.contains(" 401 "), "strike {i} should 401, got:\n{r}");
             } else {
@@ -1616,9 +1900,103 @@ mod tests {
         let body = format!(
             r#"{{"credential_id":"Y3JlZA==","prf":"{prf}","setup_code":"{real}"}}"#
         );
-        let r = raw_post_json(port, &path, &body);
+        let r = encrypted_post(port, &handle.transport_public_b64, &path, &body);
         assert!(r.contains(" 403 "), "correct code post-kill must 403, got:\n{r}");
 
+        handle.stop();
+    }
+
+    #[test]
+    fn envelope_roundtrips_through_handler() {
+        // Sanity check that the test-side encryptor (encrypt_envelope) and
+        // the production-side decryptor (ServerTransport::decrypt) agree
+        // on the protocol. A precheck round-trip with the correct setup
+        // code must reach the handler and return 200.
+        let port = ephemeral_port();
+        let handle = start(port, PasskeyPhase::Setup(SetupMode::Create), None, Some("rt".into())).expect("start server");
+        let key = key_from_handle(&handle);
+        let code = handle.setup_code.clone().unwrap();
+
+        let body = format!(r#"{{"setup_code":"{code}"}}"#);
+        let r = encrypted_post(
+            port,
+            &handle.transport_public_b64,
+            &format!("/auth/{key}/api/check-code"),
+            &body,
+        );
+        assert!(r.contains(" 200 "), "envelope round-trip should reach handler, got:\n{r}");
+        handle.stop();
+    }
+
+    #[test]
+    fn envelope_with_tampered_ciphertext_is_rejected() {
+        // Flip a byte in the ciphertext — AES-GCM's auth tag must catch
+        // it and the server must 400 before any inner-body parsing or
+        // setup-code check. Important: the strike counter must not move
+        // on a transport-level failure, otherwise a noisy network or a
+        // misbehaving client could exhaust the ceremony.
+        let port = ephemeral_port();
+        let handle = start(port, PasskeyPhase::Setup(SetupMode::Create), None, Some("rt".into())).expect("start server");
+        let key = key_from_handle(&handle);
+        let code = handle.setup_code.clone().unwrap();
+
+        // Build a valid envelope, then mutate its ciphertext base64 in
+        // place: decode, flip a byte, re-encode.
+        let inner = format!(r#"{{"setup_code":"{code}"}}"#);
+        let mut env: serde_json::Value =
+            serde_json::from_str(&encrypt_envelope(&handle.transport_public_b64, &inner)).unwrap();
+        let ct_b64 = env["ciphertext"].as_str().unwrap().to_string();
+        let mut ct_bytes = BASE64.decode(&ct_b64).unwrap();
+        ct_bytes[0] ^= 0x01;
+        env["ciphertext"] = serde_json::Value::String(BASE64.encode(&ct_bytes));
+        let body = serde_json::to_string(&env).unwrap();
+
+        let r = raw_post_json(port, &format!("/auth/{key}/api/check-code"), &body);
+        assert!(r.contains(" 400 "), "tampered ciphertext should 400, got:\n{r}");
+        assert!(
+            r.to_lowercase().contains("transport"),
+            "error body should mention transport, got:\n{r}"
+        );
+
+        // Confirm the strike counter wasn't moved: the real code must
+        // still be accepted on a fresh encrypted post.
+        let r = encrypted_post(
+            port,
+            &handle.transport_public_b64,
+            &format!("/auth/{key}/api/check-code"),
+            &inner,
+        );
+        assert!(r.contains(" 200 "), "real code after transport failure should still 200, got:\n{r}");
+        handle.stop();
+    }
+
+    #[test]
+    fn envelope_with_wrong_server_pub_is_rejected() {
+        // Encrypt against a server pub key the server doesn't own. ECDH
+        // will produce a different shared secret on each side, so the
+        // AES-GCM tag won't verify and the server must 400. This is the
+        // closest analog to a transit MITM swapping out the embedded
+        // pub key — the legitimate server fails closed.
+        let port = ephemeral_port();
+        let handle = start(port, PasskeyPhase::Setup(SetupMode::Create), None, Some("rt".into())).expect("start server");
+        let key = key_from_handle(&handle);
+        let code = handle.setup_code.clone().unwrap();
+
+        // Generate a throwaway X25519 keypair locally; use its public as
+        // the "server pub" the client encrypts against.
+        let mut buf = [0u8; 32];
+        std::fs::File::open("/dev/urandom").unwrap().read_exact(&mut buf).unwrap();
+        let bogus_priv = X25519Secret::from(buf);
+        let bogus_pub_b64 = BASE64.encode(X25519Public::from(&bogus_priv).as_bytes());
+
+        let inner = format!(r#"{{"setup_code":"{code}"}}"#);
+        let r = encrypted_post(
+            port,
+            &bogus_pub_b64,
+            &format!("/auth/{key}/api/check-code"),
+            &inner,
+        );
+        assert!(r.contains(" 400 "), "wrong server pub should 400, got:\n{r}");
         handle.stop();
     }
 }

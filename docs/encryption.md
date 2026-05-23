@@ -535,10 +535,106 @@ The inline `<script>`:
   without needing the key templated into the HTML.
 - Calls `navigator.credentials.create()` / `.get()` with the PRF
   extension (`extensions: { prf: { eval: { first: prfSalt } } }`).
-- POSTs the base64-encoded PRF output back to the API route.
+- Wraps every `/api/*` POST body in the transport-encryption envelope
+  described below — the PRF output never leaves the JS heap as
+  plaintext on the wire.
 - Disables all buttons on success so a second click can't re-prompt
   the authenticator (the server would also reject the second POST with
   409 "already provided this session").
+
+### Transport encryption (browser ↔ server)
+
+Even though the ceremony server only binds to `127.0.0.1`, the loopback
+interface is not perfectly isolated: another local process running as
+root or with `CAP_NET_RAW` can sniff loopback, a malicious browser
+extension can read `fetch` request bodies, and devtools-history /
+proxy-style inspectors capture full requests. To avoid putting the
+WebAuthn PRF output (the actual encryption key) on the wire as
+plaintext, every `/api/*` POST body is wrapped in an authenticated
+encryption envelope under a fresh per-request key.
+
+**Protocol.** At `start()` the server generates an ephemeral X25519
+keypair (`ServerTransport::generate` in `src/passkey.rs`). The private
+half lives in `Ctx` for the ceremony's lifetime; the public half is
+base64'd and inlined into the HTML as the JS const `SERVER_PUB_B64`.
+For each request the browser generates its own ephemeral X25519 keypair
+(`crypto.subtle.generateKey({ name: "X25519" }, false, …)` — private
+imported `extractable: false`), does
+`ECDH(server_pub, client_priv)` for a 32-byte shared secret, runs it
+through HKDF-SHA256 with empty salt and
+`info = b"wrustic-passkey-transport-v1"` to derive a 32-byte AES-256-GCM
+key (imported `extractable: false`), and encrypts the JSON body with a
+random 12-byte nonce. The wire format is:
+
+```json
+{
+  "client_pub": "<base64 32 bytes>",
+  "nonce":      "<base64 12 bytes>",
+  "ciphertext": "<base64 N+16 bytes — AES-GCM ct||tag>"
+}
+```
+
+The server runs the mirror routine in `ServerTransport::decrypt`,
+checks the GCM tag (so a flipped bit in transit is a hard 400, not a
+silent corruption), then hands the inner plaintext to the existing
+per-route deserializer (`CheckCodeBody`, `SetupBody`, `UnlockBody`).
+Response bodies are plaintext on purpose: errors don't carry secrets,
+and the only success-side leak the threat model worries about is the
+PRF output itself, which lives only in the inbound direction.
+
+**Non-extractable browser keys.** Both the client's X25519 private key
+and the HKDF-derived AES-GCM key are imported with `extractable: false`,
+so an XSS payload or browser-extension foothold can't `exportKey` the
+raw bytes out of WebCrypto. An attacker could still invoke the
+WebCrypto API to use the keys — but only while sitting inside the
+ceremony page's JS context, and only for that one short-lived
+ceremony. After the page unloads the keys are gone.
+
+The PRF output itself comes out of WebAuthn as an `ArrayBuffer`, not a
+`CryptoKey`, so it can't be made non-extractable per se — but it's
+encrypted and sent within the same microtask it's received, never
+written to storage, and the server's private key (the only way to
+decrypt it after the fact) is dropped when the ceremony ends.
+
+**What this doesn't defend against.**
+- An attacker who controls the wrustic process itself (they have the
+  server private key by definition).
+- An attacker who can serve their own HTML at `/auth/<key>` (they'd
+  already need to be the wrustic server — there's no separate user
+  agent doing TLS to verify the server identity, only the capability
+  URL).
+- The browser process being compromised (extensions are mitigated
+  somewhat by `extractable: false`, but a sufficiently privileged
+  extension can still drive the page).
+
+**Browser support.** WebCrypto `X25519` became broadly available in
+2025: Chrome 133+ (Feb 2025), Firefox 130+ (Sept 2024), Safari 18.4+
+(March 2025). wrustic's passkey mode is flagged `--experimental-
+passkey` and explicitly targets these versions; if `crypto.subtle.
+generateKey({ name: "X25519" }, …)` rejects, the page shows the error
+unchanged ("This browser does not support X25519").
+
+**Algorithm choice.**
+- X25519 over P-256 ECDH: smaller key, single fixed curve, faster, no
+  parameter-confusion footguns. The corresponding WebCrypto API is
+  the late arrival that finally made it usable in the browser.
+- AES-256-GCM over ChaCha20-Poly1305: WebCrypto doesn't expose
+  ChaCha20-Poly1305, so AES-GCM is the only AEAD that works on both
+  ends without a userland JS implementation. The Rust side pulls
+  `aes-gcm = "0.10"` (≈ 30 KB compiled) to match.
+- Empty HKDF salt: the ECDH shared secret is already uniformly random
+  and unique per request; adding a salt would just be ceremony. A
+  versioned `info` string handles algorithm cutover instead.
+
+**Replay.** Each ceremony has a fresh server keypair (30-min lifespan),
+each request a fresh client keypair, so every shared secret is unique
+and a captured ciphertext can't be decrypted after the ceremony ends
+or replayed against a future one.
+
+**No body-size hiding.** The envelope leaks the inner plaintext length
+(≈ ciphertext length minus 16 bytes for the tag). For the routes here
+the lengths are essentially fixed and known a priori (a 6-char setup
+code, a 32-byte PRF, etc.), so padding would add nothing.
 
 ### What the server does *not* do
 
