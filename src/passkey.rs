@@ -661,7 +661,7 @@ fn render_html(ctx: &Ctx) -> String {
                      pattern=\"[2-9A-HJKMNP-Za-hjkmnp-z=\\-]{6}\" \
                      style=\"font-size:1.2rem;width:8rem;\
                             font-family:ui-monospace,monospace;padding:0.4rem;\" \
-                     placeholder=\"Ab2Rt=\">\
+                     placeholder=\"abcdef\">\
             </p>"
         }
         PasskeyPhase::Unlock => "",
