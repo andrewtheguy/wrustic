@@ -357,7 +357,11 @@ The phase is picked at boot by `config::peek`:
     from its PRF using a fresh salt. The HTML carries a disclaimer
     explaining this won't open another machine's existing config (the
     salt would differ).
-  - On POST: server delivers
+  - **Both flows are gated by the Setup-confirmation code** (see
+    below). The browser refuses to even prompt the authenticator
+    until a valid-shape code is in the input box, and the server
+    refuses to deliver the outcome until the code matches.
+  - On accepted POST: server delivers
     `PasskeyOutcome { key, new_meta: Some(PasskeyMeta { credential_id,
     prf_salt }) }`. The App splices the meta into `self.config.passkey`
     and immediately calls `config::save` so the `[passkey]` block
@@ -366,8 +370,75 @@ The phase is picked at boot by `config::peek`:
 - **`[passkey]` block already present** → `PasskeyPhase::Unlock`. Server
   presents the stored `credential_id` + `prf_salt` to the page, the
   browser does `.get()` against that exact credential, posts the PRF
-  back. Server delivers `PasskeyOutcome { key, new_meta: None }`. App
-  uses the key to decrypt every `pkenc:` value in the config.
+  back. No setup code on Unlock — the existing `[passkey]` block plus
+  the AEAD tag verification at first decrypt already prove the user
+  knows the passkey. Server delivers
+  `PasskeyOutcome { key, new_meta: None }`. App uses the key to
+  decrypt every `pkenc:` value in the config.
+
+### Setup-confirmation code
+
+In addition to the `/auth/<key>` capability URL, the **Setup** phase
+prints a 6-character code in the TUI that the user must type into the
+browser before either Create or Use Existing will be accepted. Unlock
+has no equivalent — the existing `[passkey]` block + AEAD already gate
+that path.
+
+Why this exists: the capability URL is enough for *access control*
+(only someone who saw the TUI can reach the ceremony page), but it
+doesn't prove the user-at-terminal *intended* to create or import a
+passkey right now. A pre-loaded browser tab, a stale URL pasted into
+the wrong window, or a clipboard timing accident could otherwise drive
+the ceremony past the user. The code is an intent-confirmation
+gesture, like a sudo prompt: "I see this number on my terminal right
+now, here it is."
+
+**Alphabet (56 chars).** Excludes the well-known confusables but keeps
+both letter cases, so the displayed code is case-sensitive:
+
+- Digits `2`–`9` (excludes `0` and `1` — visually collide with `O`/`o`
+  and `I`/`l`/`L`).
+- Uppercase `A`–`Z` excluding `I`, `L`, `O`.
+- Lowercase `a`–`z` excluding `i`, `l`, `o`.
+- Two unshifted symbols: `-` and `=` (period `.` was tried and dropped
+  — too easy to miss in a terminal font).
+
+Code space: `56^6 ≈ 3.08 × 10^10`. Guess probability per attempt:
+`~3.2 × 10^-11`.
+
+**Source of truth:** `SETUP_CODE_ALPHABET` and `random_setup_code()`
+in `src/passkey.rs`. The generator pulls 6 bytes from `/dev/urandom`
+and maps each through `byte % 56`; the resulting modulo bias is well
+below any security-relevant threshold for an intent-confirmation
+token.
+
+**Input handling.** Both the browser and the server normalize the
+submitted code by stripping whitespace only — letter case is part of
+the code (`Ab2Rt=` and `aB2rt=` are different codes) so it is *not*
+folded on either side. The comparison itself is constant-time
+(`ct_eq`).
+
+**Lock-out.** Five wrong codes in one ceremony trip a `killed` flag on
+the server's `Ctx`. From that moment forward every keyed route returns
+403 with the same "expired or cancelled" message used for the 30-min
+TTL; the user has to quit wrustic and relaunch to get a fresh code.
+This is a kill-switch (so a typo'd code doesn't keep the ceremony
+exploitable indefinitely under the 30-min TTL), not anti-brute-force
+entropy — the alphabet itself already makes brute force impractical
+within the TTL.
+
+**Display.** The code is printed tight (no inter-character padding,
+since case ambiguity in some fonts would only be made worse by spacing
+the letters out) on the Passkey screen when phase is Setup:
+
+```
+Setup code (type this in the browser — letter case matters):
+
+    Ab2Rt=
+```
+
+It's suppressed when the screen is in its expired state, since there's
+no ceremony left to confirm at that point.
 
 ### 30-minute expiry net
 

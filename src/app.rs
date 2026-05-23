@@ -204,6 +204,11 @@ pub(crate) struct App {
     pub(crate) passkey_mode: bool,
     pub(crate) passkey_handle: Option<PasskeyHandle>,
     pub(crate) passkey_short_url: Option<String>,
+    /// Setup-only confirmation code printed on the TUI. The user must
+    /// type this in the browser before either Create or Use Existing
+    /// will be accepted. `None` in Unlock (no second factor needed —
+    /// the existing [passkey] block + AEAD tag are the gate).
+    pub(crate) passkey_setup_code: Option<String>,
     pub(crate) passkey_phase: Option<PasskeyPhase>,
 
     pub(crate) first_run_state: ListState,
@@ -314,6 +319,7 @@ impl App {
             passkey_mode: experimental_passkey,
             passkey_handle: None,
             passkey_short_url: None,
+            passkey_setup_code: None,
             passkey_phase: None,
             first_run_state,
             backend_list,
@@ -472,6 +478,7 @@ impl App {
         match passkey::start(self.server_port, phase, existing) {
             Ok(h) => {
                 self.passkey_short_url = Some(h.short_url.clone());
+                self.passkey_setup_code = h.setup_code.clone();
                 self.passkey_phase = Some(h.phase);
                 self.passkey_handle = Some(h);
                 self.screen = Screen::PasskeyUrl;
@@ -499,6 +506,7 @@ impl App {
             h.stop();
         }
         self.passkey_short_url = None;
+        self.passkey_setup_code = None;
         self.passkey_phase = None;
         self.load_config_or_set_fatal();
         // Setup ceremony just produced fresh metadata — splice it into the

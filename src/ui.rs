@@ -858,6 +858,19 @@ fn render_passkey_url(frame: &mut Frame, app: &mut App, area: Rect) {
             lines.push_str("(passkey URL not available)\n\n");
         }
     }
+    // Setup-only intent-confirmation code. Print it prominently so the
+    // user knows to copy it into the browser. Suppressed when expired —
+    // there's no ceremony to confirm at that point. Letter case is
+    // significant (the alphabet includes both A-Z and a-z), so we print
+    // it tightly without inter-character padding to avoid misreads.
+    if !expired
+        && let Some(code) = &app.passkey_setup_code
+    {
+        lines.push_str("Setup code (type this in the browser — letter case matters):\n\n");
+        lines.push_str("    ");
+        lines.push_str(code);
+        lines.push_str("\n\n");
+    }
     if expired {
         // 30-min safety cap fired. Server still answers but only with 403,
         // so any further click in the browser will show an error. The user

@@ -7,6 +7,7 @@
 use std::convert::Infallible;
 use std::io::Read;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -38,6 +39,25 @@ pub(crate) enum PasskeyPhase {
 /// snapshot bytes, passkey gates the entire config decryption).
 pub(crate) const PASSKEY_TTL: Duration = Duration::from_secs(30 * 60);
 
+/// Wrong-setup-code budget for the Setup phase. The auth-key URL already
+/// authenticates the caller, so this isn't anti-brute-force entropy — it's
+/// a kill-switch so a typo'd code doesn't tie up the ceremony forever, and
+/// a hostile script that somehow holds the URL can't grind through the
+/// code space under the 30-minute TTL. Five strikes is forgiving for
+/// human typos and combined with the ~56^6 ≈ 3·10^10 code space leaves
+/// the guess probability well under 1e-9.
+const MAX_SETUP_CODE_ATTEMPTS: u32 = 5;
+
+/// Alphabet for the Setup-confirmation code. Excludes the well-known
+/// confusables (0/O/o, 1/I/l/L) but keeps both cases of every other
+/// letter, so the displayed code is case-sensitive and the user must
+/// type it as printed. Symbols `-` and `=` are unshifted on US ANSI
+/// and visible (no period — too small to spot reliably). Total 56
+/// characters → 56^6 ≈ 3·10^10 code space.
+const SETUP_CODE_ALPHABET: &[u8] =
+    b"23456789ABCDEFGHJKMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz-=";
+const SETUP_CODE_LEN: usize = 6;
+
 /// Result handed back to App when the browser completes the ceremony.
 /// The 32-byte key is the WebAuthn PRF output (used as the AEAD key in
 /// `Cipher::Passkey`); `new_meta` is `Some` only on Setup so the App can
@@ -56,6 +76,11 @@ pub(crate) struct PasskeyHandle {
     /// `<key>` is a 64-bit random hex id; the server treats every other path
     /// (including bare `/`) as 404, so the URL itself is the capability.
     pub(crate) short_url: String,
+    /// 6-digit code printed on the TUI that the user must echo into the
+    /// browser to accept Setup. `Some` only when `phase == Setup`; on
+    /// Unlock the existing `[passkey]` block + AEAD tag are the gate, so
+    /// no second factor is needed.
+    pub(crate) setup_code: Option<String>,
     pub(crate) phase: PasskeyPhase,
     pub(crate) rx: std_mpsc::Receiver<PasskeyOutcome>,
     /// Wall-clock instant at which the server stops accepting any route
@@ -112,6 +137,34 @@ fn random_short_id() -> String {
     s
 }
 
+/// 6-character Setup-confirmation code drawn from SETUP_CODE_ALPHABET.
+/// Each character is `byte % 33`, with a negligible modulo bias (≈ 1/256
+/// per character — irrelevant for an intent-confirmation token). The
+/// fallback path (no /dev/urandom) is intentionally weak; it just keeps
+/// the function infallible.
+fn random_setup_code() -> String {
+    let mut buf = [0u8; SETUP_CODE_LEN];
+    let filled = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .is_ok();
+    if !filled {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id();
+        let mix = (nanos as u64) ^ ((pid as u64) << 32);
+        let mix_bytes = mix.to_le_bytes();
+        for (i, slot) in buf.iter_mut().enumerate() {
+            *slot = mix_bytes[i % mix_bytes.len()];
+        }
+    }
+    let n = SETUP_CODE_ALPHABET.len();
+    buf.iter()
+        .map(|b| SETUP_CODE_ALPHABET[(*b as usize) % n] as char)
+        .collect()
+}
+
 fn random_bytes(n: usize) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; n];
     let mut f = std::fs::File::open("/dev/urandom")
@@ -130,6 +183,17 @@ struct Ctx {
     // Credential id presented to the browser on Unlock so it knows which
     // passkey to use. Empty on Setup (the browser is creating one).
     credential_id_b64: String,
+    // 6-digit Setup-confirmation code. Some on Setup, None on Unlock. The
+    // browser must echo it back in POST /api/setup, otherwise the call is
+    // rejected (no key delivered, no [passkey] block written).
+    setup_code: Option<String>,
+    // Setup-code wrong-attempt counter. Crossing MAX_SETUP_CODE_ATTEMPTS
+    // flips `killed`, which makes every subsequent route 403 like an
+    // expired ceremony — the user has to quit + relaunch.
+    setup_code_attempts: AtomicU32,
+    // Tripped after too many wrong setup codes. Treated by the route
+    // dispatcher as equivalent to the deadline having passed.
+    killed: AtomicBool,
     // Send the PRF output (or an error) back to the App, exactly once.
     outcome_tx: std::sync::Mutex<Option<std_mpsc::Sender<PasskeyOutcome>>>,
     // Wall-clock cap. Once now >= deadline, every route returns 403.
@@ -185,6 +249,15 @@ pub(crate) fn start(
     // and anything outside that prefix gets a flat 404.
     let short_url = format!("http://localhost:{port}/auth/{short_id}");
 
+    // Setup-only intent-confirmation code: TUI prints it, browser must echo
+    // it back on POST /api/setup. The auth-key URL is enough for *access*
+    // but doesn't prove the user-at-terminal actively wanted to create or
+    // import a passkey right now; this does.
+    let setup_code = match phase {
+        PasskeyPhase::Setup => Some(random_setup_code()),
+        PasskeyPhase::Unlock => None,
+    };
+
     let (outcome_tx, outcome_rx) = std_mpsc::channel::<PasskeyOutcome>();
     let deadline = Instant::now() + PASSKEY_TTL;
 
@@ -193,6 +266,9 @@ pub(crate) fn start(
         short_id,
         prf_salt_b64,
         credential_id_b64,
+        setup_code: setup_code.clone(),
+        setup_code_attempts: AtomicU32::new(0),
+        killed: AtomicBool::new(false),
         outcome_tx: std::sync::Mutex::new(Some(outcome_tx)),
         deadline,
     });
@@ -223,6 +299,7 @@ pub(crate) fn start(
 
     Ok(PasskeyHandle {
         short_url,
+        setup_code,
         phase,
         rx: outcome_rx,
         deadline,
@@ -309,10 +386,11 @@ async fn handle(
     // confusing "connection refused") but every keyed route 403s. The TUI
     // checks the same deadline via PasskeyHandle::is_expired() and shows
     // a matching message — no flow rework, the user just quits + restarts.
-    if Instant::now() >= ctx.deadline {
+    // `killed` short-circuits the same way after too many wrong setup codes.
+    if ctx.killed.load(Ordering::Relaxed) || Instant::now() >= ctx.deadline {
         return Ok(text(
             StatusCode::FORBIDDEN,
-            "Passkey ceremony expired (30 minute cap). \
+            "Passkey ceremony expired or cancelled. \
              Quit wrustic in the terminal and relaunch to start a new ceremony.",
         ));
     }
@@ -353,6 +431,10 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 struct SetupBody {
     credential_id: String,
     prf: String,
+    /// 6-digit code printed on the TUI; the user types it in the browser
+    /// before either "Create new passkey" or "Use existing passkey" can
+    /// complete. Compared constant-time against `ctx.setup_code`.
+    setup_code: String,
 }
 
 #[derive(Deserialize)]
@@ -391,6 +473,46 @@ async fn handle_setup(req: Request<hyper::body::Incoming>, ctx: Arc<Ctx>) -> Res
         Ok(v) => v,
         Err(e) => return text(StatusCode::BAD_REQUEST, &format!("invalid JSON: {e}")),
     };
+    // Setup-code gate: the browser must echo the 6-digit code printed on
+    // the TUI. Wrong code increments the attempt counter; crossing
+    // MAX_SETUP_CODE_ATTEMPTS trips `killed`, which makes every subsequent
+    // request (this route or any other under the auth key) 403 — same kill
+    // switch as the 30-min expiry. The deliver() and meta-write only run
+    // *after* this check passes.
+    let expected = match ctx.setup_code.as_deref() {
+        Some(c) => c,
+        // Shouldn't happen: Setup phase always mints a code. Treat a None
+        // expected code as an internal error rather than auto-accept.
+        None => return text(StatusCode::INTERNAL_SERVER_ERROR, "setup code not initialized"),
+    };
+    // Normalize incoming code: strip whitespace only. Case is part of
+    // the code (the alphabet has both upper and lower case letters) so
+    // we compare the bytes verbatim. ct_eq runs in constant time over
+    // the resulting buffers; the whitespace strip operates on attacker-
+    // supplied bytes only and doesn't leak anything about the secret.
+    let submitted: String = parsed
+        .setup_code
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    if !ct_eq(submitted.as_bytes(), expected.as_bytes()) {
+        let prev = ctx.setup_code_attempts.fetch_add(1, Ordering::Relaxed);
+        let used = prev + 1;
+        if used >= MAX_SETUP_CODE_ATTEMPTS {
+            ctx.killed.store(true, Ordering::Relaxed);
+            return text(
+                StatusCode::FORBIDDEN,
+                "Too many wrong setup codes. Ceremony cancelled — quit wrustic and relaunch.",
+            );
+        }
+        let remaining = MAX_SETUP_CODE_ATTEMPTS - used;
+        return text(
+            StatusCode::UNAUTHORIZED,
+            &format!(
+                "Wrong setup code. {remaining} attempt(s) left before the ceremony is cancelled."
+            ),
+        );
+    }
     if parsed.credential_id.is_empty() {
         return text(StatusCode::BAD_REQUEST, "credential_id required");
     }
@@ -458,6 +580,32 @@ fn render_html(ctx: &Ctx) -> String {
     // "Use existing passkey" path carries a disclaimer so the user
     // understands it starts a fresh encrypted store under a new salt and
     // won't decrypt an existing wrustic config from another machine.
+    // Setup-only: a 6-character code input the user must echo from the
+    // TUI. Alphabet matches SETUP_CODE_ALPHABET (digits 2-9, A-Z and a-z
+    // each minus I/L/O / i/l/o, plus `-` and `=`). Case-sensitive — no
+    // text-transform / autocapitalize tweaks. Both Create and Use
+    // Existing flows read the same input and send it along with the
+    // WebAuthn result. No code on Unlock — the existing `[passkey]`
+    // block + AEAD tag already prove the user knows the passkey.
+    let setup_code_html = match ctx.phase {
+        PasskeyPhase::Setup => {
+            "<p>\
+              <label for=\"setup-code\">\
+                <strong>Setup code</strong> (printed in your wrustic terminal, \
+                copy it exactly — letter case matters):\
+              </label>\
+              <br>\
+              <input id=\"setup-code\" type=\"text\" autocomplete=\"off\" \
+                     spellcheck=\"false\" autocapitalize=\"none\" \
+                     maxlength=\"6\" \
+                     pattern=\"[2-9A-HJKMNP-Za-hjkmnp-z=\\-]{6}\" \
+                     style=\"font-size:1.2rem;width:8rem;\
+                            font-family:ui-monospace,monospace;padding:0.4rem;\" \
+                     placeholder=\"Ab2Rt=\">\
+            </p>"
+        }
+        PasskeyPhase::Unlock => "",
+    };
     let buttons_html = match ctx.phase {
         PasskeyPhase::Setup => {
             "<p>\
@@ -502,6 +650,7 @@ fn render_html(ctx: &Ctx) -> String {
 <body>
 <h1>{heading}</h1>
 <p>{explanation}</p>
+{setup_code_html}
 {buttons_html}
 <div id="status" class="note">Click a button above to begin.</div>
 <p><small>This page is served by the wrustic process on localhost. You can close it when finished.</small></p>
@@ -532,10 +681,28 @@ function setStatus(text, kind) {{
   el.className = kind || "note";
 }}
 
+// Setup phase only: read the 6-character code the user typed from the
+// TUI. Throws early (before any authenticator prompt) if it's missing
+// or the wrong shape. Case-sensitive: the alphabet includes both upper
+// and lower case letters, so the server compares the bytes verbatim.
+// We do strip whitespace so a stray space doesn't blow the compare.
+function readSetupCode() {{
+  const el = document.getElementById("setup-code");
+  if (!el) return null;
+  const code = (el.value || "").replace(/\s+/g, "");
+  if (!/^[2-9A-HJKMNP-Za-hjkmnp-z=\-]{{6}}$/.test(code)) {{
+    throw new Error("Enter the 6-character setup code from your wrustic terminal (letter case matters).");
+  }}
+  return code;
+}}
+
 // Create a brand-new passkey on this device and use its PRF output as the
 // encryption key. Some platform authenticators don't return PRF during
 // create(), so we fall back to a follow-up get() with the same credential.
 async function doCreate() {{
+  // Validate the setup code first — bail before triggering an authenticator
+  // prompt if the user didn't type the code from the TUI.
+  const setupCode = readSetupCode();
   const prfSalt = b64ToBytes(PRF_SALT_B64);
   const userId = crypto.getRandomValues(new Uint8Array(16));
   const challenge = crypto.getRandomValues(new Uint8Array(32));
@@ -575,13 +742,15 @@ async function doCreate() {{
   if (!prfOutput) {{
     throw new Error("Authenticator did not return a PRF output. wrustic's experimental passkey mode requires WebAuthn PRF (hmac-secret) support.");
   }}
-  await postSetup(credId, prfOutput);
+  await postSetup(credId, prfOutput, setupCode);
 }}
 
 // Reuse an existing passkey already known to the browser (e.g. synced via
 // the user's password manager). No `allowCredentials` so the browser shows
 // the user every passkey valid for this origin and they pick one.
 async function doImportExisting() {{
+  // Validate the setup code first — same reasoning as doCreate().
+  const setupCode = readSetupCode();
   const prfSalt = b64ToBytes(PRF_SALT_B64);
   const challenge = crypto.getRandomValues(new Uint8Array(32));
   const assert = await navigator.credentials.get({{
@@ -598,16 +767,17 @@ async function doImportExisting() {{
   if (!prfOutput) {{
     throw new Error("The selected passkey did not return a PRF output. wrustic requires a passkey created with WebAuthn PRF (hmac-secret) support.");
   }}
-  await postSetup(credId, prfOutput);
+  await postSetup(credId, prfOutput, setupCode);
 }}
 
-async function postSetup(credId, prfOutput) {{
+async function postSetup(credId, prfOutput, setupCode) {{
   const r = await fetch(API_BASE + "/api/setup", {{
     method: "POST",
     headers: {{ "Content-Type": "application/json" }},
     body: JSON.stringify({{
       credential_id: bytesToB64(credId),
-      prf: bytesToB64(prfOutput)
+      prf: bytesToB64(prfOutput),
+      setup_code: setupCode
     }})
   }});
   if (!r.ok) throw new Error("Server: " + (await r.text()));
@@ -678,6 +848,7 @@ wireButton("go-unlock", doUnlock);
 "#,
         heading = heading,
         explanation = explanation,
+        setup_code_html = setup_code_html,
         buttons_html = buttons_html,
         prf_salt_js = json_string(&ctx.prf_salt_b64),
         cred_id_js = json_string(&ctx.credential_id_b64),
@@ -751,16 +922,26 @@ mod tests {
         assert!(decode_prf(&exact).is_ok());
     }
 
-    #[test]
-    fn html_setup_offers_create_and_import_buttons() {
-        let ctx = Ctx {
-            phase: PasskeyPhase::Setup,
+    fn test_ctx(phase: PasskeyPhase, setup_code: Option<&str>) -> Ctx {
+        Ctx {
+            phase,
             short_id: "abc123".into(),
             prf_salt_b64: "U0FMVA==".into(),
-            credential_id_b64: String::new(),
+            credential_id_b64: match phase {
+                PasskeyPhase::Unlock => "Q1JFRA==".into(),
+                PasskeyPhase::Setup => String::new(),
+            },
+            setup_code: setup_code.map(|s| s.into()),
+            setup_code_attempts: AtomicU32::new(0),
+            killed: AtomicBool::new(false),
             outcome_tx: std::sync::Mutex::new(None),
             deadline: Instant::now() + PASSKEY_TTL,
-        };
+        }
+    }
+
+    #[test]
+    fn html_setup_offers_create_and_import_buttons() {
+        let ctx = test_ctx(PasskeyPhase::Setup, Some("AB-23K"));
         let html = render_html(&ctx);
         assert!(html.contains("Set up a passkey"));
         assert!(html.contains("U0FMVA=="));
@@ -776,18 +957,14 @@ mod tests {
         assert!(html.contains("config.toml"));
         // Success must disable all CTAs so the user can't re-trigger.
         assert!(html.contains("disableAllCtas"));
+        // Setup-code input must be present in Setup phase.
+        assert!(html.contains(r#"id="setup-code""#));
+        assert!(html.contains("Setup code"));
     }
 
     #[test]
     fn html_unlock_offers_only_unlock_button() {
-        let ctx = Ctx {
-            phase: PasskeyPhase::Unlock,
-            short_id: "abc123".into(),
-            prf_salt_b64: "U0FMVA==".into(),
-            credential_id_b64: "Q1JFRA==".into(),
-            outcome_tx: std::sync::Mutex::new(None),
-            deadline: Instant::now() + PASSKEY_TTL,
-        };
+        let ctx = test_ctx(PasskeyPhase::Unlock, None);
         let html = render_html(&ctx);
         assert!(html.contains("Unlock wrustic"));
         assert!(html.contains("Q1JFRA=="));
@@ -796,6 +973,43 @@ mod tests {
         assert!(!html.contains(r#"id="go-import""#));
         // Disclaimer is Setup-only.
         assert!(!html.contains("class=\"hint\""));
+        // Setup-code input must not appear in Unlock phase.
+        assert!(!html.contains(r#"id="setup-code""#));
+    }
+
+    #[test]
+    fn setup_code_alphabet_is_unambiguous() {
+        // Generated codes must only use SETUP_CODE_ALPHABET characters.
+        for _ in 0..32 {
+            let code = random_setup_code();
+            assert_eq!(code.chars().count(), SETUP_CODE_LEN);
+            for c in code.chars() {
+                assert!(
+                    SETUP_CODE_ALPHABET.contains(&(c as u8)),
+                    "char {c:?} not in alphabet"
+                );
+            }
+        }
+        // Sanity-check the alphabet excludes the well-known confusables
+        // and the period (replaced by `=` because periods read poorly in
+        // a TUI font).
+        let bad = b"01ILOilo.";
+        for b in bad {
+            assert!(
+                !SETUP_CODE_ALPHABET.contains(b),
+                "alphabet should not contain {:?}",
+                *b as char
+            );
+        }
+        // Spot-check that both `-` and `=` made it in (the symbol set is
+        // exactly these two).
+        assert!(SETUP_CODE_ALPHABET.contains(&b'-'));
+        assert!(SETUP_CODE_ALPHABET.contains(&b'='));
+        // And that both upper and lower case made it in.
+        assert!(SETUP_CODE_ALPHABET.contains(&b'A'));
+        assert!(SETUP_CODE_ALPHABET.contains(&b'a'));
+        assert!(SETUP_CODE_ALPHABET.contains(&b'Z'));
+        assert!(SETUP_CODE_ALPHABET.contains(&b'z'));
     }
 
     fn assert_send<T: Send>() {}
@@ -818,6 +1032,7 @@ mod tests {
         let (shutdown_tx, _shutdown_rx) = oneshot::channel::<()>();
         let h = PasskeyHandle {
             short_url: String::new(),
+            setup_code: None,
             phase: PasskeyPhase::Setup,
             rx,
             deadline: Instant::now() - Duration::from_secs(1),
@@ -830,6 +1045,7 @@ mod tests {
         let (shutdown_tx, _shutdown_rx) = oneshot::channel::<()>();
         let h2 = PasskeyHandle {
             short_url: String::new(),
+            setup_code: None,
             phase: PasskeyPhase::Setup,
             rx,
             deadline: Instant::now() + Duration::from_secs(60),
@@ -865,6 +1081,22 @@ mod tests {
         let mut sock = TcpStream::connect(("127.0.0.1", port)).expect("connect");
         let req = format!(
             "{method} {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n"
+        );
+        sock.write_all(req.as_bytes()).unwrap();
+        let mut resp = Vec::new();
+        sock.read_to_end(&mut resp).unwrap();
+        String::from_utf8_lossy(&resp).into_owned()
+    }
+
+    /// Variant of `raw_request` that ships a JSON body.
+    fn raw_post_json(port: u16, path: &str, body: &str) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        let mut sock = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        let req = format!(
+            "POST {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {len}\r\n\r\n{body}",
+            len = body.len(),
+            body = body,
         );
         sock.write_all(req.as_bytes()).unwrap();
         let mut resp = Vec::new();
@@ -941,6 +1173,182 @@ mod tests {
             r.contains(" 400 ") || r.contains(" 200 "),
             "POST {key}/api/setup should reach the handler (400 from empty body), got:\n{r}"
         );
+
+        handle.stop();
+    }
+
+    /// 32-byte base64 PRF that's well-formed enough to pass `decode_prf`
+    /// — used as filler so the test reaches the setup_code branch.
+    fn dummy_prf_b64() -> String {
+        BASE64.encode([0u8; 32])
+    }
+
+    #[test]
+    fn setup_code_wrong_returns_401_and_doesnt_deliver() {
+        let port = ephemeral_port();
+        let handle = start(port, PasskeyPhase::Setup, None).expect("start server");
+        let key = key_from_handle(&handle);
+        let setup_code = handle.setup_code.clone().expect("Setup phase mints a code");
+        let path = format!("/auth/{key}/api/setup");
+        let prf = dummy_prf_b64();
+
+        // Wrong code: deliberately mutate the real one so it stays in the
+        // alphabet but differs. Flip the first character to the next one
+        // in the alphabet (wrapping).
+        let mut bad_chars: Vec<u8> = setup_code.as_bytes().to_vec();
+        let pos = SETUP_CODE_ALPHABET
+            .iter()
+            .position(|&b| b == bad_chars[0])
+            .unwrap();
+        bad_chars[0] = SETUP_CODE_ALPHABET[(pos + 1) % SETUP_CODE_ALPHABET.len()];
+        let bad = String::from_utf8(bad_chars).unwrap();
+
+        let body = format!(
+            r#"{{"credential_id":"Y3JlZA==","prf":"{prf}","setup_code":"{bad}"}}"#
+        );
+        let r = raw_post_json(port, &path, &body);
+        assert!(r.contains(" 401 "), "wrong code should 401, got:\n{r}");
+        assert!(r.to_lowercase().contains("setup code"));
+
+        // No outcome should have been delivered — try_recv must be empty.
+        match handle.rx.try_recv() {
+            Err(std_mpsc::TryRecvError::Empty) => {}
+            Ok(_) => panic!("no outcome should be delivered on wrong code"),
+            Err(other) => panic!("unexpected channel state: {other:?}"),
+        }
+        handle.stop();
+    }
+
+    #[test]
+    fn setup_code_correct_reaches_outcome_delivery() {
+        let port = ephemeral_port();
+        let handle = start(port, PasskeyPhase::Setup, None).expect("start server");
+        let key = key_from_handle(&handle);
+        let setup_code = handle.setup_code.clone().expect("Setup phase mints a code");
+        let path = format!("/auth/{key}/api/setup");
+        let prf = dummy_prf_b64();
+
+        let body = format!(
+            r#"{{"credential_id":"Y3JlZA==","prf":"{prf}","setup_code":"{setup_code}"}}"#
+        );
+        let r = raw_post_json(port, &path, &body);
+        // Right code + well-formed body → 200 and outcome delivered.
+        assert!(r.contains(" 200 "), "correct code should 200, got:\n{r}");
+
+        let outcome = handle.rx.recv_timeout(Duration::from_secs(2)).expect("outcome");
+        assert_eq!(outcome.key, [0u8; 32]);
+        assert!(outcome.new_meta.is_some());
+        handle.stop();
+    }
+
+    #[test]
+    fn setup_code_accepts_whitespace_padding() {
+        let port = ephemeral_port();
+        let handle = start(port, PasskeyPhase::Setup, None).expect("start server");
+        let key = key_from_handle(&handle);
+        let setup_code = handle.setup_code.clone().unwrap();
+        let path = format!("/auth/{key}/api/setup");
+        let prf = dummy_prf_b64();
+
+        // Pad with whitespace — server strips it before comparing. Case
+        // is *not* normalized (the alphabet has both upper and lower)
+        // so we keep the code byte-identical otherwise.
+        let munged: String = format!(" {setup_code} ");
+        let body = format!(
+            r#"{{"credential_id":"Y3JlZA==","prf":"{prf}","setup_code":"{munged}"}}"#
+        );
+        let r = raw_post_json(port, &path, &body);
+        assert!(
+            r.contains(" 200 "),
+            "whitespace-tolerant compare should accept, got:\n{r}"
+        );
+        let outcome = handle.rx.recv_timeout(Duration::from_secs(2)).expect("outcome");
+        assert!(outcome.new_meta.is_some());
+        handle.stop();
+    }
+
+    #[test]
+    fn setup_code_case_mismatch_is_rejected() {
+        // A code typed with the wrong case should NOT be accepted — the
+        // alphabet treats upper and lower as distinct.
+        let port = ephemeral_port();
+        let handle = start(port, PasskeyPhase::Setup, None).expect("start server");
+        let key = key_from_handle(&handle);
+        let setup_code = handle.setup_code.clone().unwrap();
+        let path = format!("/auth/{key}/api/setup");
+        let prf = dummy_prf_b64();
+
+        // Build a flipped-case version of the real code. If the code has
+        // no letters (purely digits and symbols), skip the assertion —
+        // there's nothing to flip.
+        let flipped: String = setup_code
+            .chars()
+            .map(|c| {
+                if c.is_ascii_uppercase() {
+                    c.to_ascii_lowercase()
+                } else if c.is_ascii_lowercase() {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                }
+            })
+            .collect();
+        if flipped == setup_code {
+            // No letters in the code; the case-mismatch test isn't
+            // meaningful. Skip cleanly.
+            handle.stop();
+            return;
+        }
+
+        let body = format!(
+            r#"{{"credential_id":"Y3JlZA==","prf":"{prf}","setup_code":"{flipped}"}}"#
+        );
+        let r = raw_post_json(port, &path, &body);
+        assert!(r.contains(" 401 "), "case-flipped code should 401, got:\n{r}");
+        handle.stop();
+    }
+
+    #[test]
+    fn setup_code_five_strikes_kills_ceremony() {
+        let port = ephemeral_port();
+        let handle = start(port, PasskeyPhase::Setup, None).expect("start server");
+        let key = key_from_handle(&handle);
+        let real = handle.setup_code.clone().unwrap();
+        let path = format!("/auth/{key}/api/setup");
+        let prf = dummy_prf_b64();
+
+        // Use a wrong code that is guaranteed not to equal the real one.
+        // Both "------" and "======" are 6-char strings of in-alphabet
+        // chars; the real code colliding with either is overwhelmingly
+        // unlikely, but be defensive and rotate.
+        let mut wrong = "------".to_string();
+        if wrong == real {
+            wrong = "======".into();
+        }
+
+        for i in 1..=MAX_SETUP_CODE_ATTEMPTS {
+            let body = format!(
+                r#"{{"credential_id":"Y3JlZA==","prf":"{prf}","setup_code":"{wrong}"}}"#
+            );
+            let r = raw_post_json(port, &path, &body);
+            if i < MAX_SETUP_CODE_ATTEMPTS {
+                assert!(r.contains(" 401 "), "strike {i} should 401, got:\n{r}");
+            } else {
+                assert!(r.contains(" 403 "), "final strike should 403, got:\n{r}");
+            }
+        }
+
+        // After the kill switch trips, every subsequent request (even
+        // through the right key) must 403 from the expiry/killed guard.
+        let r = raw_request(port, "GET", &format!("/auth/{key}"));
+        assert!(r.contains(" 403 "), "post-kill requests must 403, got:\n{r}");
+
+        // Even the correct code is no longer accepted.
+        let body = format!(
+            r#"{{"credential_id":"Y3JlZA==","prf":"{prf}","setup_code":"{real}"}}"#
+        );
+        let r = raw_post_json(port, &path, &body);
+        assert!(r.contains(" 403 "), "correct code post-kill must 403, got:\n{r}");
 
         handle.stop();
     }
