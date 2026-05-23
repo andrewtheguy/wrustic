@@ -585,6 +585,19 @@ async function doUnlock() {{
   if (!r.ok) throw new Error("Server: " + (await r.text()));
 }}
 
+// After a successful ceremony the server has already received what it
+// needs; a second click would just hit /api/setup or /api/unlock again
+// (server returns 409 "already provided this session") and risk the user
+// re-prompting the authenticator for no reason. Visually disable every
+// button so the page reads as terminal-state.
+function disableAllCtas() {{
+  document.querySelectorAll("button").forEach(b => {{
+    b.disabled = true;
+    b.style.opacity = "0.5";
+    b.style.cursor = "not-allowed";
+  }});
+}}
+
 function wireButton(id, fn) {{
   const el = document.getElementById(id);
   if (!el) return;
@@ -597,6 +610,7 @@ function wireButton(id, fn) {{
     try {{
       await fn();
       setStatus("Done. You can close this tab and return to the wrustic terminal.", "ok");
+      disableAllCtas();
     }} catch (e) {{
       setStatus("Error: " + (e && e.message ? e.message : e), "err");
     }}
@@ -706,6 +720,8 @@ mod tests {
         assert!(html.contains("class=\"hint\""));
         assert!(html.contains("salt would differ"));
         assert!(html.contains("config.toml"));
+        // Success must disable all CTAs so the user can't re-trigger.
+        assert!(html.contains("disableAllCtas"));
     }
 
     #[test]
