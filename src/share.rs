@@ -181,7 +181,10 @@ pub(crate) fn build_signed_url(
         .append_pair("sig", &sig)
         .finish();
     let path = format!("/dl?{qs}");
-    (format!("http://127.0.0.1:{port}{path}"), path, exp)
+    // User-facing host is `localhost` (better authenticator/browser
+    // compatibility than the bare IPv4 literal); the listener still binds
+    // to 127.0.0.1 below.
+    (format!("http://localhost:{port}{path}"), path, exp)
 }
 
 struct Ctx {
@@ -232,7 +235,7 @@ pub(crate) fn start(
 
     let (url, path, exp) = build_signed_url(port, &snap_id, tree_id, &name, ttl, &key);
     let short_id = random_short_id();
-    let short_url = format!("http://127.0.0.1:{port}/s/{short_id}");
+    let short_url = format!("http://localhost:{port}/s/{short_id}");
 
     let ctx = Arc::new(Ctx {
         repo: Arc::new(repo),
