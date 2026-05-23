@@ -19,6 +19,9 @@ Options:
                               passphrase instead of age. Requires an explicit
                               --config-dir. Passphrase configs are NOT
                               interoperable with age configs.
+      --browser-auth          Use a browser-based ceremony for passphrase input
+                              instead of typing the passphrase in the terminal.
+                              Requires --experimental-passphrase.
   -h, --help                  Print this help text.
 ";
 
@@ -26,6 +29,7 @@ pub(crate) struct Cli {
     pub(crate) config_dir: Option<PathBuf>,
     pub(crate) port: u16,
     pub(crate) experimental_passphrase: bool,
+    pub(crate) browser_auth: bool,
     pub(crate) show_help: bool,
 }
 
@@ -35,6 +39,7 @@ impl Default for Cli {
             config_dir: None,
             port: DEFAULT_SERVER_PORT,
             experimental_passphrase: false,
+            browser_auth: false,
             show_help: false,
         }
     }
@@ -47,6 +52,7 @@ pub(crate) fn parse_cli() -> Result<Cli> {
         match arg.as_str() {
             "-h" | "--help" => cli.show_help = true,
             "--experimental-passphrase" => cli.experimental_passphrase = true,
+            "--browser-auth" => cli.browser_auth = true,
             "-c" | "--config-dir" => {
                 let value = args
                     .next()
@@ -80,6 +86,9 @@ pub(crate) fn parse_cli() -> Result<Cli> {
         bail!(
             "--experimental-passphrase requires an explicit --config-dir while the feature is experimental"
         );
+    }
+    if cli.browser_auth && !cli.experimental_passphrase {
+        bail!("--browser-auth requires --experimental-passphrase");
     }
     Ok(cli)
 }

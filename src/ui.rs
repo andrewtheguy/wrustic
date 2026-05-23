@@ -62,7 +62,10 @@ fn bottom_bar_text(screen: &Screen) -> &'static str {
             "j/k scroll  PgUp/PgDn page  g top  s share  Esc/Backspace/q back"
         }
         Screen::ShareUrl => "Esc/Backspace/q back (stops the server)",
-        Screen::PassphraseSubdomainPrompt => "type  Enter submit  Esc quit",
+        Screen::PassphraseInstancePrompt => "type  Enter submit  Esc quit",
+        Screen::PassphraseSetup => "Tab/Shift+Tab field  Enter submit  Esc back",
+        Screen::PassphraseUnlock => "type  Enter submit  Esc quit",
+        Screen::PassphraseDerivingKey => "working…",
         Screen::PassphraseUrl => "Esc/q quit  (waiting for browser ceremony)",
         Screen::SnapshotCompareFirst => {
             "j/k move  PgUp/PgDn page  g/G top/bottom  Enter pick FIRST  Esc cancel"
@@ -202,15 +205,21 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
         Screen::SnapshotContents => render_snapshot_contents(frame, app, area),
         Screen::FileDetails => render_file_details(frame, app, area),
         Screen::ShareUrl => render_share_url(frame, app, area),
-        Screen::PassphraseSubdomainPrompt => render_input(
+        Screen::PassphraseInstancePrompt => render_input(
             frame,
             area,
-            "Subdomain",
-            &app.passphrase_subdomain_input,
+            "Instance name",
+            &app.passphrase_instance_input,
             false,
-            "DNS-safe subdomain (a-z, 0-9, hyphens, max 32 chars). \
-             Used in the browser URL: <subdomain>.wrustic.localhost.",
+            "Lowercase letters, digits, and hyphens (max 32 chars).",
         ),
+        Screen::PassphraseSetup => render_passphrase_setup(frame, app, area),
+        Screen::PassphraseUnlock => render_passphrase_unlock(frame, app, area),
+        Screen::PassphraseDerivingKey => {
+            let para = Paragraph::new("Deriving key…")
+                .block(Block::bordered().title("Passphrase"));
+            frame.render_widget(para, area);
+        }
         Screen::PassphraseUrl => render_passphrase_url(frame, app, area),
         Screen::SnapshotCompareFirst => render_compare_first(frame, app, area),
         Screen::SnapshotCompareSecond => render_compare_second(frame, app, area),
@@ -843,6 +852,44 @@ fn render_file_details(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(para, area);
 }
 
+fn render_passphrase_setup(frame: &mut Frame, app: &App, area: Rect) {
+    let fields = [
+        ("Passphrase", &app.passphrase_input, true),
+        ("Confirm passphrase", &app.passphrase_confirm, true),
+    ];
+    let help = app
+        .passphrase_error
+        .as_deref()
+        .unwrap_or("Min 12 chars, requires lowercase, uppercase, digit, and special character.");
+    render_grouped_input(
+        frame,
+        area,
+        "Set passphrase",
+        &fields,
+        app.field_focus,
+        help,
+    );
+}
+
+fn render_passphrase_unlock(frame: &mut Frame, app: &App, area: Rect) {
+    let help = app
+        .passphrase_error
+        .as_deref()
+        .unwrap_or("Enter the passphrase to decrypt the config.");
+    let title = if let Some(inst) = app
+        .config
+        .passphrase
+        .as_ref()
+        .map(|m| m.instance.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        format!("Unlock — {inst}")
+    } else {
+        "Unlock".to_string()
+    };
+    render_input(frame, area, &title, &app.passphrase_input, true, help);
+}
+
 fn render_passphrase_url(frame: &mut Frame, app: &mut App, area: Rect) {
     let phase_label = match app.passphrase_phase {
         Some(PassphrasePhase::Setup) => "Setup",
@@ -892,14 +939,14 @@ fn render_passphrase_url(frame: &mut Frame, app: &mut App, area: Rect) {
                 );
             }
             Some(PassphrasePhase::Unlock) => {
-                if let Some(sub) = app
+                if let Some(inst) = app
                     .config
                     .passphrase
                     .as_ref()
-                    .map(|m| m.subdomain.as_str())
+                    .map(|m| m.instance.as_str())
                     .filter(|s| !s.is_empty())
                 {
-                    lines.push_str(&format!("Subdomain: {sub}\n\n"));
+                    lines.push_str(&format!("Instance: {inst}\n\n"));
                 }
                 lines.push_str(
                     "Enter the passphrase you set up earlier to decrypt the config.\n",

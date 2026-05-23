@@ -184,9 +184,9 @@ struct Ctx {
     phase: PassphrasePhase,
     short_id: String,
     path_prefix: &'static str,
-    subdomain: String,
+    instance: String,
     salt_b64: String,
-    expected_subdomain_sig: Option<String>,
+    expected_instance_sig: Option<String>,
     expected_host: String,
     setup_code: Option<String>,
     setup_code_attempts: AtomicU32,
@@ -214,7 +214,7 @@ pub(crate) fn start(
     port: u16,
     phase: PassphrasePhase,
     existing: Option<PassphraseMeta>,
-    subdomain: &str,
+    instance: &str,
 ) -> Result<PassphraseHandle> {
     let listener_std = std::net::TcpListener::bind(("127.0.0.1", port))
         .map_err(|e| anyhow!("bind 127.0.0.1:{port}: {e}"))?;
@@ -222,7 +222,7 @@ pub(crate) fn start(
         .set_nonblocking(true)
         .map_err(|e| anyhow!("set_nonblocking: {e}"))?;
 
-    let (salt_b64, expected_subdomain_sig) = match phase {
+    let (salt_b64, expected_instance_sig) = match phase {
         PassphrasePhase::Setup => {
             let salt: [u8; 32] = rand::random();
             (BASE64.encode(salt), None)
@@ -230,7 +230,7 @@ pub(crate) fn start(
         PassphrasePhase::Unlock => {
             let meta = existing
                 .ok_or_else(|| anyhow!("unlock phase requires existing passphrase metadata"))?;
-            (meta.salt, Some(meta.subdomain_sig))
+            (meta.salt, Some(meta.instance_sig))
         }
     };
 
@@ -239,7 +239,7 @@ pub(crate) fn start(
         PassphrasePhase::Setup => "setup",
         PassphrasePhase::Unlock => "auth",
     };
-    let short_url = format!("http://{subdomain}.wrustic.localhost:{port}/{path_prefix}/{short_id}");
+    let short_url = format!("http://{instance}.wrustic.localhost:{port}/{path_prefix}/{short_id}");
 
     let setup_code = match phase {
         PassphrasePhase::Setup => Some(random_setup_code()),
@@ -251,15 +251,15 @@ pub(crate) fn start(
     let transport = ServerTransport::generate();
     let script_nonce = BASE64.encode(rand::random::<[u8; 16]>());
 
-    let expected_host = format!("{subdomain}.wrustic.localhost");
+    let expected_host = format!("{instance}.wrustic.localhost");
 
     let ctx = Arc::new(Ctx {
         phase,
         short_id,
         path_prefix,
-        subdomain: subdomain.to_string(),
+        instance: instance.to_string(),
         salt_b64,
-        expected_subdomain_sig,
+        expected_instance_sig,
         expected_host,
         setup_code: setup_code.clone(),
         setup_code_attempts: AtomicU32::new(0),
@@ -482,7 +482,7 @@ async fn read_and_decrypt(
     ctx.transport.decrypt(&env).map_err(|e| e.http_response())
 }
 
-fn derive_config_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32], String> {
+pub(crate) fn derive_config_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32], String> {
     let mut key = [0u8; 32];
     let params = ScryptParams::new(SCRYPT_LOG_N, SCRYPT_R, SCRYPT_P, key.len())
         .map_err(|e| format!("invalid scrypt parameters: {e}"))?;
@@ -491,7 +491,7 @@ fn derive_config_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32], String> 
     Ok(key)
 }
 
-fn passphrase_policy_error(passphrase: &str) -> Option<&'static str> {
+pub(crate) fn passphrase_policy_error(passphrase: &str) -> Option<&'static str> {
     if passphrase.chars().count() < 12 {
         return Some("Must be at least 12 characters.");
     }
@@ -547,15 +547,21 @@ fn parse_unlock_body(inner: &[u8]) -> Result<UnlockBody, String> {
     Ok(UnlockBody { passphrase })
 }
 
-fn verify_subdomain_sig(subdomain: &str, key: &[u8; 32], expected_sig_b64: &str) -> bool {
+pub(crate) fn verify_instance_sig(instance: &str, key: &[u8; 32], expected_sig_b64: &str) -> bool {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(subdomain.as_bytes());
+    mac.update(instance.as_bytes());
     let computed = mac.finalize().into_bytes();
     let expected = match BASE64.decode(expected_sig_b64) {
         Ok(b) => b,
         Err(_) => return false,
     };
     ct_eq(&computed, &expected)
+}
+
+pub(crate) fn compute_instance_sig(instance: &str, key: &[u8; 32]) -> String {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(instance.as_bytes());
+    BASE64.encode(mac.finalize().into_bytes())
 }
 
 enum CodeCheck {
@@ -645,11 +651,11 @@ async fn handle_setup(req: Request<hyper::body::Incoming>, ctx: Arc<Ctx>) -> Res
     };
     let mut mac = HmacSha256::new_from_slice(&config_key)
         .expect("HMAC accepts any key length");
-    mac.update(ctx.subdomain.as_bytes());
-    let subdomain_sig = BASE64.encode(mac.finalize().into_bytes());
+    mac.update(ctx.instance.as_bytes());
+    let instance_sig = BASE64.encode(mac.finalize().into_bytes());
     let meta = PassphraseMeta {
-        subdomain: ctx.subdomain.clone(),
-        subdomain_sig,
+        instance: ctx.instance.clone(),
+        instance_sig,
         salt: ctx.salt_b64.clone(),
     };
     let outcome = PassphraseOutcome {
@@ -679,12 +685,12 @@ async fn handle_unlock(req: Request<hyper::body::Incoming>, ctx: Arc<Ctx>) -> Re
         Ok(k) => k,
         Err(e) => return text(StatusCode::INTERNAL_SERVER_ERROR, &format!("key derivation: {e}")),
     };
-    if let Some(expected_sig) = &ctx.expected_subdomain_sig
-        && !verify_subdomain_sig(&ctx.subdomain, &config_key, expected_sig)
+    if let Some(expected_sig) = &ctx.expected_instance_sig
+        && !verify_instance_sig(&ctx.instance, &config_key, expected_sig)
     {
         return text(
             StatusCode::UNAUTHORIZED,
-            "Wrong passphrase. The subdomain signature did not match.",
+            "Wrong passphrase. The instance signature did not match.",
         );
     }
     let outcome = PassphraseOutcome {
@@ -825,33 +831,33 @@ mod tests {
     }
 
     #[test]
-    fn verify_subdomain_sig_correct() {
+    fn verify_instance_sig_correct() {
         let key = [0x42u8; 32];
-        let subdomain = "mysite";
+        let instance = "mysite";
         let mut mac = HmacSha256::new_from_slice(&key).unwrap();
-        mac.update(subdomain.as_bytes());
+        mac.update(instance.as_bytes());
         let sig = BASE64.encode(mac.finalize().into_bytes());
-        assert!(verify_subdomain_sig(subdomain, &key, &sig));
+        assert!(verify_instance_sig(instance, &key, &sig));
     }
 
     #[test]
-    fn verify_subdomain_sig_wrong_key() {
+    fn verify_instance_sig_wrong_key() {
         let key = [0x42u8; 32];
-        let subdomain = "mysite";
+        let instance = "mysite";
         let mut mac = HmacSha256::new_from_slice(&key).unwrap();
-        mac.update(subdomain.as_bytes());
+        mac.update(instance.as_bytes());
         let sig = BASE64.encode(mac.finalize().into_bytes());
         let wrong_key = [0x43u8; 32];
-        assert!(!verify_subdomain_sig(subdomain, &wrong_key, &sig));
+        assert!(!verify_instance_sig(instance, &wrong_key, &sig));
     }
 
     #[test]
-    fn verify_subdomain_sig_wrong_subdomain() {
+    fn verify_instance_sig_wrong_instance() {
         let key = [0x42u8; 32];
         let mut mac = HmacSha256::new_from_slice(&key).unwrap();
         mac.update(b"mysite");
         let sig = BASE64.encode(mac.finalize().into_bytes());
-        assert!(!verify_subdomain_sig("other", &key, &sig));
+        assert!(!verify_instance_sig("other", &key, &sig));
     }
 
     fn test_ctx(phase: PassphrasePhase) -> Ctx {
@@ -870,9 +876,9 @@ mod tests {
                 PassphrasePhase::Setup => "setup",
                 PassphrasePhase::Unlock => "auth",
             },
-            subdomain: "testsite".into(),
+            instance: "testsite".into(),
             salt_b64: "U0FMVA==".into(),
-            expected_subdomain_sig: sig,
+            expected_instance_sig: sig,
             expected_host: "testsite.wrustic.localhost".into(),
             setup_code: match phase {
                 PassphrasePhase::Setup => Some("AB23KM".into()),
@@ -1062,9 +1068,9 @@ mod tests {
         derive_config_key(TEST_PASSPHRASE, &TEST_SALT).unwrap()
     }
 
-    fn compute_hmac(subdomain: &str, key: &[u8; 32]) -> [u8; 32] {
+    fn compute_hmac(instance: &str, key: &[u8; 32]) -> [u8; 32] {
         let mut mac = HmacSha256::new_from_slice(key).unwrap();
-        mac.update(subdomain.as_bytes());
+        mac.update(instance.as_bytes());
         mac.finalize().into_bytes().into()
     }
 
@@ -1119,7 +1125,7 @@ mod tests {
         let outcome = handle.rx.recv_timeout(Duration::from_secs(2)).expect("outcome");
         assert_eq!(outcome.key.len(), 32);
         let meta = outcome.new_meta.expect("setup must produce meta");
-        assert_eq!(meta.subdomain, "mysite");
+        assert_eq!(meta.instance, "mysite");
         handle.stop();
     }
 
@@ -1129,8 +1135,8 @@ mod tests {
         let config_key = test_config_key();
         let sig = compute_hmac("mysite", &config_key);
         let meta = PassphraseMeta {
-            subdomain: "mysite".into(),
-            subdomain_sig: BASE64.encode(sig),
+            instance: "mysite".into(),
+            instance_sig: BASE64.encode(sig),
             salt: BASE64.encode(TEST_SALT),
         };
         let handle = start(port, PassphrasePhase::Unlock, Some(meta), "mysite").expect("start server");
@@ -1151,8 +1157,8 @@ mod tests {
         let config_key = test_config_key();
         let sig = compute_hmac("mysite", &config_key);
         let meta = PassphraseMeta {
-            subdomain: "mysite".into(),
-            subdomain_sig: BASE64.encode(sig),
+            instance: "mysite".into(),
+            instance_sig: BASE64.encode(sig),
             salt: BASE64.encode(TEST_SALT),
         };
         let handle = start(port, PassphrasePhase::Unlock, Some(meta), "mysite").expect("start server");
@@ -1176,8 +1182,8 @@ mod tests {
         let config_key = test_config_key();
         let sig = compute_hmac("mysite", &config_key);
         let meta = PassphraseMeta {
-            subdomain: "mysite".into(),
-            subdomain_sig: BASE64.encode(sig),
+            instance: "mysite".into(),
+            instance_sig: BASE64.encode(sig),
             salt: BASE64.encode(TEST_SALT),
         };
         let handle = start(port, PassphrasePhase::Unlock, Some(meta), "mysite").expect("start server");

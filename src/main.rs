@@ -50,7 +50,7 @@ fn main() -> Result<()> {
     // selection; users can hold Shift to bypass and select text.
     let mouse_enabled =
         crossterm::execute!(std::io::stdout(), EnableMouseCapture).is_ok();
-    let result = run(&mut terminal, cli.config_dir, cli.port, cli.experimental_passphrase);
+    let result = run(&mut terminal, cli.config_dir, cli.port, cli.experimental_passphrase, cli.browser_auth);
     if mouse_enabled {
         let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     }
@@ -63,8 +63,9 @@ fn run(
     config_dir: Option<PathBuf>,
     server_port: u16,
     experimental_passphrase: bool,
+    browser_auth: bool,
 ) -> Result<()> {
-    let mut app = App::boot(config_dir, server_port, experimental_passphrase)?;
+    let mut app = App::boot(config_dir, server_port, experimental_passphrase, browser_auth)?;
 
     while !app.quit {
         terminal.draw(|f| render(f, &mut app))?;
@@ -87,6 +88,11 @@ fn run(
                     app.screen = Screen::Error(format!("{e:#}"));
                 }
             }
+            continue;
+        }
+
+        if matches!(app.screen, Screen::PassphraseDerivingKey) {
+            app.derive_passphrase_key();
             continue;
         }
 

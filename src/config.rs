@@ -146,11 +146,11 @@ pub fn paths(override_dir: Option<PathBuf>) -> Result<Paths> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PassphraseMeta {
-    pub subdomain: String,
-    /// base64-encoded HMAC-SHA256(subdomain, derived_key). Verified on
+    pub instance: String,
+    /// base64-encoded HMAC-SHA256(instance, derived_key). Verified on
     /// unlock to give a fast "wrong passphrase" error before attempting
     /// full config decryption.
-    pub subdomain_sig: String,
+    pub instance_sig: String,
     /// base64-encoded random 32-byte scrypt salt.
     pub salt: String,
 }
@@ -889,8 +889,8 @@ mod tests {
 
         let cfg = Config {
             passphrase: Some(PassphraseMeta {
-                subdomain: "mysite".into(),
-                subdomain_sig: "c2ln".into(),
+                instance: "mysite".into(),
+                instance_sig: "c2ln".into(),
                 salt: "c2FsdA==".into(),
             }),
             ..Config::default()
@@ -899,14 +899,14 @@ mod tests {
 
         let raw = fs::read_to_string(&paths.config)?;
         let parsed: toml::Value = toml::from_str(&raw)?;
-        assert_eq!(parsed["passphrase"]["subdomain"].as_str().unwrap(), "mysite");
-        assert_eq!(parsed["passphrase"]["subdomain_sig"].as_str().unwrap(), "c2ln");
+        assert_eq!(parsed["passphrase"]["instance"].as_str().unwrap(), "mysite");
+        assert_eq!(parsed["passphrase"]["instance_sig"].as_str().unwrap(), "c2ln");
         assert_eq!(parsed["passphrase"]["salt"].as_str().unwrap(), "c2FsdA==");
 
         let loaded = load(&paths, &cipher)?;
         let m = loaded.passphrase.expect("[passphrase] block must round-trip");
-        assert_eq!(m.subdomain, "mysite");
-        assert_eq!(m.subdomain_sig, "c2ln");
+        assert_eq!(m.instance, "mysite");
+        assert_eq!(m.instance_sig, "c2ln");
         assert_eq!(m.salt, "c2FsdA==");
         fs::remove_dir_all(&dir).ok();
         Ok(())
@@ -932,8 +932,8 @@ mod tests {
             version: CONFIG_VERSION,
             profiles,
             passphrase: Some(PassphraseMeta {
-                subdomain: "peek".into(),
-                subdomain_sig: "c2ln".into(),
+                instance: "peek".into(),
+                instance_sig: "c2ln".into(),
                 salt: "U0FMVA==".into(),
             }),
         };
@@ -941,7 +941,7 @@ mod tests {
         cfg = peek(&paths)?.expect("peek must see existing config");
         assert_eq!(cfg.cipher, CIPHER_MARKER_PASSPHRASE);
         let m = cfg.passphrase.expect("[passphrase] block visible to peek");
-        assert_eq!(m.subdomain, "peek");
+        assert_eq!(m.instance, "peek");
         match cfg.profiles.get("x") {
             Some(Profile::Local { password, .. }) => {
                 assert!(password.starts_with("pkenc:"));

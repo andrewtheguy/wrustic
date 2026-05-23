@@ -57,8 +57,8 @@ password = "ageenc:…"        # or "pkenc:…" depending on mode
 # plus backend-specific fields (some encrypted, some not — see table above)
 
 [passphrase]                 # passphrase mode only
-subdomain     = "<text>"     # DNS-safe subdomain (max 32 chars)
-subdomain_sig = "<base64>"   # HMAC-SHA256(subdomain, derived_key)
+instance     = "<text>"     # DNS-safe instance (max 32 chars)
+instance_sig = "<base64>"   # HMAC-SHA256(instance, derived_key)
 salt          = "<base64>"   # random 32-byte scrypt salt
 ```
 
@@ -91,22 +91,22 @@ mismatch, etc.).
 
 In passphrase mode the field is omitted (`#[serde(skip_serializing_if =
 "Option::is_none")]`) — there is no equivalent public key, and the
-subdomain signature plus the AEAD's integrity tag together cover the
+instance signature plus the AEAD's integrity tag together cover the
 "correct key?" check at decrypt time.
 
 ### `[passphrase]` block (passphrase mode only)
 
 ```toml
 [passphrase]
-subdomain     = "mysite"
-subdomain_sig = "<base64 HMAC-SHA256>"
+instance     = "mysite"
+instance_sig = "<base64 HMAC-SHA256>"
 salt          = "<base64 32-byte salt>"
 ```
 
-- `subdomain` is the DNS-safe label chosen by the user at Setup (max 32
+- `instance` is the DNS-safe label chosen by the user at Setup (max 32
   chars, `[a-z0-9]([a-z0-9-]*[a-z0-9])?`). Used to construct the browser
-  URL (`http://<subdomain>.wrustic.localhost:<port>/auth/<key>`).
-- `subdomain_sig` is `HMAC-SHA256(subdomain, derived_key)`, base64-encoded.
+  URL (`http://<instance>.wrustic.localhost:<port>/auth/<key>`).
+- `instance_sig` is `HMAC-SHA256(instance, derived_key)`, base64-encoded.
   Verified on Unlock to give a fast "wrong passphrase" error before
   attempting full config decryption.
 - `salt` is the random 32-byte scrypt salt, base64-encoded. Generated once
@@ -147,8 +147,8 @@ The TOML file always exposes, in plaintext:
   `s3_bucket`, `s3_region`, `s3_root`.
 - Schema metadata: `version`, `cipher` marker.
 - Age mode: the `recipient` bech32 public key.
-- Passphrase mode: the `[passphrase]` block (`subdomain`, `subdomain_sig`,
-  `salt`). The subdomain is a user-chosen label; the signature and salt are
+- Passphrase mode: the `[passphrase]` block (`instance`, `instance_sig`,
+  `salt`). The instance is a user-chosen label; the signature and salt are
   useless without the passphrase.
 
 Everything else (repo passwords, REST user/password, S3 access/secret
@@ -236,8 +236,8 @@ keeps only the derived 32-byte config key for the session.
 
 ### Subdomain signature
 
-At Setup, the server computes `HMAC-SHA256(subdomain, derived_key)` after
-scrypt finishes. This is stored in `[passphrase].subdomain_sig`.
+At Setup, the server computes `HMAC-SHA256(instance, derived_key)` after
+scrypt finishes. This is stored in `[passphrase].instance_sig`.
 
 On Unlock, the server re-computes the HMAC from the derived key and
 compares (constant-time) against the stored signature. A mismatch means
@@ -303,7 +303,7 @@ Same skeleton as `src/share.rs`:
   executor, no global runtime.
 - Bind on `127.0.0.1:<port>` (the binary's `--port`, default 7834, shared
   with the share dialog because the two flows are never simultaneously
-  active). User-facing URL uses `<subdomain>.wrustic.localhost`.
+  active). User-facing URL uses `<instance>.wrustic.localhost`.
 - Returns a `PassphraseHandle { short_url, setup_code, phase, rx, deadline,
   shutdown_tx, join_handle }` that owns the resources. Drop sends the
   shutdown oneshot; explicit `.stop()` also joins the thread (port
@@ -320,7 +320,7 @@ keypress. `new_meta` is `Some` only on Setup — Unlock reuses the on-disk
 
 The server validates the `Host` header on every request, matching the
 hostname portion (port stripped) case-insensitively against the expected
-`<subdomain>.wrustic.localhost`. Requests with a missing or mismatched
+`<instance>.wrustic.localhost`. Requests with a missing or mismatched
 Host header receive a flat 404 — indistinguishable from a wrong auth key.
 This mirrors nginx virtual-host matching (hostname only, port ignored)
 and prevents DNS rebinding attacks from reaching the ceremony routes.
@@ -330,8 +330,8 @@ and prevents DNS rebinding attacks from reaching the ceremony routes.
 The entire server lives under one prefix, chosen by phase:
 
 ```
-Setup:  http://<subdomain>.wrustic.localhost:<port>/setup/<short_id>
-Unlock: http://<subdomain>.wrustic.localhost:<port>/auth/<short_id>
+Setup:  http://<instance>.wrustic.localhost:<port>/setup/<short_id>
+Unlock: http://<instance>.wrustic.localhost:<port>/auth/<short_id>
 ```
 
 `<short_id>` is a 16-hex-char (64-bit) random id generated at
@@ -363,38 +363,38 @@ unauthenticated caller never gets to distinguish "running" from
 The phase is picked at boot by `config::peek`:
 
 - **No `config.toml` (or no `[passphrase]` block)** →
-  `PassphrasePhase::Setup`. The TUI prompts for a subdomain on
-  `Screen::PassphraseSubdomainPrompt` (pre-filled with the config dir's
+  `PassphrasePhase::Setup`. The TUI prompts for an instance name on
+  `Screen::PassphraseInstancePrompt` (pre-filled with the config dir's
   basename if it's DNS-safe), then launches the ceremony server. The
   browser page renders a passphrase form with two inputs (passphrase +
   confirm), complexity validation, and a setup-code input (see below).
   On submit: the browser posts the setup code and passphrase through the
   encrypted transport. The server enforces the same passphrase policy as
-  the page, derives the config key with scrypt, computes the subdomain
+  the page, derives the config key with scrypt, computes the instance
   HMAC signature, and delivers `PassphraseOutcome { key, new_meta:
-  Some(PassphraseMeta { subdomain, subdomain_sig, salt }) }`. The App
+  Some(PassphraseMeta { instance, instance_sig, salt }) }`. The App
   splices the meta into `self.config.passphrase` and immediately calls
   `config::save` so the `[passphrase]` block lands on disk — next launch
   routes into Unlock.
 
 - **`[passphrase]` block already present** → `PassphrasePhase::Unlock`.
-  Server reads the subdomain, salt, and subdomain_sig from the stored
+  Server reads the instance, salt, and instance_sig from the stored
   metadata. The browser page renders a single passphrase input. On submit:
   the browser posts the passphrase through the encrypted transport. The
   server derives the key with scrypt using the stored salt, then verifies
-  `HMAC-SHA256(subdomain, derived_key)` against the
-  stored `subdomain_sig` (constant-time). On mismatch → 401 "Wrong
+  `HMAC-SHA256(instance, derived_key)` against the
+  stored `instance_sig` (constant-time). On mismatch → 401 "Wrong
   passphrase", the user can retry. On match → server delivers
   `PassphraseOutcome { key, new_meta: None }`. App uses the key to
   decrypt every `pkenc:` value in the config. No setup code on Unlock — the
-  subdomain signature verification already gates the path.
+  instance signature verification already gates the path.
 
 ### Setup-confirmation code
 
 In addition to the `/auth/<key>` capability URL, the **Setup** phase
 prints a 6-character code in the TUI that the user must type into the
 browser before the passphrase submission will be accepted. Unlock
-has no equivalent — the subdomain signature verification already gates
+has no equivalent — the instance signature verification already gates
 that path.
 
 Why this exists: the capability URL is enough for *access control*
@@ -597,7 +597,7 @@ encrypted.
 ### What the server does *not* do
 
 - No persistence of the passphrase or derived key on disk. Only the salt,
-  subdomain, and subdomain signature are written. The passphrase exists
+  instance, and instance signature are written. The passphrase exists
   transiently while the server derives the key; the 32-byte config key
   lives in the App's memory for the session.
 - No CORS / no auth header / no cookies. The capability URL is the

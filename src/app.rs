@@ -3,6 +3,7 @@ use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use base64::Engine;
 use ratatui::{
     crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
     layout::Rect,
@@ -31,7 +32,10 @@ pub(crate) enum Screen {
     FirstRunChoice,
     RestoreKeyWait,
     KeyCreated,
-    PassphraseSubdomainPrompt,
+    PassphraseInstancePrompt,
+    PassphraseSetup,
+    PassphraseUnlock,
+    PassphraseDerivingKey,
     PassphraseUrl,
     Home,
     Snapshots,
@@ -114,18 +118,18 @@ impl SnapshotFilter {
     }
 }
 
-pub(crate) fn default_passphrase_subdomain(paths: &Paths) -> Option<String> {
+pub(crate) fn default_passphrase_instance(paths: &Paths) -> Option<String> {
     let parent = paths.config.parent()?;
     let resolved = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
     let basename = resolved.file_name()?.to_string_lossy().trim().to_lowercase();
-    if is_valid_subdomain(&basename) {
+    if is_valid_instance(&basename) {
         Some(basename)
     } else {
         None
     }
 }
 
-fn is_valid_subdomain(s: &str) -> bool {
+fn is_valid_instance(s: &str) -> bool {
     let len = s.len();
     if len == 0 || len > 32 {
         return false;
@@ -226,8 +230,13 @@ pub(crate) struct App {
     pub(crate) cipher: Option<Cipher>,
     pub(crate) server_port: u16,
     pub(crate) passphrase_mode: bool,
+    pub(crate) browser_auth: bool,
     pub(crate) passphrase_handle: Option<PassphraseHandle>,
-    pub(crate) passphrase_subdomain_input: Input,
+    pub(crate) passphrase_instance_input: Input,
+    pub(crate) passphrase_input: Input,
+    pub(crate) passphrase_confirm: Input,
+    pub(crate) passphrase_error: Option<String>,
+    pub(crate) passphrase_instance_value: String,
     pub(crate) passphrase_short_url: Option<String>,
     pub(crate) passphrase_setup_code: Option<String>,
     pub(crate) passphrase_phase: Option<PassphrasePhase>,
@@ -323,6 +332,7 @@ impl App {
         config_dir: Option<PathBuf>,
         server_port: u16,
         experimental_passphrase: bool,
+        browser_auth: bool,
     ) -> Result<Self> {
         let paths = config::paths(config_dir)?;
         let mut first_run_state = ListState::default();
@@ -338,8 +348,13 @@ impl App {
             cipher: None,
             server_port,
             passphrase_mode: experimental_passphrase,
+            browser_auth,
             passphrase_handle: None,
-            passphrase_subdomain_input: Input::default(),
+            passphrase_instance_input: Input::default(),
+            passphrase_input: Input::default(),
+            passphrase_confirm: Input::default(),
+            passphrase_error: None,
+            passphrase_instance_value: String::new(),
             passphrase_short_url: None,
             passphrase_setup_code: None,
             passphrase_phase: None,
@@ -465,9 +480,9 @@ impl App {
         };
         match peeked {
             None => {
-                let default = default_passphrase_subdomain(&self.paths).unwrap_or_default();
-                self.passphrase_subdomain_input = Input::new(default);
-                self.screen = Screen::PassphraseSubdomainPrompt;
+                let default = default_passphrase_instance(&self.paths).unwrap_or_default();
+                self.passphrase_instance_input = Input::new(default);
+                self.screen = Screen::PassphraseInstancePrompt;
             }
             Some(cfg) => {
                 if cfg.cipher != config::CIPHER_MARKER_PASSPHRASE {
@@ -481,12 +496,19 @@ impl App {
                 }
                 match cfg.passphrase {
                     Some(meta) => {
-                        let subdomain = meta.subdomain.clone();
-                        self.launch_passphrase_server(
-                            PassphrasePhase::Unlock,
-                            Some(meta),
-                            &subdomain,
-                        );
+                        if self.browser_auth {
+                            let instance = meta.instance.clone();
+                            self.launch_passphrase_server(
+                                PassphrasePhase::Unlock,
+                                Some(meta),
+                                &instance,
+                            );
+                        } else {
+                            self.passphrase_instance_value = meta.instance.clone();
+                            self.config.passphrase = Some(meta);
+                            self.passphrase_phase = Some(PassphrasePhase::Unlock);
+                            self.screen = Screen::PassphraseUnlock;
+                        }
                     }
                     None => {
                         self.error_is_fatal = true;
@@ -505,9 +527,9 @@ impl App {
         &mut self,
         phase: PassphrasePhase,
         existing: Option<PassphraseMeta>,
-        subdomain: &str,
+        instance: &str,
     ) {
-        match passphrase::start(self.server_port, phase, existing, subdomain) {
+        match passphrase::start(self.server_port, phase, existing, instance) {
             Ok(h) => {
                 self.passphrase_short_url = Some(h.short_url.clone());
                 self.passphrase_setup_code = h.setup_code.clone();
@@ -522,12 +544,113 @@ impl App {
         }
     }
 
-    pub(crate) fn submit_passphrase_subdomain(&mut self) {
-        let subdomain = self.passphrase_subdomain_input.value().trim().to_lowercase();
-        if !is_valid_subdomain(&subdomain) {
+    pub(crate) fn submit_passphrase_instance(&mut self) {
+        let instance = self.passphrase_instance_input.value().trim().to_lowercase();
+        if !is_valid_instance(&instance) {
             return;
         }
-        self.launch_passphrase_server(PassphrasePhase::Setup, None, &subdomain);
+        self.passphrase_instance_value = instance.clone();
+        if self.browser_auth {
+            self.launch_passphrase_server(PassphrasePhase::Setup, None, &instance);
+        } else {
+            self.passphrase_phase = Some(PassphrasePhase::Setup);
+            self.field_focus = 0;
+            self.passphrase_input = Input::default();
+            self.passphrase_confirm = Input::default();
+            self.passphrase_error = None;
+            self.screen = Screen::PassphraseSetup;
+        }
+    }
+
+    pub(crate) fn submit_passphrase_setup(&mut self) {
+        let passphrase = self.passphrase_input.value().to_string();
+        let confirm = self.passphrase_confirm.value().to_string();
+        if let Some(err) = passphrase::passphrase_policy_error(&passphrase) {
+            self.passphrase_error = Some(err.to_string());
+            return;
+        }
+        if passphrase != confirm {
+            self.passphrase_error = Some("Passphrases do not match.".to_string());
+            return;
+        }
+        self.passphrase_error = None;
+        self.screen = Screen::PassphraseDerivingKey;
+    }
+
+    pub(crate) fn submit_passphrase_unlock(&mut self) {
+        if self.passphrase_input.value().is_empty() {
+            return;
+        }
+        self.passphrase_error = None;
+        self.screen = Screen::PassphraseDerivingKey;
+    }
+
+    pub(crate) fn derive_passphrase_key(&mut self) {
+        let passphrase = self.passphrase_input.value().to_string();
+        let is_setup = self.passphrase_phase == Some(PassphrasePhase::Setup);
+
+        let salt: Vec<u8> = if is_setup {
+            let s: [u8; 32] = rand::random();
+            s.to_vec()
+        } else {
+            let meta = self.config.passphrase.as_ref().expect("unlock requires meta");
+            match base64::engine::general_purpose::STANDARD.decode(&meta.salt) {
+                Ok(s) => s,
+                Err(e) => {
+                    self.error_is_fatal = true;
+                    self.screen = Screen::Error(format!("bad salt in config: {e}"));
+                    return;
+                }
+            }
+        };
+
+        let config_key = match passphrase::derive_config_key(&passphrase, &salt) {
+            Ok(k) => k,
+            Err(e) => {
+                self.error_is_fatal = true;
+                self.screen = Screen::Error(format!("key derivation: {e}"));
+                return;
+            }
+        };
+
+        if is_setup {
+            let instance_sig =
+                passphrase::compute_instance_sig(&self.passphrase_instance_value, &config_key);
+            let meta = PassphraseMeta {
+                instance: self.passphrase_instance_value.clone(),
+                instance_sig,
+                salt: base64::engine::general_purpose::STANDARD.encode(&salt),
+            };
+            self.cipher = Some(Cipher::Passphrase { key: config_key });
+            self.load_config_or_set_fatal();
+            self.config.passphrase = Some(meta);
+            if let Some(cipher) = self.cipher.as_ref()
+                && let Err(e) = config::save(&self.config, &self.paths, cipher)
+            {
+                self.error_is_fatal = true;
+                self.screen = Screen::Error(format!(
+                    "Setup succeeded but writing {} failed: {e:#}.",
+                    self.paths.config.display()
+                ));
+            }
+        } else {
+            let meta = self.config.passphrase.as_ref().expect("unlock requires meta");
+            if !passphrase::verify_instance_sig(
+                &meta.instance,
+                &config_key,
+                &meta.instance_sig,
+            ) {
+                self.passphrase_error = Some("Wrong passphrase.".to_string());
+                self.passphrase_input = Input::default();
+                self.screen = Screen::PassphraseUnlock;
+                return;
+            }
+            self.cipher = Some(Cipher::Passphrase { key: config_key });
+            self.load_config_or_set_fatal();
+        }
+        self.passphrase_input = Input::default();
+        self.passphrase_confirm = Input::default();
+        self.passphrase_phase = None;
     }
 
     pub(crate) fn try_advance_passphrase(&mut self) {
@@ -1211,15 +1334,54 @@ impl App {
                 _ => {}
             },
 
-            Screen::PassphraseSubdomainPrompt => match key.code {
-                KeyCode::Enter => self.submit_passphrase_subdomain(),
+            Screen::PassphraseInstancePrompt => match key.code {
+                KeyCode::Enter => self.submit_passphrase_instance(),
                 KeyCode::Esc => {
                     self.quit = true;
                 }
                 _ => {
-                    self.passphrase_subdomain_input.handle_event(&Event::Key(key));
+                    self.passphrase_instance_input.handle_event(&Event::Key(key));
                 }
             },
+
+            Screen::PassphraseSetup => {
+                const N: usize = 2;
+                match key.code {
+                    KeyCode::Tab | KeyCode::Down => {
+                        self.field_focus = (self.field_focus + 1) % N;
+                    }
+                    KeyCode::BackTab | KeyCode::Up => {
+                        self.field_focus = (self.field_focus + N - 1) % N;
+                    }
+                    KeyCode::Enter => self.submit_passphrase_setup(),
+                    KeyCode::Esc => {
+                        self.passphrase_input = Input::default();
+                        self.passphrase_confirm = Input::default();
+                        self.passphrase_error = None;
+                        self.field_focus = 0;
+                        self.screen = Screen::PassphraseInstancePrompt;
+                    }
+                    _ => {
+                        let buf: &mut Input = match self.field_focus {
+                            0 => &mut self.passphrase_input,
+                            _ => &mut self.passphrase_confirm,
+                        };
+                        buf.handle_event(&Event::Key(key));
+                    }
+                }
+            }
+
+            Screen::PassphraseUnlock => match key.code {
+                KeyCode::Enter => self.submit_passphrase_unlock(),
+                KeyCode::Esc => {
+                    self.quit = true;
+                }
+                _ => {
+                    self.passphrase_input.handle_event(&Event::Key(key));
+                }
+            },
+
+            Screen::PassphraseDerivingKey => {}
 
             Screen::PassphraseUrl => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
@@ -2163,24 +2325,24 @@ mod tests {
     }
 
     #[test]
-    fn valid_subdomain() {
-        assert!(is_valid_subdomain("mysite"));
-        assert!(is_valid_subdomain("a"));
-        assert!(is_valid_subdomain("my-site"));
-        assert!(is_valid_subdomain("a1b2"));
-        assert!(is_valid_subdomain("a-b-c"));
-        assert!(is_valid_subdomain("1abc"));
+    fn valid_instance() {
+        assert!(is_valid_instance("mysite"));
+        assert!(is_valid_instance("a"));
+        assert!(is_valid_instance("my-site"));
+        assert!(is_valid_instance("a1b2"));
+        assert!(is_valid_instance("a-b-c"));
+        assert!(is_valid_instance("1abc"));
     }
 
     #[test]
-    fn invalid_subdomain() {
-        assert!(!is_valid_subdomain(""));
-        assert!(!is_valid_subdomain("-start"));
-        assert!(!is_valid_subdomain("end-"));
-        assert!(!is_valid_subdomain("UPPER"));
-        assert!(!is_valid_subdomain("has space"));
-        assert!(!is_valid_subdomain("has.dot"));
-        assert!(!is_valid_subdomain(&"a".repeat(33)));
+    fn invalid_instance() {
+        assert!(!is_valid_instance(""));
+        assert!(!is_valid_instance("-start"));
+        assert!(!is_valid_instance("end-"));
+        assert!(!is_valid_instance("UPPER"));
+        assert!(!is_valid_instance("has space"));
+        assert!(!is_valid_instance("has.dot"));
+        assert!(!is_valid_instance(&"a".repeat(33)));
     }
 
     #[test]
@@ -2220,7 +2382,7 @@ mod tests {
             std::process::id(),
             uniq()
         ));
-        let mut app = App::boot(Some(tmp), 7834, false).expect("boot");
+        let mut app = App::boot(Some(tmp), 7834, false, false).expect("boot");
         app.snapshots = snaps;
         app
     }
