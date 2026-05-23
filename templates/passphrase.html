@@ -74,7 +74,6 @@
 <p><small>This page is served by the wrustic process on localhost. You can close it when finished.</small></p>
 <script nonce="{{ script_nonce }}">
 const SALT_B64 = {{ salt_js|safe }};
-const SUBDOMAIN = {{ subdomain_js|safe }};
 const SERVER_PUB_B64 = {{ server_pub_js|safe }};
 const TRANSPORT_HKDF_INFO = new TextEncoder().encode("wrustic-passphrase-transport-v1");
 const API_BASE = window.location.pathname.replace(/\/$/, "");
@@ -173,15 +172,6 @@ async function deriveKey(passphrase) {
   return new Uint8Array(bits);
 }
 
-async function computeSubdomainSig(derivedKey) {
-  const enc = new TextEncoder();
-  const hmacKey = await crypto.subtle.importKey(
-    "raw", derivedKey, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
-  );
-  const sig = await crypto.subtle.sign("HMAC", hmacKey, enc.encode(SUBDOMAIN));
-  return new Uint8Array(sig);
-}
-
 function checkComplexity(pp) {
   if (pp.length < 12) return "Must be at least 12 characters.";
   if (!/[a-z]/.test(pp)) return "Must contain a lowercase letter.";
@@ -227,20 +217,17 @@ async function doSetup() {
   if (pp !== pp2) throw new Error("Passphrases do not match.");
   setStatus("Deriving key (this may take a moment)…", "note");
   const configKey = await deriveKey(pp);
-  const sig = await computeSubdomainSig(configKey);
   const codeBytes = new TextEncoder().encode(setupCode);
-  const payload = new Uint8Array(1 + 1 + codeBytes.length + 32 + 32);
+  const payload = new Uint8Array(1 + 1 + codeBytes.length + 32);
   let p = 0;
   payload[p++] = 1;
   payload[p++] = codeBytes.length;
   payload.set(codeBytes, p); p += codeBytes.length;
-  payload.set(sig, p); p += 32;
   payload.set(configKey, p);
   try {
     await postEncryptedBytes("/api/setup", payload);
   } finally {
     zeroBytes(configKey);
-    zeroBytes(sig);
     zeroBytes(payload);
     zeroBytes(codeBytes);
   }

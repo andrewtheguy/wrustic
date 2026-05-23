@@ -478,7 +478,6 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 struct SetupBody {
     setup_code: String,
-    subdomain_sig: [u8; 32],
     config_key: [u8; 32],
 }
 
@@ -520,32 +519,27 @@ fn decode_config_key(raw: &[u8]) -> Result<[u8; 32], String> {
 }
 
 fn parse_setup_body(inner: &[u8]) -> Result<SetupBody, String> {
-    // v1: version(1) + code_len(1) + code(N) + subdomain_sig(32) + config_key(32)
-    if inner.len() < 1 + 1 + 32 + 32 {
+    // v1: version(1) + code_len(1) + code(N) + config_key(32)
+    if inner.len() < 1 + 1 + 32 {
         return Err(format!("setup payload too short: {} bytes", inner.len()));
     }
     if inner[0] != 1 {
         return Err(format!("unsupported setup payload version {}", inner[0]));
     }
     let code_len = inner[1] as usize;
-    let expected = 1 + 1 + code_len + 32 + 32;
+    let expected = 1 + 1 + code_len + 32;
     if inner.len() != expected {
         return Err(format!(
             "setup payload size mismatch: expected {expected}, got {}",
             inner.len()
         ));
     }
-    let mut pos = 2;
+    let pos = 2;
     let setup_code = String::from_utf8(inner[pos..pos + code_len].to_vec())
         .map_err(|e| format!("setup code is not UTF-8: {e}"))?;
-    pos += code_len;
-    let mut subdomain_sig = [0u8; 32];
-    subdomain_sig.copy_from_slice(&inner[pos..pos + 32]);
-    pos += 32;
-    let config_key = decode_config_key(&inner[pos..])?;
+    let config_key = decode_config_key(&inner[pos + code_len..])?;
     Ok(SetupBody {
         setup_code,
-        subdomain_sig,
         config_key,
     })
 }
@@ -644,9 +638,13 @@ async fn handle_setup(req: Request<hyper::body::Incoming>, ctx: Arc<Ctx>) -> Res
         CodeCheck::Ok => {}
         CodeCheck::Wrong(resp) => return resp,
     }
+    let mut mac = HmacSha256::new_from_slice(&parsed.config_key)
+        .expect("HMAC accepts any key length");
+    mac.update(ctx.subdomain.as_bytes());
+    let subdomain_sig = BASE64.encode(mac.finalize().into_bytes());
     let meta = PassphraseMeta {
         subdomain: ctx.subdomain.clone(),
-        subdomain_sig: BASE64.encode(parsed.subdomain_sig),
+        subdomain_sig,
         salt: ctx.salt_b64.clone(),
     };
     let outcome = PassphraseOutcome {
@@ -692,7 +690,6 @@ struct PassphraseTemplate {
     is_setup: bool,
     script_nonce: String,
     salt_js: String,
-    subdomain_js: String,
     server_pub_js: String,
 }
 
@@ -701,7 +698,6 @@ fn render_html(ctx: &Ctx) -> String {
         is_setup: ctx.phase == PassphrasePhase::Setup,
         script_nonce: ctx.script_nonce.clone(),
         salt_js: json_string(&ctx.salt_b64),
-        subdomain_js: json_string(&ctx.subdomain),
         server_pub_js: json_string(&ctx.transport.public_b64),
     };
     tmpl.render().expect("template rendering failed")
@@ -778,11 +774,9 @@ mod tests {
         let code = b"AB23KM";
         let mut payload = vec![1u8, code.len() as u8];
         payload.extend_from_slice(code);
-        payload.extend_from_slice(&[0xAAu8; 32]);
         payload.extend_from_slice(&[0xBBu8; 32]);
         let body = parse_setup_body(&payload).unwrap();
         assert_eq!(body.setup_code, "AB23KM");
-        assert_eq!(body.subdomain_sig, [0xAA; 32]);
         assert_eq!(body.config_key, [0xBB; 32]);
     }
 
@@ -891,11 +885,10 @@ mod tests {
     }
 
     #[test]
-    fn html_embeds_salt_and_subdomain() {
+    fn html_embeds_salt_and_script() {
         let ctx = test_ctx(PassphrasePhase::Setup);
         let html = render_html(&ctx);
         assert!(html.contains("U0FMVA=="));
-        assert!(html.contains("testsite"));
         assert!(html.contains("disableAllCtas"));
     }
 
@@ -1028,13 +1021,12 @@ mod tests {
         raw_post_json_host(port, path, &body, host)
     }
 
-    fn setup_payload(setup_code: &str, subdomain_sig: &[u8; 32], config_key: &[u8; 32]) -> Vec<u8> {
+    fn setup_payload(setup_code: &str, config_key: &[u8; 32]) -> Vec<u8> {
         let code = setup_code.as_bytes();
-        let mut out = Vec::with_capacity(2 + code.len() + 64);
+        let mut out = Vec::with_capacity(2 + code.len() + 32);
         out.push(1);
         out.push(code.len() as u8);
         out.extend_from_slice(code);
-        out.extend_from_slice(subdomain_sig);
         out.extend_from_slice(config_key);
         out
     }
@@ -1090,8 +1082,7 @@ mod tests {
         let setup_code = handle.setup_code.clone().expect("Setup phase mints a code");
         let path = format!("/setup/{key}/api/setup");
         let config_key = [0x42u8; 32];
-        let sig = compute_hmac("mysite", &config_key);
-        let body = setup_payload(&setup_code, &sig, &config_key);
+        let body = setup_payload(&setup_code, &config_key);
         let r = encrypted_post_bytes(port, &handle.transport_public_b64, &path, &body, MYSITE_HOST);
         assert!(r.contains(" 200 "), "setup should 200, got:\n{r}");
 
@@ -1181,8 +1172,7 @@ mod tests {
 
         let setup_code = handle.setup_code.clone().unwrap();
         let config_key = [0u8; 32];
-        let sig = compute_hmac("mysite", &config_key);
-        let inner = setup_payload(&setup_code, &sig, &config_key);
+        let inner = setup_payload(&setup_code, &config_key);
         let mut env: serde_json::Value =
             serde_json::from_str(&encrypt_envelope_bytes(&handle.transport_public_b64, &inner)).unwrap();
         let ct_b64 = env["ciphertext"].as_str().unwrap().to_string();
