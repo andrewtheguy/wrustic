@@ -709,10 +709,10 @@ fn render_html(ctx: &Ctx) -> String {
 </head>
 <body>
 <h1>{heading}</h1>
+<div id="status" class="note">Ready. Use the controls below to begin.</div>
 <p>{explanation}</p>
 {setup_code_html}
 {buttons_html}
-<div id="status" class="note">Click a button above to begin.</div>
 <p><small>This page is served by the wrustic process on localhost. You can close it when finished.</small></p>
 <script>
 const PRF_SALT_B64 = {prf_salt_js};
