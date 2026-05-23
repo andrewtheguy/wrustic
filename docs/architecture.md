@@ -96,7 +96,7 @@ Both servers follow the same shape so the patterns transfer:
 
 - One OS thread per server, one `tokio::runtime::Builder::new_current_thread`
   per thread. No global runtime, no shared executor.
-- Bind on `127.0.0.1:<port>`. User-facing URLs use
+- Bind on `127.0.0.1:<port>` and `[::1]:<port>`. User-facing URLs use
   `<instance>.wrustic.localhost` (passphrase, browser mode) or `localhost` (share).
 - The two servers share the **same port** (`--port`, default 7834) because
   share and passphrase dialogs are never simultaneously active.
