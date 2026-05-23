@@ -179,6 +179,7 @@ struct Ctx {
     subdomain: String,
     salt_b64: String,
     expected_subdomain_sig: Option<String>,
+    expected_host: String,
     outcome_tx: std::sync::Mutex<Option<std_mpsc::Sender<PassphraseOutcome>>>,
     deadline: Instant,
     transport: ServerTransport,
@@ -230,12 +231,15 @@ pub(crate) fn start(
     let transport = ServerTransport::generate()?;
     let script_nonce = BASE64.encode(random_bytes(16)?);
 
+    let expected_host = format!("{subdomain}.wrustic.localhost");
+
     let ctx = Arc::new(Ctx {
         phase,
         short_id,
         subdomain: subdomain.to_string(),
         salt_b64,
         expected_subdomain_sig,
+        expected_host,
         outcome_tx: std::sync::Mutex::new(Some(outcome_tx)),
         deadline,
         transport,
@@ -354,10 +358,27 @@ fn html_resp(ctx: &Ctx) -> Response<RespBody> {
     resp
 }
 
+fn extract_host(req: &Request<hyper::body::Incoming>) -> Option<&str> {
+    req.headers()
+        .get(hyper::header::HOST)?
+        .to_str()
+        .ok()
+}
+
+fn host_matches(raw: &str, expected: &str) -> bool {
+    let hostname = raw.split(':').next().unwrap_or(raw).trim();
+    hostname.eq_ignore_ascii_case(expected)
+}
+
 async fn handle(
     req: Request<hyper::body::Incoming>,
     ctx: Arc<Ctx>,
 ) -> Result<Response<RespBody>, Infallible> {
+    match extract_host(&req) {
+        Some(raw) if host_matches(raw, &ctx.expected_host) => {}
+        _ => return Ok(text(StatusCode::NOT_FOUND, "not found")),
+    }
+
     let path = req.uri().path().to_string();
     let Some(suffix) = path.strip_prefix("/auth/") else {
         return Ok(text(StatusCode::NOT_FOUND, "not found"));
@@ -938,6 +959,7 @@ mod tests {
             subdomain: "testsite".into(),
             salt_b64: "U0FMVA==".into(),
             expected_subdomain_sig: sig,
+            expected_host: "testsite.wrustic.localhost".into(),
             outcome_tx: std::sync::Mutex::new(None),
             deadline: Instant::now() + PASSPHRASE_TTL,
             transport: ServerTransport::generate().expect("/dev/urandom"),
@@ -1030,12 +1052,31 @@ mod tests {
         port
     }
 
-    fn raw_request(port: u16, method: &str, path: &str) -> String {
+    fn raw_request_host(port: u16, method: &str, path: &str, host: &str) -> String {
         use std::io::{Read, Write};
         use std::net::TcpStream;
         let mut sock = TcpStream::connect(("127.0.0.1", port)).expect("connect");
         let req = format!(
-            "{method} {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n"
+            "{method} {path} HTTP/1.0\r\nHost: {host}\r\nContent-Length: 0\r\n\r\n"
+        );
+        sock.write_all(req.as_bytes()).unwrap();
+        let mut resp = Vec::new();
+        sock.read_to_end(&mut resp).unwrap();
+        String::from_utf8_lossy(&resp).into_owned()
+    }
+
+    fn raw_request(port: u16, method: &str, path: &str) -> String {
+        raw_request_host(port, method, path, "testsite.wrustic.localhost")
+    }
+
+    fn raw_post_json_host(port: u16, path: &str, body: &str, host: &str) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        let mut sock = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        let req = format!(
+            "POST {path} HTTP/1.0\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\n\r\n{body}",
+            len = body.len(),
+            body = body,
         );
         sock.write_all(req.as_bytes()).unwrap();
         let mut resp = Vec::new();
@@ -1044,18 +1085,7 @@ mod tests {
     }
 
     fn raw_post_json(port: u16, path: &str, body: &str) -> String {
-        use std::io::{Read, Write};
-        use std::net::TcpStream;
-        let mut sock = TcpStream::connect(("127.0.0.1", port)).expect("connect");
-        let req = format!(
-            "POST {path} HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {len}\r\n\r\n{body}",
-            len = body.len(),
-            body = body,
-        );
-        sock.write_all(req.as_bytes()).unwrap();
-        let mut resp = Vec::new();
-        sock.read_to_end(&mut resp).unwrap();
-        String::from_utf8_lossy(&resp).into_owned()
+        raw_post_json_host(port, path, body, "testsite.wrustic.localhost")
     }
 
     fn key_from_handle(h: &PassphraseHandle) -> String {
@@ -1092,9 +1122,9 @@ mod tests {
         )
     }
 
-    fn encrypted_post_bytes(port: u16, server_pub_b64: &str, path: &str, plaintext: &[u8]) -> String {
+    fn encrypted_post_bytes(port: u16, server_pub_b64: &str, path: &str, plaintext: &[u8], host: &str) -> String {
         let body = encrypt_envelope_bytes(server_pub_b64, plaintext);
-        raw_post_json(port, path, &body)
+        raw_post_json_host(port, path, &body, host)
     }
 
     fn setup_payload(subdomain_sig: &[u8; 32], config_key: &[u8; 32]) -> Vec<u8> {
@@ -1145,6 +1175,8 @@ mod tests {
         handle.stop();
     }
 
+    const MYSITE_HOST: &str = "mysite.wrustic.localhost";
+
     #[test]
     fn setup_delivers_outcome_with_meta() {
         let port = ephemeral_port();
@@ -1154,7 +1186,7 @@ mod tests {
         let config_key = [0x42u8; 32];
         let sig = compute_hmac("mysite", &config_key);
         let body = setup_payload(&sig, &config_key);
-        let r = encrypted_post_bytes(port, &handle.transport_public_b64, &path, &body);
+        let r = encrypted_post_bytes(port, &handle.transport_public_b64, &path, &body, MYSITE_HOST);
         assert!(r.contains(" 200 "), "setup should 200, got:\n{r}");
 
         let outcome = handle.rx.recv_timeout(Duration::from_secs(2)).expect("outcome");
@@ -1177,7 +1209,7 @@ mod tests {
         let handle = start(port, PassphrasePhase::Unlock, Some(meta), "mysite").expect("start server");
         let key = key_from_handle(&handle);
         let path = format!("/auth/{key}/api/unlock");
-        let r = encrypted_post_bytes(port, &handle.transport_public_b64, &path, &config_key);
+        let r = encrypted_post_bytes(port, &handle.transport_public_b64, &path, &config_key, MYSITE_HOST);
         assert!(r.contains(" 200 "), "unlock should 200, got:\n{r}");
 
         let outcome = handle.rx.recv_timeout(Duration::from_secs(2)).expect("outcome");
@@ -1200,7 +1232,7 @@ mod tests {
         let key = key_from_handle(&handle);
         let path = format!("/auth/{key}/api/unlock");
         let wrong_key = [0x43u8; 32];
-        let r = encrypted_post_bytes(port, &handle.transport_public_b64, &path, &wrong_key);
+        let r = encrypted_post_bytes(port, &handle.transport_public_b64, &path, &wrong_key, MYSITE_HOST);
         assert!(r.contains(" 401 "), "wrong passphrase should 401, got:\n{r}");
         assert!(r.to_lowercase().contains("wrong passphrase"));
 
@@ -1229,6 +1261,7 @@ mod tests {
             &handle.transport_public_b64,
             &format!("/auth/{key}/api/unlock"),
             &config_key,
+            MYSITE_HOST,
         );
         assert!(r.contains(" 200 "), "envelope round-trip should reach handler, got:\n{r}");
         handle.stop();
@@ -1251,9 +1284,39 @@ mod tests {
         env["ciphertext"] = serde_json::Value::String(BASE64.encode(&ct_bytes));
         let body = serde_json::to_string(&env).unwrap();
 
-        let r = raw_post_json(port, &format!("/auth/{key}/api/setup"), &body);
+        let r = raw_post_json_host(port, &format!("/auth/{key}/api/setup"), &body, MYSITE_HOST);
         assert!(r.contains(" 400 "), "tampered ciphertext should 400, got:\n{r}");
         assert!(r.to_lowercase().contains("transport"));
+
+        handle.stop();
+    }
+
+    #[test]
+    fn wrong_host_header_is_rejected() {
+        let port = ephemeral_port();
+        let handle = start(port, PassphrasePhase::Setup, None, "mysite").expect("start server");
+        let key = key_from_handle(&handle);
+
+        let r = raw_request_host(port, "GET", &format!("/auth/{key}"), "evil.example.com");
+        assert!(r.contains(" 404 "), "wrong Host must 404, got:\n{r}");
+
+        let r = raw_request_host(port, "GET", &format!("/auth/{key}"), "127.0.0.1");
+        assert!(r.contains(" 404 "), "bare IP Host must 404, got:\n{r}");
+
+        let r = raw_request_host(port, "GET", &format!("/auth/{key}"), &format!("mysite.wrustic.localhost:{port}"));
+        assert!(r.contains(" 200 "), "correct Host with port should 200, got:\n{r}");
+
+        handle.stop();
+    }
+
+    #[test]
+    fn host_match_is_case_insensitive() {
+        let port = ephemeral_port();
+        let handle = start(port, PassphrasePhase::Setup, None, "mysite").expect("start server");
+        let key = key_from_handle(&handle);
+
+        let r = raw_request_host(port, "GET", &format!("/auth/{key}"), "MYSITE.WRUSTIC.LOCALHOST");
+        assert!(r.contains(" 200 "), "uppercase Host should 200, got:\n{r}");
 
         handle.stop();
     }
