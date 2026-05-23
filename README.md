@@ -7,14 +7,13 @@ and [`ratatui`](https://crates.io/crates/ratatui).
 `wrustic` is read-only by design — write operations are out of scope, not a
 backlog item. The currently supported backends are **local**, **REST-server**,
 and **S3**, opened from a saved profile whose secrets (repository password, S3
-keys) are encrypted on disk.
+keys) are encrypted on disk with a passphrase.
 
 ## Status
 
 Implemented:
 - Named profiles stored in `~/.config/wrustic/config.toml`; secret fields are
-  age-encrypted by default and can instead use experimental passphrase
-  encryption with `--experimental-passphrase`
+  encrypted per-value with a passphrase-derived key (ChaCha20-Poly1305)
 - Profile management screens: create new, delete existing (edit comes later)
 - Snapshot listing (short ID, time, host, tags, paths), sorted by time
 - Keyboard navigation (`j`/`k`, arrow keys, Home/End, `g`/`G`) and quit (`q` / Esc / Ctrl-C)
@@ -48,7 +47,7 @@ shell profile.
 Requires a Rust toolchain (developed against rustc 1.93).
 
 Platform: Linux / macOS only. The config-file writer uses
-`std::os::unix::fs::OpenOptionsExt` to enforce mode `0600` on `age.key` and
+`std::os::unix::fs::OpenOptionsExt` to enforce mode `0600` on
 `config.toml`, so the crate does not build on Windows. Adding Windows
 support would mean swapping that for an ACL-based equivalent.
 
@@ -59,13 +58,11 @@ cargo run
 ### CLI flags
 
 ```text
-wrustic [-c|--config-dir <PATH>] [-p|--port <N>] [--experimental-passphrase] [-h|--help]
+wrustic [-c|--config-dir <PATH>] [-p|--port <N>] [--browser-auth] [-h|--help]
 ```
 
 `--config-dir <PATH>` overrides the default config location
-(`~/.config/wrustic`). The override applies to both the age identity file
-(`<PATH>/age.key`) and the encrypted profile store
-(`<PATH>/config.toml`). Useful for keeping separate profile sets, running
+(`~/.config/wrustic`). Useful for keeping separate profile sets, running
 tests, or driving an automation/CI flow against a throwaway directory:
 
 ```sh
@@ -75,35 +72,39 @@ cargo run -- --config-dir ./tmp/wrustic-sandbox
 The directory is created on first run if it doesn't exist.
 
 `--port <N>` selects the localhost port for the file-share dialog and the
-experimental passphrase ceremony. `--experimental-passphrase` uses
-passphrase encryption instead of age and requires an explicit `--config-dir`
-while it is experimental:
+passphrase ceremony (default: 7834).
+
+`--browser-auth` uses a browser-based ceremony for passphrase input
+instead of typing the passphrase in the terminal:
 
 ```sh
-cargo run -- --experimental-passphrase --config-dir ./tmp/wrustic-passphrase
+cargo run -- --browser-auth
 ```
 
-First run: if `<config-dir>/age.key` is missing, the welcome screen asks
-whether to **create a new key** or **restore an existing one** (copy your
-backup to that path, then press Enter). When creating a new key, the next
-screen shows the key path and the public-key recipient (`age1…`) — **back up
-the key file now**, since losing it means losing access to every profile
-stored in the config file alongside it.
+### First run
+
+On first run (no existing `config.toml`), wrustic prompts for an
+**instance name** — a short DNS-safe label (e.g. `laptop`, `workstation`).
+Then you set a passphrase (min 12 chars, must include uppercase, lowercase,
+digit, and special character). The passphrase derives a 32-byte encryption
+key via scrypt; this key encrypts all secret fields in `config.toml`.
+
+On subsequent launches, you re-enter the passphrase to unlock.
 
 Then in the TUI:
-1. The main menu lists **Work with a repo**, **Manage profiles**, and **Quit**.
-2. **Manage profiles → Create new profile**: type a profile name, pick a
+1. The main menu lists saved profiles. Press `n` to create a new one.
+2. **Create new profile**: type a profile name, pick a
    backend (Local / REST / S3), fill in the per-backend prompts (Esc on any
    prompt goes back one step):
    - **Local**: filesystem path, e.g. `./tmp/repo`.
    - **REST**: URL, e.g. `http://localhost:8000/` or `https://user:pass@host/path/`.
-   - **S3**: endpoint (blank → AWS default), bucket, region (blank → `us-east-1`),
+   - **S3**: endpoint (blank -> AWS default), bucket, region (blank -> `us-east-1`),
      access key ID, secret access key (masked).
    Finally type the repository password (masked) and press Enter — the profile
    is encrypted into `config.toml` and you return to the main menu.
-3. **Work with a repo**: pick a profile from the list, and the snapshot view
-   opens directly. No re-typing the password; config unlock is the auth gate.
-4. **Manage profiles → Delete a profile**: pick a profile and confirm with `y`.
+3. **Open a profile**: pick a profile from the list, and the snapshot view
+   opens directly. No re-typing the password; passphrase unlock is the auth gate.
+4. **Delete a profile**: press `d` on a profile and confirm with `y`.
 
 ## Relationship to the `restic` binary
 
@@ -185,7 +186,7 @@ simplest stand-in is [`rclone serve s3`](https://rclone.org/commands/rclone_serv
 pointed at a local directory, which lets you exercise the full S3 code path
 without an AWS account.
 
-Requires `rclone` (≥ v1.73) on `$PATH`. `serve s3` is marked **Experimental**
+Requires `rclone` (>= v1.73) on `$PATH`. `serve s3` is marked **Experimental**
 upstream but is sufficient for dev.
 
 ```sh
@@ -233,6 +234,6 @@ Caveats:
   virtual-hosted-style addressing.
 - Profiles are persisted in `~/.config/wrustic/config.toml`. Secret fields
   such as the restic password and S3 keys are encrypted per value with
-  `ageenc:` by default, or `pkenc:` in experimental passphrase mode. The file
-  itself is not a whole-file age archive; see `docs/encryption.md` for the
-  on-disk schema and threat model.
+  ChaCha20-Poly1305 under a passphrase-derived key. The file itself is not a
+  whole-file encrypted archive; see `docs/encryption.md` for the on-disk schema
+  and threat model.
