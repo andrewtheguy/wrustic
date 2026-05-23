@@ -197,8 +197,7 @@ pub(crate) fn start(
 
     // Bind synchronously so EADDRINUSE/permission errors surface before we
     // spin up a runtime. Hand the listener to tokio after.
-    let listener_std = std::net::TcpListener::bind(("127.0.0.1", port))
-        .map_err(|e| anyhow!("bind 127.0.0.1:{port}: {e}"))?;
+    let (listener_std, listener_v6) = crate::net::bind_loopback(port)?;
     listener_std
         .set_nonblocking(true)
         .map_err(|e| anyhow!("set_nonblocking: {e}"))?;
@@ -236,6 +235,14 @@ pub(crate) fn start(
                 Err(_) => return,
             };
             rt.block_on(async move {
+                if let Some(v6_std) = listener_v6
+                    && let Ok(v6) = TcpListener::from_std(v6_std)
+                {
+                    let ctx2 = thread_ctx.clone();
+                    tokio::spawn(async move {
+                        accept_v6(v6, ctx2).await;
+                    });
+                }
                 let listener = match TcpListener::from_std(listener_std) {
                     Ok(l) => l,
                     Err(_) => return,
@@ -277,6 +284,23 @@ async fn accept_loop(
                 });
             }
         }
+    }
+}
+
+async fn accept_v6(listener: TcpListener, ctx: Arc<Ctx>) {
+    loop {
+        let stream = match listener.accept().await {
+            Ok((s, _)) => s,
+            Err(_) => continue,
+        };
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            let io = TokioIo::new(stream);
+            let svc = service_fn(move |req| handle(req, ctx.clone()));
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, svc)
+                .await;
+        });
     }
 }
 

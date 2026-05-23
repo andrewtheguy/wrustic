@@ -2,6 +2,7 @@ mod app;
 mod cli;
 mod config;
 mod crypto;
+mod net;
 mod passphrase;
 mod repo;
 mod restic;
