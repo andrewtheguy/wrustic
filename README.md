@@ -7,14 +7,14 @@ and [`ratatui`](https://crates.io/crates/ratatui).
 `wrustic` is read-only by design — write operations are out of scope, not a
 backlog item. The currently supported backends are **local**, **REST-server**,
 and **S3**, opened from a saved profile whose secrets (repository password, S3
-keys) are age-encrypted on disk.
+keys) are encrypted on disk.
 
 ## Status
 
 Implemented:
-- Named profiles stored in a single age-encrypted master file
-  (`~/.config/wrustic/config.toml.age`), unlocked by an X25519 identity at
-  `~/.config/wrustic/age.key` (sops-style; mode 0600)
+- Named profiles stored in `~/.config/wrustic/config.toml`; secret fields are
+  age-encrypted by default and can instead use experimental passphrase
+  encryption with `--experimental-passphrase`
 - Profile management screens: create new, delete existing (edit comes later)
 - Snapshot listing (short ID, time, host, tags, paths), sorted by time
 - Keyboard navigation (`j`/`k`, arrow keys, Home/End, `g`/`G`) and quit (`q` / Esc / Ctrl-C)
@@ -49,7 +49,7 @@ Requires a Rust toolchain (developed against rustc 1.93).
 
 Platform: Linux / macOS only. The config-file writer uses
 `std::os::unix::fs::OpenOptionsExt` to enforce mode `0600` on `age.key` and
-`config.toml.age`, so the crate does not build on Windows. Adding Windows
+`config.toml`, so the crate does not build on Windows. Adding Windows
 support would mean swapping that for an ACL-based equivalent.
 
 ```sh
@@ -59,7 +59,7 @@ cargo run
 ### CLI flags
 
 ```text
-wrustic [-c|--config-dir <PATH>] [-p|--port <N>] [--experimental-passkey] [-h|--help]
+wrustic [-c|--config-dir <PATH>] [-p|--port <N>] [--experimental-passphrase] [-h|--help]
 ```
 
 `--config-dir <PATH>` overrides the default config location
@@ -75,9 +75,13 @@ cargo run -- --config-dir ./tmp/wrustic-sandbox
 The directory is created on first run if it doesn't exist.
 
 `--port <N>` selects the localhost port for the file-share dialog and the
-experimental passkey ceremony. `--experimental-passkey` uses WebAuthn PRF
-passkey encryption instead of age and requires an explicit `--config-dir`
-while it is experimental.
+experimental passphrase ceremony. `--experimental-passphrase` uses
+passphrase encryption instead of age and requires an explicit `--config-dir`
+while it is experimental:
+
+```sh
+cargo run -- --experimental-passphrase --config-dir ./tmp/wrustic-passphrase
+```
 
 First run: if `<config-dir>/age.key` is missing, the welcome screen asks
 whether to **create a new key** or **restore an existing one** (copy your
@@ -96,9 +100,9 @@ Then in the TUI:
    - **S3**: endpoint (blank → AWS default), bucket, region (blank → `us-east-1`),
      access key ID, secret access key (masked).
    Finally type the repository password (masked) and press Enter — the profile
-   is encrypted into `config.toml.age` and you return to the main menu.
+   is encrypted into `config.toml` and you return to the main menu.
 3. **Work with a repo**: pick a profile from the list, and the snapshot view
-   opens directly. No re-typing the password; age unlock is the auth gate.
+   opens directly. No re-typing the password; config unlock is the auth gate.
 4. **Manage profiles → Delete a profile**: pick a profile and confirm with `y`.
 
 ## Relationship to the `restic` binary
@@ -227,11 +231,8 @@ Caveats:
   to exist on disk before `restic init`.
 - `--force-path-style=true` is required — rclone's S3 server doesn't speak
   virtual-hosted-style addressing.
-- Profiles (including the S3 keys and restic password) are persisted in
-  `~/.config/wrustic/config.toml.age`, encrypted to the X25519 recipient
-  derived from `~/.config/wrustic/age.key`. Inspect the cleartext with
-  `age -d -i ~/.config/wrustic/age.key ~/.config/wrustic/config.toml.age`.
-  This `age -d` invocation is for advanced users debugging or inspecting the
-  store — it prints the decrypted `config.toml.age` (restic passwords and S3
-  keys included) to stdout, so only run it in a context where that exposure
-  is acceptable.
+- Profiles are persisted in `~/.config/wrustic/config.toml`. Secret fields
+  such as the restic password and S3 keys are encrypted per value with
+  `ageenc:` by default, or `pkenc:` in experimental passphrase mode. The file
+  itself is not a whole-file age archive; see `docs/encryption.md` for the
+  on-disk schema and threat model.

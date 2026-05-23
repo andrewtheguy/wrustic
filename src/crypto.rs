@@ -37,7 +37,7 @@ pub fn decrypt_value(value: &str, identity: &Identity) -> Result<String> {
 }
 
 /// Encrypt a single value with ChaCha20-Poly1305. `key` is the 32-byte AEAD
-/// key (typically the HKDF-derived passkey config key). Output is single-line:
+/// key (typically the passphrase-derived config key). Output is single-line:
 /// `pkenc:base64(nonce(12) || ciphertext || tag(16))`.
 pub fn encrypt_passphrase_value(plaintext: &str, key: &[u8; 32]) -> Result<String> {
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
@@ -71,8 +71,8 @@ pub fn decrypt_passphrase_value(value: &str, key: &[u8; 32]) -> Result<String> {
 }
 
 /// Dispatch backend for per-value encrypt/decrypt. Constructed once on app
-/// boot from either an age identity (default) or a passkey-derived config
-/// key (`--experimental-passkey`), then threaded into `config::load` / `save`.
+/// boot from either an age identity (default) or a passphrase-derived config
+/// key (`--experimental-passphrase`), then threaded into `config::load` / `save`.
 pub enum Cipher {
     Age {
         identity: Identity,

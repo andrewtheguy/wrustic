@@ -16,7 +16,7 @@ a config was created with is the one it stays in for its lifetime.
 | Cipher | Prefix | Algorithm | Key source | Status |
 |---|---|---|---|---|
 | `Cipher::Age` | `ageenc:` | age x25519 (single recipient) | `<config-dir>/age.key`, mode 0600 | default |
-| `Cipher::Passphrase` | `pkenc:` | ChaCha20-Poly1305 AEAD | PBKDF2-SHA256-derived config key from user passphrase, never on disk | experimental, gated behind `--experimental-passphrase` |
+| `Cipher::Passphrase` | `pkenc:` | ChaCha20-Poly1305 AEAD | scrypt-derived config key from user passphrase, never on disk | experimental, gated behind `--experimental-passphrase` |
 
 Source of truth: `src/crypto.rs`, `src/config.rs`, `src/passphrase.rs`.
 
@@ -59,7 +59,7 @@ password = "ageenc:…"        # or "pkenc:…" depending on mode
 [passphrase]                 # passphrase mode only
 subdomain     = "<text>"     # DNS-safe subdomain (max 32 chars)
 subdomain_sig = "<base64>"   # HMAC-SHA256(subdomain, derived_key)
-salt          = "<base64>"   # random 32-byte PBKDF2 salt
+salt          = "<base64>"   # random 32-byte scrypt salt
 ```
 
 ### Required fields and cross-mode safety
@@ -109,8 +109,8 @@ salt          = "<base64 32-byte salt>"
 - `subdomain_sig` is `HMAC-SHA256(subdomain, derived_key)`, base64-encoded.
   Verified on Unlock to give a fast "wrong passphrase" error before
   attempting full config decryption.
-- `salt` is the random 32-byte PBKDF2 salt, base64-encoded. Generated once
-  at Setup; the browser uses the same salt on every Unlock so the derived
+- `salt` is the random 32-byte scrypt salt, base64-encoded. Generated once
+  at Setup; the server uses the same salt on every Unlock so the derived
   key matches.
 
 These fields live inline in `config.toml` so `config::peek` can read them
@@ -170,8 +170,8 @@ sense, but worth noting:
 
 **Passphrase mode** — the key is never on disk; the `[passphrase]` block
 is metadata, not material. An attacker with only `config.toml` would need
-to brute-force the passphrase through 600,000 iterations of PBKDF2 and
-then pass the HMAC check.
+to brute-force the passphrase through wrustic's scrypt parameters and then
+pass the HMAC check.
 
 ### What's still in scope for a config-only leak
 
@@ -218,29 +218,28 @@ up on the boot Error screen.
 
 ### Key derivation
 
-The 32-byte AEAD key is derived from the user's passphrase via
-**PBKDF2-SHA256** with 600,000 iterations. The derivation runs entirely
-in the browser via WebCrypto:
+The 32-byte AEAD key is derived from the user's passphrase with
+**scrypt**. The browser encrypts the passphrase to the localhost server
+using the transport envelope described below; the Rust server then derives
+the config key:
 
 ```
-key_material = importKey("raw", encode(passphrase), "PBKDF2", false, ["deriveBits"])
-key          = PBKDF2(key_material, salt, iterations=600000, hash="SHA-256", len=256)
+key = scrypt(passphrase, salt, log_n=16, r=8, p=1, len=32)
 ```
 
 The salt is generated once at Setup (`random_bytes(32)`) and stored in
 `[passphrase].salt` so subsequent unlocks regenerate the same key.
 
-The passphrase never leaves the browser. Only the derived 32-byte config
-key is exported and sent through the encrypted localhost transport; the
-App keeps that key in memory for the session only.
+The passphrase is not sent in plaintext and is never written to disk. It
+does exist in Rust process memory long enough for scrypt to run. The App
+keeps only the derived 32-byte config key for the session.
 
 ### Subdomain signature
 
-At Setup, the browser also computes `HMAC-SHA256(subdomain, derived_key)`
-and sends the 32-byte signature alongside the config key. This is stored
-in `[passphrase].subdomain_sig`.
+At Setup, the server computes `HMAC-SHA256(subdomain, derived_key)` after
+scrypt finishes. This is stored in `[passphrase].subdomain_sig`.
 
-On Unlock, the server re-computes the HMAC from the received key and
+On Unlock, the server re-computes the HMAC from the derived key and
 compares (constant-time) against the stored signature. A mismatch means
 the passphrase is wrong — the user gets a clear error immediately instead
 of a cryptic AEAD tag failure on the first `pkenc:` value.
@@ -254,7 +253,7 @@ pkenc:<base64( nonce(12) || ciphertext || tag(16) )>
 - 12-byte nonce from `OsRng` (chacha20poly1305's `generate_nonce`). Each
   encrypt mints a fresh nonce — there is no nonce reuse window even
   within a single save.
-- ChaCha20-Poly1305 with the 32-byte PBKDF2-derived config key.
+- ChaCha20-Poly1305 with the 32-byte scrypt-derived config key.
 - 16-byte Poly1305 tag appended (the AEAD construction does this; the
   encrypted blob's last 16 bytes are the tag).
 
@@ -279,7 +278,7 @@ enters their passphrase. wrustic itself can't safely prompt for a
 passphrase in the terminal (clipboard attacks, shoulder surfing on a
 shared screen session), so `src/passphrase.rs` stands up a small localhost
 server, prints the URL in the TUI, and waits for the browser to POST the
-derived config key back through an encrypted localhost envelope. This
+passphrase through an encrypted localhost envelope. This
 section covers the server's shape; the cryptographic mechanics are in the
 [Passphrase cipher](#passphrase-cipher-cipherpassphrase) section above.
 
@@ -352,8 +351,8 @@ Routes under the correct prefix + key (any other path still 404s):
 |---|---|
 | `GET /<prefix>/<key>` or `/<prefix>/<key>/` | 200 + the inline ceremony HTML |
 | `POST /<prefix>/<key>/api/check-code` (Setup phase) | encrypted JSON `{setup_code}` → no outcome |
-| `POST /<prefix>/<key>/api/setup` (Setup phase) | encrypted binary `{setup_code, subdomain_sig, config_key}` → deliver outcome |
-| `POST /<prefix>/<key>/api/unlock` (Unlock phase) | encrypted 32-byte `config_key` → deliver outcome (after HMAC verification) |
+| `POST /<prefix>/<key>/api/setup` (Setup phase) | encrypted binary `version(1) + code_len(1) + code(N) + passphrase` → derive key and deliver outcome |
+| `POST /<prefix>/<key>/api/unlock` (Unlock phase) | encrypted passphrase bytes → derive key and deliver outcome after HMAC verification |
 
 The auth-key check runs **before** the expiry check by design: an
 unauthenticated caller never gets to distinguish "running" from
@@ -369,9 +368,10 @@ The phase is picked at boot by `config::peek`:
   basename if it's DNS-safe), then launches the ceremony server. The
   browser page renders a passphrase form with two inputs (passphrase +
   confirm), complexity validation, and a setup-code input (see below).
-  On submit: the browser derives the key via PBKDF2, computes the
-  subdomain HMAC signature, and posts both through the encrypted transport.
-  The server delivers `PassphraseOutcome { key, new_meta:
+  On submit: the browser posts the setup code and passphrase through the
+  encrypted transport. The server enforces the same passphrase policy as
+  the page, derives the config key with scrypt, computes the subdomain
+  HMAC signature, and delivers `PassphraseOutcome { key, new_meta:
   Some(PassphraseMeta { subdomain, subdomain_sig, salt }) }`. The App
   splices the meta into `self.config.passphrase` and immediately calls
   `config::save` so the `[passphrase]` block lands on disk — next launch
@@ -380,8 +380,9 @@ The phase is picked at boot by `config::peek`:
 - **`[passphrase]` block already present** → `PassphrasePhase::Unlock`.
   Server reads the subdomain, salt, and subdomain_sig from the stored
   metadata. The browser page renders a single passphrase input. On submit:
-  the browser derives the key via PBKDF2 with the stored salt and posts it.
-  The server verifies `HMAC-SHA256(subdomain, received_key)` against the
+  the browser posts the passphrase through the encrypted transport. The
+  server derives the key with scrypt using the stored salt, then verifies
+  `HMAC-SHA256(subdomain, derived_key)` against the
   stored `subdomain_sig` (constant-time). On mismatch → 401 "Wrong
   passphrase", the user can retry. On match → server delivers
   `PassphraseOutcome { key, new_meta: None }`. App uses the key to
@@ -415,8 +416,8 @@ guess probability per ceremony at `MAX_SETUP_CODE_ATTEMPTS / 31^6 ≈
 5.6 × 10^-9`.
 
 **Source of truth:** `SETUP_CODE_ALPHABET` and `random_setup_code()`
-in `src/passphrase.rs`. The generator pulls 6 bytes from `/dev/urandom`
-and maps each through `byte % 31`.
+in `src/passphrase.rs`. The generator uses `rand` to sample each
+character uniformly from the alphabet.
 
 **Input handling.** Both the browser and the server normalize the
 submitted code by stripping whitespace and uppercasing. The comparison
@@ -424,8 +425,8 @@ is constant-time (`ct_eq`). The browser input carries
 `autocapitalize="characters"` and `text-transform: uppercase`.
 
 **Pre-flight check.** The browser pre-validates the code with the
-server *before* prompting for the passphrase, via
-`POST /auth/<key>/api/check-code` with body `{"setup_code": "..."}`.
+server *before* sending the passphrase, via
+`POST /setup/<key>/api/check-code` with body `{"setup_code": "..."}`.
 This way a wrong code surfaces immediately. The subsequent
 `POST /api/setup` re-validates the same code, and both routes share
 the same `check_setup_code` helper and the same strike counter.
@@ -468,26 +469,24 @@ Ordering inside `handle()`:
 
 ### HTML and JS
 
-The ceremony page is one static `const` string in `src/passphrase.rs`. No
-build step, no static-file routing — the response body is a string
-literal.
+The ceremony page is an Askama template in `templates/passphrase.html`.
+There is no static-file routing; `src/passphrase.rs` renders the template
+directly into the response body.
 
 The inline `<script>`:
 - Derives `API_BASE` from `window.location.pathname` (with a trailing-
-  slash strip) so `fetch` targets stay under `/auth/<key>/api/…`
+  slash strip) so `fetch` targets stay under `/<prefix>/<key>/api/…`
   without needing the key templated into the HTML.
 - On Setup: renders two password inputs (passphrase + confirm), a
   complexity check (min 12 chars, uppercase, lowercase, digit, special
-  char), and a setup-code input. The code is pre-flight checked before
-  key derivation begins.
+  char), and a setup-code input. The browser checks the code before
+  sending the passphrase; the server re-checks both the code and the
+  passphrase policy before deriving a key.
 - On Unlock: renders a single password input. No complexity check, no
   setup code.
-- Derives the config key via WebCrypto PBKDF2 (`deriveBits`, 600K
-  iterations, SHA-256).
-- On Setup: computes `HMAC-SHA256(subdomain, derived_key)` via WebCrypto
-  and builds a binary payload:
-  `version(1) + code_len(1) + code(N) + subdomain_sig(32) + config_key(32)`.
-- On Unlock: sends the raw 32-byte derived key.
+- On Setup: builds a binary payload:
+  `version(1) + code_len(1) + code(N) + passphrase`.
+- On Unlock: sends the raw passphrase bytes.
 - Wraps every `/api/*` POST body in the transport-encryption envelope
   described below.
 - Disables all buttons on success so a second click can't re-submit
@@ -507,8 +506,8 @@ Content-Security-Policy:
 ```
 
 Template values embedded in JavaScript strings escape `<`, `>`, `&`, and
-the usual JSON string characters so a subdomain such as `</script>`
-cannot terminate the trusted inline script.
+the usual JSON string characters so injected constants cannot terminate
+the trusted inline script.
 
 ### Transport encryption (browser ↔ server)
 
@@ -517,7 +516,7 @@ interface is not perfectly isolated: another local process running as
 root or with `CAP_NET_RAW` can sniff loopback, a malicious browser
 extension can read `fetch` request bodies, and devtools-history /
 proxy-style inspectors capture full requests. To avoid putting the
-derived config key on the wire as plaintext, every `/api/*` POST body is
+passphrase on the wire as plaintext, every `/api/*` POST body is
 wrapped in an authenticated encryption envelope under a fresh per-request
 key.
 
@@ -547,8 +546,7 @@ checks the GCM tag (so a flipped bit in transit is a hard 400, not a
 silent corruption), then hands the inner plaintext to the existing
 per-route parser (`CheckCodeBody`, `parse_setup_body`, `parse_unlock_body`).
 Response bodies are plaintext on purpose: errors don't carry secrets,
-and the only success-side leak the threat model worries about is the
-derived config key, which lives only in the inbound direction.
+and success bodies only report `{"ok": true}`.
 
 **Non-extractable browser keys.** The client's X25519 private key, the
 transport HKDF key, and the transport AES-GCM key are all
@@ -558,7 +556,7 @@ values as raw bytes.
 
 **What this doesn't defend against.**
 - An attacker who controls the wrustic process itself (they have the
-  server private key and receive the config key by definition).
+  server private key and receive the passphrase by definition).
 - An attacker who can serve their own HTML at `/auth/<key>` (they'd
   already need to be the wrustic server).
 - The browser process being compromised (extensions are mitigated
@@ -566,10 +564,8 @@ values as raw bytes.
   extension can still drive the page).
 
 **Browser support.** WebCrypto `X25519` became broadly available in
-2025: Chrome 133+, Firefox 130+, Safari 18.4+. PBKDF2 has been
-available since much earlier (Chrome 37+, Firefox 34+, Safari 11+).
-wrustic's passphrase mode is flagged `--experimental-passphrase` and
-targets these versions.
+2025: Chrome 133+, Firefox 130+, Safari 18.4+. wrustic's passphrase mode
+is flagged `--experimental-passphrase` and targets these versions.
 
 **Algorithm choice.**
 - X25519 over P-256 ECDH: smaller key, single fixed curve, faster, no
@@ -581,8 +577,11 @@ targets these versions.
 - Empty HKDF salt: the ECDH shared secret is already uniformly random
   and unique per request; a versioned `info` string handles algorithm
   cutover instead.
-- PBKDF2-SHA256 for key derivation: built into WebCrypto (unlike Argon2),
-  widely supported, and 600K iterations provides adequate work factor.
+- scrypt for key derivation: the KDF runs in Rust, so WebCrypto support no
+  longer constrains the algorithm choice. scrypt is memory-hard and is
+  already part of the restic/rustic ecosystem. wrustic uses
+  `log_n=16, r=8, p=1`, which requires roughly 64 MiB for each password
+  guess before the HMAC or AEAD tags can be checked.
 
 **Replay.** Each ceremony has a fresh server keypair (30-min lifespan),
 each request a fresh client keypair, so every shared secret is unique
@@ -590,14 +589,16 @@ and a captured ciphertext can't be decrypted after the ceremony ends
 or replayed against a future one.
 
 **No body-size hiding.** The envelope leaks the inner plaintext length
-(≈ ciphertext length minus 16 bytes for the tag). For the routes here
-the lengths are essentially fixed and known a priori (a 6-char setup
-code, a 32-byte config key, etc.), so padding would add nothing.
+(approximately ciphertext length minus 16 bytes for the tag). For
+passphrase submissions, that means a local observer who can see request
+sizes can estimate passphrase length. The passphrase contents remain
+encrypted.
 
 ### What the server does *not* do
 
 - No persistence of the passphrase or derived key on disk. Only the salt,
-  subdomain, and subdomain signature are written. The 32-byte config key
+  subdomain, and subdomain signature are written. The passphrase exists
+  transiently while the server derives the key; the 32-byte config key
   lives in the App's memory for the session.
 - No CORS / no auth header / no cookies. The capability URL is the
   whole auth surface.
@@ -632,7 +633,7 @@ In scope:
   up in cloud sync, a generic file-share, a publicly readable backup,
   or a misconfigured snapshot does not by itself leak the secret
   fields. The attacker would need the matching `age.key` (age mode) or
-  the passphrase (passphrase mode, subject to PBKDF2 brute-force
+  the passphrase (passphrase mode, subject to scrypt brute-force
   resistance).
 - **Cross-config mixing.** Passphrase configs cannot be opened in age mode
   and vice versa; URLs minted under one identity cannot be redeemed

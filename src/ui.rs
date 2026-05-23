@@ -887,7 +887,7 @@ fn render_passphrase_url(frame: &mut Frame, app: &mut App, area: Rect) {
             Some(PassphrasePhase::Setup) => {
                 lines.push_str(
                     "Enter a strong passphrase in the browser to encrypt your config.\n\
-                     The passphrase is derived into an encryption key via PBKDF2 in the browser.\n\n\
+                     The browser encrypts it to the local server, which derives the config key with scrypt.\n\n\
                      WARNING: forgetting this passphrase means losing access to the config.\n",
                 );
             }

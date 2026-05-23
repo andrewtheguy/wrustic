@@ -17,6 +17,7 @@ use hyper::header::{CACHE_CONTROL, CONTENT_TYPE, HeaderName, HeaderValue};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use scrypt::Params as ScryptParams;
 use serde::Deserialize;
 use sha2::Sha256;
 use tokio::net::TcpListener;
@@ -38,6 +39,9 @@ pub(crate) const PASSPHRASE_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_SETUP_CODE_ATTEMPTS: u32 = 5;
 const SETUP_CODE_ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
 const SETUP_CODE_LEN: usize = 6;
+const SCRYPT_LOG_N: u8 = 16;
+const SCRYPT_R: u32 = 8;
+const SCRYPT_P: u32 = 1;
 
 pub(crate) struct PassphraseOutcome {
     pub(crate) key: [u8; 32],
@@ -478,10 +482,32 @@ async fn read_and_decrypt(
     ctx.transport.decrypt(&env).map_err(|e| e.http_response())
 }
 
-fn derive_config_key(passphrase: &str, salt: &[u8]) -> [u8; 32] {
+fn derive_config_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32], String> {
     let mut key = [0u8; 32];
-    pbkdf2::pbkdf2_hmac::<sha2::Sha256>(passphrase.as_bytes(), salt, 600_000, &mut key);
-    key
+    let params = ScryptParams::new(SCRYPT_LOG_N, SCRYPT_R, SCRYPT_P, key.len())
+        .map_err(|e| format!("invalid scrypt parameters: {e}"))?;
+    scrypt::scrypt(passphrase.as_bytes(), salt, &params, &mut key)
+        .map_err(|e| format!("scrypt failed: {e}"))?;
+    Ok(key)
+}
+
+fn passphrase_policy_error(passphrase: &str) -> Option<&'static str> {
+    if passphrase.chars().count() < 12 {
+        return Some("Must be at least 12 characters.");
+    }
+    if !passphrase.chars().any(|c| c.is_ascii_lowercase()) {
+        return Some("Must contain a lowercase letter.");
+    }
+    if !passphrase.chars().any(|c| c.is_ascii_uppercase()) {
+        return Some("Must contain an uppercase letter.");
+    }
+    if !passphrase.chars().any(|c| c.is_ascii_digit()) {
+        return Some("Must contain a digit.");
+    }
+    if !passphrase.chars().any(|c| !c.is_ascii_alphanumeric()) {
+        return Some("Must contain a special character.");
+    }
+    None
 }
 
 fn parse_setup_body(inner: &[u8]) -> Result<SetupBody, String> {
@@ -503,6 +529,9 @@ fn parse_setup_body(inner: &[u8]) -> Result<SetupBody, String> {
         .map_err(|e| format!("setup code is not UTF-8: {e}"))?;
     let passphrase = String::from_utf8(inner[2 + code_len..].to_vec())
         .map_err(|e| format!("passphrase is not UTF-8: {e}"))?;
+    if let Some(err) = passphrase_policy_error(&passphrase) {
+        return Err(err.into());
+    }
     Ok(SetupBody {
         setup_code,
         passphrase,
@@ -610,7 +639,10 @@ async fn handle_setup(req: Request<hyper::body::Incoming>, ctx: Arc<Ctx>) -> Res
         Ok(s) => s,
         Err(e) => return text(StatusCode::INTERNAL_SERVER_ERROR, &format!("bad salt: {e}")),
     };
-    let config_key = derive_config_key(&parsed.passphrase, &salt);
+    let config_key = match derive_config_key(&parsed.passphrase, &salt) {
+        Ok(k) => k,
+        Err(e) => return text(StatusCode::INTERNAL_SERVER_ERROR, &format!("key derivation: {e}")),
+    };
     let mut mac = HmacSha256::new_from_slice(&config_key)
         .expect("HMAC accepts any key length");
     mac.update(ctx.subdomain.as_bytes());
@@ -643,7 +675,10 @@ async fn handle_unlock(req: Request<hyper::body::Incoming>, ctx: Arc<Ctx>) -> Re
         Ok(s) => s,
         Err(e) => return text(StatusCode::INTERNAL_SERVER_ERROR, &format!("bad salt: {e}")),
     };
-    let config_key = derive_config_key(&parsed.passphrase, &salt);
+    let config_key = match derive_config_key(&parsed.passphrase, &salt) {
+        Ok(k) => k,
+        Err(e) => return text(StatusCode::INTERNAL_SERVER_ERROR, &format!("key derivation: {e}")),
+    };
     if let Some(expected_sig) = &ctx.expected_subdomain_sig
         && !verify_subdomain_sig(&ctx.subdomain, &config_key, expected_sig)
     {
@@ -755,6 +790,26 @@ mod tests {
         let code = b"AB23KM";
         let payload = vec![1u8, code.len() as u8, b'A', b'B', b'2', b'3', b'K', b'M'];
         assert!(parse_setup_body(&payload).is_err());
+    }
+
+    #[test]
+    fn parse_setup_body_enforces_passphrase_policy() {
+        for passphrase in [
+            "short1!",
+            "missingdigit!",
+            "missing-special1",
+            "MISSINGLOWER1!",
+            "missingupper1!",
+        ] {
+            let payload = setup_payload("AB23KM", passphrase);
+            assert!(
+                parse_setup_body(&payload).is_err(),
+                "passphrase should fail policy: {passphrase}"
+            );
+        }
+
+        let payload = setup_payload("AB23KM", TEST_PASSPHRASE);
+        assert!(parse_setup_body(&payload).is_ok());
     }
 
     #[test]
@@ -954,10 +1009,6 @@ mod tests {
         String::from_utf8_lossy(&resp).into_owned()
     }
 
-    fn raw_post_json(port: u16, path: &str, body: &str) -> String {
-        raw_post_json_host(port, path, body, "testsite.wrustic.localhost")
-    }
-
     fn key_from_handle(h: &PassphraseHandle) -> String {
         h.short_url.rsplit('/').next().unwrap().to_string()
     }
@@ -1008,7 +1059,7 @@ mod tests {
     const TEST_SALT: [u8; 32] = [0u8; 32];
 
     fn test_config_key() -> [u8; 32] {
-        derive_config_key(TEST_PASSPHRASE, &TEST_SALT)
+        derive_config_key(TEST_PASSPHRASE, &TEST_SALT).unwrap()
     }
 
     fn compute_hmac(subdomain: &str, key: &[u8; 32]) -> [u8; 32] {

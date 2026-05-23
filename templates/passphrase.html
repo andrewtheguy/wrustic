@@ -26,7 +26,7 @@
 {% endif %}
 <div id="status" class="note">Ready. Use the controls below to begin.</div>
 {% if is_setup %}
-<p>Enter a strong passphrase to encrypt your wrustic config. The passphrase is encrypted in this browser before being sent to the server, which derives the encryption key.</p>
+<p>Enter a strong passphrase to encrypt your wrustic config. The passphrase is encrypted in this browser before being sent to the server, which derives the encryption key with scrypt.</p>
 {% else %}
 <p>Enter the passphrase you set up earlier to decrypt your config.</p>
 {% endif %}
@@ -230,7 +230,7 @@ async function precheckSetupCode(code) {
 // ── Main actions ───────────────────────────────────────────────────
 
 // Setup: validate inputs → pre-check setup code → encrypt passphrase
-// + setup code and POST. The server derives the config key via PBKDF2.
+// + setup code and POST. The server derives the config key via scrypt.
 // Payload wire format: version(1) + code_len(1) + code(N) + passphrase(remaining)
 async function doSetup() {
   const setupCode = readSetupCode();
@@ -259,7 +259,7 @@ async function doSetup() {
 }
 
 // Unlock: encrypt the passphrase and send it to the server, which
-// derives the config key via PBKDF2 and verifies the subdomain HMAC.
+// derives the config key via scrypt and verifies the subdomain HMAC.
 async function doUnlock() {
   const pp = document.getElementById("passphrase").value;
   if (!pp) throw new Error("Enter your passphrase.");

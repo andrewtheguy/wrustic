@@ -151,7 +151,7 @@ pub struct PassphraseMeta {
     /// unlock to give a fast "wrong passphrase" error before attempting
     /// full config decryption.
     pub subdomain_sig: String,
-    /// base64-encoded random 32-byte PBKDF2 salt.
+    /// base64-encoded random 32-byte scrypt salt.
     pub salt: String,
 }
 
