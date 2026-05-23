@@ -205,14 +205,25 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
         Screen::SnapshotContents => render_snapshot_contents(frame, app, area),
         Screen::FileDetails => render_file_details(frame, app, area),
         Screen::ShareUrl => render_share_url(frame, app, area),
-        Screen::PassphraseInstancePrompt => render_input(
-            frame,
-            area,
-            "Instance name",
-            &app.passphrase_instance_input,
-            false,
-            "Lowercase letters, digits, and hyphens (max 32 chars).",
-        ),
+        Screen::PassphraseInstancePrompt => {
+            let banner = format!(
+                "No config found at {}. Setting up a new instance.",
+                app.paths.config.display(),
+            );
+            let [_top, banner_area, input_area, help_area, _bottom] = Layout::vertical([
+                Constraint::Fill(1),
+                Constraint::Length(1),
+                Constraint::Length(3),
+                Constraint::Length(1),
+                Constraint::Fill(1),
+            ])
+            .areas(area);
+            let banner_p = Paragraph::new(banner).style(Style::new().fg(Color::DarkGray));
+            frame.render_widget(banner_p, banner_area);
+            draw_input_field(frame, input_area, "Instance name", &app.passphrase_instance_input, false, true);
+            let help_p = Paragraph::new("Lowercase letters, digits, and hyphens (max 32 chars).").style(Style::new().fg(Color::DarkGray));
+            frame.render_widget(help_p, help_area);
+        }
         Screen::PassphraseSetup => render_passphrase_setup(frame, app, area),
         Screen::PassphraseUnlock => render_passphrase_unlock(frame, app, area),
         Screen::PassphraseDerivingKey => {

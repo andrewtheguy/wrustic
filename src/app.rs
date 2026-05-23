@@ -118,15 +118,16 @@ impl SnapshotFilter {
     }
 }
 
-pub(crate) fn default_passphrase_instance(paths: &Paths) -> Option<String> {
-    let parent = paths.config.parent()?;
-    let resolved = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
-    let basename = resolved.file_name()?.to_string_lossy().trim().to_lowercase();
-    if is_valid_instance(&basename) {
-        Some(basename)
-    } else {
-        None
-    }
+const INSTANCE_ALPHABET: &[u8] = b"2345679abcdefghjkmnpqrstuvwxyz";
+
+pub(crate) fn default_passphrase_instance() -> String {
+    use rand::RngExt;
+    let mut rng = rand::rng();
+    let n = INSTANCE_ALPHABET.len();
+    let suffix: String = (0..6)
+        .map(|_| INSTANCE_ALPHABET[rng.random_range(0..n)] as char)
+        .collect();
+    format!("instance-{suffix}")
 }
 
 fn is_valid_instance(s: &str) -> bool {
@@ -480,7 +481,7 @@ impl App {
         };
         match peeked {
             None => {
-                let default = default_passphrase_instance(&self.paths).unwrap_or_default();
+                let default = default_passphrase_instance();
                 self.passphrase_instance_input = Input::new(default);
                 self.screen = Screen::PassphraseInstancePrompt;
             }
