@@ -1,11 +1,10 @@
 [package]
 name = "wrustic"
-version = "0.0.17"
+version = "0.0.18"
 edition = "2024"
 
 [dependencies]
 aes-gcm = "0.10"
-age = ">=0.11.3, <0.12"
 anyhow = "1.0.102"
 askama = "0.16.0"
 base64 = "0.22"

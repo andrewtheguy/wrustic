@@ -2,24 +2,17 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
-use std::str::FromStr;
+use std::path::PathBuf;
 
-use age::secrecy::ExposeSecret;
-use age::x25519::Identity;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::{Cipher, is_age_encrypted, is_passphrase_encrypted};
+use crate::crypto::{Cipher, is_passphrase_encrypted};
 
 const CONFIG_DIR_NAME: &str = "wrustic";
-const IDENTITY_FILE: &str = "age.key";
 const CONFIG_FILE: &str = "config.toml";
 const CONFIG_VERSION: u32 = 2;
 
-/// Marker stored in `[root].cipher` to prevent a passphrase config dir
-/// from being opened in age mode (or vice versa).
-pub const CIPHER_MARKER_AGE: &str = "age-v1";
 pub const CIPHER_MARKER_PASSPHRASE: &str = "passphrase-v1";
 
 #[derive(Debug, Clone, Copy)]
@@ -89,9 +82,6 @@ impl Profile {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub recipient: Option<String>,
-    /// `age-v1` or `passphrase-v1`.
     pub cipher: String,
     pub version: u32,
     #[serde(default)]
@@ -103,7 +93,6 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            recipient: None,
             cipher: String::new(),
             version: CONFIG_VERSION,
             profiles: BTreeMap::new(),
@@ -127,7 +116,6 @@ impl Config {
 }
 
 pub struct Paths {
-    pub identity: PathBuf,
     pub config: PathBuf,
 }
 
@@ -139,7 +127,6 @@ pub fn paths(override_dir: Option<PathBuf>) -> Result<Paths> {
             .join(CONFIG_DIR_NAME),
     };
     Ok(Paths {
-        identity: base.join(IDENTITY_FILE),
         config: base.join(CONFIG_FILE),
     })
 }
@@ -168,71 +155,6 @@ pub fn peek(paths: &Paths) -> Result<Option<Config>> {
     Ok(Some(config))
 }
 
-/// Generate a fresh X25519 identity and write it to `path` in the sops-style
-/// format (commented public key + recipient hint, then the secret key).
-/// File is created with mode 0600. Returns the bech32-encoded public key
-/// (`age1…`) so the caller can display it to the user.
-pub fn generate_identity(path: &Path) -> Result<String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    let identity = Identity::generate();
-    let public = identity.to_public();
-    let public_str = public.to_string();
-    let secret = identity.to_string();
-
-    let body = format!(
-        "# created by wrustic\n# public key: {}\n{}\n",
-        public_str,
-        secret.expose_secret()
-    );
-
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .with_context(|| format!("creating {}", path.display()))?;
-    file.write_all(body.as_bytes())
-        .with_context(|| format!("writing {}", path.display()))?;
-    Ok(public_str)
-}
-
-/// Validate that `path` contains a parseable age identity. Returns the
-/// derived public key string on success.
-pub fn validate_identity(path: &Path) -> Result<String> {
-    let identity = parse_identity_from_file(path)?;
-    Ok(identity.to_public().to_string())
-}
-
-/// Build a `Cipher::Age` from the on-disk identity file. The recipient is
-/// derived from the secret key — there's no separate public-key file.
-pub fn load_age_cipher(path: &Path) -> Result<Cipher> {
-    let identity = parse_identity_from_file(path)?;
-    let recipient = identity.to_public();
-    Ok(Cipher::Age { identity, recipient })
-}
-
-fn parse_identity_from_file(path: &Path) -> Result<Identity> {
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let secret_lines: Vec<&str> = contents
-        .lines()
-        .map(str::trim)
-        .filter(|l| l.starts_with("AGE-SECRET-KEY-"))
-        .collect();
-    match secret_lines.len() {
-        0 => bail!("no AGE-SECRET-KEY line found in {}", path.display()),
-        1 => Identity::from_str(secret_lines[0])
-            .map_err(|e| anyhow!("parsing age identity in {}: {e}", path.display())),
-        n => bail!(
-            "age.key at {} contains {n} identities, but wrustic requires exactly one",
-            path.display()
-        ),
-    }
-}
-
 /// Load the config. If the config file does not exist, returns a default
 /// (empty) config without touching disk.
 pub fn load(paths: &Paths, cipher: &Cipher) -> Result<Config> {
@@ -245,44 +167,13 @@ pub fn load(paths: &Paths, cipher: &Cipher) -> Result<Config> {
     let mut config: Config = toml::from_str(&text)
         .with_context(|| format!("parsing TOML from {}", paths.config.display()))?;
 
-    // Cross-check the on-disk cipher marker against the active cipher mode.
-    match cipher {
-        Cipher::Age { identity, .. } => {
-            if config.cipher != CIPHER_MARKER_AGE {
-                bail!(
-                    "{} is marked `cipher = \"{}\"` but wrustic was launched in age mode; \
-                     pass --experimental-passphrase to open this config dir",
-                    paths.config.display(),
-                    config.cipher
-                );
-            }
-            let derived = identity.to_public().to_string();
-            let Some(recipient) = config.recipient.as_deref() else {
-                bail!(
-                    "{} is missing the `recipient` field (expected `{derived}` matching the identity at {})",
-                    paths.config.display(),
-                    paths.identity.display()
-                );
-            };
-            if recipient != derived {
-                bail!(
-                    "recipient mismatch: {} has recipient `{}` but the identity at {} derives `{derived}`",
-                    paths.config.display(),
-                    recipient,
-                    paths.identity.display()
-                );
-            }
-        }
-        Cipher::Passphrase { .. } => {
-            if config.cipher != CIPHER_MARKER_PASSPHRASE {
-                bail!(
-                    "{} is not a passphrase config (cipher = \"{}\"); drop \
-                     --experimental-passphrase to open it",
-                    paths.config.display(),
-                    config.cipher
-                );
-            }
-        }
+    if config.cipher != CIPHER_MARKER_PASSPHRASE {
+        bail!(
+            "{} has unsupported cipher = \"{}\"; only \"{}\" is supported",
+            paths.config.display(),
+            config.cipher,
+            CIPHER_MARKER_PASSPHRASE
+        );
     }
 
     if config.version != CONFIG_VERSION {
@@ -305,16 +196,7 @@ pub fn load(paths: &Paths, cipher: &Cipher) -> Result<Config> {
 /// Encrypt and write the config atomically using the active cipher.
 pub fn save(config: &Config, paths: &Paths, cipher: &Cipher) -> Result<()> {
     let mut on_disk = config.clone();
-    match cipher {
-        Cipher::Age { identity, .. } => {
-            on_disk.recipient = Some(identity.to_public().to_string());
-            on_disk.cipher = CIPHER_MARKER_AGE.to_string();
-        }
-        Cipher::Passphrase { .. } => {
-            on_disk.recipient = None;
-            on_disk.cipher = CIPHER_MARKER_PASSPHRASE.to_string();
-        }
-    }
+    on_disk.cipher = CIPHER_MARKER_PASSPHRASE.to_string();
     on_disk.version = CONFIG_VERSION;
     for (name, profile) in &mut on_disk.profiles {
         encrypt_profile_fields(profile, cipher)
@@ -346,21 +228,9 @@ pub fn save(config: &Config, paths: &Paths, cipher: &Cipher) -> Result<()> {
     Ok(())
 }
 
-fn already_encrypted(value: &str) -> bool {
-    is_age_encrypted(value) || is_passphrase_encrypted(value)
-}
-
 fn encrypt_field(value: &mut String, cipher: &Cipher) -> Result<()> {
-    if value.is_empty() || value.starts_with(cipher.prefix()) {
+    if value.is_empty() || is_passphrase_encrypted(value) {
         return Ok(());
-    }
-    if already_encrypted(value) {
-        // Different cipher's prefix — refuse to re-encrypt, the cross-prefix
-        // check on load would reject it anyway.
-        bail!(
-            "field is already encrypted with a different cipher (expected `{}` prefix)",
-            cipher.prefix()
-        );
     }
     *value = cipher.encrypt(value)?;
     Ok(())
@@ -443,9 +313,8 @@ mod tests {
         dir
     }
 
-    fn test_paths(dir: &Path) -> Paths {
+    fn test_paths(dir: &std::path::Path) -> Paths {
         Paths {
-            identity: dir.join("age.key"),
             config: dir.join("config.toml"),
         }
     }
@@ -454,14 +323,8 @@ mod tests {
     fn round_trip_encrypt_decrypt() -> Result<()> {
         let dir = fresh_dir("rt");
         let paths = test_paths(&dir);
+        let cipher = Cipher::new([0x55u8; 32]);
 
-        let pubkey = generate_identity(&paths.identity)?;
-        assert!(paths.identity.exists());
-        assert!(pubkey.starts_with("age1"), "expected age1 recipient, got {pubkey}");
-
-        assert_eq!(validate_identity(&paths.identity)?, pubkey);
-
-        let cipher = load_age_cipher(&paths.identity)?;
         let empty = load(&paths, &cipher)?;
         assert_eq!(empty.profiles.len(), 0);
         assert_eq!(empty.version, CONFIG_VERSION);
@@ -496,7 +359,6 @@ mod tests {
             },
         );
         let cfg = Config {
-            recipient: None,
             cipher: String::new(),
             version: CONFIG_VERSION,
             profiles,
@@ -507,25 +369,23 @@ mod tests {
 
         let raw = fs::read_to_string(&paths.config)?;
         let parsed: toml::Value = toml::from_str(&raw)?;
-        assert_eq!(parsed["recipient"].as_str().unwrap(), pubkey);
-        assert_eq!(parsed["cipher"].as_str().unwrap(), CIPHER_MARKER_AGE);
+        assert_eq!(parsed["cipher"].as_str().unwrap(), CIPHER_MARKER_PASSPHRASE);
 
         let table = parsed["profiles"].as_table().unwrap();
         assert_eq!(table.len(), 3);
         for (name, profile) in table {
             let profile = profile.as_table().unwrap();
             let password = profile["password"].as_str().unwrap();
-            assert!(password.starts_with("ageenc:"), "password should be encrypted: {password}");
-            assert!(!password.contains('\n'), "ageenc value must be single-line");
+            assert!(password.starts_with("pkenc:"), "password should be encrypted: {password}");
+            assert!(!password.contains('\n'), "pkenc value must be single-line");
             assert!(!profile.contains_key("name"), "`name` should not be inside profile `{name}`");
             if profile["backend"].as_str().unwrap() == "local" {
-                assert!(!profile["local_path"].as_str().unwrap().starts_with("ageenc:"));
+                assert!(!profile["local_path"].as_str().unwrap().starts_with("pkenc:"));
             }
         }
 
         let loaded = load(&paths, &cipher)?;
         assert_eq!(loaded.profiles.len(), 3);
-        assert_eq!(loaded.recipient.as_deref(), Some(pubkey.as_str()));
         match loaded.profiles.get("local-a") {
             Some(Profile::Local { password, local_path }) => {
                 assert_eq!(password, "pw1");
@@ -556,8 +416,7 @@ mod tests {
     fn rest_round_trip_with_split_auth() -> Result<()> {
         let dir = fresh_dir("rest_split");
         let paths = test_paths(&dir);
-        generate_identity(&paths.identity)?;
-        let cipher = load_age_cipher(&paths.identity)?;
+        let cipher = Cipher::new([0x55u8; 32]);
 
         let mut profiles = BTreeMap::new();
         profiles.insert(
@@ -570,7 +429,6 @@ mod tests {
             },
         );
         let cfg = Config {
-            recipient: None,
             cipher: String::new(),
             version: CONFIG_VERSION,
             profiles,
@@ -582,8 +440,8 @@ mod tests {
         let parsed: toml::Value = toml::from_str(&raw)?;
         let rest = &parsed["profiles"]["rest-auth"];
         assert_eq!(rest["rest_url"].as_str().unwrap(), "https://r.example.com/repo/");
-        assert!(rest["rest_user"].as_str().unwrap().starts_with("ageenc:"));
-        assert!(rest["rest_password"].as_str().unwrap().starts_with("ageenc:"));
+        assert!(rest["rest_user"].as_str().unwrap().starts_with("pkenc:"));
+        assert!(rest["rest_password"].as_str().unwrap().starts_with("pkenc:"));
 
         let loaded = load(&paths, &cipher)?;
         match loaded.profiles.get("rest-auth") {
@@ -606,75 +464,10 @@ mod tests {
     }
 
     #[test]
-    fn recipient_mismatch_is_rejected() -> Result<()> {
-        let dir = fresh_dir("rcpt");
-        let paths = test_paths(&dir);
-        generate_identity(&paths.identity)?;
-        let cipher = load_age_cipher(&paths.identity)?;
-
-        let mut profiles = BTreeMap::new();
-        profiles.insert(
-            "x".to_string(),
-            Profile::Local {
-                password: "p".into(),
-                local_path: "/x".into(),
-            },
-        );
-        let cfg = Config {
-            recipient: None,
-            cipher: String::new(),
-            version: CONFIG_VERSION,
-            profiles,
-            passphrase: None,
-        };
-        save(&cfg, &paths, &cipher)?;
-
-        // Replace recipient with a syntactically valid but unrelated age1 string.
-        let other = Identity::generate().to_public().to_string();
-        let raw = fs::read_to_string(&paths.config)?;
-        let mut doc: toml::Value = toml::from_str(&raw)?;
-        doc["recipient"] = toml::Value::String(other);
-        fs::write(&paths.config, toml::to_string_pretty(&doc)?)?;
-
-        let err = load(&paths, &cipher).expect_err("recipient mismatch should error");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("recipient"), "error should mention recipient: {msg}");
-
-        fs::remove_dir_all(&dir).ok();
-        Ok(())
-    }
-
-    #[test]
-    fn multiple_identities_rejected() -> Result<()> {
-        let dir = fresh_dir("multi");
-        let id_path = dir.join("age.key");
-
-        let a = Identity::generate();
-        let b = Identity::generate();
-        let body = format!(
-            "# id a\n{}\n# id b\n{}\n",
-            a.to_string().expose_secret(),
-            b.to_string().expose_secret()
-        );
-        fs::write(&id_path, body)?;
-
-        let err = validate_identity(&id_path).expect_err("two identities should error");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("exactly one"),
-            "error should mention exactly one: {msg}"
-        );
-
-        fs::remove_dir_all(&dir).ok();
-        Ok(())
-    }
-
-    #[test]
     fn empty_string_field_not_encrypted() -> Result<()> {
         let dir = fresh_dir("empty");
         let paths = test_paths(&dir);
-        generate_identity(&paths.identity)?;
-        let cipher = load_age_cipher(&paths.identity)?;
+        let cipher = Cipher::new([0x55u8; 32]);
 
         let mut profiles = BTreeMap::new();
         profiles.insert(
@@ -687,7 +480,6 @@ mod tests {
             },
         );
         let cfg = Config {
-            recipient: None,
             cipher: String::new(),
             version: CONFIG_VERSION,
             profiles,
@@ -722,7 +514,6 @@ mod tests {
     fn paths_uses_override_when_provided() -> Result<()> {
         let dir = fresh_dir("override");
         let p = paths(Some(dir.clone()))?;
-        assert_eq!(p.identity, dir.join("age.key"));
         assert_eq!(p.config, dir.join("config.toml"));
         fs::remove_dir_all(&dir).ok();
         Ok(())
@@ -732,11 +523,8 @@ mod tests {
     fn load_rejects_unknown_version() -> Result<()> {
         let dir = fresh_dir("ver");
         let paths = test_paths(&dir);
-        generate_identity(&paths.identity)?;
-        let cipher = load_age_cipher(&paths.identity)?;
+        let cipher = Cipher::new([0x55u8; 32]);
 
-        // Save a real config first, then bump the version on disk to one
-        // wrustic doesn't know about, and confirm load() refuses it.
         save(&Config::default(), &paths, &cipher)?;
         let raw = fs::read_to_string(&paths.config)?;
         let mut doc: toml::Value = toml::from_str(&raw)?;
@@ -755,20 +543,29 @@ mod tests {
     }
 
     #[test]
-    fn missing_identity_errors_cleanly() {
-        let dir = fresh_dir("missing");
+    fn load_rejects_unsupported_cipher() -> Result<()> {
+        let dir = fresh_dir("bad_cipher");
         let paths = test_paths(&dir);
-        let err = load_age_cipher(&paths.identity).expect_err("should fail without identity");
+        let cipher = Cipher::new([0x55u8; 32]);
+        save(&Config::default(), &paths, &cipher)?;
+
+        let raw = fs::read_to_string(&paths.config)?;
+        let mut doc: toml::Value = toml::from_str(&raw)?;
+        doc["cipher"] = toml::Value::String("age-v1".into());
+        fs::write(&paths.config, toml::to_string_pretty(&doc)?)?;
+
+        let err = load(&paths, &cipher).expect_err("unsupported cipher should error");
         let msg = format!("{err:#}");
-        assert!(msg.contains("age.key"), "error should mention key path: {msg}");
+        assert!(msg.contains("unsupported cipher"), "error should mention unsupported cipher: {msg}");
         fs::remove_dir_all(&dir).ok();
+        Ok(())
     }
 
     #[test]
     fn passphrase_round_trip_per_value() -> Result<()> {
         let dir = fresh_dir("pp_rt");
         let paths = test_paths(&dir);
-        let cipher = Cipher::Passphrase { key: [0x55u8; 32] };
+        let cipher = Cipher::new([0x55u8; 32]);
 
         let mut profiles = BTreeMap::new();
         profiles.insert(
@@ -779,7 +576,6 @@ mod tests {
             },
         );
         let cfg = Config {
-            recipient: None,
             cipher: String::new(),
             version: CONFIG_VERSION,
             profiles,
@@ -790,7 +586,6 @@ mod tests {
         let raw = fs::read_to_string(&paths.config)?;
         let parsed: toml::Value = toml::from_str(&raw)?;
         assert_eq!(parsed["cipher"].as_str().unwrap(), CIPHER_MARKER_PASSPHRASE);
-        assert!(parsed.get("recipient").is_none(), "passphrase config must not write recipient");
         let pw = parsed["profiles"]["pp-local"]["password"].as_str().unwrap();
         assert!(pw.starts_with("pkenc:"), "password should be pkenc: prefixed, got {pw}");
 
@@ -807,85 +602,10 @@ mod tests {
     }
 
     #[test]
-    fn passphrase_config_rejects_age_mode_open() -> Result<()> {
-        let dir = fresh_dir("pp_marker");
-        let paths = test_paths(&dir);
-        let pp_cipher = Cipher::Passphrase { key: [0x66u8; 32] };
-        save(&Config::default(), &paths, &pp_cipher)?;
-
-        generate_identity(&paths.identity)?;
-        let age_cipher = load_age_cipher(&paths.identity)?;
-        let err = load(&paths, &age_cipher).expect_err("age mode must refuse passphrase config");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("passphrase") || msg.contains("--experimental-passphrase"),
-            "error should explain the cipher mismatch: {msg}"
-        );
-        fs::remove_dir_all(&dir).ok();
-        Ok(())
-    }
-
-    #[test]
-    fn age_config_rejects_passphrase_mode_open() -> Result<()> {
-        let dir = fresh_dir("age_pp_marker");
-        let paths = test_paths(&dir);
-        generate_identity(&paths.identity)?;
-        let age_cipher = load_age_cipher(&paths.identity)?;
-        save(&Config::default(), &paths, &age_cipher)?;
-
-        let pp_cipher = Cipher::Passphrase { key: [0x77u8; 32] };
-        let err = load(&paths, &pp_cipher).expect_err("passphrase mode must refuse age config");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("passphrase") || msg.contains("--experimental-passphrase") || msg.contains("age"),
-            "error should explain the cipher mismatch: {msg}"
-        );
-        fs::remove_dir_all(&dir).ok();
-        Ok(())
-    }
-
-    #[test]
-    fn passphrase_save_omits_recipient_from_disk() -> Result<()> {
-        let dir = fresh_dir("pp_no_rcpt");
-        let paths = test_paths(&dir);
-        let cipher = Cipher::Passphrase { key: [0x88u8; 32] };
-        save(&Config::default(), &paths, &cipher)?;
-        let raw = fs::read_to_string(&paths.config)?;
-        let parsed: toml::Value = toml::from_str(&raw)?;
-        assert!(
-            parsed.get("recipient").is_none(),
-            "passphrase config should not write `recipient`, got: {raw}"
-        );
-        assert_eq!(parsed["cipher"].as_str().unwrap(), CIPHER_MARKER_PASSPHRASE);
-        fs::remove_dir_all(&dir).ok();
-        Ok(())
-    }
-
-    #[test]
-    fn load_rejects_missing_cipher_field() -> Result<()> {
-        let dir = fresh_dir("no_cipher");
-        let paths = test_paths(&dir);
-        generate_identity(&paths.identity)?;
-        let cipher = load_age_cipher(&paths.identity)?;
-        save(&Config::default(), &paths, &cipher)?;
-
-        let raw = fs::read_to_string(&paths.config)?;
-        let mut doc: toml::Value = toml::from_str(&raw)?;
-        doc.as_table_mut().unwrap().remove("cipher");
-        fs::write(&paths.config, toml::to_string_pretty(&doc)?)?;
-
-        let err = load(&paths, &cipher).expect_err("missing cipher must fail");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("cipher"), "error should mention cipher: {msg}");
-        fs::remove_dir_all(&dir).ok();
-        Ok(())
-    }
-
-    #[test]
     fn passphrase_block_round_trips_inline() -> Result<()> {
         let dir = fresh_dir("pp_inline");
         let paths = test_paths(&dir);
-        let cipher = Cipher::Passphrase { key: [0xA5u8; 32] };
+        let cipher = Cipher::new([0xA5u8; 32]);
 
         let cfg = Config {
             passphrase: Some(PassphraseMeta {
@@ -916,7 +636,7 @@ mod tests {
     fn peek_reads_passphrase_block_without_decrypting() -> Result<()> {
         let dir = fresh_dir("pp_peek");
         let paths = test_paths(&dir);
-        let cipher = Cipher::Passphrase { key: [0xB6u8; 32] };
+        let cipher = Cipher::new([0xB6u8; 32]);
 
         let mut profiles = BTreeMap::new();
         profiles.insert(
@@ -927,7 +647,6 @@ mod tests {
             },
         );
         let mut cfg = Config {
-            recipient: None,
             cipher: String::new(),
             version: CONFIG_VERSION,
             profiles,
