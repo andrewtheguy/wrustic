@@ -9,3 +9,9 @@
   relocated rather than showing them as a delete + add)
 - Search across snapshot contents (find files by name or path pattern)
 - Windows support (needs build and runtime testing on Windows)
+
+## Ideas (Currently out of scope but worth considering for the future)
+
+- Native write operations via rustic_core (backup, forget, etc.) if
+  rustic_core's write path matures to production stability, removing the
+  dependency on the restic CLI entirely
