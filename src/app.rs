@@ -293,6 +293,7 @@ pub(crate) struct App {
 
     pub(crate) restic_check: Option<Result<ResticInfo, ResticError>>,
     pub(crate) delete_target: Option<String>,
+    pub(crate) post_delete_select: Option<usize>,
     pub(crate) delete_details_parsed: Option<SnapshotDetails>,
     pub(crate) delete_details_raw: Option<String>,
     pub(crate) delete_root_listing: Option<ContentsPreview>,
@@ -393,6 +394,7 @@ impl App {
             quit: false,
             restic_check: None,
             delete_target: None,
+            post_delete_select: None,
             delete_details_parsed: None,
             delete_details_raw: None,
             delete_root_listing: None,

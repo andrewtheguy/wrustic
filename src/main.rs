@@ -91,9 +91,15 @@ fn run(
             match load_snapshots(profile) {
                 Ok(snaps) => {
                     app.snapshots = snaps;
-                    if !app.snapshots.is_empty() {
-                        app.list_state.select(Some(0));
+                    let len = app.visible_snapshot_indices().len();
+                    if len > 0 {
+                        let idx = app
+                            .post_delete_select
+                            .map(|i| i.min(len - 1))
+                            .unwrap_or(0);
+                        app.list_state.select(Some(idx));
                     }
+                    app.post_delete_select = None;
                     app.screen = Screen::Snapshots;
                 }
                 Err(e) => {
@@ -191,6 +197,7 @@ fn run(
             };
             match restic::forget(profile, &snapshot_id) {
                 Ok(()) => {
+                    app.post_delete_select = app.list_state.selected();
                     app.delete_details_parsed = None;
                     app.delete_details_raw = None;
                     app.snapshots.clear();
