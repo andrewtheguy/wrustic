@@ -315,8 +315,12 @@ pub(crate) struct App {
     // each frame; read by the key/mouse handler on the next event.
     pub(crate) list_area: Option<Rect>,
 
+    // Last left-click on the Snapshots list: timestamp + clicked row index.
+    // Used to detect a double-click for opening a snapshot.
+    pub(crate) last_snapshot_click: Option<(Instant, usize)>,
+
     // Last left-click on the SnapshotContents list: timestamp + clicked row
-    // index. Used to detect a double-click for opening file info.
+    // index. Used to detect a double-click for activating a content item.
     pub(crate) last_content_click: Option<(Instant, usize)>,
 }
 
@@ -413,6 +417,7 @@ impl App {
             compare_results: None,
             compare_results_state: ListState::default(),
             list_area: None,
+            last_snapshot_click: None,
             last_content_click: None,
         };
 
@@ -2146,7 +2151,16 @@ impl App {
                 let len = self.visible_snapshot_indices().len();
                 if let Some(idx) = click_to_index(area, self.list_state.offset(), len, row, col) {
                     self.list_state.select(Some(idx));
-                    self.activate_selected_snapshot();
+                    let now = Instant::now();
+                    let is_double = self
+                        .last_snapshot_click
+                        .is_some_and(|(t, i)| i == idx && now.duration_since(t) < DOUBLE_CLICK);
+                    if is_double {
+                        self.last_snapshot_click = None;
+                        self.activate_selected_snapshot();
+                    } else {
+                        self.last_snapshot_click = Some((now, idx));
+                    }
                 }
             }
             Screen::SnapshotCompareFirst => {
@@ -2210,12 +2224,10 @@ impl App {
                         .last_content_click
                         .is_some_and(|(t, i)| i == idx && now.duration_since(t) < DOUBLE_CLICK);
                     if is_double {
-                        // Consume the pair so a third click doesn't re-fire.
                         self.last_content_click = None;
-                        self.open_selected_file_details();
+                        self.activate_snapshot_content();
                     } else {
                         self.last_content_click = Some((now, idx));
-                        self.activate_snapshot_content();
                     }
                 }
             }
