@@ -16,8 +16,8 @@ use tui_input::backend::crossterm::EventHandler;
 use crate::config::{self, BackendKind, Config, PassphraseMeta, Paths, Profile};
 use crate::crypto::Cipher;
 use crate::passphrase::{self, PassphraseHandle, PassphrasePhase};
-use crate::repo::{ContentKind, ContentRow, ContentsPreview, FileDetails, SnapshotRow};
-use crate::restic::{self, DiffChange, DiffSummary, ResticError, ResticInfo, SnapshotDetails};
+use crate::repo::{ContentKind, ContentRow, ContentsPreview, DiffChange, DiffSummary, FileDetails, SnapshotRow};
+use crate::restic::{self, ResticError, ResticInfo, SnapshotDetails};
 use crate::share::{self, SHARE_TTL, ShareHandle, ShareTarget};
 
 pub(crate) const BACKEND_ORDER: [BackendKind; 3] =
