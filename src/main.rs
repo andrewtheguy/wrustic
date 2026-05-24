@@ -29,7 +29,7 @@ use crate::app::{App, BrowseFrame, Screen};
 use crate::cli::{USAGE, parse_cli};
 use crate::repo::{
     ContentRow, diff_snapshots, get_file_details, list_tree, load_snapshots, open_indexed,
-    preview_snapshot_contents, snapshot_root_tree, verify_profile,
+    preview_snapshot_contents, snapshot_delete_info, snapshot_root_tree, verify_profile,
 };
 use crate::ui::render;
 
@@ -162,18 +162,65 @@ fn run(
                 );
                 continue;
             };
-            const PREVIEW_LIMIT: usize = 50;
+            let limit = app.delete_preview_limit;
+            let need_details = app.delete_info.is_none();
             let result = (|| -> anyhow::Result<_> {
-                let (parsed, raw) = restic::snapshot_details_json(profile, &snap_id)?;
                 let repo = open_indexed(profile)?;
-                let preview = preview_snapshot_contents(&repo, &snap_id, PREVIEW_LIMIT)?;
-                Ok((parsed, raw, preview))
+                let info = if need_details {
+                    Some(snapshot_delete_info(&repo, &snap_id)?)
+                } else {
+                    None
+                };
+                let restic_details = if need_details {
+                    Some(restic::snapshot_details_json(profile, &snap_id)?)
+                } else {
+                    None
+                };
+                if let (Some(info), Some((parsed, _))) = (&info, &restic_details) {
+                    let mut mismatches = Vec::new();
+                    if let Some(rh) = &parsed.hostname
+                        && *rh != info.hostname
+                    {
+                        mismatches.push(format!(
+                            "hostname: rustic={:?}, restic={:?}",
+                            info.hostname, rh
+                        ));
+                    }
+                    if let Some(rt) = &parsed.tree
+                        && *rt != info.tree
+                    {
+                        mismatches.push(format!(
+                            "tree: rustic={:?}, restic={:?}",
+                            info.tree, rt
+                        ));
+                    }
+                    if parsed.paths != info.paths {
+                        mismatches.push(format!(
+                            "paths: rustic={:?}, restic={:?}",
+                            info.paths, parsed.paths
+                        ));
+                    }
+                    if !mismatches.is_empty() {
+                        anyhow::bail!(
+                            "rustic and restic disagree on snapshot metadata \
+                             (possible rustic bug, unsafe to proceed):\n{}",
+                            mismatches.join("\n")
+                        );
+                    }
+                }
+                let preview = preview_snapshot_contents(&repo, &snap_id, limit)?;
+                Ok((info, restic_details, preview))
             })();
             match result {
-                Ok((parsed, raw, preview)) => {
+                Ok((info, restic_details, preview)) => {
                     let has_entries = !preview.entries.is_empty();
-                    app.delete_details_parsed = Some(parsed);
-                    app.delete_details_raw = Some(raw);
+                    if let Some(info) = info {
+                        app.delete_info = Some(info);
+                    }
+                    if let Some((parsed, raw)) = restic_details {
+                        app.delete_details_parsed = Some(parsed);
+                        app.delete_details_raw = Some(raw);
+                    }
                     app.delete_root_listing = Some(preview);
                     app.delete_preview_state = ListState::default();
                     if has_entries {

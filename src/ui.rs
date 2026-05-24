@@ -1162,16 +1162,17 @@ fn human_size(bytes: u64) -> String {
 
 fn render_snapshot_delete_confirm(frame: &mut Frame, app: &mut App, area: Rect) {
     let id = app.delete_target.as_deref().unwrap_or("(unknown)");
-    let parsed = app.delete_details_parsed.as_ref();
-    let paths = parsed
-        .map(|p| {
-            if p.paths.is_empty() {
+    let info = app.delete_info.as_ref();
+    let paths = info
+        .map(|i| {
+            if i.paths.is_empty() {
                 "(no paths)".to_string()
             } else {
-                p.paths.join(", ")
+                i.paths.join(", ")
             }
         })
         .unwrap_or_else(|| "(unknown)".into());
+    let host = info.map(|i| i.hostname.as_str()).unwrap_or("?");
 
     let outer = Block::bordered().title("Confirm snapshot delete");
     let inner = outer.inner(area);
@@ -1179,8 +1180,14 @@ fn render_snapshot_delete_confirm(frame: &mut Frame, app: &mut App, area: Rect) 
 
     let [header, body] = Layout::vertical([Constraint::Length(8), Constraint::Fill(1)]).areas(inner);
 
-    let mut summary = format!("Delete snapshot {id}?\n\nPaths: {paths}");
-    if let Some(sum) = parsed.and_then(|p| p.summary.as_ref()) {
+    let tags = info
+        .filter(|i| !i.tags.is_empty())
+        .map(|i| i.tags.join(", "));
+    let mut summary = format!("Delete snapshot {id}?\n\nHost: {host}\nPaths: {paths}");
+    if let Some(tags) = tags {
+        summary.push_str(&format!("\nTags: {tags}"));
+    }
+    if let Some(sum) = app.delete_details_parsed.as_ref().and_then(|p| p.summary.as_ref()) {
         let files = sum
             .total_files_processed
             .map(|n| n.to_string())
@@ -1249,10 +1256,7 @@ fn render_snapshot_delete_confirm(frame: &mut Frame, app: &mut App, area: Rect) 
         .collect();
     if preview.truncated {
         items.push(
-            ListItem::new(format!(
-                "   …recursion stopped after {} entries; more files exist below.",
-                preview.limit
-            ))
+            ListItem::new("   …load more")
             .style(Style::new().fg(Color::DarkGray)),
         );
     }
