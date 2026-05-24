@@ -59,7 +59,13 @@ pub(crate) struct PreviewEntry {
 pub(crate) struct ContentsPreview {
     pub(crate) entries: Vec<PreviewEntry>,
     pub(crate) truncated: bool,
-    pub(crate) limit: usize,
+}
+
+pub(crate) struct DeleteSnapshotInfo {
+    pub(crate) hostname: String,
+    pub(crate) paths: Vec<String>,
+    pub(crate) tags: Vec<String>,
+    pub(crate) tree: String,
 }
 
 pub(crate) struct FileDetails {
@@ -239,6 +245,19 @@ pub(crate) fn snapshot_root_tree(
     Ok(snap.tree)
 }
 
+pub(crate) fn snapshot_delete_info(
+    repo: &Repository<IndexedIdsStatus>,
+    snapshot_id: &str,
+) -> Result<DeleteSnapshotInfo> {
+    let snap = repo.get_snapshot_from_str(snapshot_id, |_| true)?;
+    Ok(DeleteSnapshotInfo {
+        hostname: snap.hostname.clone(),
+        paths: snap.paths.iter().cloned().collect(),
+        tags: snap.tags.iter().cloned().collect(),
+        tree: snap.tree.to_hex().as_str().to_string(),
+    })
+}
+
 pub(crate) fn list_tree(
     repo: &Repository<IndexedIdsStatus>,
     tree_id: TreeId,
@@ -295,7 +314,7 @@ pub(crate) fn preview_snapshot_contents(
     let mut entries = Vec::new();
     let mut truncated = false;
     walk_preview(repo, root, "", &mut entries, limit, &mut truncated)?;
-    Ok(ContentsPreview { entries, truncated, limit })
+    Ok(ContentsPreview { entries, truncated })
 }
 
 pub(crate) fn get_file_details(

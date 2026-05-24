@@ -16,7 +16,7 @@ use tui_input::backend::crossterm::EventHandler;
 use crate::config::{self, BackendKind, Config, PassphraseMeta, Paths, Profile};
 use crate::crypto::Cipher;
 use crate::passphrase::{self, PassphraseHandle, PassphrasePhase};
-use crate::repo::{ContentKind, ContentRow, ContentsPreview, DiffChange, DiffSummary, FileDetails, SnapshotRow};
+use crate::repo::{ContentKind, ContentRow, ContentsPreview, DeleteSnapshotInfo, DiffChange, DiffSummary, FileDetails, SnapshotRow};
 use crate::restic::{self, ResticError, ResticInfo, SnapshotDetails};
 use crate::share::{self, SHARE_TTL, ShareHandle, ShareTarget};
 
@@ -292,8 +292,10 @@ pub(crate) struct App {
 
     pub(crate) restic_check: Option<Result<ResticInfo, ResticError>>,
     pub(crate) delete_target: Option<String>,
+    pub(crate) delete_info: Option<DeleteSnapshotInfo>,
     pub(crate) delete_show_json: bool,
     pub(crate) delete_preview_state: ListState,
+    pub(crate) delete_preview_limit: usize,
     pub(crate) post_delete_select: Option<usize>,
     pub(crate) delete_details_parsed: Option<SnapshotDetails>,
     pub(crate) delete_details_raw: Option<String>,
@@ -395,8 +397,10 @@ impl App {
             quit: false,
             restic_check: None,
             delete_target: None,
+            delete_info: None,
             delete_show_json: false,
             delete_preview_state: ListState::default(),
+            delete_preview_limit: 50,
             post_delete_select: None,
             delete_details_parsed: None,
             delete_details_raw: None,
@@ -961,8 +965,10 @@ impl App {
 
     fn clear_delete_scratch(&mut self) {
         self.delete_target = None;
+        self.delete_info = None;
         self.delete_show_json = false;
         self.delete_preview_state = ListState::default();
+        self.delete_preview_limit = 50;
         self.delete_details_parsed = None;
         self.delete_details_raw = None;
         self.delete_root_listing = None;
@@ -1698,6 +1704,17 @@ impl App {
                 }
                 KeyCode::Char('r') | KeyCode::Char('R') => {
                     self.delete_show_json = !self.delete_show_json;
+                }
+                KeyCode::Enter => {
+                    if let Some(preview) = &self.delete_root_listing
+                        && preview.truncated
+                    {
+                        let selected = self.delete_preview_state.selected().unwrap_or(0);
+                        if selected == preview.entries.len() {
+                            self.delete_preview_limit += 50;
+                            self.screen = Screen::SnapshotDeleteLoading;
+                        }
+                    }
                 }
                 KeyCode::Down => {
                     self.delete_preview_state.select_next();
