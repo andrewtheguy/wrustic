@@ -72,6 +72,7 @@ fn parse_version(v: &str) -> Option<(u32, u32, u32)> {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub(crate) struct SnapshotDetails {
     pub(crate) id: String,
     pub(crate) short_id: Option<String>,
@@ -89,6 +90,7 @@ pub(crate) struct SnapshotDetails {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub(crate) struct SnapshotSummary {
     pub(crate) backup_start: Option<String>,
     pub(crate) backup_end: Option<String>,

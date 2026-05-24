@@ -34,8 +34,7 @@ pub(crate) enum Screen {
     Snapshots,
     SnapshotFilterDim,
     SnapshotFilterValue,
-    SnapshotDeleteInfo,
-    SnapshotDeleteContentsLoading,
+    SnapshotDeleteLoading,
     SnapshotDeleteConfirm,
     SnapshotDeleting,
     SnapshotDeleteError(String),
@@ -293,6 +292,8 @@ pub(crate) struct App {
 
     pub(crate) restic_check: Option<Result<ResticInfo, ResticError>>,
     pub(crate) delete_target: Option<String>,
+    pub(crate) delete_show_json: bool,
+    pub(crate) delete_preview_state: ListState,
     pub(crate) post_delete_select: Option<usize>,
     pub(crate) delete_details_parsed: Option<SnapshotDetails>,
     pub(crate) delete_details_raw: Option<String>,
@@ -394,6 +395,8 @@ impl App {
             quit: false,
             restic_check: None,
             delete_target: None,
+            delete_show_json: false,
+            delete_preview_state: ListState::default(),
             post_delete_select: None,
             delete_details_parsed: None,
             delete_details_raw: None,
@@ -915,6 +918,13 @@ impl App {
         h.saturating_sub(2).max(1) as usize
     }
 
+    fn delete_preview_len(&self) -> usize {
+        self.delete_root_listing
+            .as_ref()
+            .map(|p| p.entries.len() + usize::from(p.truncated))
+            .unwrap_or(0)
+    }
+
     // Indices into `self.snapshots` for rows that pass the current filter,
     // preserving the underlying time-desc order.
     pub(crate) fn visible_snapshot_indices(&self) -> Vec<usize> {
@@ -951,6 +961,8 @@ impl App {
 
     fn clear_delete_scratch(&mut self) {
         self.delete_target = None;
+        self.delete_show_json = false;
+        self.delete_preview_state = ListState::default();
         self.delete_details_parsed = None;
         self.delete_details_raw = None;
         self.delete_root_listing = None;
@@ -998,10 +1010,6 @@ impl App {
             .collect()
     }
 
-    // Run version detection lazily (cached) and, if restic is available, fetch
-    // the snapshot's `restic snapshots --json` details. On any failure, stash
-    // a user-facing message and transition to SnapshotDeleteError. On success,
-    // populate delete_target/details and transition to SnapshotDeleteInfo.
     fn begin_delete_flow(&mut self, snapshot_id: String) {
         if self.restic_check.is_none() {
             self.restic_check = Some(restic::detect());
@@ -1010,23 +1018,9 @@ impl App {
             self.screen = Screen::SnapshotDeleteError(e.user_message());
             return;
         }
-        let Some((_, profile)) = self.config.profile_at(self.loading_index) else {
-            self.screen = Screen::SnapshotDeleteError(
-                "Selected profile no longer exists.".into(),
-            );
-            return;
-        };
-        match restic::snapshot_details_json(profile, &snapshot_id) {
-            Ok((parsed, raw)) => {
-                self.delete_target = Some(snapshot_id);
-                self.delete_details_parsed = Some(parsed);
-                self.delete_details_raw = Some(raw);
-                self.screen = Screen::SnapshotDeleteInfo;
-            }
-            Err(e) => {
-                self.screen = Screen::SnapshotDeleteError(format!("{e:#}"));
-            }
-        }
+        self.delete_target = Some(snapshot_id);
+        self.delete_show_json = false;
+        self.screen = Screen::SnapshotDeleteLoading;
     }
 
     fn go_up(&mut self) {
@@ -1698,22 +1692,39 @@ impl App {
                 _ => {}
             },
 
-            Screen::SnapshotDeleteInfo => match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    self.screen = Screen::SnapshotDeleteContentsLoading;
-                }
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') | KeyCode::Char('N') => {
-                    self.clear_delete_scratch();
-                    self.screen = Screen::Snapshots;
-                }
-                _ => {}
-            },
-
             Screen::SnapshotDeleteConfirm => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     self.screen = Screen::SnapshotDeleting;
                 }
-                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    self.delete_show_json = !self.delete_show_json;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.delete_preview_state.select_next();
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.delete_preview_state.select_previous();
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    self.delete_preview_state.select(Some(0));
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    let len = self.delete_preview_len();
+                    if len > 0 {
+                        self.delete_preview_state.select(Some(len - 1));
+                    }
+                }
+                KeyCode::PageDown => {
+                    let step = self.page_step();
+                    let len = self.delete_preview_len();
+                    page_select(&mut self.delete_preview_state, len, true, step);
+                }
+                KeyCode::PageUp => {
+                    let step = self.page_step();
+                    let len = self.delete_preview_len();
+                    page_select(&mut self.delete_preview_state, len, false, step);
+                }
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') | KeyCode::Char('N') => {
                     self.clear_delete_scratch();
                     self.screen = Screen::Snapshots;
                 }
@@ -1792,7 +1803,7 @@ impl App {
             | Screen::LoadingDir
             | Screen::LoadingFileDetails
             | Screen::SnapshotDeleting
-            | Screen::SnapshotDeleteContentsLoading
+            | Screen::SnapshotDeleteLoading
             | Screen::SnapshotCompareLoading => {}
 
             Screen::FileDetails => match key.code {

@@ -86,8 +86,9 @@ fn bottom_bar_text(app: &App) -> &'static str {
         Screen::SnapshotFilterValue => {
             "j/k move  PgUp/PgDn page  g/G top/bottom  Enter pick  Esc back"
         }
-        Screen::SnapshotDeleteInfo => "y proceed  n/Esc cancel",
-        Screen::SnapshotDeleteConfirm => "y confirm delete  n/Esc cancel",
+        Screen::SnapshotDeleteConfirm => {
+            "y confirm delete  j/k scroll  PgUp/PgDn page  r raw JSON  n/Esc cancel"
+        }
         Screen::SnapshotDeleteError(_) => "any key to continue",
         Screen::SnapshotContents => {
             "j/k move  PgUp/PgDn page  g/G top/bottom  Enter open  Backspace up  r reload  q/Esc back"
@@ -123,7 +124,7 @@ fn bottom_bar_text(app: &App) -> &'static str {
         | Screen::Loading
         | Screen::Verifying
         | Screen::SnapshotDeleting
-        | Screen::SnapshotDeleteContentsLoading
+        | Screen::SnapshotDeleteLoading
         | Screen::SnapshotCompareLoading => "working…",
         Screen::CreateProfileName => "type  Enter submit  Esc cancel",
         Screen::BackendChoice => "j/k move  PgUp/PgDn page  Enter pick  Esc back",
@@ -207,15 +208,14 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
         Screen::Snapshots => render_snapshots(frame, app, area),
         Screen::SnapshotFilterDim => render_filter_dim(frame, app, area),
         Screen::SnapshotFilterValue => render_filter_value(frame, app, area),
-        Screen::SnapshotDeleteInfo => render_snapshot_delete_info(frame, app, area),
-        Screen::SnapshotDeleteConfirm => render_snapshot_delete_confirm(frame, app, area),
+        Screen::SnapshotDeleteConfirm => render_snapshot_delete_confirm(frame, &mut *app, area),
         Screen::SnapshotDeleting => {
             let para = Paragraph::new("Running `restic forget`…")
                 .block(Block::bordered().title("Deleting snapshot"));
             frame.render_widget(para, area);
         }
-        Screen::SnapshotDeleteContentsLoading => {
-            let para = Paragraph::new("Reading snapshot contents…")
+        Screen::SnapshotDeleteLoading => {
+            let para = Paragraph::new("Loading snapshot details…")
                 .block(Block::bordered().title("Loading"));
             frame.render_widget(para, area);
         }
@@ -1160,84 +1160,7 @@ fn human_size(bytes: u64) -> String {
     format!("{:.1} {}", v, UNITS[i])
 }
 
-fn render_snapshot_delete_info(frame: &mut Frame, app: &App, area: Rect) {
-    let parsed = app.delete_details_parsed.as_ref();
-    let raw = app.delete_details_raw.as_deref().unwrap_or("(no raw JSON)");
-
-    let mut lines = String::new();
-    if let Some(p) = parsed {
-        lines.push_str(&format!("ID:       {}\n", p.id));
-        if let Some(s) = &p.short_id {
-            lines.push_str(&format!("Short ID: {s}\n"));
-        }
-        if let Some(t) = &p.time {
-            lines.push_str(&format!("Time:     {t}\n"));
-        }
-        if let Some(h) = &p.hostname {
-            lines.push_str(&format!("Host:     {h}\n"));
-        }
-        if let Some(u) = &p.username {
-            lines.push_str(&format!("User:     {u}\n"));
-        }
-        if !p.paths.is_empty() {
-            lines.push_str(&format!("Paths:    {}\n", p.paths.join(", ")));
-        }
-        if !p.tags.is_empty() {
-            lines.push_str(&format!("Tags:     {}\n", p.tags.join(", ")));
-        }
-        if let Some(par) = &p.parent {
-            lines.push_str(&format!("Parent:   {par}\n"));
-        }
-        if let Some(tree) = &p.tree {
-            lines.push_str(&format!("Tree:     {tree}\n"));
-        }
-        if let Some(pv) = &p.program_version {
-            lines.push_str(&format!("Program:  {pv}\n"));
-        }
-        if let Some(sum) = &p.summary {
-            if let Some(n) = sum.total_files_processed {
-                lines.push_str(&format!("Files:    {n}\n"));
-            }
-            if let Some(b) = sum.total_bytes_processed {
-                lines.push_str(&format!("Bytes:    {b}\n"));
-            }
-            if let Some(b) = sum.data_added {
-                lines.push_str(&format!("Added:    {b}\n"));
-            }
-            if let Some(b) = sum.data_added_packed {
-                lines.push_str(&format!("Packed:   {b}\n"));
-            }
-            if let Some(s) = &sum.backup_start {
-                lines.push_str(&format!("Start:    {s}\n"));
-            }
-            if let Some(s) = &sum.backup_end {
-                lines.push_str(&format!("End:      {s}\n"));
-            }
-        }
-    } else {
-        lines.push_str("(no parsed details)\n");
-    }
-
-    let outer = Block::bordered().title("Snapshot details — press y to proceed");
-    let inner = outer.inner(area);
-    frame.render_widget(outer, area);
-
-    // Half parsed, half raw JSON.
-    let [top, bottom] = Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)])
-        .areas(inner);
-
-    let parsed_para = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .block(Block::bordered().title("Parsed"));
-    frame.render_widget(parsed_para, top);
-
-    let raw_para = Paragraph::new(raw)
-        .wrap(Wrap { trim: false })
-        .block(Block::bordered().title("Raw `restic snapshots --json`"));
-    frame.render_widget(raw_para, bottom);
-}
-
-fn render_snapshot_delete_confirm(frame: &mut Frame, app: &App, area: Rect) {
+fn render_snapshot_delete_confirm(frame: &mut Frame, app: &mut App, area: Rect) {
     let id = app.delete_target.as_deref().unwrap_or("(unknown)");
     let parsed = app.delete_details_parsed.as_ref();
     let paths = parsed
@@ -1254,9 +1177,6 @@ fn render_snapshot_delete_confirm(frame: &mut Frame, app: &App, area: Rect) {
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
 
-    // Header: identification + the file-count/byte summary already fetched from
-    // `restic snapshots --json`, so the user sees "what they're losing" at a
-    // glance. Body: top-level entries from the snapshot tree.
     let [header, body] = Layout::vertical([Constraint::Length(8), Constraint::Fill(1)]).areas(inner);
 
     let mut summary = format!("Delete snapshot {id}?\n\nPaths: {paths}");
@@ -1278,6 +1198,15 @@ fn render_snapshot_delete_confirm(frame: &mut Frame, app: &App, area: Rect) {
         .style(Style::new().fg(Color::Yellow))
         .wrap(Wrap { trim: false });
     frame.render_widget(header_para, header);
+
+    if app.delete_show_json {
+        let raw = app.delete_details_raw.as_deref().unwrap_or("(no raw JSON)");
+        let raw_para = Paragraph::new(raw)
+            .wrap(Wrap { trim: false })
+            .block(Block::bordered().title("Raw `restic snapshots --json`"));
+        frame.render_widget(raw_para, body);
+        return;
+    }
 
     let Some(preview) = app.delete_root_listing.as_ref() else {
         let para = Paragraph::new("(no preview)")
@@ -1332,8 +1261,10 @@ fn render_snapshot_delete_confirm(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         format!("Contents ({} entries)", preview.entries.len())
     };
-    let list = List::new(items).block(Block::bordered().title(title));
-    frame.render_widget(list, body);
+    let list = List::new(items)
+        .highlight_style(Style::new().bg(Color::DarkGray))
+        .block(Block::bordered().title(title));
+    frame.render_stateful_widget(list, body, &mut app.delete_preview_state);
 }
 
 #[cfg(test)]
