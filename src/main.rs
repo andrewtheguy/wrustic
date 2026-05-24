@@ -91,9 +91,17 @@ fn run(
             match load_snapshots(profile) {
                 Ok(snaps) => {
                     app.snapshots = snaps;
-                    if !app.snapshots.is_empty() {
-                        app.list_state.select(Some(0));
+                    let len = app.visible_snapshot_indices().len();
+                    if len > 0 {
+                        let idx = app
+                            .post_delete_select
+                            .map(|i| i.min(len - 1))
+                            .unwrap_or(0);
+                        app.list_state.select(Some(idx));
+                    } else {
+                        app.list_state.select(None);
                     }
+                    app.post_delete_select = None;
                     app.screen = Screen::Snapshots;
                 }
                 Err(e) => {
@@ -140,7 +148,7 @@ fn run(
             continue;
         }
 
-        if matches!(app.screen, Screen::SnapshotDeleteContentsLoading) {
+        if matches!(app.screen, Screen::SnapshotDeleteLoading) {
             let Some(snap_id) = app.delete_target.clone() else {
                 app.screen = Screen::SnapshotDeleteError(
                     "No snapshot selected for deletion.".into(),
@@ -154,22 +162,27 @@ fn run(
                 );
                 continue;
             };
-            // 50 entries fits comfortably in a typical terminal and is enough
-            // to see past the path-prefix dirs into a snapshot's actual files.
             const PREVIEW_LIMIT: usize = 50;
-            let result = (|| {
+            let result = (|| -> anyhow::Result<_> {
+                let (parsed, raw) = restic::snapshot_details_json(profile, &snap_id)?;
                 let repo = open_indexed(profile)?;
-                preview_snapshot_contents(&repo, &snap_id, PREVIEW_LIMIT)
+                let preview = preview_snapshot_contents(&repo, &snap_id, PREVIEW_LIMIT)?;
+                Ok((parsed, raw, preview))
             })();
             match result {
-                Ok(preview) => {
+                Ok((parsed, raw, preview)) => {
+                    let has_entries = !preview.entries.is_empty();
+                    app.delete_details_parsed = Some(parsed);
+                    app.delete_details_raw = Some(raw);
                     app.delete_root_listing = Some(preview);
+                    app.delete_preview_state = ListState::default();
+                    if has_entries {
+                        app.delete_preview_state.select(Some(0));
+                    }
                     app.screen = Screen::SnapshotDeleteConfirm;
                 }
                 Err(e) => {
-                    app.screen = Screen::SnapshotDeleteError(format!(
-                        "Could not read snapshot contents: {e:#}"
-                    ));
+                    app.screen = Screen::SnapshotDeleteError(format!("{e:#}"));
                 }
             }
             continue;
@@ -191,6 +204,7 @@ fn run(
             };
             match restic::forget(profile, &snapshot_id) {
                 Ok(()) => {
+                    app.post_delete_select = app.list_state.selected();
                     app.delete_details_parsed = None;
                     app.delete_details_raw = None;
                     app.snapshots.clear();
