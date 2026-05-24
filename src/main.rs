@@ -2,6 +2,7 @@ mod app;
 mod cli;
 mod config;
 mod crypto;
+mod keychain;
 mod local_server;
 mod passphrase;
 mod repo;

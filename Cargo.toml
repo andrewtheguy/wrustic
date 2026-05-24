@@ -1,6 +1,6 @@
 [package]
 name = "wrustic"
-version = "0.0.22"
+version = "0.0.23-alpha1"
 edition = "2024"
 
 [dependencies]
@@ -29,4 +29,5 @@ tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "macros"] }
 toml = "0.8"
 tui-input = { version = "0.14", default-features = false, features = ["crossterm"] }
 url = "2"
+keyring = { version = "3", features = ["sync-secret-service"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
