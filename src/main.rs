@@ -2,6 +2,8 @@ mod app;
 mod cli;
 mod config;
 mod crypto;
+#[cfg(feature = "keychain")]
+mod keychain;
 mod local_server;
 mod passphrase;
 mod repo;
@@ -40,9 +42,19 @@ fn main() -> Result<()> {
             std::process::exit(2);
         }
     };
+    if cli.show_version {
+        println!("wrustic {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     if cli.show_help {
         println!("{USAGE}");
         return Ok(());
+    }
+
+    let mut no_keychain = cli.no_keychain;
+    #[cfg(feature = "keychain")]
+    if !no_keychain && !keychain::init_store() {
+        no_keychain = true;
     }
 
     let mut terminal = ratatui::init();
@@ -51,7 +63,7 @@ fn main() -> Result<()> {
     // selection; users can hold Shift to bypass and select text.
     let mouse_enabled = !cli.no_mouse
         && crossterm::execute!(std::io::stdout(), EnableMouseCapture).is_ok();
-    let result = run(&mut terminal, cli.config_dir, cli.port);
+    let result = run(&mut terminal, cli.config_dir, cli.port, no_keychain);
     if mouse_enabled {
         let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     }
@@ -63,8 +75,9 @@ fn run(
     terminal: &mut DefaultTerminal,
     config_dir: Option<PathBuf>,
     server_port: u16,
+    no_keychain: bool,
 ) -> Result<()> {
-    let mut app = App::boot(config_dir, server_port)?;
+    let mut app = App::boot(config_dir, server_port, no_keychain)?;
 
     while !app.quit {
         terminal.draw(|f| render(f, &mut app))?;

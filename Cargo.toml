@@ -1,6 +1,6 @@
 [package]
 name = "wrustic"
-version = "0.0.22"
+version = "0.0.23"
 edition = "2024"
 
 [dependencies]
@@ -29,4 +29,14 @@ tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "macros"] }
 toml = "0.8"
 tui-input = { version = "0.14", default-features = false, features = ["crossterm"] }
 url = "2"
+keyring-core = { version = "1", optional = true }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1", features = ["keychain"], optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+dbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"], optional = true }
+
+[features]
+keychain = ["dep:keyring-core", "dep:apple-native-keyring-store", "dep:dbus-secret-service-keyring-store"]
