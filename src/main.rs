@@ -42,9 +42,18 @@ fn main() -> Result<()> {
             std::process::exit(2);
         }
     };
+    if cli.show_version {
+        println!("wrustic {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     if cli.show_help {
         println!("{USAGE}");
         return Ok(());
+    }
+
+    #[cfg(feature = "keychain")]
+    if !cli.no_keychain {
+        keychain::init_store();
     }
 
     let mut terminal = ratatui::init();

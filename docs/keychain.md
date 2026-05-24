@@ -12,11 +12,14 @@ default**. The prebuilt macOS binary ships with it; the Linux binaries do not.
 cargo build --release --features keychain
 ```
 
+The feature uses `keyring-core` with platform-specific credential stores:
+`apple-native-keyring-store` on macOS, `dbus-secret-service-keyring-store` on
+Linux.
+
 ### Why not enabled on Linux by default
 
 Linux is frequently used headless (servers, containers, SSH sessions) where no
-keyring daemon is available. The underlying `keyring` crate talks to D-Bus
-secret-service (GNOME Keyring, KDE Wallet), which requires:
+keyring daemon is available. The D-Bus secret-service store requires:
 
 - `libdbus-1-dev` at **build time**
 - A running secret-service daemon at **runtime**
@@ -67,9 +70,9 @@ When keychain is enabled and the user chooses the terminal auth method:
 
 ## Supported backends
 
-The `keyring` crate selects the backend by platform:
+Platform credential stores (via `keyring-core`):
 
-| Platform | Backend |
-|----------|---------|
-| macOS    | macOS Keychain (Security.framework) |
-| Linux    | D-Bus secret-service (GNOME Keyring / KDE Wallet) |
+| Platform | Store crate | Backend |
+|----------|-------------|---------|
+| macOS    | `apple-native-keyring-store` | macOS Keychain (Security.framework) |
+| Linux    | `dbus-secret-service-keyring-store` | D-Bus secret-service (GNOME Keyring / KDE Wallet) |

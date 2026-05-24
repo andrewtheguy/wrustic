@@ -17,6 +17,7 @@ Options:
       --no-mouse              Disable mouse reporting (useful for QA / copy-paste).
       --no-keychain           Disable keychain integration even when the binary
                               was built with the 'keychain' feature.
+  -V, --version               Print version and exit.
   -h, --help                  Print this help text.
 ";
 
@@ -25,6 +26,7 @@ pub(crate) struct Cli {
     pub(crate) port: u16,
     pub(crate) no_mouse: bool,
     pub(crate) no_keychain: bool,
+    pub(crate) show_version: bool,
     pub(crate) show_help: bool,
 }
 
@@ -35,6 +37,7 @@ impl Default for Cli {
             port: DEFAULT_SERVER_PORT,
             no_mouse: false,
             no_keychain: false,
+            show_version: false,
             show_help: false,
         }
     }
@@ -46,6 +49,7 @@ pub(crate) fn parse_cli() -> Result<Cli> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => cli.show_help = true,
+            "-V" | "--version" | "version" => cli.show_version = true,
             "--no-mouse" => cli.no_mouse = true,
             "--no-keychain" => cli.no_keychain = true,
             "-c" | "--config-dir" => {
