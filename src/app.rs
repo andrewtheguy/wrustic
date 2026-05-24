@@ -233,6 +233,7 @@ pub(crate) struct App {
     pub(crate) passphrase_setup_code: Option<String>,
     pub(crate) passphrase_phase: Option<PassphrasePhase>,
 
+    pub(crate) no_keychain: bool,
     pub(crate) save_to_keychain: bool,
 
     pub(crate) auth_method_list: ListState,
@@ -322,6 +323,7 @@ impl App {
     pub(crate) fn boot(
         config_dir: Option<PathBuf>,
         server_port: u16,
+        no_keychain: bool,
     ) -> Result<Self> {
         let paths = config::paths(config_dir)?;
         let mut auth_method_list = ListState::default();
@@ -344,6 +346,7 @@ impl App {
             passphrase_short_url: None,
             passphrase_setup_code: None,
             passphrase_phase: None,
+            no_keychain,
             save_to_keychain: true,
             auth_method_list,
             backend_list,
@@ -406,6 +409,10 @@ impl App {
 
         app.start_passphrase_ceremony();
         Ok(app)
+    }
+
+    pub(crate) fn keychain_enabled(&self) -> bool {
+        cfg!(feature = "keychain") && !self.no_keychain
     }
 
     fn load_config_or_set_fatal(&mut self) {
@@ -490,23 +497,26 @@ impl App {
                 self.launch_passphrase_server(PassphrasePhase::Setup, None, &instance);
             }
             (PassphrasePhase::Unlock, false) => {
-                let instance = self
-                    .config
-                    .passphrase
-                    .as_ref()
-                    .map(|m| m.instance.as_str())
-                    .unwrap_or("");
-                if let Some(pw) = crate::keychain::load_passphrase(instance) {
-                    self.passphrase_input = Input::new(pw);
-                    self.passphrase_error = None;
-                    self.screen = Screen::PassphraseDerivingKey;
-                } else {
-                    self.passphrase_input = Input::default();
-                    self.passphrase_error = None;
-                    self.save_to_keychain = true;
-                    self.field_focus = 0;
-                    self.screen = Screen::PassphraseUnlock;
+                #[cfg(feature = "keychain")]
+                if self.keychain_enabled() {
+                    let instance = self
+                        .config
+                        .passphrase
+                        .as_ref()
+                        .map(|m| m.instance.as_str())
+                        .unwrap_or("");
+                    if let Some(pw) = crate::keychain::load_passphrase(instance) {
+                        self.passphrase_input = Input::new(pw);
+                        self.passphrase_error = None;
+                        self.screen = Screen::PassphraseDerivingKey;
+                        return;
+                    }
                 }
+                self.passphrase_input = Input::default();
+                self.passphrase_error = None;
+                self.save_to_keychain = true;
+                self.field_focus = 0;
+                self.screen = Screen::PassphraseUnlock;
             }
             (PassphrasePhase::Unlock, true) => {
                 let meta = self.config.passphrase.clone();
@@ -622,7 +632,9 @@ impl App {
                     self.paths.config.display()
                 ));
             }
-            if self.save_to_keychain
+            #[cfg(feature = "keychain")]
+            if self.keychain_enabled()
+                && self.save_to_keychain
                 && let Err(e) = crate::keychain::save_passphrase(
                     &self.passphrase_instance_value,
                     &passphrase,
@@ -649,7 +661,9 @@ impl App {
             let instance_sig = meta.instance_sig.clone();
             self.cipher = Some(Cipher::new(config_key, instance.clone(), &instance_sig));
             self.load_config_or_set_fatal();
-            if self.save_to_keychain
+            #[cfg(feature = "keychain")]
+            if self.keychain_enabled()
+                && self.save_to_keychain
                 && let Err(e) = crate::keychain::save_passphrase(&instance, &passphrase)
             {
                 self.screen = Screen::Error(format!("Keychain unavailable \u{2014} passphrase not saved: {e}"));
@@ -1291,19 +1305,19 @@ impl App {
             },
 
             Screen::PassphraseSetup => {
-                const N: usize = 3;
+                let n: usize = if self.keychain_enabled() { 3 } else { 2 };
                 match key.code {
                     KeyCode::Tab | KeyCode::Down => {
-                        self.field_focus = (self.field_focus + 1) % N;
+                        self.field_focus = (self.field_focus + 1) % n;
                     }
                     KeyCode::BackTab | KeyCode::Up => {
-                        self.field_focus = (self.field_focus + N - 1) % N;
+                        self.field_focus = (self.field_focus + n - 1) % n;
                     }
-                    KeyCode::Char(' ') if self.field_focus == 2 => {
+                    KeyCode::Char(' ') if self.keychain_enabled() && self.field_focus == 2 => {
                         self.save_to_keychain = !self.save_to_keychain;
                     }
                     KeyCode::Enter => {
-                        if self.field_focus == 2 {
+                        if self.keychain_enabled() && self.field_focus == 2 {
                             self.save_to_keychain = !self.save_to_keychain;
                         } else {
                             self.submit_passphrase_setup();
@@ -1328,14 +1342,14 @@ impl App {
                 }
             }
 
-            Screen::PassphraseUnlock => {
-                const N: usize = 2;
+            Screen::PassphraseUnlock => if self.keychain_enabled() {
+                let n: usize = 2;
                 match key.code {
                     KeyCode::Tab | KeyCode::Down => {
-                        self.field_focus = (self.field_focus + 1) % N;
+                        self.field_focus = (self.field_focus + 1) % n;
                     }
                     KeyCode::BackTab | KeyCode::Up => {
-                        self.field_focus = (self.field_focus + N - 1) % N;
+                        self.field_focus = (self.field_focus + n - 1) % n;
                     }
                     KeyCode::Char(' ') if self.field_focus == 1 => {
                         self.save_to_keychain = !self.save_to_keychain;
@@ -1354,6 +1368,16 @@ impl App {
                         if self.field_focus == 0 {
                             self.passphrase_input.handle_event(&Event::Key(key));
                         }
+                    }
+                }
+            } else {
+                match key.code {
+                    KeyCode::Enter => self.submit_passphrase_unlock(),
+                    KeyCode::Esc => {
+                        self.quit = true;
+                    }
+                    _ => {
+                        self.passphrase_input.handle_event(&Event::Key(key));
                     }
                 }
             }
@@ -2381,7 +2405,7 @@ mod tests {
             std::process::id(),
             uniq()
         ));
-        let mut app = App::boot(Some(tmp), 7834).expect("boot");
+        let mut app = App::boot(Some(tmp), 7834, false).expect("boot");
         app.snapshots = snaps;
         app
     }

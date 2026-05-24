@@ -58,7 +58,7 @@ cargo run
 ### CLI flags
 
 ```text
-wrustic [-c|--config-dir <PATH>] [-p|--port <N>] [--browser-auth] [-h|--help]
+wrustic [-c|--config-dir <PATH>] [-p|--port <N>] [--browser-auth] [--no-keychain] [-h|--help]
 ```
 
 `--config-dir <PATH>` overrides the default config location
@@ -73,6 +73,11 @@ The directory is created on first run if it doesn't exist.
 
 `--port <N>` selects the localhost port for the file-share dialog and the
 passphrase ceremony (default: 7834).
+
+`--no-keychain` disables keychain integration at runtime, even when the
+binary was built with the `keychain` feature. See
+[`docs/keychain.md`](docs/keychain.md) for details on keychain support,
+why it is not enabled on Linux by default, and how to build with it.
 
 `--browser-auth` uses a browser-based ceremony for passphrase input
 instead of typing the passphrase in the terminal:

@@ -36,7 +36,7 @@ fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_bottom_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let text = bottom_bar_text(&app.screen);
+    let text = bottom_bar_text(app);
     let content_width = area.width.saturating_sub(2) as usize;
     let segments: Vec<&str> = text.split("  ").collect();
     let footer_line = build_footer_line(&segments, content_width);
@@ -76,8 +76,8 @@ fn build_footer_line(segments: &[&str], width: usize) -> Line<'static> {
     Line::from(Span::styled(joined, style))
 }
 
-fn bottom_bar_text(screen: &Screen) -> &'static str {
-    match screen {
+fn bottom_bar_text(app: &App) -> &'static str {
+    match &app.screen {
         Screen::Home => "j/k move  PgUp/PgDn page  Enter open  n new  e edit  d delete  q quit",
         Screen::Snapshots => {
             "j/k move  PgUp/PgDn page  g/G top/bottom  Enter browse  c compare  f filter  d delete  r refresh  q/Esc back"
@@ -97,8 +97,16 @@ fn bottom_bar_text(screen: &Screen) -> &'static str {
         }
         Screen::ShareUrl => "Esc/Backspace/q back (stops the server)",
         Screen::PassphraseInstancePrompt => "type  Enter submit  Esc quit",
-        Screen::PassphraseSetup => "Tab/Shift+Tab field  Space toggle  Enter submit  Esc back",
-        Screen::PassphraseUnlock => "Tab/Shift+Tab field  Space toggle  Enter submit  Esc quit",
+        Screen::PassphraseSetup => if app.keychain_enabled() {
+            "Tab/Shift+Tab field  Space toggle  Enter submit  Esc back"
+        } else {
+            "Tab/Shift+Tab field  Enter submit  Esc back"
+        },
+        Screen::PassphraseUnlock => if app.keychain_enabled() {
+            "Tab/Shift+Tab field  Space toggle  Enter submit  Esc quit"
+        } else {
+            "type  Enter submit  Esc quit"
+        },
         Screen::PassphraseDerivingKey => "working…",
         Screen::AuthMethodChoice => "j/k move  Enter pick  Esc back",
         Screen::PassphraseUrl => "Esc/q quit",
@@ -850,8 +858,13 @@ fn render_file_details(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_auth_method_choice(frame: &mut Frame, app: &mut App, area: Rect) {
+    let terminal_label = if app.keychain_enabled() {
+        "Keychain-assisted terminal"
+    } else {
+        "Enter passphrase in terminal"
+    };
     let items = vec![
-        ListItem::new("Keychain-assisted terminal"),
+        ListItem::new(terminal_label),
         ListItem::new("Enter passphrase in browser"),
     ];
     let phase_label = match app.passphrase_phase {
@@ -874,29 +887,37 @@ fn render_passphrase_setup(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         format!("Set passphrase \u{2014} {}", app.passphrase_instance_value)
     };
-    let outer = Block::bordered().title(title);
-    let inner_area = outer.inner(area);
-    frame.render_widget(outer, area);
-
-    let areas = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Length(3),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Fill(1),
-    ])
-    .split(inner_area);
-
-    draw_input_field(frame, areas[0], "Passphrase", &app.passphrase_input, true, app.field_focus == 0);
-    draw_input_field(frame, areas[1], "Confirm passphrase", &app.passphrase_confirm, true, app.field_focus == 1);
-    render_keychain_checkbox(frame, areas[2], app.save_to_keychain, app.field_focus == 2);
-
     let help = app
         .passphrase_error
         .as_deref()
         .unwrap_or("Min 12 chars, requires lowercase, uppercase, digit, and special character.");
-    let help_para = Paragraph::new(help).style(Style::new().fg(Color::White));
-    frame.render_widget(help_para, areas[3]);
+
+    if app.keychain_enabled() {
+        let outer = Block::bordered().title(title);
+        let inner_area = outer.inner(area);
+        frame.render_widget(outer, area);
+
+        let areas = Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+        ])
+        .split(inner_area);
+
+        draw_input_field(frame, areas[0], "Passphrase", &app.passphrase_input, true, app.field_focus == 0);
+        draw_input_field(frame, areas[1], "Confirm passphrase", &app.passphrase_confirm, true, app.field_focus == 1);
+        render_keychain_checkbox(frame, areas[2], app.save_to_keychain, app.field_focus == 2);
+        let help_para = Paragraph::new(help).style(Style::new().fg(Color::White));
+        frame.render_widget(help_para, areas[3]);
+    } else {
+        let fields = [
+            ("Passphrase", &app.passphrase_input, true),
+            ("Confirm passphrase", &app.passphrase_confirm, true),
+        ];
+        render_grouped_input(frame, area, &title, &fields, app.field_focus, help);
+    }
 }
 
 fn render_passphrase_unlock(frame: &mut Frame, app: &App, area: Rect) {
@@ -913,24 +934,27 @@ fn render_passphrase_unlock(frame: &mut Frame, app: &App, area: Rect) {
         "Enter the passphrase to decrypt the config.".to_string()
     };
 
-    let outer = Block::bordered().title(title);
-    let inner_area = outer.inner(area);
-    frame.render_widget(outer, area);
+    if app.keychain_enabled() {
+        let outer = Block::bordered().title(title);
+        let inner_area = outer.inner(area);
+        frame.render_widget(outer, area);
 
-    let areas = Layout::vertical([
-        Constraint::Fill(1),
-        Constraint::Length(3),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Fill(1),
-    ])
-    .split(inner_area);
+        let areas = Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+        ])
+        .split(inner_area);
 
-    draw_input_field(frame, areas[1], "Passphrase", &app.passphrase_input, true, app.field_focus == 0);
-    render_keychain_checkbox(frame, areas[2], app.save_to_keychain, app.field_focus == 1);
-
-    let help_para = Paragraph::new(help).style(Style::new().fg(Color::White));
-    frame.render_widget(help_para, areas[3]);
+        draw_input_field(frame, areas[1], "Passphrase", &app.passphrase_input, true, app.field_focus == 0);
+        render_keychain_checkbox(frame, areas[2], app.save_to_keychain, app.field_focus == 1);
+        let help_para = Paragraph::new(help).style(Style::new().fg(Color::White));
+        frame.render_widget(help_para, areas[3]);
+    } else {
+        render_input(frame, area, &title, &app.passphrase_input, true, &help);
+    }
 }
 
 fn render_passphrase_url(frame: &mut Frame, app: &mut App, area: Rect) {

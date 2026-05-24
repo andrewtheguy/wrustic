@@ -2,6 +2,7 @@ mod app;
 mod cli;
 mod config;
 mod crypto;
+#[cfg(feature = "keychain")]
 mod keychain;
 mod local_server;
 mod passphrase;
@@ -52,7 +53,7 @@ fn main() -> Result<()> {
     // selection; users can hold Shift to bypass and select text.
     let mouse_enabled = !cli.no_mouse
         && crossterm::execute!(std::io::stdout(), EnableMouseCapture).is_ok();
-    let result = run(&mut terminal, cli.config_dir, cli.port);
+    let result = run(&mut terminal, cli.config_dir, cli.port, cli.no_keychain);
     if mouse_enabled {
         let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     }
@@ -64,8 +65,9 @@ fn run(
     terminal: &mut DefaultTerminal,
     config_dir: Option<PathBuf>,
     server_port: u16,
+    no_keychain: bool,
 ) -> Result<()> {
-    let mut app = App::boot(config_dir, server_port)?;
+    let mut app = App::boot(config_dir, server_port, no_keychain)?;
 
     while !app.quit {
         terminal.draw(|f| render(f, &mut app))?;
