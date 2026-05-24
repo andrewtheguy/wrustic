@@ -98,6 +98,8 @@ fn run(
                             .map(|i| i.min(len - 1))
                             .unwrap_or(0);
                         app.list_state.select(Some(idx));
+                    } else {
+                        app.list_state.select(None);
                     }
                     app.post_delete_select = None;
                     app.screen = Screen::Snapshots;
