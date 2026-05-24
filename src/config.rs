@@ -251,22 +251,18 @@ fn encrypt_profile_fields(profile: &mut Profile, cipher: &Cipher) -> Result<()> 
         }
         Profile::Rest {
             password,
-            rest_user,
             rest_password,
             ..
         } => {
             encrypt_field(password, cipher)?;
-            encrypt_field(rest_user, cipher)?;
             encrypt_field(rest_password, cipher)?;
         }
         Profile::S3 {
             password,
-            s3_access_key,
             s3_secret_key,
             ..
         } => {
             encrypt_field(password, cipher)?;
-            encrypt_field(s3_access_key, cipher)?;
             encrypt_field(s3_secret_key, cipher)?;
         }
     }
@@ -280,22 +276,18 @@ fn decrypt_profile_fields(profile: &mut Profile, cipher: &Cipher) -> Result<()> 
         }
         Profile::Rest {
             password,
-            rest_user,
             rest_password,
             ..
         } => {
             decrypt_field(password, cipher)?;
-            decrypt_field(rest_user, cipher)?;
             decrypt_field(rest_password, cipher)?;
         }
         Profile::S3 {
             password,
-            s3_access_key,
             s3_secret_key,
             ..
         } => {
             decrypt_field(password, cipher)?;
-            decrypt_field(s3_access_key, cipher)?;
             decrypt_field(s3_secret_key, cipher)?;
         }
     }
@@ -440,7 +432,7 @@ mod tests {
         let parsed: toml::Value = toml::from_str(&raw)?;
         let rest = &parsed["profiles"]["rest-auth"];
         assert_eq!(rest["rest_url"].as_str().unwrap(), "https://r.example.com/repo/");
-        assert!(crate::crypto::is_passphrase_encrypted(rest["rest_user"].as_str().unwrap()));
+        assert_eq!(rest["rest_user"].as_str().unwrap(), "andrew");
         assert!(crate::crypto::is_passphrase_encrypted(rest["rest_password"].as_str().unwrap()));
 
         let loaded = load(&paths, &cipher)?;
