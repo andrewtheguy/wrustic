@@ -5,19 +5,27 @@ repositories, built on [`rustic_core`](https://crates.io/crates/rustic_core)
 and [`ratatui`](https://crates.io/crates/ratatui).
 
 `wrustic` is read-only by design — write operations are out of scope, not a
-backlog item. The currently supported backends are **local**, **REST-server**,
-and **S3**, opened from a saved profile whose secrets (repository password, S3
-keys) are encrypted on disk with a passphrase.
+backlog item.
 
-## Status
+## Features
 
-Implemented:
-- Named profiles stored in `~/.config/wrustic/config.toml`; secret fields are
-  encrypted per-value with a passphrase-derived key (AES-256-GCM)
-- Profile management screens: create new, delete existing (edit comes later)
-- Snapshot listing (short ID, time, host, tags, paths), sorted by time
-- Keyboard navigation (`j`/`k`, arrow keys, Home/End, `g`/`G`) and quit (`q` / Esc / Ctrl-C)
-- Error screen on bad password / bad path, returning to the menu without restarting
+- **Backends**: local filesystem, REST-server, and S3
+- **Profile management**: create, edit, and delete saved profiles; secrets
+  (repository password, S3 keys) are encrypted per-value with AES-256-GCM
+  under a passphrase-derived key
+- **Snapshot browsing**: list snapshots, navigate the file tree, view file
+  details, and compare two snapshots side-by-side
+- **Snapshot filtering**: narrow by host, tag, or path
+- **Snapshot deletion** via `restic forget`
+- **File sharing**: one-time signed download URLs served from localhost
+- **Keyboard and mouse navigation**: Vim-style keys, arrow keys, PgUp/PgDn,
+  mouse click/scroll; `--no-mouse` to disable
+- **Passphrase entry**: terminal input or browser-based ceremony
+  (`--browser-auth`)
+- **Keychain integration** (macOS): optionally save the passphrase to the OS
+  keychain for auto-unlock; see [`docs/keychain.md`](docs/keychain.md)
+
+See [`docs/roadmap.md`](docs/roadmap.md) for planned features.
 
 ## Install (prebuilt binary)
 
