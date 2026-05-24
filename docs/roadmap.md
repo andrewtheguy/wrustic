@@ -1,6 +1,6 @@
 # Roadmap
 
-- Read passphrase from stdin (for scripted / non-interactive use)
+- Read passphrase from stdin (for securely passing passwords from external tools like password managers)
 - Directory-level diff: compare arbitrary subdirectories across arbitrary snapshots
   — e.g. compare `/photos` in one snapshot against `/backup/old-photos`
   in another — useful for backups from different machines or after a
