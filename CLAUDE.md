@@ -1,5 +1,5 @@
 - no backward compatibility of any kind since it is a private and personal project.
-- use restic cli for write operations or operations not supported by wrustic for dev flows
+- use restic cli only for write operations in dev flows (init, backup, forget, etc.). All read operations should use rustic_core natively, not shell out to restic
 - use this project root's tmp/ folder for dev/test data and workspace to avoid permission issues
 - run cargo clippy and cargo test with --all-features after rust code changes, don't run cargo fmt because it affects diff
 - for local testing, use alternative config dir such as cargo run -- --config-dir ./tmp/wrustic-sandbox so that it won't interfere production config in ~/.config/wrustic
