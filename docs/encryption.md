@@ -248,9 +248,9 @@ Same skeleton as `src/share.rs`:
 - One OS thread spawned in `passphrase::start()`, one
   `tokio::runtime::Builder::new_current_thread()` per thread. No shared
   executor, no global runtime.
-- Bind on `127.0.0.1:<port>` (the binary's `--port`, default 7834, shared
-  with the share dialog because the two flows are never simultaneously
-  active). User-facing URL uses `<instance>.wrustic.localhost`.
+- Bind on `127.0.0.1:<port>` and `[::1]:<port>` (the binary's `--port`,
+  default 7834, shared with the share dialog because the two flows are never
+  simultaneously active). User-facing URL uses `<instance>.wrustic.localhost`.
 - Returns a `PassphraseHandle { short_url, setup_code, phase, rx, deadline,
   shutdown_tx, join_handle }` that owns the resources. Drop sends the
   shutdown oneshot; explicit `.stop()` also joins the thread (port

@@ -1,9 +1,10 @@
-// A one-file, signed-URL localhost downloader bound to the File Details
-// screen. Each ShareHandle owns a Tokio runtime on its own OS thread, a
-// hyper http1 listener on 127.0.0.1:<port>, and a Repository opened with the
-// full blob index/cache. The server serves only the (snap_id, tree_id, name)
-// it was started with — never anything else — so a URL minted for file A can
-// never be replayed against a server later started for file B.
+// A one-file, signed-URL localhost downloader for the File Details screen.
+// Each ShareHandle owns a Tokio runtime on its own OS thread, HTTP/1 listeners
+// on 127.0.0.1:<port> and [::1]:<port>, and a Repository opened with the full
+// blob index/cache.
+//
+// The server is bound to exactly one (snap_id, tree_id, name). A URL minted for
+// file A cannot be replayed against a later server started for file B.
 
 use std::convert::Infallible;
 use std::io;
@@ -28,6 +29,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::Profile;
+use crate::local_server;
 use crate::repo::{open_indexed_full, stream_file_content};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -46,7 +48,7 @@ pub(crate) struct ShareTarget {
 
 pub(crate) struct ShareHandle {
     pub(crate) url: String,
-    // Short alias: http://127.0.0.1:<port>/s/<short_id>. The server holds
+    // Short alias: http://localhost:<port>/s/<short_id>. The server holds
     // <short_id> in-memory and 302-redirects it to the fixed long URL.
     // The short id is freshly generated on every `start` call.
     pub(crate) short_url: String,
@@ -154,8 +156,8 @@ pub(crate) fn build_signed_url(
         .finish();
     let path = format!("/dl?{qs}");
     // User-facing host is `localhost` (better authenticator/browser
-    // compatibility than the bare IPv4 literal); the listener still binds
-    // to 127.0.0.1 below.
+    // compatibility than a bare IP literal); listeners bind both IPv4 and
+    // IPv6 loopback below.
     (format!("http://localhost:{port}{path}"), path, exp)
 }
 
@@ -196,12 +198,8 @@ pub(crate) fn start(
     }
 
     // Bind synchronously so EADDRINUSE/permission errors surface before we
-    // spin up a runtime. Hand the listener to tokio after.
-    let listener_std = std::net::TcpListener::bind(("127.0.0.1", port))
-        .map_err(|e| anyhow!("bind 127.0.0.1:{port}: {e}"))?;
-    listener_std
-        .set_nonblocking(true)
-        .map_err(|e| anyhow!("set_nonblocking: {e}"))?;
+    // spin up a runtime. Hand the listeners to tokio after.
+    let listeners_std = local_server::bind_localhost(port)?;
 
     let repo = open_indexed_full(&profile)?;
 
@@ -236,11 +234,15 @@ pub(crate) fn start(
                 Err(_) => return,
             };
             rt.block_on(async move {
-                let listener = match TcpListener::from_std(listener_std) {
-                    Ok(l) => l,
-                    Err(_) => return,
-                };
-                accept_loop(listener, thread_ctx, shutdown_rx).await;
+                let mut listeners = Vec::with_capacity(listeners_std.len());
+                for listener_std in listeners_std {
+                    let listener = match TcpListener::from_std(listener_std) {
+                        Ok(l) => l,
+                        Err(_) => return,
+                    };
+                    listeners.push(listener);
+                }
+                accept_loop(listeners, thread_ctx, shutdown_rx).await;
             });
         })
         .map_err(|e| anyhow!("spawning share thread: {e}"))?;
@@ -255,28 +257,34 @@ pub(crate) fn start(
 }
 
 async fn accept_loop(
-    listener: TcpListener,
+    listeners: Vec<TcpListener>,
     ctx: Arc<Ctx>,
-    mut shutdown_rx: oneshot::Receiver<()>,
+    shutdown_rx: oneshot::Receiver<()>,
 ) {
+    for listener in listeners {
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            accept_one(listener, ctx).await;
+        });
+    }
+
+    let _ = shutdown_rx.await;
+}
+
+async fn accept_one(listener: TcpListener, ctx: Arc<Ctx>) {
     loop {
-        tokio::select! {
-            _ = &mut shutdown_rx => break,
-            res = listener.accept() => {
-                let stream = match res {
-                    Ok((s, _)) => s,
-                    Err(_) => continue,
-                };
-                let ctx = ctx.clone();
-                tokio::spawn(async move {
-                    let io = TokioIo::new(stream);
-                    let svc = service_fn(move |req| handle(req, ctx.clone()));
-                    let _ = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(io, svc)
-                        .await;
-                });
-            }
-        }
+        let stream = match listener.accept().await {
+            Ok((s, _)) => s,
+            Err(_) => continue,
+        };
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            let io = TokioIo::new(stream);
+            let svc = service_fn(move |req| handle(req, ctx.clone()));
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, svc)
+                .await;
+        });
     }
 }
 
@@ -675,9 +683,9 @@ mod tests {
 
         // Bind to an ephemeral port instead of 7834 so this test can run
         // alongside a real wrustic instance.
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
+        let listeners = crate::local_server::bind_localhost(0).unwrap();
+        let port = listeners[0].local_addr().unwrap().port();
+        drop(listeners);
 
         let key = [0x77u8; 32];
 

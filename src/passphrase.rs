@@ -25,6 +25,7 @@ use tokio::sync::oneshot;
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret as X25519Secret};
 
 use crate::config::PassphraseMeta;
+use crate::local_server;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -216,11 +217,7 @@ pub(crate) fn start(
     existing: Option<PassphraseMeta>,
     instance: &str,
 ) -> Result<PassphraseHandle> {
-    let listener_std = std::net::TcpListener::bind(("127.0.0.1", port))
-        .map_err(|e| anyhow!("bind 127.0.0.1:{port}: {e}"))?;
-    listener_std
-        .set_nonblocking(true)
-        .map_err(|e| anyhow!("set_nonblocking: {e}"))?;
+    let listeners_std = local_server::bind_localhost(port)?;
 
     let (salt_b64, expected_instance_sig) = match phase {
         PassphrasePhase::Setup => {
@@ -285,11 +282,15 @@ pub(crate) fn start(
                 Err(_) => return,
             };
             rt.block_on(async move {
-                let listener = match TcpListener::from_std(listener_std) {
-                    Ok(l) => l,
-                    Err(_) => return,
-                };
-                accept_loop(listener, thread_ctx, shutdown_rx).await;
+                let mut listeners = Vec::with_capacity(listeners_std.len());
+                for listener_std in listeners_std {
+                    let listener = match TcpListener::from_std(listener_std) {
+                        Ok(l) => l,
+                        Err(_) => return,
+                    };
+                    listeners.push(listener);
+                }
+                accept_loop(listeners, thread_ctx, shutdown_rx).await;
             });
         })
         .map_err(|e| anyhow!("spawning passphrase thread: {e}"))?;
@@ -308,28 +309,34 @@ pub(crate) fn start(
 }
 
 async fn accept_loop(
-    listener: TcpListener,
+    listeners: Vec<TcpListener>,
     ctx: Arc<Ctx>,
-    mut shutdown_rx: oneshot::Receiver<()>,
+    shutdown_rx: oneshot::Receiver<()>,
 ) {
+    for listener in listeners {
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            accept_one(listener, ctx).await;
+        });
+    }
+
+    let _ = shutdown_rx.await;
+}
+
+async fn accept_one(listener: TcpListener, ctx: Arc<Ctx>) {
     loop {
-        tokio::select! {
-            _ = &mut shutdown_rx => break,
-            res = listener.accept() => {
-                let stream = match res {
-                    Ok((s, _)) => s,
-                    Err(_) => continue,
-                };
-                let ctx = ctx.clone();
-                tokio::spawn(async move {
-                    let io = TokioIo::new(stream);
-                    let svc = service_fn(move |req| handle(req, ctx.clone()));
-                    let _ = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(io, svc)
-                        .await;
-                });
-            }
-        }
+        let stream = match listener.accept().await {
+            Ok((s, _)) => s,
+            Err(_) => continue,
+        };
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            let io = TokioIo::new(stream);
+            let svc = service_fn(move |req| handle(req, ctx.clone()));
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, svc)
+                .await;
+        });
     }
 }
 
@@ -979,9 +986,9 @@ mod tests {
     }
 
     fn ephemeral_port() -> u16 {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
+        let listeners = crate::local_server::bind_localhost(0).unwrap();
+        let port = listeners[0].local_addr().unwrap().port();
+        drop(listeners);
         port
     }
 
