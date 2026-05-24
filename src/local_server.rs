@@ -3,10 +3,12 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpLi
 
 use anyhow::{Result, anyhow};
 
+const MAX_EPHEMERAL_BIND_RETRIES: u32 = 64;
+
 pub(crate) fn bind_localhost(port: u16) -> Result<Vec<TcpListener>> {
     if port == 0 {
         let mut last_err = None;
-        for _ in 0..64 {
+        for _ in 0..MAX_EPHEMERAL_BIND_RETRIES {
             match bind_localhost_once(0) {
                 Ok(listeners) => return Ok(listeners),
                 Err(e) => last_err = Some(e),

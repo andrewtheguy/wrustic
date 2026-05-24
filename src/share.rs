@@ -1,10 +1,10 @@
-// A one-file, signed-URL localhost downloader bound to the File Details
-// screen. Each ShareHandle owns a Tokio runtime on its own OS thread, a
-// hyper http1 listeners on 127.0.0.1:<port> and [::1]:<port>, and a Repository
-// opened with the full blob index/cache. The server serves only the
-// (snap_id, tree_id, name) it was started with — never anything else — so a URL
-// minted for file A can never be replayed against a server later started for
-// file B.
+// A one-file, signed-URL localhost downloader for the File Details screen.
+// Each ShareHandle owns a Tokio runtime on its own OS thread, HTTP/1 listeners
+// on 127.0.0.1:<port> and [::1]:<port>, and a Repository opened with the full
+// blob index/cache.
+//
+// The server is bound to exactly one (snap_id, tree_id, name). A URL minted for
+// file A cannot be replayed against a later server started for file B.
 
 use std::convert::Infallible;
 use std::io;
