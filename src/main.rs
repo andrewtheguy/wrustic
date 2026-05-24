@@ -28,7 +28,7 @@ use ratatui::widgets::ListState;
 use crate::app::{App, BrowseFrame, Screen};
 use crate::cli::{USAGE, parse_cli};
 use crate::repo::{
-    ContentRow, get_file_details, list_tree, load_snapshots, open_indexed,
+    ContentRow, diff_snapshots, get_file_details, list_tree, load_snapshots, open_indexed,
     preview_snapshot_contents, snapshot_root_tree, verify_profile,
 };
 use crate::ui::render;
@@ -220,7 +220,11 @@ fn run(
                     Screen::Error("Compare flow lost a snapshot id mid-flight.".into());
                 continue;
             };
-            match restic::diff(profile, &first, &second) {
+            let diff_result = (|| {
+                let repo = open_indexed(profile)?;
+                diff_snapshots(&repo, &first, &second)
+            })();
+            match diff_result {
                 Ok((sum, changes)) => {
                     let has_rows = !changes.is_empty();
                     app.compare_results = Some((sum, changes));

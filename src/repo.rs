@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 use std::io::{self, Write};
+use std::mem;
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use rustic_backend::BackendOptions;
-use rustic_core::repofile::NodeType;
+use rustic_core::repofile::{Node, NodeType};
 use rustic_core::{
     Credentials, IndexedFull, IndexedFullStatus, IndexedIdsStatus, Repository, RepositoryOptions,
     TreeId,
@@ -379,6 +380,233 @@ fn walk_preview(
             && let Some(sub) = subtree
         {
             walk_preview(repo, sub, &path, out, limit, truncated)?;
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot diff (native, no restic CLI)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DiffModifier {
+    Added,
+    Removed,
+    Modified,
+    TypeChanged,
+}
+
+impl DiffModifier {
+    pub(crate) fn as_char(self) -> char {
+        match self {
+            DiffModifier::Added => '+',
+            DiffModifier::Removed => '-',
+            DiffModifier::Modified => 'M',
+            DiffModifier::TypeChanged => 'T',
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct DiffChange {
+    pub(crate) modifier: DiffModifier,
+    pub(crate) path: String,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct DiffSummary {
+    pub(crate) changed_files: u64,
+    pub(crate) added_files: u64,
+    pub(crate) added_bytes: u64,
+    pub(crate) removed_files: u64,
+    pub(crate) removed_bytes: u64,
+}
+
+pub(crate) fn diff_snapshots(
+    repo: &Repository<IndexedIdsStatus>,
+    first_id: &str,
+    second_id: &str,
+) -> Result<(DiffSummary, Vec<DiffChange>)> {
+    let tree1 = snapshot_root_tree(repo, first_id)?;
+    let tree2 = snapshot_root_tree(repo, second_id)?;
+
+    let mut changes = Vec::new();
+    let mut summary = DiffSummary::default();
+
+    if tree1 != tree2 {
+        diff_trees(repo, tree1, tree2, "", &mut changes, &mut summary)?;
+    }
+
+    Ok((summary, changes))
+}
+
+fn diff_trees(
+    repo: &Repository<IndexedIdsStatus>,
+    tree1: TreeId,
+    tree2: TreeId,
+    prefix: &str,
+    changes: &mut Vec<DiffChange>,
+    summary: &mut DiffSummary,
+) -> Result<()> {
+    let nodes1 = repo.get_tree(&tree1)?.nodes;
+    let nodes2 = repo.get_tree(&tree2)?.nodes;
+
+    let mut i = 0;
+    let mut j = 0;
+    while i < nodes1.len() && j < nodes2.len() {
+        let n1 = &nodes1[i];
+        let n2 = &nodes2[j];
+        let raw1 = n1.name();
+        let raw2 = n2.name();
+        let name1 = raw1.to_string_lossy();
+        let name2 = raw2.to_string_lossy();
+
+        match name1.as_ref().cmp(name2.as_ref()) {
+            std::cmp::Ordering::Less => {
+                let path = format!("{prefix}/{name1}");
+                emit_node(n1, &path, DiffModifier::Removed, changes, summary);
+                if let Some(sub) = n1.subtree {
+                    collect_all_as(repo, sub, &path, DiffModifier::Removed, changes, summary)?;
+                }
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                let path = format!("{prefix}/{name2}");
+                emit_node(n2, &path, DiffModifier::Added, changes, summary);
+                if let Some(sub) = n2.subtree {
+                    collect_all_as(repo, sub, &path, DiffModifier::Added, changes, summary)?;
+                }
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                let path = format!("{prefix}/{name1}");
+                diff_matched_nodes(repo, n1, n2, &path, changes, summary)?;
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    for n in &nodes1[i..] {
+        let path = format!("{prefix}/{}", n.name().to_string_lossy());
+        emit_node(n, &path, DiffModifier::Removed, changes, summary);
+        if let Some(sub) = n.subtree {
+            collect_all_as(repo, sub, &path, DiffModifier::Removed, changes, summary)?;
+        }
+    }
+    for n in &nodes2[j..] {
+        let path = format!("{prefix}/{}", n.name().to_string_lossy());
+        emit_node(n, &path, DiffModifier::Added, changes, summary);
+        if let Some(sub) = n.subtree {
+            collect_all_as(repo, sub, &path, DiffModifier::Added, changes, summary)?;
+        }
+    }
+    Ok(())
+}
+
+fn diff_matched_nodes(
+    repo: &Repository<IndexedIdsStatus>,
+    n1: &Node,
+    n2: &Node,
+    path: &str,
+    changes: &mut Vec<DiffChange>,
+    summary: &mut DiffSummary,
+) -> Result<()> {
+    if mem::discriminant(&n1.node_type) != mem::discriminant(&n2.node_type) {
+        changes.push(DiffChange {
+            modifier: DiffModifier::TypeChanged,
+            path: path.to_string(),
+        });
+        return Ok(());
+    }
+
+    match (&n1.node_type, &n2.node_type) {
+        (NodeType::Dir, NodeType::Dir) => {
+            let s1 = n1.subtree;
+            let s2 = n2.subtree;
+            if s1 != s2
+                && let (Some(s1), Some(s2)) = (s1, s2)
+            {
+                diff_trees(repo, s1, s2, path, changes, summary)?;
+            }
+        }
+        (NodeType::File, NodeType::File) => {
+            if n1.content != n2.content {
+                changes.push(DiffChange {
+                    modifier: DiffModifier::Modified,
+                    path: path.to_string(),
+                });
+                summary.changed_files += 1;
+            }
+        }
+        (
+            NodeType::Symlink {
+                linktarget: lt1, ..
+            },
+            NodeType::Symlink {
+                linktarget: lt2, ..
+            },
+        ) => {
+            if lt1 != lt2 {
+                changes.push(DiffChange {
+                    modifier: DiffModifier::Modified,
+                    path: path.to_string(),
+                });
+            }
+        }
+        _ => {
+            if n1.node_type != n2.node_type {
+                changes.push(DiffChange {
+                    modifier: DiffModifier::Modified,
+                    path: path.to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn emit_node(
+    node: &Node,
+    path: &str,
+    modifier: DiffModifier,
+    changes: &mut Vec<DiffChange>,
+    summary: &mut DiffSummary,
+) {
+    changes.push(DiffChange {
+        modifier,
+        path: path.to_string(),
+    });
+    if matches!(node.node_type, NodeType::File) {
+        let size = node.meta.size;
+        match modifier {
+            DiffModifier::Added => {
+                summary.added_files += 1;
+                summary.added_bytes += size;
+            }
+            DiffModifier::Removed => {
+                summary.removed_files += 1;
+                summary.removed_bytes += size;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_all_as(
+    repo: &Repository<IndexedIdsStatus>,
+    tree_id: TreeId,
+    prefix: &str,
+    modifier: DiffModifier,
+    changes: &mut Vec<DiffChange>,
+    summary: &mut DiffSummary,
+) -> Result<()> {
+    let nodes = repo.get_tree(&tree_id)?.nodes;
+    for n in &nodes {
+        let path = format!("{prefix}/{}", n.name().to_string_lossy());
+        emit_node(n, &path, modifier, changes, summary);
+        if let Some(sub) = n.subtree {
+            collect_all_as(repo, sub, &path, modifier, changes, summary)?;
         }
     }
     Ok(())
