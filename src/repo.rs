@@ -517,6 +517,12 @@ fn diff_matched_nodes(
             modifier: DiffModifier::TypeChanged,
             path: path.to_string(),
         });
+        if let Some(sub) = n1.subtree {
+            collect_all_as(repo, sub, path, DiffModifier::Removed, changes, summary)?;
+        }
+        if let Some(sub) = n2.subtree {
+            collect_all_as(repo, sub, path, DiffModifier::Added, changes, summary)?;
+        }
         return Ok(());
     }
 
