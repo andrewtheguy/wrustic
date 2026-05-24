@@ -622,11 +622,13 @@ impl App {
                     self.paths.config.display()
                 ));
             }
-            if self.save_to_keychain {
-                let _ = crate::keychain::save_passphrase(
+            if self.save_to_keychain
+                && let Err(e) = crate::keychain::save_passphrase(
                     &self.passphrase_instance_value,
                     &passphrase,
-                );
+                )
+            {
+                self.screen = Screen::Error(format!("Keychain unavailable \u{2014} passphrase not saved: {e}"));
             }
         } else {
             let meta = self.config.passphrase.as_ref().expect("unlock requires meta");
@@ -647,8 +649,10 @@ impl App {
             let instance_sig = meta.instance_sig.clone();
             self.cipher = Some(Cipher::new(config_key, instance.clone(), &instance_sig));
             self.load_config_or_set_fatal();
-            if self.save_to_keychain {
-                let _ = crate::keychain::save_passphrase(&instance, &passphrase);
+            if self.save_to_keychain
+                && let Err(e) = crate::keychain::save_passphrase(&instance, &passphrase)
+            {
+                self.screen = Screen::Error(format!("Keychain unavailable \u{2014} passphrase not saved: {e}"));
             }
         }
         self.clear_passphrase_scratch();
