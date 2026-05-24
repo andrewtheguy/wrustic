@@ -1,18 +1,21 @@
 const SERVICE: &str = "wrustic";
 
-pub(crate) fn init_store() {
+pub(crate) fn init_store() -> bool {
     #[cfg(target_os = "macos")]
     {
         if let Ok(store) = apple_native_keyring_store::keychain::Store::new() {
             keyring_core::set_default_store(store);
+            return true;
         }
     }
     #[cfg(target_os = "linux")]
     {
         if let Ok(store) = dbus_secret_service_keyring_store::Store::new() {
             keyring_core::set_default_store(store);
+            return true;
         }
     }
+    false
 }
 
 pub(crate) fn save_passphrase(instance: &str, passphrase: &str) -> Result<(), String> {

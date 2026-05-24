@@ -51,9 +51,10 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    let mut no_keychain = cli.no_keychain;
     #[cfg(feature = "keychain")]
-    if !cli.no_keychain {
-        keychain::init_store();
+    if !no_keychain && !keychain::init_store() {
+        no_keychain = true;
     }
 
     let mut terminal = ratatui::init();
@@ -62,7 +63,7 @@ fn main() -> Result<()> {
     // selection; users can hold Shift to bypass and select text.
     let mouse_enabled = !cli.no_mouse
         && crossterm::execute!(std::io::stdout(), EnableMouseCapture).is_ok();
-    let result = run(&mut terminal, cli.config_dir, cli.port, cli.no_keychain);
+    let result = run(&mut terminal, cli.config_dir, cli.port, no_keychain);
     if mouse_enabled {
         let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     }
