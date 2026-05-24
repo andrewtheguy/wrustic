@@ -78,23 +78,23 @@ fn build_footer_line(segments: &[&str], width: usize) -> Line<'static> {
 
 fn bottom_bar_text(app: &App) -> &'static str {
     match &app.screen {
-        Screen::Home => "j/k move  PgUp/PgDn page  Enter open  n new  e edit  d delete  q quit",
+        Screen::Home => "Up/Dn move  PgUp/PgDn page  Enter open  n new  e edit  d delete  q quit",
         Screen::Snapshots => {
-            "j/k move  PgUp/PgDn page  g/G top/bottom  Enter browse  c compare  f filter  d delete  r refresh  q/Esc back"
+            "Up/Dn move  PgUp/PgDn page  g/G top/bottom  Enter browse  c compare  f filter  d delete  r refresh  q/Esc back"
         }
-        Screen::SnapshotFilterDim => "j/k move  PgUp/PgDn page  Enter pick  Esc back",
+        Screen::SnapshotFilterDim => "Up/Dn move  PgUp/PgDn page  Enter pick  Esc back",
         Screen::SnapshotFilterValue => {
-            "j/k move  PgUp/PgDn page  g/G top/bottom  Enter pick  Esc back"
+            "Up/Dn move  PgUp/PgDn page  g/G top/bottom  Enter pick  Esc back"
         }
         Screen::SnapshotDeleteConfirm => {
-            "y confirm delete  j/k scroll  PgUp/PgDn page  r raw JSON  n/Esc cancel"
+            "y confirm delete  Up/Dn scroll  PgUp/PgDn page  r raw JSON  n/Esc cancel"
         }
         Screen::SnapshotDeleteError(_) => "any key to continue",
         Screen::SnapshotContents => {
-            "j/k move  PgUp/PgDn page  g/G top/bottom  Enter open  Backspace up  r reload  q/Esc back"
+            "Up/Dn move  PgUp/PgDn page  g/G top/bottom  Enter open  Backspace up  r reload  q/Esc back"
         }
         Screen::FileDetails => {
-            "j/k scroll  PgUp/PgDn page  g top  s share  Esc/Backspace/q back"
+            "Up/Dn scroll  PgUp/PgDn page  g top  s share  Esc/Backspace/q back"
         }
         Screen::ShareUrl => "Esc/Backspace/q back (stops the server)",
         Screen::PassphraseInstancePrompt => "type  Enter submit  Esc quit",
@@ -109,15 +109,15 @@ fn bottom_bar_text(app: &App) -> &'static str {
             "type  Enter submit  Esc quit"
         },
         Screen::PassphraseDerivingKey => "working…",
-        Screen::AuthMethodChoice => "j/k move  Enter pick  Esc back",
+        Screen::AuthMethodChoice => "Up/Dn move  Enter pick  Esc back",
         Screen::PassphraseUrl => "Esc/q quit",
         Screen::SnapshotCompareFirst => {
-            "j/k move  PgUp/PgDn page  g/G top/bottom  Enter pick FIRST  Esc cancel"
+            "Up/Dn move  PgUp/PgDn page  g/G top/bottom  Enter pick FIRST  Esc cancel"
         }
         Screen::SnapshotCompareSecond => {
-            "j/k move  PgUp/PgDn page  g/G top/bottom  Enter pick SECOND  a toggle related/all  Esc back"
+            "Up/Dn move  PgUp/PgDn page  g/G top/bottom  Enter pick SECOND  a toggle related/all  Esc back"
         }
-        Screen::SnapshotCompareResults => "j/k move  PgUp/PgDn page  g/G top/bottom  q/Esc back",
+        Screen::SnapshotCompareResults => "Up/Dn move  PgUp/PgDn page  g/G top/bottom  q/Esc back",
         Screen::OpeningSnapshot
         | Screen::LoadingDir
         | Screen::LoadingFileDetails
@@ -127,7 +127,7 @@ fn bottom_bar_text(app: &App) -> &'static str {
         | Screen::SnapshotDeleteLoading
         | Screen::SnapshotCompareLoading => "working…",
         Screen::CreateProfileName => "type  Enter submit  Esc cancel",
-        Screen::BackendChoice => "j/k move  PgUp/PgDn page  Enter pick  Esc back",
+        Screen::BackendChoice => "Up/Dn move  PgUp/PgDn page  Enter pick  Esc back",
         Screen::LocalPath => "type  Enter submit  Esc back",
         Screen::RestConfig | Screen::S3Location | Screen::S3Credentials => {
             "Tab/Shift+Tab field  Enter continue  Esc back"

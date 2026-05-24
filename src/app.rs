@@ -1376,8 +1376,8 @@ impl App {
             Screen::PassphraseDerivingKey => {}
 
             Screen::AuthMethodChoice => match key.code {
-                KeyCode::Down | KeyCode::Char('j') => self.auth_method_list.select_next(),
-                KeyCode::Up | KeyCode::Char('k') => self.auth_method_list.select_previous(),
+                KeyCode::Down => self.auth_method_list.select_next(),
+                KeyCode::Up => self.auth_method_list.select_previous(),
                 KeyCode::Enter => self.activate_auth_method(),
                 KeyCode::Esc => {
                     if self.passphrase_phase == Some(PassphrasePhase::Setup) {
@@ -1408,8 +1408,8 @@ impl App {
             },
 
             Screen::Home => match key.code {
-                KeyCode::Down | KeyCode::Char('j') => self.profile_list_state.select_next(),
-                KeyCode::Up | KeyCode::Char('k') => self.profile_list_state.select_previous(),
+                KeyCode::Down => self.profile_list_state.select_next(),
+                KeyCode::Up => self.profile_list_state.select_previous(),
                 KeyCode::PageDown => {
                     let step = self.page_step();
                     page_select(
@@ -1467,8 +1467,8 @@ impl App {
                     self.snapshot_filter = None;
                     self.enter_home();
                 }
-                KeyCode::Down | KeyCode::Char('j') => self.list_state.select_next(),
-                KeyCode::Up | KeyCode::Char('k') => self.list_state.select_previous(),
+                KeyCode::Down => self.list_state.select_next(),
+                KeyCode::Up => self.list_state.select_previous(),
                 KeyCode::Home | KeyCode::Char('g') => self.list_state.select(Some(0)),
                 KeyCode::End | KeyCode::Char('G') => {
                     let visible = self.visible_snapshot_indices();
@@ -1528,8 +1528,8 @@ impl App {
                     self.clear_compare_scratch();
                     self.screen = Screen::Snapshots;
                 }
-                KeyCode::Down | KeyCode::Char('j') => self.compare_picker_state.select_next(),
-                KeyCode::Up | KeyCode::Char('k') => self.compare_picker_state.select_previous(),
+                KeyCode::Down => self.compare_picker_state.select_next(),
+                KeyCode::Up => self.compare_picker_state.select_previous(),
                 KeyCode::Home | KeyCode::Char('g') => {
                     self.compare_picker_state.select(Some(0));
                 }
@@ -1570,8 +1570,8 @@ impl App {
                     self.compare_first_row_idx = None;
                     self.screen = Screen::SnapshotCompareFirst;
                 }
-                KeyCode::Down | KeyCode::Char('j') => self.compare_picker_state.select_next(),
-                KeyCode::Up | KeyCode::Char('k') => self.compare_picker_state.select_previous(),
+                KeyCode::Down => self.compare_picker_state.select_next(),
+                KeyCode::Up => self.compare_picker_state.select_previous(),
                 KeyCode::Home | KeyCode::Char('g') => {
                     self.compare_picker_state.select(Some(0));
                 }
@@ -1611,8 +1611,8 @@ impl App {
                     self.clear_compare_scratch();
                     self.screen = Screen::Snapshots;
                 }
-                KeyCode::Down | KeyCode::Char('j') => self.compare_results_state.select_next(),
-                KeyCode::Up | KeyCode::Char('k') => self.compare_results_state.select_previous(),
+                KeyCode::Down => self.compare_results_state.select_next(),
+                KeyCode::Up => self.compare_results_state.select_previous(),
                 KeyCode::Home | KeyCode::Char('g') => {
                     self.compare_results_state.select(Some(0));
                 }
@@ -1645,8 +1645,8 @@ impl App {
             },
 
             Screen::SnapshotFilterDim => match key.code {
-                KeyCode::Down | KeyCode::Char('j') => self.filter_picker_state.select_next(),
-                KeyCode::Up | KeyCode::Char('k') => self.filter_picker_state.select_previous(),
+                KeyCode::Down => self.filter_picker_state.select_next(),
+                KeyCode::Up => self.filter_picker_state.select_previous(),
                 KeyCode::PageDown => {
                     let step = self.page_step();
                     let len = filter_dim_entries(self.snapshot_filter.is_some()).len();
@@ -1663,8 +1663,8 @@ impl App {
             },
 
             Screen::SnapshotFilterValue => match key.code {
-                KeyCode::Down | KeyCode::Char('j') => self.filter_picker_state.select_next(),
-                KeyCode::Up | KeyCode::Char('k') => self.filter_picker_state.select_previous(),
+                KeyCode::Down => self.filter_picker_state.select_next(),
+                KeyCode::Up => self.filter_picker_state.select_previous(),
                 KeyCode::Home | KeyCode::Char('g') => self.filter_picker_state.select(Some(0)),
                 KeyCode::End | KeyCode::Char('G') => {
                     if !self.filter_values.is_empty() {
@@ -1699,10 +1699,10 @@ impl App {
                 KeyCode::Char('r') | KeyCode::Char('R') => {
                     self.delete_show_json = !self.delete_show_json;
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Down => {
                     self.delete_preview_state.select_next();
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Up => {
                     self.delete_preview_state.select_previous();
                 }
                 KeyCode::Home | KeyCode::Char('g') => {
@@ -1746,12 +1746,12 @@ impl App {
                     self.last_content_click = None;
                     self.screen = Screen::Snapshots;
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Down => {
                     if let Some(f) = self.browse_stack.last_mut() {
                         f.list_state.select_next();
                     }
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Up => {
                     if let Some(f) = self.browse_stack.last_mut() {
                         f.list_state.select_previous();
                     }
@@ -1826,10 +1826,10 @@ impl App {
                         self.screen = Screen::ShareUrl;
                     }
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Down => {
                     self.file_details_scroll = self.file_details_scroll.saturating_add(1);
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Up => {
                     self.file_details_scroll = self.file_details_scroll.saturating_sub(1);
                 }
                 KeyCode::Home | KeyCode::Char('g') => {
@@ -1880,8 +1880,8 @@ impl App {
             },
 
             Screen::BackendChoice => match key.code {
-                KeyCode::Down | KeyCode::Char('j') => self.backend_list.select_next(),
-                KeyCode::Up | KeyCode::Char('k') => self.backend_list.select_previous(),
+                KeyCode::Down => self.backend_list.select_next(),
+                KeyCode::Up => self.backend_list.select_previous(),
                 KeyCode::PageDown => {
                     let step = self.page_step();
                     page_select(&mut self.backend_list, BACKEND_ORDER.len(), true, step);
