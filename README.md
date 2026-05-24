@@ -54,10 +54,7 @@ shell profile.
 
 Requires a Rust toolchain (developed against rustc 1.93).
 
-Platform: Linux / macOS only. The config-file writer uses
-`std::os::unix::fs::OpenOptionsExt` to enforce mode `0600` on
-`config.toml`, so the crate does not build on Windows. Adding Windows
-support would mean swapping that for an ACL-based equivalent.
+Platform: Linux / macOS only.
 
 ```sh
 cargo run
