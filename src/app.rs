@@ -498,19 +498,14 @@ impl App {
             }
             (PassphrasePhase::Unlock, false) => {
                 #[cfg(feature = "keychain")]
-                if self.keychain_enabled() {
-                    let instance = self
-                        .config
-                        .passphrase
-                        .as_ref()
-                        .map(|m| m.instance.as_str())
-                        .unwrap_or("");
-                    if let Some(pw) = crate::keychain::load_passphrase(instance) {
-                        self.passphrase_input = Input::new(pw);
-                        self.passphrase_error = None;
-                        self.screen = Screen::PassphraseDerivingKey;
-                        return;
-                    }
+                if self.keychain_enabled()
+                    && let Some(meta) = self.config.passphrase.as_ref()
+                    && let Some(pw) = crate::keychain::load_passphrase(&meta.instance)
+                {
+                    self.passphrase_input = Input::new(pw);
+                    self.passphrase_error = None;
+                    self.screen = Screen::PassphraseDerivingKey;
+                    return;
                 }
                 self.passphrase_input = Input::default();
                 self.passphrase_error = None;
