@@ -1,9 +1,9 @@
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout, Rect},
+    layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Cell, HighlightSpacing, List, ListItem, Paragraph, Row, Table, Wrap},
 };
 use tui_input::Input;
 
@@ -753,33 +753,23 @@ fn render_snapshot_contents(frame: &mut Frame, app: &mut App, area: Rect) {
         path_display,
     );
 
-    let outer = Block::bordered().title(title);
-    let inner = outer.inner(area);
-    frame.render_widget(outer, area);
-
-    let [hdr, body] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
-    render_column_header(
-        frame,
-        hdr,
-        &format!("{}  {:<40}  {:>10}  {}", "T", "Name", "Size", "Modified"),
-    );
     app.list_header_rows = 1;
 
     let frame_idx = app.browse_stack.len() - 1;
     let top = &app.browse_stack[frame_idx];
-    let items: Vec<ListItem> = top
+    let rows: Vec<Row> = top
         .items
         .iter()
         .map(|row| {
             if matches!(row.kind, ContentKind::Parent) {
-                return ListItem::new("..".to_string());
+                return Row::new(["", "..", "", ""]);
             }
             let kind_char = match row.kind {
-                ContentKind::Dir => 'd',
-                ContentKind::File => '-',
-                ContentKind::Symlink => 'l',
-                ContentKind::Other => '?',
-                ContentKind::Parent => '^',
+                ContentKind::Dir => "d",
+                ContentKind::File => "-",
+                ContentKind::Symlink => "l",
+                ContentKind::Other => "?",
+                ContentKind::Parent => "^",
             };
             let display_name = if matches!(row.kind, ContentKind::Dir) {
                 format!("{}/", row.name)
@@ -787,24 +777,46 @@ fn render_snapshot_contents(frame: &mut Frame, app: &mut App, area: Rect) {
                 row.name.clone()
             };
             let size_col = if matches!(row.kind, ContentKind::File) {
-                format!("{:>10}", human_size(row.size))
+                human_size(row.size)
             } else {
-                String::from("          ")
+                String::new()
             };
-            ListItem::new(format!(
-                "{}  {:<40}  {}  {}",
-                kind_char, display_name, size_col, row.mtime
-            ))
+            Row::new([
+                Cell::from(kind_char),
+                Cell::from(display_name),
+                Cell::from(Line::from(size_col).alignment(Alignment::Right)),
+                Cell::from(row.mtime.clone()),
+            ])
         })
         .collect();
 
-    let list = List::new(items)
-        .highlight_style(selection_highlight())
-        .highlight_symbol(">> ");
+    let header = Row::new([
+        Cell::from("T"),
+        Cell::from("Name"),
+        Cell::from(Line::from("Size").alignment(Alignment::Right)),
+        Cell::from("Modified"),
+    ])
+        .style(Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(1),
+            Constraint::Fill(1),
+            Constraint::Length(10),
+            Constraint::Length(19),
+        ],
+    )
+    .header(header)
+    .block(Block::bordered().title(title))
+    .row_highlight_style(selection_highlight())
+    .highlight_symbol(">> ")
+    .highlight_spacing(HighlightSpacing::Always)
+    .column_spacing(2);
 
     record_list_area(app, area);
     let top_mut = &mut app.browse_stack[frame_idx];
-    frame.render_stateful_widget(list, body, &mut top_mut.list_state);
+    frame.render_stateful_widget(table, area, &mut top_mut.table_state);
 }
 
 fn render_file_details(frame: &mut Frame, app: &mut App, area: Rect) {

@@ -7,7 +7,7 @@ use base64::Engine;
 use ratatui::{
     crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
     layout::Rect,
-    widgets::ListState,
+    widgets::{ListState, TableState},
 };
 use rustic_core::{IndexedIdsStatus, Repository, TreeId};
 use tui_input::Input;
@@ -171,14 +171,25 @@ fn click_to_index(
     (idx < len).then_some(idx)
 }
 
-// Advance the viewport by exactly one page and put the cursor on the first
-// item of the new page. Used by PageUp/PageDown handlers.
-//
-// On PageDown, if a full page can't be advanced (already on the last/partial
-// page), the cursor moves to the last item instead of paging past the end.
-// PageUp mirrors this against the previous page; if already on the first
-// page, it clamps to index 0.
-fn page_select(state: &mut ListState, len: usize, forward: bool, page_size: usize) {
+pub(crate) trait Scrollable {
+    fn select(&mut self, index: Option<usize>);
+    fn offset(&self) -> usize;
+    fn offset_mut(&mut self) -> &mut usize;
+}
+
+impl Scrollable for ListState {
+    fn select(&mut self, index: Option<usize>) { ListState::select(self, index); }
+    fn offset(&self) -> usize { ListState::offset(self) }
+    fn offset_mut(&mut self) -> &mut usize { ListState::offset_mut(self) }
+}
+
+impl Scrollable for TableState {
+    fn select(&mut self, index: Option<usize>) { TableState::select(self, index); }
+    fn offset(&self) -> usize { TableState::offset(self) }
+    fn offset_mut(&mut self) -> &mut usize { TableState::offset_mut(self) }
+}
+
+fn page_select(state: &mut impl Scrollable, len: usize, forward: bool, page_size: usize) {
     if len == 0 {
         state.select(None);
         return;
@@ -204,7 +215,7 @@ pub(crate) struct BrowseFrame {
     pub(crate) name: String,
     pub(crate) tree_id: TreeId,
     pub(crate) items: Vec<ContentRow>,
-    pub(crate) list_state: ListState,
+    pub(crate) table_state: TableState,
 }
 
 enum ProfileRollback {
@@ -1132,7 +1143,7 @@ impl App {
         let Some(f) = self.browse_stack.last() else {
             return;
         };
-        let Some(idx) = f.list_state.selected() else {
+        let Some(idx) = f.table_state.selected() else {
             return;
         };
         let Some(row) = f.items.get(idx) else {
@@ -1160,7 +1171,7 @@ impl App {
         let Some(f) = self.browse_stack.last() else {
             return;
         };
-        let Some(idx) = f.list_state.selected() else {
+        let Some(idx) = f.table_state.selected() else {
             return;
         };
         let Some(row) = f.items.get(idx) else {
@@ -1717,36 +1728,36 @@ impl App {
                 }
                 KeyCode::Down => {
                     if let Some(f) = self.browse_stack.last_mut() {
-                        f.list_state.select_next();
+                        f.table_state.select_next();
                     }
                 }
                 KeyCode::Up => {
                     if let Some(f) = self.browse_stack.last_mut() {
-                        f.list_state.select_previous();
+                        f.table_state.select_previous();
                     }
                 }
                 KeyCode::Home | KeyCode::Char('g') => {
                     if let Some(f) = self.browse_stack.last_mut() {
-                        f.list_state.select(Some(0));
+                        f.table_state.select(Some(0));
                     }
                 }
                 KeyCode::End | KeyCode::Char('G') => {
                     if let Some(f) = self.browse_stack.last_mut()
                         && !f.items.is_empty()
                     {
-                        f.list_state.select(Some(f.items.len() - 1));
+                        f.table_state.select(Some(f.items.len() - 1));
                     }
                 }
                 KeyCode::PageDown => {
                     let step = self.page_step();
                     if let Some(f) = self.browse_stack.last_mut() {
-                        page_select(&mut f.list_state, f.items.len(), true, step);
+                        page_select(&mut f.table_state, f.items.len(), true, step);
                     }
                 }
                 KeyCode::PageUp => {
                     let step = self.page_step();
                     if let Some(f) = self.browse_stack.last_mut() {
-                        page_select(&mut f.list_state, f.items.len(), false, step);
+                        page_select(&mut f.table_state, f.items.len(), false, step);
                     }
                 }
                 KeyCode::Enter => self.activate_snapshot_content(),
@@ -2155,9 +2166,9 @@ impl App {
                     return;
                 };
                 let len = f.items.len();
-                let offset = f.list_state.offset();
+                let offset = f.table_state.offset();
                 if let Some(idx) = click_to_index(area, offset, len, row, col, hdr) {
-                    f.list_state.select(Some(idx));
+                    f.table_state.select(Some(idx));
                     let now = Instant::now();
                     let is_double = self
                         .last_content_click
@@ -2231,9 +2242,9 @@ impl App {
             Screen::SnapshotContents => {
                 if let Some(f) = self.browse_stack.last_mut() {
                     if down {
-                        f.list_state.select_next();
+                        f.table_state.select_next();
                     } else {
-                        f.list_state.select_previous();
+                        f.table_state.select_previous();
                     }
                 }
             }
