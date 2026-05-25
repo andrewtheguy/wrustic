@@ -7,7 +7,7 @@ use base64::Engine;
 use ratatui::{
     crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
     layout::Rect,
-    widgets::ListState,
+    widgets::{ListState, TableState},
 };
 use rustic_core::{IndexedIdsStatus, Repository, TreeId};
 use tui_input::Input;
@@ -149,13 +149,14 @@ fn click_to_index(
     len: usize,
     row: u16,
     col: u16,
+    header_rows: u16,
 ) -> Option<usize> {
     if len == 0 {
         return None;
     }
     // Bordered interior: skip the top/left border and stop before the
     // bottom/right border.
-    let inner_top = list_area.y.checked_add(1)?;
+    let inner_top = list_area.y.checked_add(1)?.checked_add(header_rows)?;
     let inner_left = list_area.x.checked_add(1)?;
     let inner_bottom = list_area.y.saturating_add(list_area.height.saturating_sub(1));
     let inner_right = list_area.x.saturating_add(list_area.width.saturating_sub(1));
@@ -170,14 +171,25 @@ fn click_to_index(
     (idx < len).then_some(idx)
 }
 
-// Advance the viewport by exactly one page and put the cursor on the first
-// item of the new page. Used by PageUp/PageDown handlers.
-//
-// On PageDown, if a full page can't be advanced (already on the last/partial
-// page), the cursor moves to the last item instead of paging past the end.
-// PageUp mirrors this against the previous page; if already on the first
-// page, it clamps to index 0.
-fn page_select(state: &mut ListState, len: usize, forward: bool, page_size: usize) {
+pub(crate) trait Scrollable {
+    fn select(&mut self, index: Option<usize>);
+    fn offset(&self) -> usize;
+    fn offset_mut(&mut self) -> &mut usize;
+}
+
+impl Scrollable for ListState {
+    fn select(&mut self, index: Option<usize>) { ListState::select(self, index); }
+    fn offset(&self) -> usize { ListState::offset(self) }
+    fn offset_mut(&mut self) -> &mut usize { ListState::offset_mut(self) }
+}
+
+impl Scrollable for TableState {
+    fn select(&mut self, index: Option<usize>) { TableState::select(self, index); }
+    fn offset(&self) -> usize { TableState::offset(self) }
+    fn offset_mut(&mut self) -> &mut usize { TableState::offset_mut(self) }
+}
+
+fn page_select(state: &mut impl Scrollable, len: usize, forward: bool, page_size: usize) {
     if len == 0 {
         state.select(None);
         return;
@@ -203,7 +215,7 @@ pub(crate) struct BrowseFrame {
     pub(crate) name: String,
     pub(crate) tree_id: TreeId,
     pub(crate) items: Vec<ContentRow>,
-    pub(crate) list_state: ListState,
+    pub(crate) table_state: TableState,
 }
 
 enum ProfileRollback {
@@ -236,8 +248,8 @@ pub(crate) struct App {
 
     pub(crate) auth_method_list: ListState,
     pub(crate) backend_list: ListState,
-    pub(crate) profile_list_state: ListState,
-    pub(crate) list_state: ListState,
+    pub(crate) profile_list_state: TableState,
+    pub(crate) list_state: TableState,
 
     pub(crate) new_profile_name: Input,
     pub(crate) backend_kind: BackendKind,
@@ -293,7 +305,7 @@ pub(crate) struct App {
     pub(crate) delete_target: Option<String>,
     pub(crate) delete_info: Option<DeleteSnapshotInfo>,
     pub(crate) delete_show_json: bool,
-    pub(crate) delete_preview_state: ListState,
+    pub(crate) delete_preview_state: TableState,
     pub(crate) delete_preview_limit: usize,
     pub(crate) post_delete_select: Option<usize>,
     pub(crate) delete_details_parsed: Option<SnapshotDetails>,
@@ -304,15 +316,16 @@ pub(crate) struct App {
     pub(crate) compare_first_row_idx: Option<usize>,
     pub(crate) compare_second_id: Option<String>,
     pub(crate) compare_only_related: bool,
-    pub(crate) compare_picker_state: ListState,
+    pub(crate) compare_picker_state: TableState,
     pub(crate) compare_results: Option<(DiffSummary, Vec<DiffChange>)>,
-    pub(crate) compare_results_state: ListState,
+    pub(crate) compare_results_state: TableState,
 
     // Outer rect of the currently-rendered list/paragraph (bordered area).
     // Used by PageUp/PageDown to size the jump and by the mouse handler
     // to translate click coordinates into a row index. Set by the renderer
     // each frame; read by the key/mouse handler on the next event.
     pub(crate) list_area: Option<Rect>,
+    pub(crate) list_header_rows: u16,
 
     // Last left-click on the Snapshots list: timestamp + clicked row index.
     // Used to detect a double-click for opening a snapshot.
@@ -357,8 +370,8 @@ impl App {
             save_to_keychain: true,
             auth_method_list,
             backend_list,
-            profile_list_state: ListState::default(),
-            list_state: ListState::default(),
+            profile_list_state: TableState::default(),
+            list_state: TableState::default(),
             new_profile_name: Input::default(),
             backend_kind: BackendKind::Local,
             local_path: Input::default(),
@@ -402,7 +415,7 @@ impl App {
             delete_target: None,
             delete_info: None,
             delete_show_json: false,
-            delete_preview_state: ListState::default(),
+            delete_preview_state: TableState::default(),
             delete_preview_limit: 50,
             post_delete_select: None,
             delete_details_parsed: None,
@@ -412,10 +425,11 @@ impl App {
             compare_first_row_idx: None,
             compare_second_id: None,
             compare_only_related: true,
-            compare_picker_state: ListState::default(),
+            compare_picker_state: TableState::default(),
             compare_results: None,
-            compare_results_state: ListState::default(),
+            compare_results_state: TableState::default(),
             list_area: None,
+            list_header_rows: 0,
             last_snapshot_click: None,
             last_content_click: None,
         };
@@ -922,8 +936,8 @@ impl App {
     // page's worth, used by PageDown/PageUp to advance the viewport.
     fn page_step(&self) -> usize {
         let h = self.list_area.map(|r| r.height).unwrap_or(0);
-        // height - 2 borders, with a floor of 1 row.
-        h.saturating_sub(2).max(1) as usize
+        // height - 2 borders - column header rows, with a floor of 1 row.
+        h.saturating_sub(2).saturating_sub(self.list_header_rows).max(1) as usize
     }
 
     fn delete_preview_len(&self) -> usize {
@@ -971,7 +985,7 @@ impl App {
         self.delete_target = None;
         self.delete_info = None;
         self.delete_show_json = false;
-        self.delete_preview_state = ListState::default();
+        self.delete_preview_state = TableState::default();
         self.delete_preview_limit = 50;
         self.delete_details_parsed = None;
         self.delete_details_raw = None;
@@ -983,9 +997,9 @@ impl App {
         self.compare_first_row_idx = None;
         self.compare_second_id = None;
         self.compare_only_related = true;
-        self.compare_picker_state = ListState::default();
+        self.compare_picker_state = TableState::default();
         self.compare_results = None;
-        self.compare_results_state = ListState::default();
+        self.compare_results_state = TableState::default();
     }
 
     // Indices into `self.snapshots` for step 2 of the compare flow: start from
@@ -1129,7 +1143,7 @@ impl App {
         let Some(f) = self.browse_stack.last() else {
             return;
         };
-        let Some(idx) = f.list_state.selected() else {
+        let Some(idx) = f.table_state.selected() else {
             return;
         };
         let Some(row) = f.items.get(idx) else {
@@ -1157,7 +1171,7 @@ impl App {
         let Some(f) = self.browse_stack.last() else {
             return;
         };
-        let Some(idx) = f.list_state.selected() else {
+        let Some(idx) = f.table_state.selected() else {
             return;
         };
         let Some(row) = f.items.get(idx) else {
@@ -1511,7 +1525,7 @@ impl App {
                     self.compare_first_id = Some(s.id.clone());
                     self.compare_first_row_idx = Some(abs);
                     self.compare_only_related = true;
-                    self.compare_picker_state = ListState::default();
+                    self.compare_picker_state = TableState::default();
                     if !self.compare_second_visible_indices().is_empty() {
                         self.compare_picker_state.select(Some(0));
                     }
@@ -1552,7 +1566,7 @@ impl App {
                     // to the top to avoid pointing at a row that fell out of
                     // (or wasn't in) the new set.
                     let visible = self.compare_second_visible_indices();
-                    self.compare_picker_state = ListState::default();
+                    self.compare_picker_state = TableState::default();
                     if !visible.is_empty() {
                         self.compare_picker_state.select(Some(0));
                     }
@@ -1714,36 +1728,36 @@ impl App {
                 }
                 KeyCode::Down => {
                     if let Some(f) = self.browse_stack.last_mut() {
-                        f.list_state.select_next();
+                        f.table_state.select_next();
                     }
                 }
                 KeyCode::Up => {
                     if let Some(f) = self.browse_stack.last_mut() {
-                        f.list_state.select_previous();
+                        f.table_state.select_previous();
                     }
                 }
                 KeyCode::Home | KeyCode::Char('g') => {
                     if let Some(f) = self.browse_stack.last_mut() {
-                        f.list_state.select(Some(0));
+                        f.table_state.select(Some(0));
                     }
                 }
                 KeyCode::End | KeyCode::Char('G') => {
                     if let Some(f) = self.browse_stack.last_mut()
                         && !f.items.is_empty()
                     {
-                        f.list_state.select(Some(f.items.len() - 1));
+                        f.table_state.select(Some(f.items.len() - 1));
                     }
                 }
                 KeyCode::PageDown => {
                     let step = self.page_step();
                     if let Some(f) = self.browse_stack.last_mut() {
-                        page_select(&mut f.list_state, f.items.len(), true, step);
+                        page_select(&mut f.table_state, f.items.len(), true, step);
                     }
                 }
                 KeyCode::PageUp => {
                     let step = self.page_step();
                     if let Some(f) = self.browse_stack.last_mut() {
-                        page_select(&mut f.list_state, f.items.len(), false, step);
+                        page_select(&mut f.table_state, f.items.len(), false, step);
                     }
                 }
                 KeyCode::Enter => self.activate_snapshot_content(),
@@ -2065,11 +2079,12 @@ impl App {
         let Some(area) = self.list_area else {
             return;
         };
+        let hdr = self.list_header_rows;
         match &self.screen {
             Screen::Home => {
                 let len = self.config.profiles.len();
                 if let Some(idx) =
-                    click_to_index(area, self.profile_list_state.offset(), len, row, col)
+                    click_to_index(area, self.profile_list_state.offset(), len, row, col, hdr)
                 {
                     self.profile_list_state.select(Some(idx));
                     self.activate_home_profile();
@@ -2077,7 +2092,7 @@ impl App {
             }
             Screen::AuthMethodChoice => {
                 if let Some(idx) =
-                    click_to_index(area, self.auth_method_list.offset(), 2, row, col)
+                    click_to_index(area, self.auth_method_list.offset(), 2, row, col, 0)
                 {
                     self.auth_method_list.select(Some(idx));
                     self.activate_auth_method();
@@ -2085,7 +2100,7 @@ impl App {
             }
             Screen::BackendChoice => {
                 if let Some(idx) =
-                    click_to_index(area, self.backend_list.offset(), BACKEND_ORDER.len(), row, col)
+                    click_to_index(area, self.backend_list.offset(), BACKEND_ORDER.len(), row, col, 0)
                 {
                     self.backend_list.select(Some(idx));
                     self.activate_backend();
@@ -2093,7 +2108,7 @@ impl App {
             }
             Screen::Snapshots => {
                 let len = self.visible_snapshot_indices().len();
-                if let Some(idx) = click_to_index(area, self.list_state.offset(), len, row, col) {
+                if let Some(idx) = click_to_index(area, self.list_state.offset(), len, row, col, hdr) {
                     self.list_state.select(Some(idx));
                     let now = Instant::now();
                     let is_double = self
@@ -2110,7 +2125,7 @@ impl App {
             Screen::SnapshotCompareSecond => {
                 let len = self.compare_second_visible_indices().len();
                 if let Some(idx) =
-                    click_to_index(area, self.compare_picker_state.offset(), len, row, col)
+                    click_to_index(area, self.compare_picker_state.offset(), len, row, col, hdr)
                 {
                     self.compare_picker_state.select(Some(idx));
                     self.activate_compare_second();
@@ -2123,7 +2138,7 @@ impl App {
                     .map(|(_, c)| c.len())
                     .unwrap_or(0);
                 if let Some(idx) =
-                    click_to_index(area, self.compare_results_state.offset(), len, row, col)
+                    click_to_index(area, self.compare_results_state.offset(), len, row, col, hdr)
                 {
                     self.compare_results_state.select(Some(idx));
                 }
@@ -2131,7 +2146,7 @@ impl App {
             Screen::SnapshotFilterDim => {
                 let len = filter_dim_entries(self.snapshot_filter.is_some()).len();
                 if let Some(idx) =
-                    click_to_index(area, self.filter_picker_state.offset(), len, row, col)
+                    click_to_index(area, self.filter_picker_state.offset(), len, row, col, 0)
                 {
                     self.filter_picker_state.select(Some(idx));
                     self.activate_filter_dim();
@@ -2140,7 +2155,7 @@ impl App {
             Screen::SnapshotFilterValue => {
                 let len = self.filter_values.len();
                 if let Some(idx) =
-                    click_to_index(area, self.filter_picker_state.offset(), len, row, col)
+                    click_to_index(area, self.filter_picker_state.offset(), len, row, col, 0)
                 {
                     self.filter_picker_state.select(Some(idx));
                     self.activate_filter_value();
@@ -2151,9 +2166,9 @@ impl App {
                     return;
                 };
                 let len = f.items.len();
-                let offset = f.list_state.offset();
-                if let Some(idx) = click_to_index(area, offset, len, row, col) {
-                    f.list_state.select(Some(idx));
+                let offset = f.table_state.offset();
+                if let Some(idx) = click_to_index(area, offset, len, row, col, hdr) {
+                    f.table_state.select(Some(idx));
                     let now = Instant::now();
                     let is_double = self
                         .last_content_click
@@ -2227,9 +2242,9 @@ impl App {
             Screen::SnapshotContents => {
                 if let Some(f) = self.browse_stack.last_mut() {
                     if down {
-                        f.list_state.select_next();
+                        f.table_state.select_next();
                     } else {
-                        f.list_state.select_previous();
+                        f.table_state.select_previous();
                     }
                 }
             }
@@ -2445,39 +2460,48 @@ mod tests {
         // row 11, col 5 and col 24. Interior rows are 3..=10.
         let area = Rect { x: 5, y: 2, width: 20, height: 10 };
         // Clicking the first interior row (row=3) with offset=0 → idx 0.
-        assert_eq!(click_to_index(area, 0, 100, 3, 10), Some(0));
+        assert_eq!(click_to_index(area, 0, 100, 3, 10, 0), Some(0));
         // Last interior row (row=10) with offset=0 → idx 7.
-        assert_eq!(click_to_index(area, 0, 100, 10, 10), Some(7));
+        assert_eq!(click_to_index(area, 0, 100, 10, 10, 0), Some(7));
         // Same click with offset=4 → idx 11.
-        assert_eq!(click_to_index(area, 4, 100, 10, 10), Some(11));
+        assert_eq!(click_to_index(area, 4, 100, 10, 10, 0), Some(11));
     }
 
     #[test]
     fn click_to_index_rejects_borders_and_outside() {
         let area = Rect { x: 5, y: 2, width: 20, height: 10 };
         // Top border row.
-        assert_eq!(click_to_index(area, 0, 100, 2, 10), None);
+        assert_eq!(click_to_index(area, 0, 100, 2, 10, 0), None);
         // Bottom border row.
-        assert_eq!(click_to_index(area, 0, 100, 11, 10), None);
+        assert_eq!(click_to_index(area, 0, 100, 11, 10, 0), None);
         // Left border column.
-        assert_eq!(click_to_index(area, 0, 100, 5, 5), None);
+        assert_eq!(click_to_index(area, 0, 100, 5, 5, 0), None);
         // Right border column.
-        assert_eq!(click_to_index(area, 0, 100, 5, 24), None);
+        assert_eq!(click_to_index(area, 0, 100, 5, 24, 0), None);
         // Above and below the rect entirely.
-        assert_eq!(click_to_index(area, 0, 100, 0, 10), None);
-        assert_eq!(click_to_index(area, 0, 100, 99, 10), None);
+        assert_eq!(click_to_index(area, 0, 100, 0, 10, 0), None);
+        assert_eq!(click_to_index(area, 0, 100, 99, 10, 0), None);
     }
 
     #[test]
     fn click_to_index_clamps_to_list_length() {
         let area = Rect { x: 0, y: 0, width: 10, height: 10 };
         // Interior rows 1..=8, but only 3 items in the list.
-        assert_eq!(click_to_index(area, 0, 3, 1, 5), Some(0));
-        assert_eq!(click_to_index(area, 0, 3, 3, 5), Some(2));
+        assert_eq!(click_to_index(area, 0, 3, 1, 5, 0), Some(0));
+        assert_eq!(click_to_index(area, 0, 3, 3, 5, 0), Some(2));
         // Row 4 is the empty area past the last item.
-        assert_eq!(click_to_index(area, 0, 3, 4, 5), None);
+        assert_eq!(click_to_index(area, 0, 3, 4, 5, 0), None);
         // Empty list rejects all clicks.
-        assert_eq!(click_to_index(area, 0, 0, 1, 5), None);
+        assert_eq!(click_to_index(area, 0, 0, 1, 5, 0), None);
+    }
+
+    #[test]
+    fn click_to_index_skips_header_rows() {
+        let area = Rect { x: 5, y: 2, width: 20, height: 10 };
+        // With 1 header row, first data row is row=4 (border + header).
+        assert_eq!(click_to_index(area, 0, 100, 3, 10, 1), None);
+        assert_eq!(click_to_index(area, 0, 100, 4, 10, 1), Some(0));
+        assert_eq!(click_to_index(area, 0, 100, 10, 10, 1), Some(6));
     }
 
     fn list_state_at(offset: usize, selected: usize) -> ListState {

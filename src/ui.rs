@@ -1,9 +1,9 @@
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout, Rect},
+    layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Cell, HighlightSpacing, List, ListItem, Paragraph, Row, Table, TableState, Wrap},
 };
 use tui_input::Input;
 
@@ -136,7 +136,9 @@ fn bottom_bar_text(app: &App) -> &'static str {
     }
 }
 
+
 fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
+    app.list_header_rows = 0;
     match &app.screen {
         Screen::Home => render_home(frame, app, area),
         Screen::CreateProfileName => render_input(
@@ -325,20 +327,28 @@ fn render_home(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let items: Vec<ListItem> = app
+    app.list_header_rows = 1;
+
+    let rows: Vec<Row> = app
         .config
         .profiles
         .iter()
-        .map(|(name, p)| ListItem::new(format!("{:<24} [{}]", name, p.backend_kind().label())))
+        .map(|(name, p)| Row::new([Cell::from(name.clone()), Cell::from(p.backend_kind().label())]))
         .collect();
 
-    let list = List::new(items)
+    let header = Row::new(["Name", "Backend"])
+        .style(Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+    let table = Table::new(rows, [Constraint::Length(24), Constraint::Fill(1)])
+        .header(header)
         .block(Block::bordered().title(title))
-        .highlight_style(selection_highlight())
-        .highlight_symbol(">> ");
+        .row_highlight_style(selection_highlight())
+        .highlight_symbol(">> ")
+        .highlight_spacing(HighlightSpacing::Always)
+        .column_spacing(2);
 
     record_list_area(app, area);
-    frame.render_stateful_widget(list, area, &mut app.profile_list_state);
+    frame.render_stateful_widget(table, area, &mut app.profile_list_state);
 }
 
 fn render_backend_choice(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -536,21 +546,22 @@ fn render_snapshots(frame: &mut Frame, app: &mut App, area: Rect) {
     };
 
     record_list_area(app, area);
+    app.list_header_rows = 1;
     render_snapshot_picker(frame, area, &title, &app.snapshots, &visible, &mut app.list_state);
 }
 
 // Shared picker rendering for the Snapshots screen and the two compare-flow
 // pick screens. Indices are absolute into `snapshots`; the picker's own
-// `ListState` is positional within `visible`.
+// `TableState` is positional within `visible`.
 fn render_snapshot_picker(
     frame: &mut Frame,
     area: Rect,
     title: &str,
     snapshots: &[crate::repo::SnapshotRow],
     visible: &[usize],
-    state: &mut ratatui::widgets::ListState,
+    state: &mut TableState,
 ) {
-    let items: Vec<ListItem> = visible
+    let rows: Vec<Row> = visible
         .iter()
         .map(|&i| &snapshots[i])
         .map(|s| {
@@ -559,23 +570,37 @@ fn render_snapshot_picker(
             } else {
                 format!("[{}]", s.tags.join(","))
             };
-            ListItem::new(format!(
-                "{:<8}  {:<19}  {:<20}  {:<20}  {}",
-                short_snap_id(&s.id),
-                s.time,
-                s.host,
-                tags,
-                s.paths.join(",")
-            ))
+            Row::new([
+                Cell::from(short_snap_id(&s.id)),
+                Cell::from(s.time.as_str()),
+                Cell::from(s.host.as_str()),
+                Cell::from(tags),
+                Cell::from(s.paths.join(",")),
+            ])
         })
         .collect();
 
-    let list = List::new(items)
-        .block(Block::bordered().title(title))
-        .highlight_style(selection_highlight())
-        .highlight_symbol(">> ");
+    let header = Row::new(["ID", "Time", "Host", "Tags", "Paths"])
+        .style(Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
-    frame.render_stateful_widget(list, area, state);
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(8),
+            Constraint::Length(19),
+            Constraint::Length(20),
+            Constraint::Length(20),
+            Constraint::Fill(1),
+        ],
+    )
+    .header(header)
+    .block(Block::bordered().title(title))
+    .row_highlight_style(selection_highlight())
+    .highlight_symbol(">> ")
+    .highlight_spacing(HighlightSpacing::Always)
+    .column_spacing(2);
+
+    frame.render_stateful_widget(table, area, state);
 }
 
 fn render_compare_second(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -591,6 +616,7 @@ fn render_compare_second(frame: &mut Frame, app: &mut App, area: Rect) {
         visible.len()
     );
     record_list_area(app, area);
+    app.list_header_rows = 1;
     render_snapshot_picker(
         frame,
         area,
@@ -620,7 +646,7 @@ fn render_compare_results(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let [header, body] = Layout::vertical([Constraint::Length(3), Constraint::Fill(1)]).areas(inner);
 
-    let (summary_text, items) = match &app.compare_results {
+    let (summary_text, rows) = match &app.compare_results {
         Some((sum, changes)) => {
             let text = format!(
                 "+{} files / -{} / M{}  |  +{} / -{}  ({} change{})",
@@ -632,11 +658,14 @@ fn render_compare_results(frame: &mut Frame, app: &mut App, area: Rect) {
                 changes.len(),
                 if changes.len() == 1 { "" } else { "s" },
             );
-            let items: Vec<ListItem> = changes
+            let rows: Vec<Row> = changes
                 .iter()
-                .map(|c| ListItem::new(format!("{}  {}", c.modifier.as_char(), c.path)))
+                .map(|c| Row::new([
+                    Cell::from(c.modifier.as_char().to_string()),
+                    Cell::from(c.path.clone()),
+                ]))
                 .collect();
-            (text, items)
+            (text, rows)
         }
         None => ("(no diff loaded)".to_string(), Vec::new()),
     };
@@ -646,7 +675,7 @@ fn render_compare_results(frame: &mut Frame, app: &mut App, area: Rect) {
         .block(Block::bordered().title("Summary"));
     frame.render_widget(summary_para, header);
 
-    if items.is_empty() {
+    if rows.is_empty() {
         let para = Paragraph::new("No file-level changes between these snapshots.")
             .style(Style::new().fg(Color::DarkGray))
             .block(Block::bordered().title("Changes"));
@@ -654,13 +683,22 @@ fn render_compare_results(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let count = items.len();
-    let list = List::new(items)
+    let count = rows.len();
+    app.list_header_rows = 1;
+
+    let col_header = Row::new(["M", "Path"])
+        .style(Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+    let table = Table::new(rows, [Constraint::Length(1), Constraint::Fill(1)])
+        .header(col_header)
         .block(Block::bordered().title(format!("Changes ({count})")))
-        .highlight_style(selection_highlight())
-        .highlight_symbol(">> ");
+        .row_highlight_style(selection_highlight())
+        .highlight_symbol(">> ")
+        .highlight_spacing(HighlightSpacing::Always)
+        .column_spacing(2);
+
     record_list_area(app, body);
-    frame.render_stateful_widget(list, body, &mut app.compare_results_state);
+    frame.render_stateful_widget(table, body, &mut app.compare_results_state);
 }
 
 fn render_filter_dim(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -718,21 +756,23 @@ fn render_snapshot_contents(frame: &mut Frame, app: &mut App, area: Rect) {
         path_display,
     );
 
+    app.list_header_rows = 1;
+
     let frame_idx = app.browse_stack.len() - 1;
     let top = &app.browse_stack[frame_idx];
-    let items: Vec<ListItem> = top
+    let rows: Vec<Row> = top
         .items
         .iter()
         .map(|row| {
             if matches!(row.kind, ContentKind::Parent) {
-                return ListItem::new("..".to_string());
+                return Row::new(["", "..", "", ""]);
             }
             let kind_char = match row.kind {
-                ContentKind::Dir => 'd',
-                ContentKind::File => '-',
-                ContentKind::Symlink => 'l',
-                ContentKind::Other => '?',
-                ContentKind::Parent => '^',
+                ContentKind::Dir => "d",
+                ContentKind::File => "-",
+                ContentKind::Symlink => "l",
+                ContentKind::Other => "?",
+                ContentKind::Parent => "^",
             };
             let display_name = if matches!(row.kind, ContentKind::Dir) {
                 format!("{}/", row.name)
@@ -740,25 +780,46 @@ fn render_snapshot_contents(frame: &mut Frame, app: &mut App, area: Rect) {
                 row.name.clone()
             };
             let size_col = if matches!(row.kind, ContentKind::File) {
-                format!("{:>10}", human_size(row.size))
+                human_size(row.size)
             } else {
-                String::from("          ")
+                String::new()
             };
-            ListItem::new(format!(
-                "{}  {:<40}  {}  {}",
-                kind_char, display_name, size_col, row.mtime
-            ))
+            Row::new([
+                Cell::from(kind_char),
+                Cell::from(display_name),
+                Cell::from(Line::from(size_col).alignment(Alignment::Right)),
+                Cell::from(row.mtime.clone()),
+            ])
         })
         .collect();
 
-    let list = List::new(items)
-        .block(Block::bordered().title(title))
-        .highlight_style(selection_highlight())
-        .highlight_symbol(">> ");
+    let header = Row::new([
+        Cell::from("T"),
+        Cell::from("Name"),
+        Cell::from(Line::from("Size").alignment(Alignment::Right)),
+        Cell::from("Modified"),
+    ])
+        .style(Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(1),
+            Constraint::Fill(1),
+            Constraint::Length(10),
+            Constraint::Length(19),
+        ],
+    )
+    .header(header)
+    .block(Block::bordered().title(title))
+    .row_highlight_style(selection_highlight())
+    .highlight_symbol(">> ")
+    .highlight_spacing(HighlightSpacing::Always)
+    .column_spacing(2);
 
     record_list_area(app, area);
     let top_mut = &mut app.browse_stack[frame_idx];
-    frame.render_stateful_widget(list, area, &mut top_mut.list_state);
+    frame.render_stateful_widget(table, area, &mut top_mut.table_state);
 }
 
 fn render_file_details(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -1212,16 +1273,16 @@ fn render_snapshot_delete_confirm(frame: &mut Frame, app: &mut App, area: Rect) 
         return;
     }
 
-    let mut items: Vec<ListItem> = preview
+    let mut rows: Vec<Row> = preview
         .entries
         .iter()
         .map(|row| {
             let kind_char = match row.kind {
-                ContentKind::Dir => 'd',
-                ContentKind::File => '-',
-                ContentKind::Symlink => 'l',
-                ContentKind::Other => '?',
-                ContentKind::Parent => '^',
+                ContentKind::Dir => "d",
+                ContentKind::File => "-",
+                ContentKind::Symlink => "l",
+                ContentKind::Other => "?",
+                ContentKind::Parent => "^",
             };
             let display_path = if matches!(row.kind, ContentKind::Dir) {
                 format!("{}/", row.path)
@@ -1229,17 +1290,21 @@ fn render_snapshot_delete_confirm(frame: &mut Frame, app: &mut App, area: Rect) 
                 row.path.clone()
             };
             let size_col = if matches!(row.kind, ContentKind::File) {
-                format!("{:>10}", human_size(row.size))
+                human_size(row.size)
             } else {
-                String::from("          ")
+                String::new()
             };
-            ListItem::new(format!("{}  {}  {}", kind_char, size_col, display_path))
+            Row::new([
+                Cell::from(kind_char),
+                Cell::from(Line::from(size_col).alignment(Alignment::Right)),
+                Cell::from(display_path),
+            ])
         })
         .collect();
     if preview.truncated {
-        items.push(
-            ListItem::new("   …load more")
-            .style(Style::new().fg(Color::DarkGray)),
+        rows.push(
+            Row::new([Cell::from(""), Cell::from(""), Cell::from("…load more")])
+                .style(Style::new().fg(Color::DarkGray)),
         );
     }
     let title = if preview.truncated {
@@ -1247,10 +1312,29 @@ fn render_snapshot_delete_confirm(frame: &mut Frame, app: &mut App, area: Rect) 
     } else {
         format!("Contents ({} entries)", preview.entries.len())
     };
-    let list = List::new(items)
-        .highlight_style(Style::new().bg(Color::DarkGray))
-        .block(Block::bordered().title(title));
-    frame.render_stateful_widget(list, body, &mut app.delete_preview_state);
+
+    let col_header = Row::new([
+        Cell::from("T"),
+        Cell::from(Line::from("Size").alignment(Alignment::Right)),
+        Cell::from("Path"),
+    ])
+    .style(Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(1),
+            Constraint::Length(10),
+            Constraint::Fill(1),
+        ],
+    )
+    .header(col_header)
+    .block(Block::bordered().title(title))
+    .row_highlight_style(Style::new().bg(Color::DarkGray))
+    .column_spacing(2);
+
+    app.list_header_rows = 1;
+    frame.render_stateful_widget(table, body, &mut app.delete_preview_state);
 }
 
 #[cfg(test)]

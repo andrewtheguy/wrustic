@@ -23,7 +23,7 @@ use ratatui::{
     },
 };
 
-use ratatui::widgets::ListState;
+use ratatui::widgets::TableState;
 
 use crate::app::{App, BrowseFrame, Screen};
 use crate::cli::{USAGE, parse_cli};
@@ -222,7 +222,7 @@ fn run(
                         app.delete_details_raw = Some(raw);
                     }
                     app.delete_root_listing = Some(preview);
-                    app.delete_preview_state = ListState::default();
+                    app.delete_preview_state = TableState::default();
                     if has_entries {
                         app.delete_preview_state.select(Some(0));
                     }
@@ -289,7 +289,7 @@ fn run(
                 Ok((sum, changes)) => {
                     let has_rows = !changes.is_empty();
                     app.compare_results = Some((sum, changes));
-                    app.compare_results_state = ratatui::widgets::ListState::default();
+                    app.compare_results_state = TableState::default();
                     if has_rows {
                         app.compare_results_state.select(Some(0));
                     }
@@ -314,12 +314,12 @@ fn run(
             };
             match list_tree(repo, tree_id) {
                 Ok(items) => {
-                    let (items, list_state) = with_parent(items);
+                    let (items, table_state) = with_parent(items);
                     app.browse_stack.push(BrowseFrame {
                         name,
                         tree_id,
                         items,
-                        list_state,
+                        table_state,
                     });
                     app.screen = Screen::SnapshotContents;
                 }
@@ -401,12 +401,12 @@ fn open_and_walk(
     let repo = open_indexed(profile)?;
     let root_tree = snapshot_root_tree(&repo, snapshot_id)?;
     let root_items = list_tree(&repo, root_tree)?;
-    let (root_items, root_list_state) = with_parent(root_items);
+    let (root_items, root_table_state) = with_parent(root_items);
     let mut stack = vec![BrowseFrame {
         name: String::new(),
         tree_id: root_tree,
         items: root_items,
-        list_state: root_list_state,
+        table_state: root_table_state,
     }];
 
     if let Some(path) = refresh_path {
@@ -420,12 +420,12 @@ fn open_and_walk(
             match next {
                 Some((tree_id, name)) => {
                     let items = list_tree(&repo, tree_id)?;
-                    let (items, list_state) = with_parent(items);
+                    let (items, table_state) = with_parent(items);
                     stack.push(BrowseFrame {
                         name,
                         tree_id,
                         items,
-                        list_state,
+                        table_state,
                     });
                 }
                 None => break,
@@ -438,12 +438,12 @@ fn open_and_walk(
 
 // Prepend a synthetic `..` row and pick a default selection: the first real
 // entry if any, otherwise the `..` row itself.
-fn with_parent(items: Vec<ContentRow>) -> (Vec<ContentRow>, ListState) {
+fn with_parent(items: Vec<ContentRow>) -> (Vec<ContentRow>, TableState) {
     let mut out = Vec::with_capacity(items.len() + 1);
     out.push(ContentRow::parent());
     out.extend(items);
-    let mut list_state = ListState::default();
+    let mut table_state = TableState::default();
     let initial = if out.len() > 1 { 1 } else { 0 };
-    list_state.select(Some(initial));
-    (out, list_state)
+    table_state.select(Some(initial));
+    (out, table_state)
 }
