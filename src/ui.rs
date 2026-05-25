@@ -111,11 +111,8 @@ fn bottom_bar_text(app: &App) -> &'static str {
         Screen::PassphraseDerivingKey => "working…",
         Screen::AuthMethodChoice => "Up/Dn move  Enter pick  Esc back",
         Screen::PassphraseUrl => "Esc/q quit",
-        Screen::SnapshotCompareFirst => {
-            "Up/Dn move  PgUp/PgDn page  g/G top/bottom  Enter pick FIRST  Esc cancel"
-        }
         Screen::SnapshotCompareSecond => {
-            "Up/Dn move  PgUp/PgDn page  g/G top/bottom  Enter pick SECOND  a toggle related/all  Esc back"
+            "Up/Dn move  PgUp/PgDn page  g/G top/bottom  Enter pick SECOND  a toggle related/all  Esc cancel"
         }
         Screen::SnapshotCompareResults => "Up/Dn move  PgUp/PgDn page  g/G top/bottom  q/Esc back",
         Screen::OpeningSnapshot
@@ -273,7 +270,6 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
             frame.render_widget(para, area);
         }
         Screen::PassphraseUrl => render_passphrase_url(frame, app, area),
-        Screen::SnapshotCompareFirst => render_compare_first(frame, app, area),
         Screen::SnapshotCompareSecond => render_compare_second(frame, app, area),
         Screen::SnapshotCompareLoading => render_compare_loading(frame, app, area),
         Screen::SnapshotCompareResults => render_compare_results(frame, app, area),
@@ -580,20 +576,6 @@ fn render_snapshot_picker(
         .highlight_symbol(">> ");
 
     frame.render_stateful_widget(list, area, state);
-}
-
-fn render_compare_first(frame: &mut Frame, app: &mut App, area: Rect) {
-    let visible = app.visible_snapshot_indices();
-    let title = format!("Compare — pick FIRST snapshot ({})", visible.len());
-    record_list_area(app, area);
-    render_snapshot_picker(
-        frame,
-        area,
-        &title,
-        &app.snapshots,
-        &visible,
-        &mut app.compare_picker_state,
-    );
 }
 
 fn render_compare_second(frame: &mut Frame, app: &mut App, area: Rect) {
