@@ -44,7 +44,6 @@ pub(crate) enum Screen {
     LoadingFileDetails,
     FileDetails,
     ShareUrl,
-    SnapshotCompareFirst,
     SnapshotCompareSecond,
     SnapshotCompareLoading,
     SnapshotCompareResults,
@@ -1081,25 +1080,6 @@ impl App {
         }
     }
 
-    fn activate_compare_first(&mut self) {
-        let visible = self.visible_snapshot_indices();
-        if let Some(pos) = self.compare_picker_state.selected()
-            && let Some(&abs) = visible.get(pos)
-            && let Some(s) = self.snapshots.get(abs)
-        {
-            self.compare_first_id = Some(s.id.clone());
-            self.compare_first_row_idx = Some(abs);
-            self.compare_only_related = true;
-            // Reset picker selection — index meaning changes with the new
-            // (related-only) visible set.
-            self.compare_picker_state = ListState::default();
-            if !self.compare_second_visible_indices().is_empty() {
-                self.compare_picker_state.select(Some(0));
-            }
-            self.screen = Screen::SnapshotCompareSecond;
-        }
-    }
-
     fn activate_compare_second(&mut self) {
         let visible = self.compare_second_visible_indices();
         if let Some(pos) = self.compare_picker_state.selected()
@@ -1540,52 +1520,10 @@ impl App {
                 _ => {}
             },
 
-            Screen::SnapshotCompareFirst => match key.code {
+            Screen::SnapshotCompareSecond => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
                     self.clear_compare_scratch();
                     self.screen = Screen::Snapshots;
-                }
-                KeyCode::Down => self.compare_picker_state.select_next(),
-                KeyCode::Up => self.compare_picker_state.select_previous(),
-                KeyCode::Home | KeyCode::Char('g') => {
-                    self.compare_picker_state.select(Some(0));
-                }
-                KeyCode::End | KeyCode::Char('G') => {
-                    let visible = self.visible_snapshot_indices();
-                    if !visible.is_empty() {
-                        self.compare_picker_state.select(Some(visible.len() - 1));
-                    }
-                }
-                KeyCode::PageDown => {
-                    let step = self.page_step();
-                    let len = self.visible_snapshot_indices().len();
-                    page_select(&mut self.compare_picker_state, len, true, step);
-                }
-                KeyCode::PageUp => {
-                    let step = self.page_step();
-                    let len = self.visible_snapshot_indices().len();
-                    page_select(&mut self.compare_picker_state, len, false, step);
-                }
-                KeyCode::Enter => self.activate_compare_first(),
-                _ => {}
-            },
-
-            Screen::SnapshotCompareSecond => match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => {
-                    self.compare_second_id = None;
-                    self.compare_only_related = true;
-                    // Restore picker to first-pick position so user lands where
-                    // they were.
-                    self.compare_picker_state = ListState::default();
-                    if let Some(idx) = self.compare_first_row_idx {
-                        let visible = self.visible_snapshot_indices();
-                        if let Some(pos) = visible.iter().position(|&i| i == idx) {
-                            self.compare_picker_state.select(Some(pos));
-                        }
-                    }
-                    self.compare_first_id = None;
-                    self.compare_first_row_idx = None;
-                    self.screen = Screen::SnapshotCompareFirst;
                 }
                 KeyCode::Down => self.compare_picker_state.select_next(),
                 KeyCode::Up => self.compare_picker_state.select_previous(),
@@ -2169,15 +2107,6 @@ impl App {
                     }
                 }
             }
-            Screen::SnapshotCompareFirst => {
-                let len = self.visible_snapshot_indices().len();
-                if let Some(idx) =
-                    click_to_index(area, self.compare_picker_state.offset(), len, row, col)
-                {
-                    self.compare_picker_state.select(Some(idx));
-                    self.activate_compare_first();
-                }
-            }
             Screen::SnapshotCompareSecond => {
                 let len = self.compare_second_visible_indices().len();
                 if let Some(idx) =
@@ -2274,7 +2203,7 @@ impl App {
                     self.list_state.select_previous();
                 }
             }
-            Screen::SnapshotCompareFirst | Screen::SnapshotCompareSecond => {
+            Screen::SnapshotCompareSecond => {
                 if down {
                     self.compare_picker_state.select_next();
                 } else {
