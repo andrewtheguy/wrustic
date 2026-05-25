@@ -136,7 +136,15 @@ fn bottom_bar_text(app: &App) -> &'static str {
     }
 }
 
+fn render_column_header(frame: &mut Frame, area: Rect, columns: &str) {
+    let text = format!("   {columns}");
+    let para = Paragraph::new(text)
+        .style(Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
+    frame.render_widget(para, area);
+}
+
 fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
+    app.list_header_rows = 0;
     match &app.screen {
         Screen::Home => render_home(frame, app, area),
         Screen::CreateProfileName => render_input(
@@ -325,6 +333,14 @@ fn render_home(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
+    let outer = Block::bordered().title(title);
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    let [hdr, body] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
+    render_column_header(frame, hdr, &format!("{:<24} Backend", "Name"));
+    app.list_header_rows = 1;
+
     let items: Vec<ListItem> = app
         .config
         .profiles
@@ -333,12 +349,11 @@ fn render_home(frame: &mut Frame, app: &mut App, area: Rect) {
         .collect();
 
     let list = List::new(items)
-        .block(Block::bordered().title(title))
         .highlight_style(selection_highlight())
         .highlight_symbol(">> ");
 
     record_list_area(app, area);
-    frame.render_stateful_widget(list, area, &mut app.profile_list_state);
+    frame.render_stateful_widget(list, body, &mut app.profile_list_state);
 }
 
 fn render_backend_choice(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -536,6 +551,7 @@ fn render_snapshots(frame: &mut Frame, app: &mut App, area: Rect) {
     };
 
     record_list_area(app, area);
+    app.list_header_rows = 1;
     render_snapshot_picker(frame, area, &title, &app.snapshots, &visible, &mut app.list_state);
 }
 
@@ -550,6 +566,17 @@ fn render_snapshot_picker(
     visible: &[usize],
     state: &mut ratatui::widgets::ListState,
 ) {
+    let outer = Block::bordered().title(title);
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    let [hdr, body] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
+    render_column_header(
+        frame,
+        hdr,
+        &format!("{:<8}  {:<19}  {:<20}  {:<20}  {}", "ID", "Time", "Host", "Tags", "Paths"),
+    );
+
     let items: Vec<ListItem> = visible
         .iter()
         .map(|&i| &snapshots[i])
@@ -571,11 +598,10 @@ fn render_snapshot_picker(
         .collect();
 
     let list = List::new(items)
-        .block(Block::bordered().title(title))
         .highlight_style(selection_highlight())
         .highlight_symbol(">> ");
 
-    frame.render_stateful_widget(list, area, state);
+    frame.render_stateful_widget(list, body, state);
 }
 
 fn render_compare_second(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -591,6 +617,7 @@ fn render_compare_second(frame: &mut Frame, app: &mut App, area: Rect) {
         visible.len()
     );
     record_list_area(app, area);
+    app.list_header_rows = 1;
     render_snapshot_picker(
         frame,
         area,
@@ -655,12 +682,20 @@ fn render_compare_results(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 
     let count = items.len();
+    let changes_block = Block::bordered().title(format!("Changes ({count})"));
+    let changes_inner = changes_block.inner(body);
+    frame.render_widget(changes_block, body);
+
+    let [col_hdr, list_body] =
+        Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(changes_inner);
+    render_column_header(frame, col_hdr, "M  Path");
+    app.list_header_rows = 1;
+
     let list = List::new(items)
-        .block(Block::bordered().title(format!("Changes ({count})")))
         .highlight_style(selection_highlight())
         .highlight_symbol(">> ");
     record_list_area(app, body);
-    frame.render_stateful_widget(list, body, &mut app.compare_results_state);
+    frame.render_stateful_widget(list, list_body, &mut app.compare_results_state);
 }
 
 fn render_filter_dim(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -718,6 +753,18 @@ fn render_snapshot_contents(frame: &mut Frame, app: &mut App, area: Rect) {
         path_display,
     );
 
+    let outer = Block::bordered().title(title);
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    let [hdr, body] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
+    render_column_header(
+        frame,
+        hdr,
+        &format!("{}  {:<40}  {:>10}  {}", "T", "Name", "Size", "Modified"),
+    );
+    app.list_header_rows = 1;
+
     let frame_idx = app.browse_stack.len() - 1;
     let top = &app.browse_stack[frame_idx];
     let items: Vec<ListItem> = top
@@ -752,13 +799,12 @@ fn render_snapshot_contents(frame: &mut Frame, app: &mut App, area: Rect) {
         .collect();
 
     let list = List::new(items)
-        .block(Block::bordered().title(title))
         .highlight_style(selection_highlight())
         .highlight_symbol(">> ");
 
     record_list_area(app, area);
     let top_mut = &mut app.browse_stack[frame_idx];
-    frame.render_stateful_widget(list, area, &mut top_mut.list_state);
+    frame.render_stateful_widget(list, body, &mut top_mut.list_state);
 }
 
 fn render_file_details(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -1247,10 +1293,21 @@ fn render_snapshot_delete_confirm(frame: &mut Frame, app: &mut App, area: Rect) 
     } else {
         format!("Contents ({} entries)", preview.entries.len())
     };
+    let contents_block = Block::bordered().title(title);
+    let contents_inner = contents_block.inner(body);
+    frame.render_widget(contents_block, body);
+
+    let [col_hdr, list_body] =
+        Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(contents_inner);
+    render_column_header(
+        frame,
+        col_hdr,
+        &format!("{}  {:>10}  {}", "T", "Size", "Path"),
+    );
+
     let list = List::new(items)
-        .highlight_style(Style::new().bg(Color::DarkGray))
-        .block(Block::bordered().title(title));
-    frame.render_stateful_widget(list, body, &mut app.delete_preview_state);
+        .highlight_style(Style::new().bg(Color::DarkGray));
+    frame.render_stateful_widget(list, list_body, &mut app.delete_preview_state);
 }
 
 #[cfg(test)]

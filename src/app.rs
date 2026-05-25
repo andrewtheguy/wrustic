@@ -149,13 +149,14 @@ fn click_to_index(
     len: usize,
     row: u16,
     col: u16,
+    header_rows: u16,
 ) -> Option<usize> {
     if len == 0 {
         return None;
     }
     // Bordered interior: skip the top/left border and stop before the
     // bottom/right border.
-    let inner_top = list_area.y.checked_add(1)?;
+    let inner_top = list_area.y.checked_add(1)?.checked_add(header_rows)?;
     let inner_left = list_area.x.checked_add(1)?;
     let inner_bottom = list_area.y.saturating_add(list_area.height.saturating_sub(1));
     let inner_right = list_area.x.saturating_add(list_area.width.saturating_sub(1));
@@ -313,6 +314,7 @@ pub(crate) struct App {
     // to translate click coordinates into a row index. Set by the renderer
     // each frame; read by the key/mouse handler on the next event.
     pub(crate) list_area: Option<Rect>,
+    pub(crate) list_header_rows: u16,
 
     // Last left-click on the Snapshots list: timestamp + clicked row index.
     // Used to detect a double-click for opening a snapshot.
@@ -416,6 +418,7 @@ impl App {
             compare_results: None,
             compare_results_state: ListState::default(),
             list_area: None,
+            list_header_rows: 0,
             last_snapshot_click: None,
             last_content_click: None,
         };
@@ -922,8 +925,8 @@ impl App {
     // page's worth, used by PageDown/PageUp to advance the viewport.
     fn page_step(&self) -> usize {
         let h = self.list_area.map(|r| r.height).unwrap_or(0);
-        // height - 2 borders, with a floor of 1 row.
-        h.saturating_sub(2).max(1) as usize
+        // height - 2 borders - column header rows, with a floor of 1 row.
+        h.saturating_sub(2).saturating_sub(self.list_header_rows).max(1) as usize
     }
 
     fn delete_preview_len(&self) -> usize {
@@ -2065,11 +2068,12 @@ impl App {
         let Some(area) = self.list_area else {
             return;
         };
+        let hdr = self.list_header_rows;
         match &self.screen {
             Screen::Home => {
                 let len = self.config.profiles.len();
                 if let Some(idx) =
-                    click_to_index(area, self.profile_list_state.offset(), len, row, col)
+                    click_to_index(area, self.profile_list_state.offset(), len, row, col, hdr)
                 {
                     self.profile_list_state.select(Some(idx));
                     self.activate_home_profile();
@@ -2077,7 +2081,7 @@ impl App {
             }
             Screen::AuthMethodChoice => {
                 if let Some(idx) =
-                    click_to_index(area, self.auth_method_list.offset(), 2, row, col)
+                    click_to_index(area, self.auth_method_list.offset(), 2, row, col, 0)
                 {
                     self.auth_method_list.select(Some(idx));
                     self.activate_auth_method();
@@ -2085,7 +2089,7 @@ impl App {
             }
             Screen::BackendChoice => {
                 if let Some(idx) =
-                    click_to_index(area, self.backend_list.offset(), BACKEND_ORDER.len(), row, col)
+                    click_to_index(area, self.backend_list.offset(), BACKEND_ORDER.len(), row, col, 0)
                 {
                     self.backend_list.select(Some(idx));
                     self.activate_backend();
@@ -2093,7 +2097,7 @@ impl App {
             }
             Screen::Snapshots => {
                 let len = self.visible_snapshot_indices().len();
-                if let Some(idx) = click_to_index(area, self.list_state.offset(), len, row, col) {
+                if let Some(idx) = click_to_index(area, self.list_state.offset(), len, row, col, hdr) {
                     self.list_state.select(Some(idx));
                     let now = Instant::now();
                     let is_double = self
@@ -2110,7 +2114,7 @@ impl App {
             Screen::SnapshotCompareSecond => {
                 let len = self.compare_second_visible_indices().len();
                 if let Some(idx) =
-                    click_to_index(area, self.compare_picker_state.offset(), len, row, col)
+                    click_to_index(area, self.compare_picker_state.offset(), len, row, col, hdr)
                 {
                     self.compare_picker_state.select(Some(idx));
                     self.activate_compare_second();
@@ -2123,7 +2127,7 @@ impl App {
                     .map(|(_, c)| c.len())
                     .unwrap_or(0);
                 if let Some(idx) =
-                    click_to_index(area, self.compare_results_state.offset(), len, row, col)
+                    click_to_index(area, self.compare_results_state.offset(), len, row, col, hdr)
                 {
                     self.compare_results_state.select(Some(idx));
                 }
@@ -2131,7 +2135,7 @@ impl App {
             Screen::SnapshotFilterDim => {
                 let len = filter_dim_entries(self.snapshot_filter.is_some()).len();
                 if let Some(idx) =
-                    click_to_index(area, self.filter_picker_state.offset(), len, row, col)
+                    click_to_index(area, self.filter_picker_state.offset(), len, row, col, 0)
                 {
                     self.filter_picker_state.select(Some(idx));
                     self.activate_filter_dim();
@@ -2140,7 +2144,7 @@ impl App {
             Screen::SnapshotFilterValue => {
                 let len = self.filter_values.len();
                 if let Some(idx) =
-                    click_to_index(area, self.filter_picker_state.offset(), len, row, col)
+                    click_to_index(area, self.filter_picker_state.offset(), len, row, col, 0)
                 {
                     self.filter_picker_state.select(Some(idx));
                     self.activate_filter_value();
@@ -2152,7 +2156,7 @@ impl App {
                 };
                 let len = f.items.len();
                 let offset = f.list_state.offset();
-                if let Some(idx) = click_to_index(area, offset, len, row, col) {
+                if let Some(idx) = click_to_index(area, offset, len, row, col, hdr) {
                     f.list_state.select(Some(idx));
                     let now = Instant::now();
                     let is_double = self
@@ -2445,39 +2449,48 @@ mod tests {
         // row 11, col 5 and col 24. Interior rows are 3..=10.
         let area = Rect { x: 5, y: 2, width: 20, height: 10 };
         // Clicking the first interior row (row=3) with offset=0 → idx 0.
-        assert_eq!(click_to_index(area, 0, 100, 3, 10), Some(0));
+        assert_eq!(click_to_index(area, 0, 100, 3, 10, 0), Some(0));
         // Last interior row (row=10) with offset=0 → idx 7.
-        assert_eq!(click_to_index(area, 0, 100, 10, 10), Some(7));
+        assert_eq!(click_to_index(area, 0, 100, 10, 10, 0), Some(7));
         // Same click with offset=4 → idx 11.
-        assert_eq!(click_to_index(area, 4, 100, 10, 10), Some(11));
+        assert_eq!(click_to_index(area, 4, 100, 10, 10, 0), Some(11));
     }
 
     #[test]
     fn click_to_index_rejects_borders_and_outside() {
         let area = Rect { x: 5, y: 2, width: 20, height: 10 };
         // Top border row.
-        assert_eq!(click_to_index(area, 0, 100, 2, 10), None);
+        assert_eq!(click_to_index(area, 0, 100, 2, 10, 0), None);
         // Bottom border row.
-        assert_eq!(click_to_index(area, 0, 100, 11, 10), None);
+        assert_eq!(click_to_index(area, 0, 100, 11, 10, 0), None);
         // Left border column.
-        assert_eq!(click_to_index(area, 0, 100, 5, 5), None);
+        assert_eq!(click_to_index(area, 0, 100, 5, 5, 0), None);
         // Right border column.
-        assert_eq!(click_to_index(area, 0, 100, 5, 24), None);
+        assert_eq!(click_to_index(area, 0, 100, 5, 24, 0), None);
         // Above and below the rect entirely.
-        assert_eq!(click_to_index(area, 0, 100, 0, 10), None);
-        assert_eq!(click_to_index(area, 0, 100, 99, 10), None);
+        assert_eq!(click_to_index(area, 0, 100, 0, 10, 0), None);
+        assert_eq!(click_to_index(area, 0, 100, 99, 10, 0), None);
     }
 
     #[test]
     fn click_to_index_clamps_to_list_length() {
         let area = Rect { x: 0, y: 0, width: 10, height: 10 };
         // Interior rows 1..=8, but only 3 items in the list.
-        assert_eq!(click_to_index(area, 0, 3, 1, 5), Some(0));
-        assert_eq!(click_to_index(area, 0, 3, 3, 5), Some(2));
+        assert_eq!(click_to_index(area, 0, 3, 1, 5, 0), Some(0));
+        assert_eq!(click_to_index(area, 0, 3, 3, 5, 0), Some(2));
         // Row 4 is the empty area past the last item.
-        assert_eq!(click_to_index(area, 0, 3, 4, 5), None);
+        assert_eq!(click_to_index(area, 0, 3, 4, 5, 0), None);
         // Empty list rejects all clicks.
-        assert_eq!(click_to_index(area, 0, 0, 1, 5), None);
+        assert_eq!(click_to_index(area, 0, 0, 1, 5, 0), None);
+    }
+
+    #[test]
+    fn click_to_index_skips_header_rows() {
+        let area = Rect { x: 5, y: 2, width: 20, height: 10 };
+        // With 1 header row, first data row is row=4 (border + header).
+        assert_eq!(click_to_index(area, 0, 100, 3, 10, 1), None);
+        assert_eq!(click_to_index(area, 0, 100, 4, 10, 1), Some(0));
+        assert_eq!(click_to_index(area, 0, 100, 10, 10, 1), Some(6));
     }
 
     fn list_state_at(offset: usize, selected: usize) -> ListState {
