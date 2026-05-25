@@ -1333,6 +1333,7 @@ fn render_snapshot_delete_confirm(frame: &mut Frame, app: &mut App, area: Rect) 
     .row_highlight_style(Style::new().bg(Color::DarkGray))
     .column_spacing(2);
 
+    app.list_header_rows = 1;
     frame.render_stateful_widget(table, body, &mut app.delete_preview_state);
 }
 
