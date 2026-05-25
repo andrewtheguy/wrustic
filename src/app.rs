@@ -1520,16 +1520,22 @@ impl App {
                     }
                 }
                 KeyCode::Char('c') => {
-                    // Need at least two snapshots in the current visible set to
-                    // compare anything; otherwise the flow has no second pick.
                     let visible = self.visible_snapshot_indices();
                     if visible.len() < 2 {
                         return;
                     }
                     self.clear_compare_scratch();
-                    let start = self.list_state.selected().unwrap_or(0).min(visible.len() - 1);
-                    self.compare_picker_state.select(Some(start));
-                    self.screen = Screen::SnapshotCompareFirst;
+                    let pos = self.list_state.selected().unwrap_or(0).min(visible.len() - 1);
+                    let abs = visible[pos];
+                    let s = &self.snapshots[abs];
+                    self.compare_first_id = Some(s.id.clone());
+                    self.compare_first_row_idx = Some(abs);
+                    self.compare_only_related = true;
+                    self.compare_picker_state = ListState::default();
+                    if !self.compare_second_visible_indices().is_empty() {
+                        self.compare_picker_state.select(Some(0));
+                    }
+                    self.screen = Screen::SnapshotCompareSecond;
                 }
                 _ => {}
             },
