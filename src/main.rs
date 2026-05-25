@@ -23,7 +23,7 @@ use ratatui::{
     },
 };
 
-use ratatui::widgets::{ListState, TableState};
+use ratatui::widgets::TableState;
 
 use crate::app::{App, BrowseFrame, Screen};
 use crate::cli::{USAGE, parse_cli};
@@ -222,7 +222,7 @@ fn run(
                         app.delete_details_raw = Some(raw);
                     }
                     app.delete_root_listing = Some(preview);
-                    app.delete_preview_state = ListState::default();
+                    app.delete_preview_state = TableState::default();
                     if has_entries {
                         app.delete_preview_state.select(Some(0));
                     }
@@ -289,7 +289,7 @@ fn run(
                 Ok((sum, changes)) => {
                     let has_rows = !changes.is_empty();
                     app.compare_results = Some((sum, changes));
-                    app.compare_results_state = ratatui::widgets::ListState::default();
+                    app.compare_results_state = TableState::default();
                     if has_rows {
                         app.compare_results_state.select(Some(0));
                     }

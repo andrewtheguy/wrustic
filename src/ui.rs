@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, HighlightSpacing, List, ListItem, Paragraph, Row, Table, Wrap},
+    widgets::{Block, Borders, Cell, HighlightSpacing, List, ListItem, Paragraph, Row, Table, TableState, Wrap},
 };
 use tui_input::Input;
 
@@ -136,12 +136,6 @@ fn bottom_bar_text(app: &App) -> &'static str {
     }
 }
 
-fn render_column_header(frame: &mut Frame, area: Rect, columns: &str) {
-    let text = format!("   {columns}");
-    let para = Paragraph::new(text)
-        .style(Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
-    frame.render_widget(para, area);
-}
 
 fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
     app.list_header_rows = 0;
@@ -333,27 +327,28 @@ fn render_home(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let outer = Block::bordered().title(title);
-    let inner = outer.inner(area);
-    frame.render_widget(outer, area);
-
-    let [hdr, body] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
-    render_column_header(frame, hdr, &format!("{:<24} Backend", "Name"));
     app.list_header_rows = 1;
 
-    let items: Vec<ListItem> = app
+    let rows: Vec<Row> = app
         .config
         .profiles
         .iter()
-        .map(|(name, p)| ListItem::new(format!("{:<24} [{}]", name, p.backend_kind().label())))
+        .map(|(name, p)| Row::new([Cell::from(name.clone()), Cell::from(p.backend_kind().label())]))
         .collect();
 
-    let list = List::new(items)
-        .highlight_style(selection_highlight())
-        .highlight_symbol(">> ");
+    let header = Row::new(["Name", "Backend"])
+        .style(Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+    let table = Table::new(rows, [Constraint::Length(24), Constraint::Fill(1)])
+        .header(header)
+        .block(Block::bordered().title(title))
+        .row_highlight_style(selection_highlight())
+        .highlight_symbol(">> ")
+        .highlight_spacing(HighlightSpacing::Always)
+        .column_spacing(2);
 
     record_list_area(app, area);
-    frame.render_stateful_widget(list, body, &mut app.profile_list_state);
+    frame.render_stateful_widget(table, area, &mut app.profile_list_state);
 }
 
 fn render_backend_choice(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -557,27 +552,16 @@ fn render_snapshots(frame: &mut Frame, app: &mut App, area: Rect) {
 
 // Shared picker rendering for the Snapshots screen and the two compare-flow
 // pick screens. Indices are absolute into `snapshots`; the picker's own
-// `ListState` is positional within `visible`.
+// `TableState` is positional within `visible`.
 fn render_snapshot_picker(
     frame: &mut Frame,
     area: Rect,
     title: &str,
     snapshots: &[crate::repo::SnapshotRow],
     visible: &[usize],
-    state: &mut ratatui::widgets::ListState,
+    state: &mut TableState,
 ) {
-    let outer = Block::bordered().title(title);
-    let inner = outer.inner(area);
-    frame.render_widget(outer, area);
-
-    let [hdr, body] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
-    render_column_header(
-        frame,
-        hdr,
-        &format!("{:<8}  {:<19}  {:<20}  {:<20}  {}", "ID", "Time", "Host", "Tags", "Paths"),
-    );
-
-    let items: Vec<ListItem> = visible
+    let rows: Vec<Row> = visible
         .iter()
         .map(|&i| &snapshots[i])
         .map(|s| {
@@ -586,22 +570,37 @@ fn render_snapshot_picker(
             } else {
                 format!("[{}]", s.tags.join(","))
             };
-            ListItem::new(format!(
-                "{:<8}  {:<19}  {:<20}  {:<20}  {}",
-                short_snap_id(&s.id),
-                s.time,
-                s.host,
-                tags,
-                s.paths.join(",")
-            ))
+            Row::new([
+                Cell::from(short_snap_id(&s.id)),
+                Cell::from(s.time.as_str()),
+                Cell::from(s.host.as_str()),
+                Cell::from(tags),
+                Cell::from(s.paths.join(",")),
+            ])
         })
         .collect();
 
-    let list = List::new(items)
-        .highlight_style(selection_highlight())
-        .highlight_symbol(">> ");
+    let header = Row::new(["ID", "Time", "Host", "Tags", "Paths"])
+        .style(Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
-    frame.render_stateful_widget(list, body, state);
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(8),
+            Constraint::Length(19),
+            Constraint::Length(20),
+            Constraint::Length(20),
+            Constraint::Fill(1),
+        ],
+    )
+    .header(header)
+    .block(Block::bordered().title(title))
+    .row_highlight_style(selection_highlight())
+    .highlight_symbol(">> ")
+    .highlight_spacing(HighlightSpacing::Always)
+    .column_spacing(2);
+
+    frame.render_stateful_widget(table, area, state);
 }
 
 fn render_compare_second(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -647,7 +646,7 @@ fn render_compare_results(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let [header, body] = Layout::vertical([Constraint::Length(3), Constraint::Fill(1)]).areas(inner);
 
-    let (summary_text, items) = match &app.compare_results {
+    let (summary_text, rows) = match &app.compare_results {
         Some((sum, changes)) => {
             let text = format!(
                 "+{} files / -{} / M{}  |  +{} / -{}  ({} change{})",
@@ -659,11 +658,14 @@ fn render_compare_results(frame: &mut Frame, app: &mut App, area: Rect) {
                 changes.len(),
                 if changes.len() == 1 { "" } else { "s" },
             );
-            let items: Vec<ListItem> = changes
+            let rows: Vec<Row> = changes
                 .iter()
-                .map(|c| ListItem::new(format!("{}  {}", c.modifier.as_char(), c.path)))
+                .map(|c| Row::new([
+                    Cell::from(c.modifier.as_char().to_string()),
+                    Cell::from(c.path.clone()),
+                ]))
                 .collect();
-            (text, items)
+            (text, rows)
         }
         None => ("(no diff loaded)".to_string(), Vec::new()),
     };
@@ -673,7 +675,7 @@ fn render_compare_results(frame: &mut Frame, app: &mut App, area: Rect) {
         .block(Block::bordered().title("Summary"));
     frame.render_widget(summary_para, header);
 
-    if items.is_empty() {
+    if rows.is_empty() {
         let para = Paragraph::new("No file-level changes between these snapshots.")
             .style(Style::new().fg(Color::DarkGray))
             .block(Block::bordered().title("Changes"));
@@ -681,21 +683,22 @@ fn render_compare_results(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let count = items.len();
-    let changes_block = Block::bordered().title(format!("Changes ({count})"));
-    let changes_inner = changes_block.inner(body);
-    frame.render_widget(changes_block, body);
-
-    let [col_hdr, list_body] =
-        Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(changes_inner);
-    render_column_header(frame, col_hdr, "M  Path");
+    let count = rows.len();
     app.list_header_rows = 1;
 
-    let list = List::new(items)
-        .highlight_style(selection_highlight())
-        .highlight_symbol(">> ");
+    let col_header = Row::new(["M", "Path"])
+        .style(Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
+
+    let table = Table::new(rows, [Constraint::Length(1), Constraint::Fill(1)])
+        .header(col_header)
+        .block(Block::bordered().title(format!("Changes ({count})")))
+        .row_highlight_style(selection_highlight())
+        .highlight_symbol(">> ")
+        .highlight_spacing(HighlightSpacing::Always)
+        .column_spacing(2);
+
     record_list_area(app, body);
-    frame.render_stateful_widget(list, list_body, &mut app.compare_results_state);
+    frame.render_stateful_widget(table, body, &mut app.compare_results_state);
 }
 
 fn render_filter_dim(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -1270,16 +1273,16 @@ fn render_snapshot_delete_confirm(frame: &mut Frame, app: &mut App, area: Rect) 
         return;
     }
 
-    let mut items: Vec<ListItem> = preview
+    let mut rows: Vec<Row> = preview
         .entries
         .iter()
         .map(|row| {
             let kind_char = match row.kind {
-                ContentKind::Dir => 'd',
-                ContentKind::File => '-',
-                ContentKind::Symlink => 'l',
-                ContentKind::Other => '?',
-                ContentKind::Parent => '^',
+                ContentKind::Dir => "d",
+                ContentKind::File => "-",
+                ContentKind::Symlink => "l",
+                ContentKind::Other => "?",
+                ContentKind::Parent => "^",
             };
             let display_path = if matches!(row.kind, ContentKind::Dir) {
                 format!("{}/", row.path)
@@ -1287,17 +1290,21 @@ fn render_snapshot_delete_confirm(frame: &mut Frame, app: &mut App, area: Rect) 
                 row.path.clone()
             };
             let size_col = if matches!(row.kind, ContentKind::File) {
-                format!("{:>10}", human_size(row.size))
+                human_size(row.size)
             } else {
-                String::from("          ")
+                String::new()
             };
-            ListItem::new(format!("{}  {}  {}", kind_char, size_col, display_path))
+            Row::new([
+                Cell::from(kind_char),
+                Cell::from(Line::from(size_col).alignment(Alignment::Right)),
+                Cell::from(display_path),
+            ])
         })
         .collect();
     if preview.truncated {
-        items.push(
-            ListItem::new("   …load more")
-            .style(Style::new().fg(Color::DarkGray)),
+        rows.push(
+            Row::new([Cell::from(""), Cell::from(""), Cell::from("…load more")])
+                .style(Style::new().fg(Color::DarkGray)),
         );
     }
     let title = if preview.truncated {
@@ -1305,21 +1312,28 @@ fn render_snapshot_delete_confirm(frame: &mut Frame, app: &mut App, area: Rect) 
     } else {
         format!("Contents ({} entries)", preview.entries.len())
     };
-    let contents_block = Block::bordered().title(title);
-    let contents_inner = contents_block.inner(body);
-    frame.render_widget(contents_block, body);
 
-    let [col_hdr, list_body] =
-        Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(contents_inner);
-    render_column_header(
-        frame,
-        col_hdr,
-        &format!("{}  {:>10}  {}", "T", "Size", "Path"),
-    );
+    let col_header = Row::new([
+        Cell::from("T"),
+        Cell::from(Line::from("Size").alignment(Alignment::Right)),
+        Cell::from("Path"),
+    ])
+    .style(Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
-    let list = List::new(items)
-        .highlight_style(Style::new().bg(Color::DarkGray));
-    frame.render_stateful_widget(list, list_body, &mut app.delete_preview_state);
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(1),
+            Constraint::Length(10),
+            Constraint::Fill(1),
+        ],
+    )
+    .header(col_header)
+    .block(Block::bordered().title(title))
+    .row_highlight_style(Style::new().bg(Color::DarkGray))
+    .column_spacing(2);
+
+    frame.render_stateful_widget(table, body, &mut app.delete_preview_state);
 }
 
 #[cfg(test)]

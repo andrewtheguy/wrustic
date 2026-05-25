@@ -248,8 +248,8 @@ pub(crate) struct App {
 
     pub(crate) auth_method_list: ListState,
     pub(crate) backend_list: ListState,
-    pub(crate) profile_list_state: ListState,
-    pub(crate) list_state: ListState,
+    pub(crate) profile_list_state: TableState,
+    pub(crate) list_state: TableState,
 
     pub(crate) new_profile_name: Input,
     pub(crate) backend_kind: BackendKind,
@@ -305,7 +305,7 @@ pub(crate) struct App {
     pub(crate) delete_target: Option<String>,
     pub(crate) delete_info: Option<DeleteSnapshotInfo>,
     pub(crate) delete_show_json: bool,
-    pub(crate) delete_preview_state: ListState,
+    pub(crate) delete_preview_state: TableState,
     pub(crate) delete_preview_limit: usize,
     pub(crate) post_delete_select: Option<usize>,
     pub(crate) delete_details_parsed: Option<SnapshotDetails>,
@@ -316,9 +316,9 @@ pub(crate) struct App {
     pub(crate) compare_first_row_idx: Option<usize>,
     pub(crate) compare_second_id: Option<String>,
     pub(crate) compare_only_related: bool,
-    pub(crate) compare_picker_state: ListState,
+    pub(crate) compare_picker_state: TableState,
     pub(crate) compare_results: Option<(DiffSummary, Vec<DiffChange>)>,
-    pub(crate) compare_results_state: ListState,
+    pub(crate) compare_results_state: TableState,
 
     // Outer rect of the currently-rendered list/paragraph (bordered area).
     // Used by PageUp/PageDown to size the jump and by the mouse handler
@@ -370,8 +370,8 @@ impl App {
             save_to_keychain: true,
             auth_method_list,
             backend_list,
-            profile_list_state: ListState::default(),
-            list_state: ListState::default(),
+            profile_list_state: TableState::default(),
+            list_state: TableState::default(),
             new_profile_name: Input::default(),
             backend_kind: BackendKind::Local,
             local_path: Input::default(),
@@ -415,7 +415,7 @@ impl App {
             delete_target: None,
             delete_info: None,
             delete_show_json: false,
-            delete_preview_state: ListState::default(),
+            delete_preview_state: TableState::default(),
             delete_preview_limit: 50,
             post_delete_select: None,
             delete_details_parsed: None,
@@ -425,9 +425,9 @@ impl App {
             compare_first_row_idx: None,
             compare_second_id: None,
             compare_only_related: true,
-            compare_picker_state: ListState::default(),
+            compare_picker_state: TableState::default(),
             compare_results: None,
-            compare_results_state: ListState::default(),
+            compare_results_state: TableState::default(),
             list_area: None,
             list_header_rows: 0,
             last_snapshot_click: None,
@@ -985,7 +985,7 @@ impl App {
         self.delete_target = None;
         self.delete_info = None;
         self.delete_show_json = false;
-        self.delete_preview_state = ListState::default();
+        self.delete_preview_state = TableState::default();
         self.delete_preview_limit = 50;
         self.delete_details_parsed = None;
         self.delete_details_raw = None;
@@ -997,9 +997,9 @@ impl App {
         self.compare_first_row_idx = None;
         self.compare_second_id = None;
         self.compare_only_related = true;
-        self.compare_picker_state = ListState::default();
+        self.compare_picker_state = TableState::default();
         self.compare_results = None;
-        self.compare_results_state = ListState::default();
+        self.compare_results_state = TableState::default();
     }
 
     // Indices into `self.snapshots` for step 2 of the compare flow: start from
@@ -1525,7 +1525,7 @@ impl App {
                     self.compare_first_id = Some(s.id.clone());
                     self.compare_first_row_idx = Some(abs);
                     self.compare_only_related = true;
-                    self.compare_picker_state = ListState::default();
+                    self.compare_picker_state = TableState::default();
                     if !self.compare_second_visible_indices().is_empty() {
                         self.compare_picker_state.select(Some(0));
                     }
@@ -1566,7 +1566,7 @@ impl App {
                     // to the top to avoid pointing at a row that fell out of
                     // (or wasn't in) the new set.
                     let visible = self.compare_second_visible_indices();
-                    self.compare_picker_state = ListState::default();
+                    self.compare_picker_state = TableState::default();
                     if !visible.is_empty() {
                         self.compare_picker_state.select(Some(0));
                     }
