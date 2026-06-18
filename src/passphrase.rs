@@ -491,7 +491,7 @@ async fn read_and_decrypt(
 
 pub(crate) fn derive_config_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32], String> {
     let mut key = [0u8; 32];
-    let params = ScryptParams::new(SCRYPT_LOG_N, SCRYPT_R, SCRYPT_P, key.len())
+    let params = ScryptParams::new(SCRYPT_LOG_N, SCRYPT_R, SCRYPT_P)
         .map_err(|e| format!("invalid scrypt parameters: {e}"))?;
     scrypt::scrypt(passphrase.as_bytes(), salt, &params, &mut key)
         .map_err(|e| format!("scrypt failed: {e}"))?;
