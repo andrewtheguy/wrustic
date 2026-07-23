@@ -634,6 +634,14 @@ mod tests {
         use std::path::PathBuf;
 
         let root = PathBuf::from("tmp").join(format!("share-it-{}", std::process::id()));
+        // Remove the fixture directory on both normal completion and panic.
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                std::fs::remove_dir_all(&self.0).ok();
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
         let repository = root.join("repository");
         let source = root.join("source");
         std::fs::create_dir_all(&source).unwrap();
@@ -829,6 +837,5 @@ mod tests {
             std::time::Duration::from_millis(500),
         );
         assert!(res.is_err(), "server should be stopped");
-        std::fs::remove_dir_all(root).ok();
     }
 }

@@ -260,9 +260,18 @@ pub(crate) fn stream_dump(
 
     let mut buffer = vec![0_u8; 64 * 1024];
     loop {
-        let count = stdout
-            .read(&mut buffer)
-            .map_err(|e| anyhow!("reading restic dump stdout: {e}"))?;
+        let count = match stdout.read(&mut buffer) {
+            Ok(count) => count,
+            Err(e) => {
+                // Tear the child and stderr reader down before surfacing the
+                // read error. Cleanup failures are swallowed so they can't
+                // mask the primary error.
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stderr_reader.join();
+                return Err(anyhow!("reading restic dump stdout: {e}"));
+            }
+        };
         if count == 0 {
             break;
         }
@@ -277,9 +286,16 @@ pub(crate) fn stream_dump(
         }
     }
 
-    let status = child
-        .wait()
-        .map_err(|e| anyhow!("waiting on restic dump: {e}"))?;
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(e) => {
+            // Same teardown as the read-error path; the primary error wins.
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stderr_reader.join();
+            return Err(anyhow!("waiting on restic dump: {e}"));
+        }
+    };
     let (stderr_result, stderr) = stderr_reader
         .join()
         .map_err(|_| anyhow!("restic dump stderr reader panicked"))?;

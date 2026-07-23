@@ -121,7 +121,7 @@ run_test() {
     info "running the live wrustic Garage S3 integration test"
     WRUSTIC_GARAGE_ENDPOINT="http://127.0.0.1:${GARAGE_S3_PORT}" \
         PATH="${test_bin_dir}:${PATH}" \
-        cargo test --all-features \
+        cargo test --manifest-path "${project_root}/Cargo.toml" --all-features \
         repo::tests::live_garage_s3_profile_reads_seeded_repository \
         -- --ignored --nocapture
 }
