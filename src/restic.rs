@@ -331,12 +331,12 @@ fn repo_url(profile: &Profile) -> Result<String> {
             let endpoint = if s3_endpoint.is_empty() {
                 "s3.amazonaws.com".to_string()
             } else {
-                // Strip scheme + trailing slash so the URL composes cleanly.
-                s3_endpoint
-                    .trim_start_matches("https://")
-                    .trim_start_matches("http://")
-                    .trim_end_matches('/')
-                    .to_string()
+                let endpoint = s3_endpoint.trim_end_matches('/');
+                if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+                    endpoint.to_string()
+                } else {
+                    format!("https://{endpoint}")
+                }
             };
             let root = s3_root.trim_matches('/');
             if root.is_empty() {
@@ -420,7 +420,27 @@ mod tests {
             s3_access_key: "AK".into(),
             s3_secret_key: "SK".into(),
         };
-        assert_eq!(repo_url(&p).unwrap(), "s3:127.0.0.1:8333/buk/sub/dir");
+        assert_eq!(
+            repo_url(&p).unwrap(),
+            "s3:http://127.0.0.1:8333/buk/sub/dir"
+        );
+    }
+
+    #[test]
+    fn repo_url_s3_custom_endpoint_defaults_to_https() {
+        let p = Profile::S3 {
+            password: "pw".into(),
+            s3_endpoint: "garage.example.com/".into(),
+            s3_bucket: "buk".into(),
+            s3_region: "garage".into(),
+            s3_root: String::new(),
+            s3_access_key: "AK".into(),
+            s3_secret_key: "SK".into(),
+        };
+        assert_eq!(
+            repo_url(&p).unwrap(),
+            "s3:https://garage.example.com/buk"
+        );
     }
 
     #[test]

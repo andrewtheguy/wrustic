@@ -474,4 +474,55 @@ mod tests {
 
         fs::remove_dir_all(root).ok();
     }
+
+    #[test]
+    #[ignore]
+    fn live_garage_s3_profile_reads_seeded_repository() {
+        let profile = Profile::S3 {
+            password: "garage-repository-password".into(),
+            s3_endpoint: "http://127.0.0.1:3900".into(),
+            s3_bucket: "wrustic-it".into(),
+            s3_region: "garage".into(),
+            s3_root: "repository".into(),
+            s3_access_key: "GK22222222222222222222222222222222".into(),
+            s3_secret_key:
+                "3333333333333333333333333333333333333333333333333333333333333333".into(),
+        };
+
+        verify_profile(&profile).expect("verify Garage profile");
+        let snapshots = load_snapshots(&profile).expect("list Garage snapshots");
+        let snapshot = snapshots.first().expect("seeded Garage snapshot");
+        let previous = snapshots.get(1).expect("second seeded Garage snapshot");
+        assert!(snapshot.tags.iter().any(|tag| tag == "garage-e2e-second"));
+
+        let session = open_indexed(&profile).expect("open Garage session");
+        let (summary, changes) =
+            diff_snapshots(&session, &previous.id, &snapshot.id).expect("diff Garage snapshots");
+        assert!(summary.changed_files > 0);
+        assert!(changes.iter().any(|change| change.path.ends_with("/hello.txt")));
+        assert!(changes.iter().any(|change| change.path.ends_with("/second.txt")));
+
+        let preview =
+            preview_snapshot_contents(&session, &snapshot.id, 100).expect("preview Garage tree");
+        let hello = preview
+            .entries
+            .iter()
+            .find(|entry| entry.path.ends_with("/hello.txt"))
+            .expect("hello.txt in Garage snapshot");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let dump_profile = profile.clone();
+        let dump_snapshot = snapshot.id.clone();
+        let dump_path = hello.path.clone();
+        let dump = std::thread::spawn(move || {
+            restic::stream_dump(&dump_profile, &dump_snapshot, &dump_path, &tx)
+        });
+        let mut bytes = Vec::new();
+        while let Some(chunk) = rx.blocking_recv() {
+            bytes.extend_from_slice(&chunk.expect("Garage dump chunk"));
+        }
+        dump.join()
+            .expect("Garage dump thread")
+            .expect("stream Garage hello.txt");
+        assert_eq!(bytes, b"hello from Garage S3 integration, revision 2\n");
+    }
 }
