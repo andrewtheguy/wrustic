@@ -20,8 +20,7 @@ backlog item.
 - **File sharing**: one-time signed download URLs served from localhost
 - **Keyboard and mouse navigation**: Vim-style keys, arrow keys, PgUp/PgDn,
   mouse click/scroll; `--no-mouse` to disable
-- **Passphrase entry**: terminal input or browser-based ceremony
-  (`--browser-auth`)
+- **Passphrase entry**: masked TUI input, with optional keychain auto-unlock
 - **Keychain integration** (macOS): optionally save the passphrase to the OS
   keychain for auto-unlock; see [`docs/keychain.md`](docs/keychain.md)
 
@@ -63,7 +62,7 @@ cargo run
 ### CLI flags
 
 ```text
-wrustic [-c|--config-dir <PATH>] [-p|--port <N>] [--browser-auth] [--no-keychain] [-h|--help]
+wrustic [-c|--config-dir <PATH>] [-p|--port <N>] [--no-keychain] [-h|--help]
 ```
 
 `--config-dir <PATH>` overrides the default config location
@@ -76,20 +75,13 @@ cargo run -- --config-dir ./tmp/wrustic-sandbox
 
 The directory is created on first run if it doesn't exist.
 
-`--port <N>` selects the localhost port for the file-share dialog and the
-passphrase ceremony (default: 7834).
+`--port <N>` selects the localhost port for the file-share dialog
+(default: 7834).
 
 `--no-keychain` disables keychain integration at runtime, even when the
 binary was built with the `keychain` feature. See
 [`docs/keychain.md`](docs/keychain.md) for details on keychain support,
 why it is not enabled on Linux by default, and how to build with it.
-
-`--browser-auth` uses a browser-based ceremony for passphrase input
-instead of typing the passphrase in the terminal:
-
-```sh
-cargo run -- --browser-auth
-```
 
 ### First run
 

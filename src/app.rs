@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -15,7 +14,7 @@ use tui_input::backend::crossterm::EventHandler;
 
 use crate::config::{self, BackendKind, Config, PassphraseMeta, Paths, Profile};
 use crate::crypto::Cipher;
-use crate::passphrase::{self, PassphraseHandle, PassphrasePhase};
+use crate::passphrase::{self, PassphrasePhase};
 use crate::repo::{ContentKind, ContentRow, ContentsPreview, DeleteSnapshotInfo, DiffChange, DiffSummary, FileDetails, SnapshotRow};
 use crate::restic::{self, ResticError, ResticInfo, SnapshotDetails};
 use crate::share::{self, SHARE_TTL, ShareHandle, ShareTarget};
@@ -29,7 +28,6 @@ pub(crate) enum Screen {
     PassphraseSetup,
     PassphraseUnlock,
     PassphraseDerivingKey,
-    PassphraseUrl,
     Home,
     Snapshots,
     SnapshotFilterDim,
@@ -233,14 +231,11 @@ pub(crate) struct App {
     /// expects it to be).
     pub(crate) cipher: Option<Cipher>,
     pub(crate) server_port: u16,
-    pub(crate) passphrase_handle: Option<PassphraseHandle>,
     pub(crate) passphrase_instance_input: Input,
     pub(crate) passphrase_input: Input,
     pub(crate) passphrase_confirm: Input,
     pub(crate) passphrase_error: Option<String>,
     pub(crate) passphrase_instance_value: String,
-    pub(crate) passphrase_short_url: Option<String>,
-    pub(crate) passphrase_setup_code: Option<String>,
     pub(crate) passphrase_phase: Option<PassphrasePhase>,
 
     pub(crate) no_keychain: bool,
@@ -357,14 +352,11 @@ impl App {
             config: Config::default(),
             cipher: None,
             server_port,
-            passphrase_handle: None,
             passphrase_instance_input: Input::default(),
             passphrase_input: Input::default(),
             passphrase_confirm: Input::default(),
             passphrase_error: None,
             passphrase_instance_value: String::new(),
-            passphrase_short_url: None,
-            passphrase_setup_code: None,
             passphrase_phase: None,
             no_keychain,
             save_to_keychain: true,
@@ -434,7 +426,7 @@ impl App {
             last_content_click: None,
         };
 
-        app.start_passphrase_ceremony();
+        app.start_passphrase_flow();
         Ok(app)
     }
 
@@ -460,7 +452,7 @@ impl App {
         }
     }
 
-    fn start_passphrase_ceremony(&mut self) {
+    fn start_passphrase_flow(&mut self) {
         let peeked = match config::peek(&self.paths) {
             Ok(p) => p,
             Err(e) => {
@@ -491,8 +483,12 @@ impl App {
                         self.passphrase_instance_value = meta.instance.clone();
                         self.config.passphrase = Some(meta);
                         self.passphrase_phase = Some(PassphrasePhase::Unlock);
-                        self.auth_method_list.select(Some(0));
-                        self.screen = Screen::AuthMethodChoice;
+                        if self.keychain_enabled() {
+                            self.auth_method_list.select(Some(0));
+                            self.screen = Screen::AuthMethodChoice;
+                        } else {
+                            self.enter_manual_passphrase(false);
+                        }
                     }
                     None => {
                         self.error_is_fatal = true;
@@ -508,68 +504,34 @@ impl App {
     }
 
     fn activate_auth_method(&mut self) {
-        let is_browser = self.auth_method_list.selected().unwrap_or(0) == 1;
-        let phase = self.passphrase_phase.unwrap_or(PassphrasePhase::Setup);
-        match (phase, is_browser) {
-            (PassphrasePhase::Setup, false) => {
-                self.field_focus = 0;
-                self.passphrase_input = Input::default();
-                self.passphrase_confirm = Input::default();
-                self.passphrase_error = None;
-                self.save_to_keychain = true;
-                self.screen = Screen::PassphraseSetup;
-            }
-            (PassphrasePhase::Setup, true) => {
-                let instance = self.passphrase_instance_value.clone();
-                self.launch_passphrase_server(PassphrasePhase::Setup, None, &instance);
-            }
-            (PassphrasePhase::Unlock, false) => {
-                #[cfg(feature = "keychain")]
-                if self.keychain_enabled()
-                    && let Some(meta) = self.config.passphrase.as_ref()
-                    && let Some(pw) = crate::keychain::load_passphrase(&meta.instance)
-                {
-                    self.passphrase_input = Input::new(pw);
-                    self.passphrase_error = None;
-                    self.screen = Screen::PassphraseDerivingKey;
-                    return;
-                }
-                self.passphrase_input = Input::default();
-                self.passphrase_error = None;
-                self.save_to_keychain = true;
-                self.field_focus = 0;
-                self.screen = Screen::PassphraseUnlock;
-            }
-            (PassphrasePhase::Unlock, true) => {
-                let meta = self.config.passphrase.clone();
-                let instance = meta
-                    .as_ref()
-                    .map(|m| m.instance.clone())
-                    .unwrap_or_default();
-                self.launch_passphrase_server(PassphrasePhase::Unlock, meta, &instance);
-            }
+        let enter_manually = self.auth_method_list.selected().unwrap_or(0) == 1;
+        if enter_manually {
+            self.enter_manual_passphrase(false);
+            return;
         }
+        #[cfg(feature = "keychain")]
+        if self.keychain_enabled()
+            && let Some(meta) = self.config.passphrase.as_ref()
+            && let Some(pw) = crate::keychain::load_passphrase(&meta.instance)
+        {
+            self.passphrase_input = Input::new(pw);
+            self.passphrase_error = None;
+            self.screen = Screen::PassphraseDerivingKey;
+            return;
+        }
+        self.enter_manual_passphrase(true);
     }
 
-    fn launch_passphrase_server(
-        &mut self,
-        phase: PassphrasePhase,
-        existing: Option<PassphraseMeta>,
-        instance: &str,
-    ) {
-        match passphrase::start(self.server_port, phase, existing, instance) {
-            Ok(h) => {
-                self.passphrase_short_url = Some(h.short_url.clone());
-                self.passphrase_setup_code = h.setup_code.clone();
-                self.passphrase_phase = Some(h.phase);
-                self.passphrase_handle = Some(h);
-                self.screen = Screen::PassphraseUrl;
-            }
-            Err(e) => {
-                self.error_is_fatal = true;
-                self.screen = Screen::Error(format!("starting passphrase server: {e:#}"));
-            }
-        }
+    fn enter_manual_passphrase(&mut self, save_to_keychain: bool) {
+        self.field_focus = 0;
+        self.passphrase_input = Input::default();
+        self.passphrase_confirm = Input::default();
+        self.passphrase_error = None;
+        self.save_to_keychain = save_to_keychain;
+        self.screen = match self.passphrase_phase {
+            Some(PassphrasePhase::Setup) => Screen::PassphraseSetup,
+            _ => Screen::PassphraseUnlock,
+        };
     }
 
     pub(crate) fn submit_passphrase_instance(&mut self) {
@@ -579,8 +541,7 @@ impl App {
         }
         self.passphrase_instance_value = instance;
         self.passphrase_phase = Some(PassphrasePhase::Setup);
-        self.auth_method_list.select(Some(0));
-        self.screen = Screen::AuthMethodChoice;
+        self.enter_manual_passphrase(true);
     }
 
     pub(crate) fn submit_passphrase_setup(&mut self) {
@@ -700,52 +661,8 @@ impl App {
         self.passphrase_instance_input = Input::default();
         self.passphrase_instance_value.clear();
         self.passphrase_error = None;
-        self.passphrase_short_url = None;
-        self.passphrase_setup_code = None;
         self.passphrase_phase = None;
         self.save_to_keychain = true;
-    }
-
-    pub(crate) fn try_advance_passphrase(&mut self) {
-        let Some(h) = self.passphrase_handle.as_ref() else {
-            return;
-        };
-        let outcome = match h.rx.try_recv() {
-            Ok(o) => o,
-            Err(std_mpsc::TryRecvError::Empty) => return,
-            Err(std_mpsc::TryRecvError::Disconnected) => return,
-        };
-        let Some(meta_ref) = outcome
-            .new_meta
-            .as_ref()
-            .or(self.config.passphrase.as_ref())
-            .filter(|m| !m.instance.is_empty())
-        else {
-            self.error_is_fatal = true;
-            self.screen = Screen::Error(
-                "internal: passphrase ceremony completed but no instance name is available".into(),
-            );
-            return;
-        };
-        self.cipher = Some(Cipher::new(outcome.key, meta_ref.instance.clone(), &meta_ref.instance_sig));
-        if let Some(h) = self.passphrase_handle.take() {
-            h.stop();
-        }
-        self.clear_passphrase_scratch();
-        self.load_config_or_set_fatal();
-        if let Some(meta) = outcome.new_meta {
-            self.config.passphrase = Some(meta);
-            if let Some(cipher) = self.cipher.as_ref()
-                && let Err(e) = config::save(&self.config, &self.paths, cipher)
-            {
-                self.error_is_fatal = true;
-                self.screen = Screen::Error(format!(
-                    "Setup succeeded in the browser but writing {} failed: {e:#}. \
-                     Quit and retry the ceremony.",
-                    self.paths.config.display()
-                ));
-            }
-        }
     }
 
     // Single writer for `Screen::Home`. Clears profile-creation scratch and
@@ -1389,24 +1306,6 @@ impl App {
                         self.screen = Screen::PassphraseInstancePrompt;
                     } else {
                         self.quit = true;
-                    }
-                }
-                _ => {}
-            },
-
-            Screen::PassphraseUrl => match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => {
-                    if let Some(h) = self.passphrase_handle.take() {
-                        h.stop();
-                    }
-                    self.quit = true;
-                }
-                KeyCode::Char('o') if self.passphrase_error.is_none() => {
-                    if let Some(url) = &self.passphrase_short_url
-                        && let Err(e) = open::that(url)
-                    {
-                        self.passphrase_error =
-                            Some(format!("Could not open browser: {e}"));
                     }
                 }
                 _ => {}

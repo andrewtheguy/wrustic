@@ -12,8 +12,6 @@ mod share;
 mod ui;
 
 use std::path::PathBuf;
-use std::time::Duration;
-
 use anyhow::Result;
 use ratatui::{
     DefaultTerminal,
@@ -51,11 +49,10 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let mut no_keychain = cli.no_keychain;
     #[cfg(feature = "keychain")]
-    if !no_keychain && !keychain::init_store() {
-        no_keychain = true;
-    }
+    let no_keychain = cli.no_keychain || !keychain::init_store();
+    #[cfg(not(feature = "keychain"))]
+    let no_keychain = cli.no_keychain;
 
     let mut terminal = ratatui::init();
     // Enable mouse reporting after entering raw mode. With capture on,
@@ -350,22 +347,6 @@ fn run(
                     app.screen = Screen::Error(format!("{e:#}"));
                 }
             }
-            continue;
-        }
-
-        if matches!(app.screen, Screen::PassphraseUrl) {
-            if event::poll(Duration::from_millis(150))?
-                && let Ok(ev) = event::read()
-            {
-                match ev {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        app.handle_key(key);
-                    }
-                    Event::Resize(_, _) => {}
-                    _ => {}
-                }
-            }
-            app.try_advance_passphrase();
             continue;
         }
 

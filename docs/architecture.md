@@ -29,9 +29,9 @@ It is intentionally **not** a restic replacement:
 
 ```
 main()
- └── App::boot(config_dir, port, browser_auth)  // app.rs
+ └── App::boot(config_dir, port, no_keychain)  // app.rs
       ├── config::paths(override) → Paths { config }
-      ├── start_passphrase_ceremony()       // app.rs + passphrase.rs
+      ├── start_passphrase_flow()           // app.rs + passphrase.rs
       └── load_config_or_set_fatal()
             └── config::load(paths, cipher) → Config (with profiles decrypted)
  │
@@ -40,9 +40,7 @@ main()
      │   LoadingDir, LoadingFileDetails, SnapshotDeleteContentsLoading,
      │   SnapshotDeleting, SnapshotCompareLoading) — main.rs runs the
      │   blocking work synchronously and transitions the screen
-     ├── Screen::PassphraseDerivingKey — runs scrypt synchronously (terminal mode)
-     ├── Screen::PassphraseUrl — short timeout poll so try_advance_passphrase
-     │   can pick up the mpsc message from passphrase.rs without a keypress (browser mode)
+     ├── Screen::PassphraseDerivingKey — runs scrypt synchronously
      └── otherwise — blocking event::read(), App::handle_key/mouse
 ```
 
@@ -50,8 +48,8 @@ The event loop lives in `main.rs` rather than `App` because some screens need
 to take long-blocking work out of the rendering tick. Each "async-ish" branch
 matches a `Screen::*Loading` variant, runs the blocking call inline, and
 transitions to the next screen — there is no real async/await in the main
-loop. The two localhost servers (share, passphrase) are the only true async
-machinery, each isolated on its own OS thread + tokio current-thread runtime.
+loop. The share server is the only true async machinery, isolated on its own
+OS thread + tokio current-thread runtime.
 
 ## State: `App` and `Screen`
 
@@ -73,8 +71,6 @@ struct includes:
 - Share dialog: `share_target`, `share_handle`, `share_url`, etc.
 - Passphrase dialog: `passphrase_input`, `passphrase_confirm`,
   `passphrase_instance_input`, `passphrase_phase`, `passphrase_error`.
-  Browser mode adds: `passphrase_handle`, `passphrase_short_url`,
-  `passphrase_setup_code`.
 
 Keypress handling is concentrated in `App::handle_key` (single big match on
 `self.screen`); mouse in `App::handle_mouse`.
@@ -86,21 +82,17 @@ Keypress handling is concentrated in `App::handle_key` (single big match on
 0600, then `rename(2)` over the target.
 
 Encryption is per-value (not whole-file) so non-secret edits diff cleanly.
-For schema details, key derivation, threat model, the ceremony server, and
+For schema details, key derivation, threat model, and
 the share-server signing-key derivation, see
 [encryption.md](encryption.md).
 
-## Localhost servers (`share.rs`, `passphrase.rs`)
+## Localhost server (`share.rs`)
 
-Both servers follow the same shape so the patterns transfer:
-
-- One OS thread per server, one `tokio::runtime::Builder::new_current_thread`
-  per thread. No global runtime, no shared executor.
-- Bind on `127.0.0.1:<port>` and `[::1]:<port>`. User-facing URLs use
-  `<instance>.wrustic.localhost` (passphrase, browser mode) or `localhost` (share).
-- The two servers share the **same port** (`--port`, default 7834) because
-  share and passphrase dialogs are never simultaneously active.
-- Each returns a handle (`ShareHandle`, `PassphraseHandle`) that owns a
+- One OS thread and one `tokio::runtime::Builder::new_current_thread`.
+  No global runtime or shared executor.
+- Binds on `127.0.0.1:<port>` and `[::1]:<port>`. User-facing URLs use
+  `localhost`.
+- Returns a `ShareHandle` that owns a
   `oneshot::Sender<()>` for shutdown plus a `JoinHandle`. Drop = stop server.
   Explicit `.stop()` joins the thread (port released by the time it returns).
 - Routes are spelled out as a flat `match` inside one `async fn handle()`;
@@ -125,21 +117,10 @@ Both servers follow the same shape so the patterns transfer:
 
 ### Passphrase (`src/passphrase.rs`)
 
-**Terminal mode (default):** no server is started. `passphrase.rs` exposes
+No server is started. `passphrase.rs` exposes
 `derive_config_key`, `verify_instance_sig`, `compute_instance_sig`, and
 `passphrase_policy_error` for direct use by `app.rs`. Key derivation runs
 synchronously on `Screen::PassphraseDerivingKey`.
-
-**Browser mode (`--browser-auth`):** same runtime shape as the share
-dialog (own OS thread, current-thread tokio runtime, RAII handle), but
-bidirectional: the browser POSTs the passphrase back to localhost through
-an encrypted envelope, and the server hands the derived key to the App
-via an mpsc channel that the main loop polls every 150 ms while
-`Screen::PassphraseUrl` is up.
-
-Auth, routing, the capability URL, Setup vs Unlock phases, the 30-minute
-expiry net, host header validation, and the cryptographic key derivation
-all live in [encryption.md](encryption.md).
 
 ## Repository access (`src/repo.rs`, `src/restic.rs`)
 

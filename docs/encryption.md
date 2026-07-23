@@ -1,6 +1,6 @@
 # Encryption
 
-Per-value secret encryption for `config.toml`, plus the passphrase ceremony
+Per-value secret encryption for `config.toml`, plus passphrase input
 server that derives the key.
 
 **Scope: single-user, single-device.** wrustic is a personal tool — one
@@ -199,354 +199,32 @@ Decrypt strips the header and instance field, then requires
 
 ### Why not whole-file passphrase encryption?
 
-The passphrase ceremony is interactive and 30-minute-bounded (see
-[Passphrase ceremony server](#passphrase-ceremony-server) below). Whole-file
-encryption would force a ceremony for any `peek()` lookup, including the
-one needed to decide whether to do a Setup or an Unlock — boot would be
-impossible without already having unlocked. Per-value lets the boot code
-peek at the `[passphrase]` block first, then pick the right ceremony, then
-decrypt everything else with the resulting key.
+Per-value encryption lets the boot code read the non-secret
+`[passphrase]` metadata before it has the key. It can then derive the key,
+verify the instance signature, and decrypt only the encrypted profile fields.
 
 ## Passphrase input
 
-### Two modes: terminal (default) and browser
+Passphrases are entered in masked TUI fields.
 
-By default, wrustic prompts for passphrase input directly in the terminal.
-Adding `--browser-auth` switches to a browser-based ceremony where the
-user enters the passphrase on a localhost page instead.
+**Setup** (`Screen::PassphraseSetup`): after the instance-name prompt, the
+user enters and confirms a passphrase. It must be at least 12 characters and
+include an uppercase letter, lowercase letter, digit, and special character.
+scrypt runs synchronously on `Screen::PassphraseDerivingKey`, then wrustic
+computes the instance HMAC and saves the `[passphrase]` metadata. When
+keychain support is enabled, a checkbox controls whether the passphrase is
+stored there.
 
-| Mode | Flag | Setup flow | Unlock flow |
-|------|------|-----------|-------------|
-| Terminal (default) | (none) | Instance prompt → passphrase + confirm → scrypt | Passphrase prompt → scrypt → HMAC verify |
-| Browser | `--browser-auth` | Instance prompt → browser URL + setup code → scrypt | Browser URL → passphrase → scrypt → HMAC verify |
+**Unlock**: without keychain support, wrustic goes directly to the masked
+manual input. With keychain support, `Screen::AuthMethodChoice` offers
+`Use passphrase from keychain` and `Enter passphrase manually`. Manual
+entry starts with keychain saving disabled but lets the user opt in. After
+scrypt derives the key from the stored salt, `verify_instance_sig` checks
+the HMAC. A mismatch returns to the manual prompt with an error.
 
-### Terminal passphrase input (default)
-
-**Setup** (`Screen::PassphraseSetup`): after the instance name prompt,
-two masked fields — "Passphrase" and "Confirm passphrase" — are shown in
-a grouped input. The same passphrase policy from the browser flow applies
-(min 12 chars, uppercase, lowercase, digit, special char). On submit,
-scrypt runs synchronously on `Screen::PassphraseDerivingKey` (same
-pattern as `Screen::Verifying`), the HMAC instance signature is computed,
-and the `[passphrase]` block is saved to config.toml.
-
-**Unlock** (`Screen::PassphraseUnlock`): a single masked passphrase
-field. On submit, scrypt derives the key with the stored salt, then
-`verify_instance_sig` checks the HMAC. On mismatch the error says
-"Wrong passphrase (or config.toml was corrupted)." and returns to the
-input. On match, the config is decrypted and the app proceeds to Home.
-
-No setup code is used in terminal mode — the passphrase is entered
-directly by the user at the terminal.
-
-### Browser passphrase ceremony (`--browser-auth`)
-
-### Runtime shape
-
-Same skeleton as `src/share.rs`:
-
-- One OS thread spawned in `passphrase::start()`, one
-  `tokio::runtime::Builder::new_current_thread()` per thread. No shared
-  executor, no global runtime.
-- Bind on `127.0.0.1:<port>` and `[::1]:<port>` (the binary's `--port`,
-  default 7834, shared with the share dialog because the two flows are never
-  simultaneously active). User-facing URL uses `<instance>.wrustic.localhost`.
-- Returns a `PassphraseHandle { short_url, setup_code, phase, rx, deadline,
-  shutdown_tx, join_handle }` that owns the resources. Drop sends the
-  shutdown oneshot; explicit `.stop()` also joins the thread (port
-  released by the time it returns).
-
-The handle and the App communicate via `std::sync::mpsc`:
-`PassphraseOutcome { key: [u8; 32], new_meta: Option<PassphraseMeta> }`.
-The main loop polls `App::try_advance_passphrase()` every 150 ms while
-`Screen::PassphraseUrl` is active, so the ceremony can complete without a
-keypress. `new_meta` is `Some` only on Setup — Unlock reuses the on-disk
-`[passphrase]` block.
-
-### Host header validation
-
-The server validates the `Host` header on every request, matching the
-hostname portion (port stripped) case-insensitively against the expected
-`<instance>.wrustic.localhost`. Requests with a missing or mismatched
-Host header receive a flat 404 — indistinguishable from a wrong auth key.
-This mirrors nginx virtual-host matching (hostname only, port ignored)
-and prevents DNS rebinding attacks from reaching the ceremony routes.
-
-### Capability URL
-
-The entire server lives under one prefix, chosen by phase:
-
-```
-Setup:  http://<instance>.wrustic.localhost:<port>/setup/<short_id>
-Unlock: http://<instance>.wrustic.localhost:<port>/auth/<short_id>
-```
-
-`<short_id>` is a 16-hex-char (64-bit) random id generated at
-`start()`. **It is the auth credential, not a decoration.** Every
-request is gated by a constant-time bytewise compare of the URL's key
-segment against `ctx.short_id` (`ct_eq` in `src/passphrase.rs`). On
-mismatch — including bare `/`, the wrong prefix, the wrong key, or any
-unrecognized path — the response is a flat 404, no information leakage.
-
-This mirrors the share dialog's model: the URL is the capability. A
-port scanner sees the same 404 wall whether the server is live or
-expired.
-
-Routes under the correct prefix + key (any other path still 404s):
-
-| Method + path | Response |
-|---|---|
-| `GET /<prefix>/<key>` or `/<prefix>/<key>/` | 200 + the inline ceremony HTML |
-| `POST /<prefix>/<key>/api/check-code` (Setup phase) | encrypted JSON `{setup_code}` → no outcome |
-| `POST /<prefix>/<key>/api/setup` (Setup phase) | encrypted binary `version(1) + code_len(1) + code(N) + passphrase` → derive key and deliver outcome |
-| `POST /<prefix>/<key>/api/unlock` (Unlock phase) | encrypted passphrase bytes → derive key and deliver outcome after HMAC verification |
-
-The auth-key check runs **before** the expiry check by design: an
-unauthenticated caller never gets to distinguish "running" from
-"expired" — both look like 404.
-
-### Two phases: Setup and Unlock (browser mode)
-
-The phase is picked at boot by `config::peek`:
-
-- **No `config.toml` (or no `[passphrase]` block)** →
-  `PassphrasePhase::Setup`. The TUI prompts for an instance name on
-  `Screen::PassphraseInstancePrompt` (pre-filled with the config dir's
-  basename if it's DNS-safe), then launches the ceremony server. The
-  browser page renders a passphrase form with two inputs (passphrase +
-  confirm), complexity validation, and a setup-code input (see below).
-  On submit: the browser posts the setup code and passphrase through the
-  encrypted transport. The server enforces the same passphrase policy as
-  the page, derives the config key with scrypt, computes the instance
-  HMAC signature, and delivers `PassphraseOutcome { key, new_meta:
-  Some(PassphraseMeta { instance, instance_sig, salt }) }`. The App
-  splices the meta into `self.config.passphrase` and immediately calls
-  `config::save` so the `[passphrase]` block lands on disk — next launch
-  routes into Unlock.
-
-- **`[passphrase]` block already present** → `PassphrasePhase::Unlock`.
-  Server reads the instance, salt, and instance_sig from the stored
-  metadata. The browser page renders a single passphrase input. On submit:
-  the browser posts the passphrase through the encrypted transport. The
-  server derives the key with scrypt using the stored salt, then verifies
-  `HMAC-SHA256(instance, derived_key)` against the
-  stored `instance_sig` (constant-time). On mismatch → 401 "Wrong
-  passphrase", the user can retry. On match → server delivers
-  `PassphraseOutcome { key, new_meta: None }`. App uses the key to
-  decrypt every `$WR;1.0;AES-256-GCM;` value in the config. No setup code on Unlock — the
-  instance signature verification already gates the path.
-
-### Setup-confirmation code
-
-In addition to the `/auth/<key>` capability URL, the **Setup** phase
-prints a 6-character code in the TUI that the user must type into the
-browser before the passphrase submission will be accepted. Unlock
-has no equivalent — the instance signature verification already gates
-that path.
-
-Why this exists: the capability URL is enough for *access control*
-(only someone who saw the TUI can reach the ceremony page), but it
-doesn't prove the user-at-terminal *intended* to set a passphrase right
-now. A pre-loaded browser tab, a stale URL pasted into the wrong window,
-or a clipboard timing accident could otherwise drive the ceremony past
-the user. The code is an intent-confirmation gesture, like a sudo prompt.
-
-**Alphabet (31 chars).** Uppercase letters and digits only, with the
-well-known confusables removed so a misread can't trip a strike:
-
-- Digits `2`–`9` (excludes `0` and `1` — visually collide with `O` and
-  `I`/`L`).
-- Uppercase `A`–`Z` excluding `I`, `L`, `O`.
-
-Code space: `31^6 ≈ 8.87 × 10^8`. The strike limit (below) caps total
-guess probability per ceremony at `MAX_SETUP_CODE_ATTEMPTS / 31^6 ≈
-5.6 × 10^-9`.
-
-**Source of truth:** `SETUP_CODE_ALPHABET` and `random_setup_code()`
-in `src/passphrase.rs`. The generator uses `rand` to sample each
-character uniformly from the alphabet.
-
-**Input handling.** Both the browser and the server normalize the
-submitted code by stripping whitespace and uppercasing. The comparison
-is constant-time (`ct_eq`). The browser input carries
-`autocapitalize="characters"` and `text-transform: uppercase`.
-
-**Pre-flight check.** The browser pre-validates the code with the
-server *before* sending the passphrase, via
-`POST /setup/<key>/api/check-code` with body `{"setup_code": "..."}`.
-This way a wrong code surfaces immediately. The subsequent
-`POST /api/setup` re-validates the same code, and both routes share
-the same `check_setup_code` helper and the same strike counter.
-
-**Lock-out.** Five wrong codes in one ceremony — counted across
-**both** `/api/check-code` and `/api/setup` combined — trip a `killed`
-flag on the server's `Ctx`. From that moment forward every keyed route
-returns 403; the user has to quit wrustic and relaunch to get a fresh
-code.
-
-**Display.** The code is printed tight (no inter-character padding) on
-the Passphrase screen when phase is Setup:
-
-```
-Setup code (type this in the browser):
-
-    K4M9XR
-```
-
-Suppressed when the screen is in its expired state.
-
-### 30-minute expiry net
-
-`PASSPHRASE_TTL = 30 minutes`, captured at `start()` as
-`deadline: Instant`. After expiry the server **keeps accepting
-connections** (so a stale browser tab gets a clear 403 instead of a
-confusing "connection refused"), but every keyed route returns 403.
-
-The TUI checks the same `deadline` via `PassphraseHandle::is_expired()`
-and switches the screen to a red "session expired" message. Quit +
-relaunch is the only recovery — no flow logic for in-place renewal.
-
-Ordering inside `handle()`:
-
-1. Host header check (404 on miss — DNS rebinding rejected silently).
-2. Auth-key check (404 on miss — unauthenticated scanners learn nothing).
-3. Killed / expiry check (403 on miss — only legitimate callers ever see
-   this).
-4. Route dispatch.
-
-### HTML and JS
-
-The ceremony page is an Askama template in `templates/passphrase.html`.
-There is no static-file routing; `src/passphrase.rs` renders the template
-directly into the response body.
-
-The inline `<script>`:
-- Derives `API_BASE` from `window.location.pathname` (with a trailing-
-  slash strip) so `fetch` targets stay under `/<prefix>/<key>/api/…`
-  without needing the key templated into the HTML.
-- On Setup: renders two password inputs (passphrase + confirm), a
-  complexity check (min 12 chars, uppercase, lowercase, digit, special
-  char), and a setup-code input. The browser checks the code before
-  sending the passphrase; the server re-checks both the code and the
-  passphrase policy before deriving a key.
-- On Unlock: renders a single password input. No complexity check, no
-  setup code.
-- On Setup: builds a binary payload:
-  `version(1) + code_len(1) + code(N) + passphrase`.
-- On Unlock: sends the raw passphrase bytes.
-- Wraps every `/api/*` POST body in the transport-encryption envelope
-  described below.
-- Disables all buttons on success so a second click can't re-submit
-  (the server would also reject with 409 "already provided this session").
-- Zeroes temporary key buffers best-effort via `fill(0)`.
-
-The HTML response carries a per-page CSP nonce:
-
-```
-Content-Security-Policy:
-  default-src 'none';
-  script-src 'nonce-…';
-  connect-src 'self';
-  base-uri 'none';
-  form-action 'none';
-  frame-ancestors 'none'
-```
-
-Template values embedded in JavaScript strings escape `<`, `>`, `&`, and
-the usual JSON string characters so injected constants cannot terminate
-the trusted inline script.
-
-### Transport encryption (browser ↔ server)
-
-Even though the ceremony server only binds to `127.0.0.1`, the loopback
-interface is not perfectly isolated: another local process running as
-root or with `CAP_NET_RAW` can sniff loopback, a malicious browser
-extension can read `fetch` request bodies, and devtools-history /
-proxy-style inspectors capture full requests. To avoid putting the
-passphrase on the wire as plaintext, every `/api/*` POST body is
-wrapped in an authenticated encryption envelope under a fresh per-request
-key.
-
-**Protocol.** At `start()` the server generates an ephemeral X25519
-keypair (`ServerTransport::generate` in `src/passphrase.rs`). The private
-half lives in `Ctx` for the ceremony's lifetime; the public half is
-base64'd and inlined into the HTML as the JS const `SERVER_PUB_B64`.
-For each request the browser generates its own ephemeral X25519 keypair
-(`crypto.subtle.generateKey({ name: "X25519" }, false, …)` — private
-imported `extractable: false`), does
-`ECDH(server_pub, client_priv)` directly into a non-extractable HKDF
-`CryptoKey`, runs it through HKDF-SHA256 with empty salt and
-`info = b"wrustic-passphrase-transport-v1"` to derive a 32-byte AES-256-GCM
-key (`extractable: false`), and encrypts the route body with a random
-12-byte nonce. The outer wire format is:
-
-```json
-{
-  "client_pub": "<base64 32 bytes>",
-  "nonce":      "<base64 12 bytes>",
-  "ciphertext": "<base64 N+16 bytes — AES-GCM ct||tag>"
-}
-```
-
-The server runs the mirror routine in `ServerTransport::decrypt`,
-checks the GCM tag (so a flipped bit in transit is a hard 400, not a
-silent corruption), then hands the inner plaintext to the existing
-per-route parser (`CheckCodeBody`, `parse_setup_body`, `parse_unlock_body`).
-Response bodies are plaintext on purpose: errors don't carry secrets,
-and success bodies only report `{"ok": true}`.
-
-**Non-extractable browser keys.** The client's X25519 private key, the
-transport HKDF key, and the transport AES-GCM key are all
-`extractable: false`. An attacker inside the ceremony page can still
-invoke WebCrypto while the page is alive, but cannot `exportKey` those
-values as raw bytes.
-
-**What this doesn't defend against.**
-- An attacker who controls the wrustic process itself (they have the
-  server private key and receive the passphrase by definition).
-- An attacker who can serve their own HTML at `/auth/<key>` (they'd
-  already need to be the wrustic server).
-- The browser process being compromised (extensions are mitigated
-  somewhat by `extractable: false`, but a sufficiently privileged
-  extension can still drive the page).
-
-**Browser support.** WebCrypto `X25519` became broadly available in
-2025: Chrome 133+, Firefox 130+, Safari 18.4+.
-
-**Algorithm choice.**
-- X25519 over P-256 ECDH: smaller key, single fixed curve, faster, no
-  parameter-confusion footguns.
-- AES-256-GCM: the same AEAD used for config value encryption, and
-  natively supported by WebCrypto on the browser side. One crate for
-  both transport and config encryption.
-- Empty HKDF salt: the ECDH shared secret is already uniformly random
-  and unique per request; a versioned `info` string handles algorithm
-  cutover instead.
-- scrypt for key derivation: the KDF runs in Rust, so WebCrypto support no
-  longer constrains the algorithm choice. scrypt is memory-hard and is
-  already part of the restic/rustic ecosystem. wrustic uses
-  `log_n=16, r=8, p=1`, which requires roughly 64 MiB for each password
-  guess before the HMAC or AEAD tags can be checked.
-
-**Replay.** Each ceremony has a fresh server keypair (30-min lifespan),
-each request a fresh client keypair, so every shared secret is unique
-and a captured ciphertext can't be decrypted after the ceremony ends
-or replayed against a future one.
-
-**No body-size hiding.** The envelope leaks the inner plaintext length
-(approximately ciphertext length minus 16 bytes for the tag). For
-passphrase submissions, that means a local observer who can see request
-sizes can estimate passphrase length. The passphrase contents remain
-encrypted.
-
-### What the server does *not* do
-
-- No persistence of the passphrase or derived key on disk. Only the salt,
-  instance, and instance signature are written. The passphrase exists
-  transiently while the server derives the key; the 32-byte config key
-  lives in the App's memory for the session.
-- No CORS / no auth header / no cookies. The capability URL is the
-  whole auth surface.
+The passphrase and derived key are never persisted in the config. Only the
+salt, instance, and instance signature are stored there; the derived key
+lives in application memory for the session.
 
 ## Share dialog signing key
 

@@ -1,22 +1,19 @@
 [package]
 name = "wrustic"
-version = "0.0.30"
+version = "0.0.31"
 edition = "2024"
 
 [dependencies]
 aes-gcm = "0.10"
 anyhow = "1"
-askama = "0.16.0"
 base64 = "0.22"
 bytes = "1"
 dirs = "6"
-hkdf = "0.13"
 hmac = "0.13"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 jiff = "0.2"
-open = "5"
 rand = "0.10.1"
 ratatui = "0.30.0"
 rustic_backend = { version = "0.6.2", default-features = false, features = ["rest", "opendal"] }
@@ -30,7 +27,6 @@ toml = "1"
 tui-input = { version = "0.15", default-features = false, features = ["crossterm"] }
 url = "2"
 keyring-core = { version = "1", optional = true }
-x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1", features = ["keychain"], optional = true }

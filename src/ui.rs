@@ -8,7 +8,6 @@ use ratatui::{
 use tui_input::Input;
 
 use crate::app::{App, BACKEND_ORDER, Screen, filter_dim_entries};
-use crate::passphrase::PassphrasePhase;
 use crate::repo::ContentKind;
 
 pub(crate) fn render(frame: &mut Frame, app: &mut App) {
@@ -110,7 +109,6 @@ fn bottom_bar_text(app: &App) -> &'static str {
         },
         Screen::PassphraseDerivingKey => "working…",
         Screen::AuthMethodChoice => "Up/Dn move  Enter pick  Esc back",
-        Screen::PassphraseUrl => "Esc/q quit",
         Screen::SnapshotCompareSecond => {
             "Up/Dn move  PgUp/PgDn page  g/G top/bottom  Enter pick SECOND  a toggle related/all  Esc cancel"
         }
@@ -271,7 +269,6 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
                 .block(Block::bordered().title("Passphrase"));
             frame.render_widget(para, area);
         }
-        Screen::PassphraseUrl => render_passphrase_url(frame, app, area),
         Screen::SnapshotCompareSecond => render_compare_second(frame, app, area),
         Screen::SnapshotCompareLoading => render_compare_loading(frame, app, area),
         Screen::SnapshotCompareResults => render_compare_results(frame, app, area),
@@ -901,23 +898,12 @@ fn render_file_details(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_auth_method_choice(frame: &mut Frame, app: &mut App, area: Rect) {
-    let terminal_label = if app.keychain_enabled() {
-        "Keychain-assisted terminal"
-    } else {
-        "Enter passphrase in terminal"
-    };
     let items = vec![
-        ListItem::new(terminal_label),
-        ListItem::new("Enter passphrase in browser"),
+        ListItem::new("Use passphrase from keychain"),
+        ListItem::new("Enter passphrase manually"),
     ];
-    let phase_label = match app.passphrase_phase {
-        Some(PassphrasePhase::Setup) => "Setup",
-        Some(PassphrasePhase::Unlock) => "Unlock",
-        None => "Passphrase",
-    };
-    let title = format!("Choose auth method \u{2014} {phase_label}");
     let list = List::new(items)
-        .block(Block::bordered().title(title))
+        .block(Block::bordered().title("Choose unlock method"))
         .highlight_style(selection_highlight())
         .highlight_symbol(">> ");
     record_list_area(app, area);
@@ -997,104 +983,6 @@ fn render_passphrase_unlock(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(help_para, areas[3]);
     } else {
         render_input(frame, area, &title, &app.passphrase_input, true, &help);
-    }
-}
-
-fn render_passphrase_url(frame: &mut Frame, app: &mut App, area: Rect) {
-    let phase_label = match app.passphrase_phase {
-        Some(PassphrasePhase::Setup) => "Setup",
-        Some(PassphrasePhase::Unlock) => "Unlock",
-        None => "Passphrase",
-    };
-    let expired = app
-        .passphrase_handle
-        .as_ref()
-        .map(|h| h.is_expired())
-        .unwrap_or(false);
-    let mut lines = String::new();
-    lines.push_str(&format!(
-        "Experimental passphrase mode — {phase_label} ceremony\n\n"
-    ));
-    match &app.passphrase_short_url {
-        Some(short) => {
-            lines.push_str("Open this URL in a browser:\n");
-            lines.push_str(short);
-            lines.push_str("\n\n");
-        }
-        None => {
-            lines.push_str("(URL not available)\n\n");
-        }
-    }
-    if !expired
-        && let Some(code) = &app.passphrase_setup_code
-    {
-        lines.push_str("Setup code (type this in the browser):\n\n");
-        lines.push_str("    ");
-        lines.push_str(code);
-        lines.push_str("\n\n");
-    }
-    if expired {
-        lines.push_str(
-            "SESSION EXPIRED — passphrase ceremony timed out after 30 minutes.\n\
-             The server now returns 403 for every request.\n\
-             Press Esc/q to quit, then relaunch wrustic to try again.\n\n",
-        );
-    } else {
-        match app.passphrase_phase {
-            Some(PassphrasePhase::Setup) => {
-                lines.push_str(
-                    "Enter a strong passphrase in the browser to encrypt your config.\n\
-                     The browser encrypts it to the local server, which derives the config key with scrypt.\n\n\
-                     WARNING: forgetting this passphrase means losing access to the config.\n",
-                );
-            }
-            Some(PassphrasePhase::Unlock) => {
-                if let Some(m) = app.config.passphrase.as_ref() {
-                    if !m.instance.is_empty() {
-                        lines.push_str(&format!("Instance: {}\n", m.instance));
-                    }
-                    if !m.instance_sig.is_empty() {
-                        lines.push_str(&format!("Signature: {}\n", m.instance_sig));
-                    }
-                    lines.push('\n');
-                }
-                lines.push_str(
-                    "Enter the passphrase you set up earlier to decrypt the config.\n",
-                );
-            }
-            None => {}
-        }
-    }
-    if !expired {
-        if app.passphrase_error.is_none() {
-            lines.push_str("\nPress o to open the URL in your browser.\n");
-        }
-        lines.push_str("\nWaiting for browser ceremony\u{2026}\n");
-    }
-    let block = Block::bordered().title(format!("Passphrase \u{2014} {phase_label}"));
-    let inner = block.inner(area);
-    record_list_area(app, area);
-    frame.render_widget(block, area);
-    let main_style = if expired {
-        Style::new().fg(Color::Red)
-    } else {
-        Style::default()
-    };
-    if let Some(err) = &app.passphrase_error {
-        let [main_area, err_area] = Layout::vertical([
-            Constraint::Fill(1),
-            Constraint::Length(3),
-        ])
-        .areas(inner);
-        let para = Paragraph::new(lines).style(main_style).wrap(Wrap { trim: false });
-        frame.render_widget(para, main_area);
-        let err_para = Paragraph::new(format!("{err}\nCopy and paste the URL manually."))
-            .style(Style::new().fg(Color::Red))
-            .wrap(Wrap { trim: false });
-        frame.render_widget(err_para, err_area);
-    } else {
-        let para = Paragraph::new(lines).style(main_style).wrap(Wrap { trim: false });
-        frame.render_widget(para, inner);
     }
 }
 
