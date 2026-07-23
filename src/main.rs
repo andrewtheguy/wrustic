@@ -27,7 +27,7 @@ use crate::app::{App, BrowseFrame, Screen};
 use crate::cli::{USAGE, parse_cli};
 use crate::repo::{
     ContentRow, diff_snapshots, get_file_details, list_tree, load_snapshots, open_indexed,
-    preview_snapshot_contents, snapshot_delete_info, snapshot_root_tree, verify_profile,
+    preview_snapshot_contents, snapshot_root_tree, verify_profile,
 };
 use crate::ui::render;
 
@@ -163,48 +163,19 @@ fn run(
             let need_details = app.delete_info.is_none();
             let result = (|| -> anyhow::Result<_> {
                 let repo = open_indexed(profile)?;
-                let info = if need_details {
-                    Some(snapshot_delete_info(&repo, &snap_id)?)
-                } else {
-                    None
-                };
                 let restic_details = if need_details {
                     Some(restic::snapshot_details_json(profile, &snap_id)?)
                 } else {
                     None
                 };
-                if let (Some(info), Some((parsed, _))) = (&info, &restic_details) {
-                    let mut mismatches = Vec::new();
-                    if let Some(rh) = &parsed.hostname
-                        && *rh != info.hostname
-                    {
-                        mismatches.push(format!(
-                            "hostname: rustic={:?}, restic={:?}",
-                            info.hostname, rh
-                        ));
+                let info = restic_details.as_ref().map(|(parsed, _)| {
+                    crate::repo::DeleteSnapshotInfo {
+                        hostname: parsed.hostname.clone().unwrap_or_default(),
+                        paths: parsed.paths.clone(),
+                        tags: parsed.tags.clone(),
+                        tree: parsed.tree.clone().unwrap_or_default(),
                     }
-                    if let Some(rt) = &parsed.tree
-                        && *rt != info.tree
-                    {
-                        mismatches.push(format!(
-                            "tree: rustic={:?}, restic={:?}",
-                            info.tree, rt
-                        ));
-                    }
-                    if parsed.paths != info.paths {
-                        mismatches.push(format!(
-                            "paths: rustic={:?}, restic={:?}",
-                            info.paths, parsed.paths
-                        ));
-                    }
-                    if !mismatches.is_empty() {
-                        anyhow::bail!(
-                            "rustic and restic disagree on snapshot metadata \
-                             (possible rustic bug, unsafe to proceed):\n{}",
-                            mismatches.join("\n")
-                        );
-                    }
-                }
+                });
                 let preview = preview_snapshot_contents(&repo, &snap_id, limit)?;
                 Ok((info, restic_details, preview))
             })();
@@ -309,7 +280,7 @@ fn run(
                 app.screen = Screen::Error("Repository session was dropped.".into());
                 continue;
             };
-            match list_tree(repo, tree_id) {
+            match list_tree(repo, &tree_id) {
                 Ok(items) => {
                     let (items, table_state) = with_parent(items);
                     app.browse_stack.push(BrowseFrame {
@@ -338,7 +309,7 @@ fn run(
                 app.screen = Screen::Error("Repository session was dropped.".into());
                 continue;
             };
-            match get_file_details(repo, tree_id, &name, full_path) {
+            match get_file_details(repo, &tree_id, &name, full_path) {
                 Ok(details) => {
                     app.file_details = Some(details);
                     app.screen = Screen::FileDetails;
@@ -381,7 +352,7 @@ fn open_and_walk(
 )> {
     let repo = open_indexed(profile)?;
     let root_tree = snapshot_root_tree(&repo, snapshot_id)?;
-    let root_items = list_tree(&repo, root_tree)?;
+    let root_items = list_tree(&repo, &root_tree)?;
     let (root_items, root_table_state) = with_parent(root_items);
     let mut stack = vec![BrowseFrame {
         name: String::new(),
@@ -397,10 +368,10 @@ fn open_and_walk(
                 .items
                 .iter()
                 .find(|row| row.name == *name && row.subtree.is_some())
-                .map(|row| (row.subtree.unwrap(), row.name.clone()));
+                .map(|row| (row.subtree.clone().unwrap(), row.name.clone()));
             match next {
                 Some((tree_id, name)) => {
-                    let items = list_tree(&repo, tree_id)?;
+                    let items = list_tree(&repo, &tree_id)?;
                     let (items, table_state) = with_parent(items);
                     stack.push(BrowseFrame {
                         name,

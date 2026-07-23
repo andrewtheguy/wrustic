@@ -1,8 +1,11 @@
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
+use std::thread;
 
 use anyhow::{Result, anyhow};
+use bytes::Bytes;
 use serde::Deserialize;
+use tokio::sync::mpsc;
 
 use crate::config::Profile;
 
@@ -226,6 +229,73 @@ pub(crate) fn run(profile: &Profile, args: &[&str]) -> Result<Vec<u8>> {
         ));
     }
     Ok(output.stdout)
+}
+
+pub(crate) fn stream_dump(
+    profile: &Profile,
+    snapshot_id: &str,
+    path: &str,
+    tx: &mpsc::Sender<std::io::Result<Bytes>>,
+) -> Result<()> {
+    ensure_full_snapshot_id(snapshot_id)?;
+    let mut cmd = command(profile, &["dump", snapshot_id, path])?;
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow!("failed to spawn `restic dump`: {e}"))?;
+    write_password(&mut child, profile)?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("failed to open restic dump stdout"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("failed to open restic dump stderr"))?;
+    let stderr_reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stderr.read_to_end(&mut bytes);
+        (result, bytes)
+    });
+
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let count = stdout
+            .read(&mut buffer)
+            .map_err(|e| anyhow!("reading restic dump stdout: {e}"))?;
+        if count == 0 {
+            break;
+        }
+        if tx
+            .blocking_send(Ok(Bytes::copy_from_slice(&buffer[..count])))
+            .is_err()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stderr_reader.join();
+            return Ok(());
+        }
+    }
+
+    let status = child
+        .wait()
+        .map_err(|e| anyhow!("waiting on restic dump: {e}"))?;
+    let (stderr_result, stderr) = stderr_reader
+        .join()
+        .map_err(|_| anyhow!("restic dump stderr reader panicked"))?;
+    stderr_result.map_err(|e| anyhow!("reading restic dump stderr: {e}"))?;
+    if !status.success() {
+        let message = String::from_utf8_lossy(&stderr).trim().to_string();
+        return Err(anyhow!(
+            "restic dump exited with status {status}: {}",
+            if message.is_empty() {
+                "(no stderr)"
+            } else {
+                &message
+            }
+        ));
+    }
+    Ok(())
 }
 
 fn repo_url(profile: &Profile) -> Result<String> {

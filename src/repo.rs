@@ -1,15 +1,8 @@
-use std::collections::{BTreeMap, HashMap};
-use std::io::{self, Write};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
-use bytes::Bytes;
-use rustic_backend::BackendOptions;
-use rustic_core::{
-    Credentials, IndexedFull, IndexedFullStatus, Repository, RepositoryOptions, TreeId,
-};
 use serde::Deserialize;
-use tokio::sync::mpsc;
 
 use crate::config::Profile;
 use crate::restic;
@@ -47,7 +40,7 @@ pub(crate) struct ContentRow {
     pub(crate) kind: ContentKind,
     pub(crate) size: u64,
     pub(crate) mtime: String,
-    pub(crate) subtree: Option<TreeId>,
+    pub(crate) subtree: Option<String>,
 }
 
 pub(crate) struct PreviewEntry {
@@ -89,7 +82,7 @@ pub(crate) struct FileDetails {
 #[derive(Clone)]
 pub(crate) struct RepoSession {
     profile: Profile,
-    tree_selectors: Arc<Mutex<HashMap<TreeId, String>>>,
+    tree_selectors: Arc<Mutex<HashMap<String, String>>>,
 }
 
 #[derive(Deserialize)]
@@ -128,10 +121,12 @@ struct TreeNode {
     subtree: Option<String>,
 }
 
-fn parse_tree_id(value: &str) -> Result<TreeId> {
-    value
-        .parse()
-        .with_context(|| format!("parsing restic tree id `{value}`"))
+fn parse_tree_id(value: &str) -> Result<String> {
+    if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(value.to_string())
+    } else {
+        bail!("invalid restic tree id `{value}`")
+    }
 }
 
 fn display_time(value: Option<String>) -> String {
@@ -178,12 +173,12 @@ pub(crate) fn open_indexed(profile: &Profile) -> Result<RepoSession> {
     })
 }
 
-fn load_tree(repo: &RepoSession, tree_id: TreeId) -> Result<TreeDocument> {
+fn load_tree(repo: &RepoSession, tree_id: &str) -> Result<TreeDocument> {
     let selector = repo
         .tree_selectors
         .lock()
         .map_err(|_| anyhow!("restic tree selector cache was poisoned"))?
-        .get(&tree_id)
+        .get(tree_id)
         .cloned()
         .ok_or_else(|| anyhow!("no restic snapshot path registered for tree `{tree_id}`"))?;
     let output = restic::run(&repo.profile, &["cat", "tree", &selector, "--json"])?;
@@ -191,7 +186,7 @@ fn load_tree(repo: &RepoSession, tree_id: TreeId) -> Result<TreeDocument> {
         .with_context(|| format!("parsing restic tree JSON for `{selector}`"))
 }
 
-pub(crate) fn snapshot_root_tree(repo: &RepoSession, snapshot_id: &str) -> Result<TreeId> {
+pub(crate) fn snapshot_root_tree(repo: &RepoSession, snapshot_id: &str) -> Result<String> {
     let (snapshot, _) = restic::snapshot_details_json(&repo.profile, snapshot_id)?;
     let tree = snapshot
         .tree
@@ -200,31 +195,16 @@ pub(crate) fn snapshot_root_tree(repo: &RepoSession, snapshot_id: &str) -> Resul
     repo.tree_selectors
         .lock()
         .map_err(|_| anyhow!("restic tree selector cache was poisoned"))?
-        .insert(tree_id, format!("{snapshot_id}:/"));
+        .insert(tree_id.clone(), format!("{snapshot_id}:/"));
     Ok(tree_id)
 }
 
-pub(crate) fn snapshot_delete_info(
-    repo: &RepoSession,
-    snapshot_id: &str,
-) -> Result<DeleteSnapshotInfo> {
-    let (snapshot, _) = restic::snapshot_details_json(&repo.profile, snapshot_id)?;
-    Ok(DeleteSnapshotInfo {
-        hostname: snapshot.hostname.unwrap_or_default(),
-        paths: snapshot.paths,
-        tags: snapshot.tags,
-        tree: snapshot
-            .tree
-            .ok_or_else(|| anyhow!("snapshot `{snapshot_id}` has no root tree"))?,
-    })
-}
-
-pub(crate) fn list_tree(repo: &RepoSession, tree_id: TreeId) -> Result<Vec<ContentRow>> {
+pub(crate) fn list_tree(repo: &RepoSession, tree_id: &str) -> Result<Vec<ContentRow>> {
     let parent_selector = repo
         .tree_selectors
         .lock()
         .map_err(|_| anyhow!("restic tree selector cache was poisoned"))?
-        .get(&tree_id)
+        .get(tree_id)
         .cloned()
         .ok_or_else(|| anyhow!("no restic snapshot path registered for tree `{tree_id}`"))?;
     let mut rows = load_tree(repo, tree_id)?
@@ -232,7 +212,7 @@ pub(crate) fn list_tree(repo: &RepoSession, tree_id: TreeId) -> Result<Vec<Conte
         .into_iter()
         .map(|node| {
             let subtree = node.subtree.as_deref().map(parse_tree_id).transpose()?;
-            if let Some(subtree) = subtree {
+            if let Some(ref subtree) = subtree {
                 let (snapshot, path) = parent_selector
                     .split_once(':')
                     .ok_or_else(|| anyhow!("invalid restic tree selector `{parent_selector}`"))?;
@@ -244,7 +224,7 @@ pub(crate) fn list_tree(repo: &RepoSession, tree_id: TreeId) -> Result<Vec<Conte
                 repo.tree_selectors
                     .lock()
                     .map_err(|_| anyhow!("restic tree selector cache was poisoned"))?
-                    .insert(subtree, format!("{snapshot}:{child_path}"));
+                    .insert(subtree.clone(), format!("{snapshot}:{child_path}"));
             }
             Ok(ContentRow {
                 name: node.name,
@@ -265,7 +245,7 @@ pub(crate) fn list_tree(repo: &RepoSession, tree_id: TreeId) -> Result<Vec<Conte
 
 pub(crate) fn get_file_details(
     repo: &RepoSession,
-    tree_id: TreeId,
+    tree_id: &str,
     file_name: &str,
     full_path: String,
 ) -> Result<FileDetails> {
@@ -313,13 +293,13 @@ pub(crate) fn preview_snapshot_contents(
     let root = snapshot_root_tree(repo, snapshot_id)?;
     let mut entries = Vec::new();
     let mut truncated = false;
-    walk_preview(repo, root, "", &mut entries, limit, &mut truncated)?;
+    walk_preview(repo, &root, "", &mut entries, limit, &mut truncated)?;
     Ok(ContentsPreview { entries, truncated })
 }
 
 fn walk_preview(
     repo: &RepoSession,
-    tree_id: TreeId,
+    tree_id: &str,
     prefix: &str,
     out: &mut Vec<PreviewEntry>,
     limit: usize,
@@ -341,7 +321,7 @@ fn walk_preview(
         if is_dir
             && let Some(subtree) = subtree
         {
-            walk_preview(repo, subtree, &path, out, limit, truncated)?;
+            walk_preview(repo, &subtree, &path, out, limit, truncated)?;
         }
     }
     Ok(())
@@ -449,106 +429,6 @@ pub(crate) fn diff_snapshots(
     Ok((summary, changes))
 }
 
-// Temporary native content path. The share server moves to `restic dump` in
-// the next migration phase; keeping this isolated makes the intermediate
-// commit buildable and reviewable.
-fn build_backend_opts(profile: &Profile) -> Result<BackendOptions> {
-    let mut opts = BackendOptions::default();
-    match profile {
-        Profile::Local { local_path, .. } => {
-            opts = opts.repository(local_path.clone());
-        }
-        Profile::Rest {
-            rest_url,
-            rest_user,
-            rest_password,
-            ..
-        } => {
-            let mut url = url::Url::parse(rest_url)
-                .with_context(|| format!("parsing REST URL `{rest_url}`"))?;
-            if rest_user.is_empty() && !rest_password.is_empty() {
-                bail!("REST profile has a password but no username");
-            }
-            if !rest_user.is_empty() {
-                url.set_username(rest_user)
-                    .map_err(|_| anyhow!("REST URL `{rest_url}` cannot carry a username"))?;
-            }
-            if !rest_password.is_empty() {
-                url.set_password(Some(rest_password))
-                    .map_err(|_| anyhow!("REST URL `{rest_url}` cannot carry a password"))?;
-            }
-            opts = opts.repository(format!("rest:{url}"));
-        }
-        Profile::S3 {
-            s3_endpoint,
-            s3_bucket,
-            s3_region,
-            s3_root,
-            s3_access_key,
-            s3_secret_key,
-            ..
-        } => {
-            opts = opts.repository("opendal:s3:");
-            let mut s3_opts = BTreeMap::new();
-            s3_opts.insert("bucket".to_string(), s3_bucket.clone());
-            s3_opts.insert("region".to_string(), s3_region.clone());
-            s3_opts.insert("access_key_id".to_string(), s3_access_key.clone());
-            s3_opts.insert("secret_access_key".to_string(), s3_secret_key.clone());
-            if !s3_endpoint.is_empty() {
-                s3_opts.insert("endpoint".to_string(), s3_endpoint.clone());
-            }
-            if !s3_root.is_empty() {
-                s3_opts.insert("root".to_string(), s3_root.clone());
-            }
-            opts = opts.options(s3_opts);
-        }
-    }
-    Ok(opts)
-}
-
-pub(crate) fn open_indexed_full(profile: &Profile) -> Result<Repository<IndexedFullStatus>> {
-    let backends = build_backend_opts(profile)?.to_backends()?;
-    Repository::new(&RepositoryOptions::default(), &backends)?
-        .open(&Credentials::password(profile.password()))?
-        .to_indexed()
-        .map_err(Into::into)
-}
-
-pub(crate) fn stream_file_content<S: IndexedFull>(
-    repo: &Repository<S>,
-    tree_id: TreeId,
-    name: &str,
-    tx: &mpsc::Sender<io::Result<Bytes>>,
-) -> Result<()> {
-    let tree = repo.get_tree(&tree_id)?;
-    let node = tree
-        .nodes
-        .into_iter()
-        .find(|node| node.name().to_string_lossy() == name)
-        .ok_or_else(|| anyhow!("file `{name}` not found in tree"))?;
-    let mut writer = ChannelWriter { tx };
-    repo.dump(&node, &mut writer)?;
-    Ok(())
-}
-
-struct ChannelWriter<'a> {
-    tx: &'a mpsc::Sender<io::Result<Bytes>>,
-}
-
-impl Write for ChannelWriter<'_> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let len = buf.len();
-        self.tx
-            .blocking_send(Ok(Bytes::copy_from_slice(buf)))
-            .map_err(|_| io::Error::other("client disconnected"))?;
-        Ok(len)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -581,7 +461,7 @@ mod tests {
 
         let session = open_indexed(&profile).expect("session");
         let root_tree = snapshot_root_tree(&session, &snapshots[0].id).expect("root tree");
-        let root_rows = list_tree(&session, root_tree).expect("root rows");
+        let root_rows = list_tree(&session, &root_tree).expect("root rows");
         assert!(!root_rows.is_empty());
 
         let preview =

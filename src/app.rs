@@ -8,7 +8,6 @@ use ratatui::{
     layout::Rect,
     widgets::{ListState, TableState},
 };
-use rustic_core::TreeId;
 use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
@@ -211,7 +210,7 @@ fn page_select(state: &mut impl Scrollable, len: usize, forward: bool, page_size
 
 pub(crate) struct BrowseFrame {
     pub(crate) name: String,
-    pub(crate) tree_id: TreeId,
+    pub(crate) tree_id: String,
     pub(crate) items: Vec<ContentRow>,
     pub(crate) table_state: TableState,
 }
@@ -274,9 +273,9 @@ pub(crate) struct App {
     pub(crate) repo_session: Option<RepoSession>,
     pub(crate) browse_snapshot_id: String,
     pub(crate) browse_stack: Vec<BrowseFrame>,
-    pub(crate) pending_descend: Option<(TreeId, String)>,
+    pub(crate) pending_descend: Option<(String, String)>,
     pub(crate) pending_refresh_path: Option<Vec<String>>,
-    pub(crate) pending_file_lookup: Option<(TreeId, String, String)>,
+    pub(crate) pending_file_lookup: Option<(String, String, String)>,
     pub(crate) file_details: Option<FileDetails>,
     pub(crate) file_details_scroll: u16,
     // What `Screen::ShareUrl` would serve if started. Captured at the moment
@@ -1069,7 +1068,7 @@ impl App {
         match row.kind {
             ContentKind::Parent => self.go_up(),
             ContentKind::Dir => {
-                if let Some(subtree) = row.subtree {
+                if let Some(subtree) = row.subtree.clone() {
                     // Descending — drop any pending double-click pair so the
                     // new frame can't inherit a stale match.
                     self.last_content_click = None;
@@ -1114,11 +1113,12 @@ impl App {
         };
         self.share_target = Some(ShareTarget {
             snap_id: self.browse_snapshot_id.clone(),
-            tree_id: f.tree_id,
+            tree_id: f.tree_id.clone(),
             name: row.name.clone(),
             display_path: full_path.clone(),
         });
-        self.pending_file_lookup = Some((f.tree_id, row.name.clone(), full_path));
+        self.pending_file_lookup =
+            Some((f.tree_id.clone(), row.name.clone(), full_path));
         self.file_details_scroll = 0;
         self.screen = Screen::LoadingFileDetails;
     }
