@@ -165,6 +165,7 @@ fn run(
             };
             let limit = app.delete_preview_limit;
             let need_details = app.delete_info.is_none();
+            let cached_preview = app.preview_cache.get(&(snap_id.clone(), limit)).cloned();
             let result = (|| -> anyhow::Result<_> {
                 let repo = open_indexed(profile)?;
                 let restic_details = if need_details {
@@ -179,7 +180,10 @@ fn run(
                         tags: parsed.tags.clone(),
                     }
                 });
-                let preview = preview_snapshot_contents(&repo, &snap_id, limit)?;
+                let preview = match cached_preview {
+                    Some(preview) => preview,
+                    None => preview_snapshot_contents(&repo, &snap_id, limit)?,
+                };
                 Ok((info, restic_details, preview))
             })();
             match result {
@@ -192,6 +196,8 @@ fn run(
                         app.delete_details_parsed = Some(parsed);
                         app.delete_details_raw = Some(raw);
                     }
+                    app.preview_cache
+                        .insert((snap_id.clone(), limit), preview.clone());
                     app.delete_root_listing = Some(preview);
                     app.delete_preview_state = TableState::default();
                     if has_entries {
@@ -225,6 +231,7 @@ fn run(
                     app.post_delete_select = app.list_state.selected();
                     app.delete_details_parsed = None;
                     app.delete_details_raw = None;
+                    app.preview_cache.retain(|(id, _), _| id != &snapshot_id);
                     app.snapshots.clear();
                     app.screen = Screen::Loading;
                 }

@@ -15,6 +15,7 @@ pub(crate) struct SnapshotRow {
     pub(crate) paths: Vec<String>,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) enum ContentKind {
     Parent,
     Dir,
@@ -43,12 +44,14 @@ pub(crate) struct ContentRow {
     pub(crate) subtree: Option<String>,
 }
 
+#[derive(Clone)]
 pub(crate) struct PreviewEntry {
     pub(crate) path: String,
     pub(crate) kind: ContentKind,
     pub(crate) size: u64,
 }
 
+#[derive(Clone)]
 pub(crate) struct ContentsPreview {
     pub(crate) entries: Vec<PreviewEntry>,
     pub(crate) truncated: bool,

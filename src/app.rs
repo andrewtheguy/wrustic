@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -304,6 +305,10 @@ pub(crate) struct App {
     pub(crate) delete_details_parsed: Option<SnapshotDetails>,
     pub(crate) delete_details_raw: Option<String>,
     pub(crate) delete_root_listing: Option<ContentsPreview>,
+    // Snapshot previews keyed by (snapshot id, limit). Snapshots are
+    // immutable and ids are content-derived, so entries can never go stale —
+    // they're only dropped to reclaim memory once a snapshot is forgotten.
+    pub(crate) preview_cache: HashMap<(String, usize), ContentsPreview>,
 
     pub(crate) compare_first_id: Option<String>,
     pub(crate) compare_first_row_idx: Option<usize>,
@@ -410,6 +415,7 @@ impl App {
             delete_details_parsed: None,
             delete_details_raw: None,
             delete_root_listing: None,
+            preview_cache: HashMap::new(),
             compare_first_id: None,
             compare_first_row_idx: None,
             compare_second_id: None,
