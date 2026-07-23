@@ -1,11 +1,14 @@
 # wrustic
 
-A minimal read-only terminal UI for [restic](https://restic.net/)-format backup
-repositories, built on the restic 0.19 CLI and
+A terminal UI for browsing and managing [restic](https://restic.net/)-format
+backup repositories, built on the restic 0.19 CLI and
 [`ratatui`](https://crates.io/crates/ratatui).
 
-`wrustic` is read-focused by design. Snapshot deletion through `restic forget`
-is its only repository mutation; other write operations are out of scope.
+`wrustic` is a read/write repository manager. Repository creation, backup,
+restore, retention, and maintenance operations are in scope and are delegated
+to restic subprocesses. The current UI exposes repository reads and snapshot
+deletion; additional write workflows are tracked in
+[`docs/roadmap.md`](docs/roadmap.md).
 
 ## Features
 

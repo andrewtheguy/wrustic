@@ -6,9 +6,12 @@ update this file.
 
 ## What wrustic is
 
-A read-only terminal UI for browsing restic backup repositories. It opens a
-repo, lists snapshots, lets you walk the file tree, inspect file details,
+A terminal UI for browsing and managing restic backup repositories. It opens
+a repo, lists snapshots, lets you walk the file tree, inspect file details,
 diff two snapshots, and download a single file via a localhost signed URL.
+The product scope includes repository writes such as initialization, backup,
+restore, retention, and maintenance. Snapshot deletion is the first write
+workflow currently exposed by the UI.
 
 **Scope: single-user, single-device.** wrustic is a personal tool — one
 person, one machine (or one account on a shared box that they fully own).
@@ -19,10 +22,12 @@ machine. This shapes the on-disk permissions, the threat model in
 [encryption.md](encryption.md), and the choice to keep all state in one
 flat `App` struct.
 
-It is intentionally **not** a restic replacement:
+It does not reimplement restic's repository engine:
 - Repository operations go through restic >= 0.19.1 subprocesses.
-- The only write exposed by wrustic is `forget`. Anything more complex
-  (backup, prune, init, key add) is out of scope — use restic directly.
+- Structured results use restic JSON/JSONL output, while file content and
+  progress-oriented operations are streamed over pipes.
+- Read and write workflows share the same subprocess boundary and password
+  transport guarantees.
 
 ## Runtime shape
 
@@ -133,7 +138,9 @@ synchronously on `Screen::PassphraseDerivingKey`.
 - `run()` captures structured command output.
 - `stream_dump()` streams file bytes with backpressure and kills the child if
   the HTTP client disconnects.
-- `forget()` performs the one repository mutation exposed by the UI.
+- `forget()` performs the repository mutation currently exposed by the UI.
+  Future write workflows belong beside it and must retain the same credential
+  and structured-output boundaries.
 
 `repo.rs` translates restic JSON into UI models:
 - `snapshots --json` lists snapshots.
