@@ -284,46 +284,81 @@ pub(crate) fn get_file_details(
     })
 }
 
+#[derive(Deserialize)]
+struct LsNode {
+    #[serde(rename = "type")]
+    kind: String,
+    path: String,
+    #[serde(default)]
+    size: u64,
+}
+
 pub(crate) fn preview_snapshot_contents(
     repo: &RepoSession,
     snapshot_id: &str,
     limit: usize,
 ) -> Result<ContentsPreview> {
-    let root = snapshot_root_tree(repo, snapshot_id)?;
+    let output = restic::ls_json(&repo.profile, snapshot_id)?;
+    let text = String::from_utf8(output).context("restic ls output was not UTF-8")?;
+    parse_ls_preview(&text, limit)
+}
+
+fn parse_ls_preview(text: &str, limit: usize) -> Result<ContentsPreview> {
+    let mut children: HashMap<String, Vec<LsNode>> = HashMap::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let value: serde_json::Value =
+            serde_json::from_str(line).context("parsing restic ls JSON line")?;
+        if value.get("message_type").and_then(|kind| kind.as_str()) != Some("node") {
+            continue;
+        }
+        let node: LsNode =
+            serde_json::from_value(value).context("parsing restic ls node")?;
+        let parent = node
+            .path
+            .rsplit_once('/')
+            .map(|(parent, _)| parent.to_string())
+            .ok_or_else(|| anyhow!("restic ls node path `{}` has no parent", node.path))?;
+        children.entry(parent).or_default().push(node);
+    }
+    for nodes in children.values_mut() {
+        // Paths within one directory share their parent prefix, so comparing
+        // paths orders siblings by name — same order list_tree produces.
+        nodes.sort_by(|a, b| {
+            let ad = a.kind == "dir";
+            let bd = b.kind == "dir";
+            bd.cmp(&ad).then_with(|| a.path.cmp(&b.path))
+        });
+    }
     let mut entries = Vec::new();
     let mut truncated = false;
-    walk_preview(repo, &root, "", &mut entries, limit, &mut truncated)?;
+    walk_preview(&children, "", &mut entries, limit, &mut truncated);
     Ok(ContentsPreview { entries, truncated })
 }
 
 fn walk_preview(
-    repo: &RepoSession,
-    tree_id: &str,
-    prefix: &str,
+    children: &HashMap<String, Vec<LsNode>>,
+    dir: &str,
     out: &mut Vec<PreviewEntry>,
     limit: usize,
     truncated: &mut bool,
-) -> Result<()> {
-    for row in list_tree(repo, tree_id)? {
+) {
+    let Some(rows) = children.get(dir) else {
+        return;
+    };
+    for node in rows {
         if out.len() >= limit {
             *truncated = true;
             break;
         }
-        let path = format!("{prefix}/{}", row.name);
-        let is_dir = matches!(row.kind, ContentKind::Dir);
-        let subtree = row.subtree;
         out.push(PreviewEntry {
-            path: path.clone(),
-            kind: row.kind,
-            size: row.size,
+            path: node.path.clone(),
+            kind: node_kind(&node.kind),
+            size: node.size,
         });
-        if is_dir
-            && let Some(subtree) = subtree
-        {
-            walk_preview(repo, &subtree, &path, out, limit, truncated)?;
+        if node.kind == "dir" {
+            walk_preview(children, &node.path, out, limit, truncated);
         }
     }
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -431,6 +466,33 @@ pub(crate) fn diff_snapshots(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const LS_FIXTURE: &str = r#"
+{"message_type":"snapshot","id":"abc","short_id":"abc"}
+{"message_type":"node","name":"a.txt","type":"file","path":"/a.txt","size":3}
+{"message_type":"node","name":"zdir","type":"dir","path":"/zdir"}
+{"message_type":"node","name":"inner.txt","type":"file","path":"/zdir/inner.txt","size":7}
+{"message_type":"node","name":"link","type":"symlink","path":"/zdir/link"}
+"#;
+
+    #[test]
+    fn ls_preview_orders_dirs_first_and_recurses() {
+        let preview = parse_ls_preview(LS_FIXTURE, 10).expect("parse");
+        let paths: Vec<&str> = preview.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, ["/zdir", "/zdir/inner.txt", "/zdir/link", "/a.txt"]);
+        assert!(!preview.truncated);
+        assert!(matches!(preview.entries[0].kind, ContentKind::Dir));
+        assert_eq!(preview.entries[1].size, 7);
+        assert!(matches!(preview.entries[2].kind, ContentKind::Symlink));
+    }
+
+    #[test]
+    fn ls_preview_truncates_at_limit() {
+        let preview = parse_ls_preview(LS_FIXTURE, 2).expect("parse");
+        let paths: Vec<&str> = preview.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, ["/zdir", "/zdir/inner.txt"]);
+        assert!(preview.truncated);
+    }
 
     #[test]
     #[ignore]

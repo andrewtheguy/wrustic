@@ -135,6 +135,15 @@ pub(crate) fn snapshot_details_json(
 }
 
 /// `snapshot_id` must be the full 64-char hex hash (enforced — short ids are
+/// rejected to avoid prefix ambiguity). Returns the raw JSONL output of
+/// `restic ls --json`, which lists the whole snapshot recursively in one
+/// invocation.
+pub(crate) fn ls_json(profile: &Profile, snapshot_id: &str) -> Result<Vec<u8>> {
+    ensure_full_snapshot_id(snapshot_id)?;
+    run(profile, &["ls", "--json", snapshot_id])
+}
+
+/// `snapshot_id` must be the full 64-char hex hash (enforced — short ids are
 /// rejected to avoid silently forgetting the wrong snapshot when a prefix
 /// matches multiple).
 pub(crate) fn forget(profile: &Profile, snapshot_id: &str) -> Result<()> {
