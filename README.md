@@ -126,6 +126,41 @@ All dev/test artifacts in the snippets below go under the project's `./tmp/`
 directory (already in `.gitignore`) rather than the system `/tmp` — this keeps
 the workspace self-contained and sidesteps permission issues.
 
+### Garage S3 end-to-end test
+
+The Garage server and the wrustic integration test have separate runners.
+Start a fresh server in its own terminal:
+
+```sh
+./scripts/garage-test-server.sh --reset
+```
+
+The server script downloads the pinned Garage binary into `./tmp/tools/` when
+needed and directly runs `server --single-node --default-bucket` in the
+foreground. Only its S3 API is configured; the web and admin APIs are omitted.
+It does not run restic, Cargo, or tests, and Ctrl-C stops it. Omit `--reset` to
+reuse the existing Garage data.
+
+With a fresh server running, seed the repository and run the integration test
+independently:
+
+```sh
+./scripts/garage-e2e.sh run
+```
+
+`seed` and `test` are also available separately. Test state stays under
+`./tmp/garage-e2e/`. The E2E runner requires restic >= 0.19.1 from
+`./tmp/tools/restic` or `PATH`; use `RESTIC_BIN=/path/to/restic` to select
+another binary. The repository password is piped to
+`--password-file /dev/stdin` and is never exported.
+
+To select another S3 port, pass the same value to the independent commands:
+
+```sh
+GARAGE_S3_PORT=3910 ./scripts/garage-test-server.sh --reset
+GARAGE_S3_PORT=3910 ./scripts/garage-e2e.sh run
+```
+
 Typical dev loop to get something to point `wrustic` at:
 
 ```sh

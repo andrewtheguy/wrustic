@@ -478,9 +478,11 @@ mod tests {
     #[test]
     #[ignore]
     fn live_garage_s3_profile_reads_seeded_repository() {
+        let endpoint = std::env::var("WRUSTIC_GARAGE_ENDPOINT")
+            .unwrap_or_else(|_| "http://127.0.0.1:3900".into());
         let profile = Profile::S3 {
             password: "garage-repository-password".into(),
-            s3_endpoint: "http://127.0.0.1:3900".into(),
+            s3_endpoint: endpoint,
             s3_bucket: "wrustic-it".into(),
             s3_region: "garage".into(),
             s3_root: "repository".into(),
