@@ -428,27 +428,12 @@ mod tests {
         fs::create_dir_all(&source).unwrap();
         fs::write(source.join("a.txt"), b"hello\n").unwrap();
 
-        let init = Command::new("restic")
-            .arg("init")
-            .env("RESTIC_REPOSITORY", &repo)
-            .env("RESTIC_PASSWORD", "pw")
-            .output()
-            .expect("init");
-        assert!(init.status.success(), "init failed: {init:?}");
-
-        let backup = Command::new("restic")
-            .arg("backup")
-            .arg(&source)
-            .env("RESTIC_REPOSITORY", &repo)
-            .env("RESTIC_PASSWORD", "pw")
-            .output()
-            .expect("backup");
-        assert!(backup.status.success(), "backup failed: {backup:?}");
-
         let profile = Profile::Local {
             password: "pw".into(),
             local_path: repo.to_string_lossy().into_owned(),
         };
+        run(&profile, &["init"]).expect("init");
+        run(&profile, &["backup", source.to_str().unwrap()]).expect("backup");
 
         // List snapshots via restic CLI (also exercises stdin-password path).
         let list = run(&profile, &["snapshots", "--json"]).expect("list");

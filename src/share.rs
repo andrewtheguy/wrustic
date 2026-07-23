@@ -639,33 +639,31 @@ mod tests {
         use std::io::{Read, Write};
         use std::net::TcpStream;
 
-        // Find the latest snapshot id (64-hex) and the file's parent tree id
-        // by walking the repo via rustic_core, so this test isn't tied to a
-        // specific snapshot id that's only known after `restic backup`.
+        // Find the latest snapshot id and the file's parent tree through the
+        // same restic CLI metadata path used by the application.
         let profile = Profile::Local {
             password: "sandbox".into(),
             local_path: "tmp/share-test/restic-repo".into(),
         };
         let repo = crate::repo::open_indexed(&profile).expect("open repo");
-        let snaps = repo.get_all_snapshots().expect("list snapshots");
-        let snap = snaps.last().expect("at least one snapshot");
-        let snap_id = snap.id.to_hex().as_str().to_string();
+        let snaps = crate::repo::load_snapshots(&profile).expect("list snapshots");
+        let snap = snaps.first().expect("at least one snapshot");
+        let snap_id = snap.id.clone();
 
         // Walk to the tree containing `greeting.txt`. The backup put files
         // under `source/`, so the path is `/source/greeting.txt`. Resolve
         // the parent tree id by descending into `source`.
-        let root_tree = snap.tree;
-        let root_rows = repo.get_tree(&root_tree).expect("root tree");
+        let root_tree =
+            crate::repo::snapshot_root_tree(&repo, &snap_id).expect("root tree id");
+        let root_rows = crate::repo::list_tree(&repo, root_tree).expect("root tree");
         let source_node = root_rows
-            .nodes
             .iter()
-            .find(|n| n.name().to_string_lossy() == "source")
+            .find(|node| node.name == "source")
             .expect("source dir node");
         let source_tree = source_node.subtree.expect("source has subtree");
 
-        // tiny helper inlined for the test
-        fn tree_hex_str(t: TreeId) -> String {
-            t.to_hex().as_str().to_string()
+        fn tree_hex_str(tree: TreeId) -> String {
+            tree.to_hex().as_str().to_string()
         }
 
         // Free up our `repo` handle — share::start opens its own with the

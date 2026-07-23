@@ -376,7 +376,7 @@ fn open_and_walk(
     snapshot_id: &str,
     refresh_path: Option<&[String]>,
 ) -> Result<(
-    rustic_core::Repository<rustic_core::IndexedIdsStatus>,
+    crate::repo::RepoSession,
     Vec<BrowseFrame>,
 )> {
     let repo = open_indexed(profile)?;

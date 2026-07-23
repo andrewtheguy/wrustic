@@ -8,14 +8,14 @@ use ratatui::{
     layout::Rect,
     widgets::{ListState, TableState},
 };
-use rustic_core::{IndexedIdsStatus, Repository, TreeId};
+use rustic_core::TreeId;
 use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
 
 use crate::config::{self, BackendKind, Config, PassphraseMeta, Paths, Profile};
 use crate::crypto::Cipher;
 use crate::passphrase::{self, PassphrasePhase};
-use crate::repo::{ContentKind, ContentRow, ContentsPreview, DeleteSnapshotInfo, DiffChange, DiffSummary, FileDetails, SnapshotRow};
+use crate::repo::{ContentKind, ContentRow, ContentsPreview, DeleteSnapshotInfo, DiffChange, DiffSummary, FileDetails, RepoSession, SnapshotRow};
 use crate::restic::{self, ResticError, ResticInfo, SnapshotDetails};
 use crate::share::{self, SHARE_TTL, ShareHandle, ShareTarget};
 
@@ -271,7 +271,7 @@ pub(crate) struct App {
     pub(crate) filter_values: Vec<String>,
     pub(crate) filter_pending_kind: Option<FilterKind>,
     pub(crate) active_profile_name: Option<String>,
-    pub(crate) repo_session: Option<Repository<IndexedIdsStatus>>,
+    pub(crate) repo_session: Option<RepoSession>,
     pub(crate) browse_snapshot_id: String,
     pub(crate) browse_stack: Vec<BrowseFrame>,
     pub(crate) pending_descend: Option<(TreeId, String)>,
