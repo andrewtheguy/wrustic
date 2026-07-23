@@ -51,22 +51,21 @@ simpler setup or environments where the keyring daemon is unavailable.
 
 ## How it works
 
-When keychain is enabled and the user chooses the terminal auth method:
+When keychain is enabled:
 
 - **Setup**: after entering and confirming the passphrase, a checkbox
   (`[x] Save passphrase to keychain`) lets the user opt in to storing it.
   The passphrase is saved under service `wrustic` with the instance name as
   the account identifier.
 
-- **Unlock**: wrustic first tries to read the passphrase from the keychain.
-  If found, it skips the input screen and proceeds directly to key derivation.
-  If not found (or if the keychain is unavailable), it falls back to the
-  manual passphrase entry screen, which also offers a checkbox to save for
-  next time.
+- **Unlock**: wrustic offers `Use passphrase from keychain` and
+  `Enter passphrase manually`. The keychain option skips the input screen when
+  a credential is found; otherwise it falls back to the manual TUI prompt.
+  Choosing manual entry starts with the save-to-keychain checkbox cleared.
 
-- **Wrong passphrase in keychain**: if the stored passphrase no longer matches
-  (e.g. changed via browser mode), HMAC verification fails and the user is
-  shown the manual entry screen with an error message.
+- **Wrong passphrase in keychain**: if the stored passphrase no longer matches,
+  HMAC verification fails and the user is shown the manual entry screen with
+  an error message.
 
 ## Supported backends
 

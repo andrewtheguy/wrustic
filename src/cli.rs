@@ -11,9 +11,8 @@ Options:
   -c, --config-dir <PATH>     Use <PATH> as the wrustic config directory instead
                               of the platform default (~/.config/wrustic on Linux).
                               The directory will be created on first run.
-  -p, --port <N>              Localhost port for both the file-share dialog and
-                              the passphrase ceremony. Default: 7834.
-                              They never run concurrently, so they share a port.
+  -p, --port <N>              Localhost port for the file-share dialog.
+                              Default: 7834.
       --no-mouse              Disable mouse reporting (useful for QA / copy-paste).
       --no-keychain           Disable keychain integration even when the binary
                               was built with the 'keychain' feature.
