@@ -58,7 +58,6 @@ pub(crate) struct DeleteSnapshotInfo {
     pub(crate) hostname: String,
     pub(crate) paths: Vec<String>,
     pub(crate) tags: Vec<String>,
-    pub(crate) tree: String,
 }
 
 pub(crate) struct FileDetails {

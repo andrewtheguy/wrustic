@@ -15,7 +15,7 @@ use crate::config::{self, BackendKind, Config, PassphraseMeta, Paths, Profile};
 use crate::crypto::Cipher;
 use crate::passphrase::{self, PassphrasePhase};
 use crate::repo::{ContentKind, ContentRow, ContentsPreview, DeleteSnapshotInfo, DiffChange, DiffSummary, FileDetails, RepoSession, SnapshotRow};
-use crate::restic::{self, ResticError, ResticInfo, SnapshotDetails};
+use crate::restic::SnapshotDetails;
 use crate::share::{self, SHARE_TTL, ShareHandle, ShareTarget};
 
 pub(crate) const BACKEND_ORDER: [BackendKind; 3] =
@@ -295,7 +295,6 @@ pub(crate) struct App {
     pub(crate) error_is_fatal: bool,
     pub(crate) quit: bool,
 
-    pub(crate) restic_check: Option<Result<ResticInfo, ResticError>>,
     pub(crate) delete_target: Option<String>,
     pub(crate) delete_info: Option<DeleteSnapshotInfo>,
     pub(crate) delete_show_json: bool,
@@ -402,7 +401,6 @@ impl App {
             share_error: None,
             error_is_fatal: false,
             quit: false,
-            restic_check: None,
             delete_target: None,
             delete_info: None,
             delete_show_json: false,
@@ -951,13 +949,6 @@ impl App {
     }
 
     fn begin_delete_flow(&mut self, snapshot_id: String) {
-        if self.restic_check.is_none() {
-            self.restic_check = Some(restic::detect());
-        }
-        if let Some(Err(e)) = &self.restic_check {
-            self.screen = Screen::SnapshotDeleteError(e.user_message());
-            return;
-        }
         self.delete_target = Some(snapshot_id);
         self.delete_show_json = false;
         self.screen = Screen::SnapshotDeleteLoading;

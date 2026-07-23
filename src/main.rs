@@ -48,6 +48,10 @@ fn main() -> Result<()> {
         println!("{USAGE}");
         return Ok(());
     }
+    if let Err(error) = restic::detect() {
+        eprintln!("{}", error.user_message());
+        std::process::exit(1);
+    }
 
     #[cfg(feature = "keychain")]
     let no_keychain = cli.no_keychain || !keychain::init_store();
@@ -173,7 +177,6 @@ fn run(
                         hostname: parsed.hostname.clone().unwrap_or_default(),
                         paths: parsed.paths.clone(),
                         tags: parsed.tags.clone(),
-                        tree: parsed.tree.clone().unwrap_or_default(),
                     }
                 });
                 let preview = preview_snapshot_contents(&repo, &snap_id, limit)?;

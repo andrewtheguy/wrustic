@@ -143,7 +143,7 @@ pub(crate) fn forget(profile: &Profile, snapshot_id: &str) -> Result<()> {
     Ok(())
 }
 
-// restic/rustic snapshot ids are SHA-256 hashes — 32 bytes = 64 hex chars
+// Restic snapshot ids are SHA-256 hashes — 32 bytes = 64 hex chars
 // (either case accepted; hex is case-insensitive). Restic's CLI accepts
 // shorter prefixes, but we refuse them so callers can't accidentally act on
 // the wrong snapshot if a prefix matches multiple.
@@ -435,7 +435,7 @@ mod tests {
             "paths": ["/home"],
             "parent": "parentid",
             "tree": "treeid",
-            "program_version": "restic 0.18.1",
+            "program_version": "restic 0.19.1",
             "summary": {
                 "backup_start": "2025-01-01T00:00:00Z",
                 "backup_end": "2025-01-01T00:00:05Z",
