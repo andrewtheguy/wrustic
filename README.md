@@ -154,10 +154,12 @@ independently:
 another binary. The repository password is piped to
 `--password-file /dev/stdin` and is never exported.
 
-To select another S3 port, pass the same value to the independent commands:
+The S3 and internal RPC ports default to 3900 and 3901. Select different ports
+with `GARAGE_S3_PORT` and `GARAGE_RPC_PORT`; only the S3 value is needed by the
+E2E client:
 
 ```sh
-GARAGE_S3_PORT=3910 ./scripts/garage-test-server.sh --reset
+GARAGE_S3_PORT=3910 GARAGE_RPC_PORT=3911 ./scripts/garage-test-server.sh --reset
 GARAGE_S3_PORT=3910 ./scripts/garage-e2e.sh run
 ```
 

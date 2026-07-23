@@ -4,6 +4,7 @@ set -euo pipefail
 
 GARAGE_VERSION="2.3.0"
 GARAGE_S3_PORT="${GARAGE_S3_PORT:-3900}"
+GARAGE_RPC_PORT="${GARAGE_RPC_PORT:-3901}"
 GARAGE_ACCESS_KEY="GK22222222222222222222222222222222"
 GARAGE_SECRET_KEY="3333333333333333333333333333333333333333333333333333333333333333"
 GARAGE_BUCKET="wrustic-it"
@@ -21,6 +22,9 @@ fail() {
 [[ "$GARAGE_S3_PORT" =~ ^[0-9]+$ ]] &&
     (( GARAGE_S3_PORT >= 1 && GARAGE_S3_PORT <= 65535 )) ||
     fail "GARAGE_S3_PORT must be an integer from 1 through 65535"
+[[ "$GARAGE_RPC_PORT" =~ ^[0-9]+$ ]] &&
+    (( GARAGE_RPC_PORT >= 1 && GARAGE_RPC_PORT <= 65535 )) ||
+    fail "GARAGE_RPC_PORT must be an integer from 1 through 65535"
 
 if [[ "${1:-}" == "--reset" ]]; then
     # This is an intentionally disposable path under the project-local tmp directory.
@@ -48,7 +52,7 @@ metadata_dir = "${runtime}/meta"
 data_dir = "${runtime}/data"
 db_engine = "sqlite"
 replication_factor = 1
-rpc_bind_addr = "127.0.0.1:3901"
+rpc_bind_addr = "127.0.0.1:${GARAGE_RPC_PORT}"
 rpc_bind_outgoing = false
 rpc_secret = "1111111111111111111111111111111111111111111111111111111111111111"
 
@@ -59,6 +63,7 @@ root_domain = ".s3.garage.localhost"
 EOF
 
 printf '[garage-server] S3 endpoint: http://127.0.0.1:%s\n' "$GARAGE_S3_PORT"
+printf '[garage-server] RPC endpoint: 127.0.0.1:%s\n' "$GARAGE_RPC_PORT"
 printf '[garage-server] press Ctrl-C to stop Garage\n'
 exec env \
     GARAGE_CONFIG_FILE="$garage_config" \
