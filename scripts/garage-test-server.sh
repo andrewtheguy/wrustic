@@ -49,6 +49,7 @@ data_dir = "${runtime}/data"
 db_engine = "sqlite"
 replication_factor = 1
 rpc_bind_addr = "127.0.0.1:3901"
+rpc_bind_outgoing = false
 rpc_secret = "1111111111111111111111111111111111111111111111111111111111111111"
 
 [s3_api]
