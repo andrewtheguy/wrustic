@@ -636,3 +636,79 @@ fn collect_all_as(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn live_garage_s3_profile_reads_seeded_repository() {
+        let endpoint = std::env::var("WRUSTIC_GARAGE_ENDPOINT")
+            .unwrap_or_else(|_| "http://127.0.0.1:3900".into());
+        let profile = Profile::S3 {
+            password: "garage-repository-password".into(),
+            s3_endpoint: endpoint,
+            s3_bucket: "wrustic-it".into(),
+            s3_region: "garage".into(),
+            s3_root: "repository".into(),
+            s3_access_key: "GK22222222222222222222222222222222".into(),
+            s3_secret_key:
+                "3333333333333333333333333333333333333333333333333333333333333333".into(),
+        };
+
+        verify_profile(&profile).expect("verify Garage profile");
+        let snapshots = load_snapshots(&profile).expect("list Garage snapshots");
+        let snapshot = snapshots.first().expect("seeded Garage snapshot");
+        let previous = snapshots.get(1).expect("second seeded Garage snapshot");
+        assert!(snapshot.tags.iter().any(|tag| tag == "garage-e2e-second"));
+
+        let repo = open_indexed(&profile).expect("open Garage repository");
+        let (summary, changes) =
+            diff_snapshots(&repo, &previous.id, &snapshot.id).expect("diff Garage snapshots");
+        assert!(summary.changed_files > 0);
+        assert!(changes.iter().any(|change| change.path.ends_with("/hello.txt")));
+        assert!(changes.iter().any(|change| change.path.ends_with("/second.txt")));
+
+        let preview =
+            preview_snapshot_contents(&repo, &snapshot.id, 100).expect("preview Garage tree");
+        let hello = preview
+            .entries
+            .iter()
+            .find(|entry| entry.path.ends_with("/hello.txt"))
+            .expect("hello.txt in Garage snapshot");
+
+        let full_repo = open_indexed_full(&profile).expect("open full Garage repository");
+        let mut parent_tree =
+            snapshot_root_tree(&repo, &snapshot.id).expect("Garage snapshot root tree");
+        let mut components = hello.path.trim_start_matches('/').split('/').peekable();
+        let file_name = loop {
+            let component = components.next().expect("hello.txt path component");
+            if components.peek().is_none() {
+                break component.to_string();
+            }
+            let tree = full_repo
+                .get_tree(&parent_tree)
+                .expect("read Garage directory tree");
+            parent_tree = tree
+                .nodes
+                .into_iter()
+                .find(|node| node.name().to_string_lossy() == component)
+                .and_then(|node| node.subtree)
+                .expect("Garage directory subtree");
+        };
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let dump = std::thread::spawn(move || {
+            stream_file_content(&full_repo, parent_tree, &file_name, &tx)
+        });
+        let mut bytes = Vec::new();
+        while let Some(chunk) = rx.blocking_recv() {
+            bytes.extend_from_slice(&chunk.expect("Garage file chunk"));
+        }
+        dump.join()
+            .expect("Garage dump thread")
+            .expect("stream Garage hello.txt");
+        assert_eq!(bytes, b"hello from Garage S3 integration, revision 2\n");
+    }
+}
