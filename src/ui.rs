@@ -567,17 +567,19 @@ fn render_snapshot_picker(
             } else {
                 format!("[{}]", s.tags.join(","))
             };
+            let size = s.size.map(human_size).unwrap_or_else(|| "-".to_string());
             Row::new([
                 Cell::from(short_snap_id(&s.id)),
                 Cell::from(s.time.as_str()),
                 Cell::from(s.host.as_str()),
                 Cell::from(tags),
+                Cell::from(size),
                 Cell::from(s.paths.join(",")),
             ])
         })
         .collect();
 
-    let header = Row::new(["ID", "Time", "Host", "Tags", "Paths"])
+    let header = Row::new(["ID", "Time", "Host", "Tags", "Size", "Paths"])
         .style(Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
     let table = Table::new(
@@ -587,6 +589,7 @@ fn render_snapshot_picker(
             Constraint::Length(19),
             Constraint::Length(20),
             Constraint::Length(20),
+            Constraint::Length(9),
             Constraint::Fill(1),
         ],
     )

@@ -19,6 +19,7 @@ pub(crate) struct SnapshotRow {
     pub(crate) time: String,
     pub(crate) host: String,
     pub(crate) tags: Vec<String>,
+    pub(crate) size: Option<u64>,
     pub(crate) paths: Vec<String>,
 }
 
@@ -167,6 +168,7 @@ pub(crate) fn load_snapshots(profile: &Profile) -> Result<Vec<SnapshotRow>> {
             time: s.time.strftime("%Y-%m-%d %H:%M:%S").to_string(),
             host: s.hostname.clone(),
             tags: s.tags.iter().cloned().collect(),
+            size: s.summary.as_ref().map(|summary| summary.total_bytes_processed),
             paths: s.paths.iter().cloned().collect(),
         })
         .collect())

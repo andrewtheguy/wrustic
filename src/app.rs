@@ -2229,6 +2229,7 @@ mod tests {
             time: String::new(),
             host: host.into(),
             tags: tags.iter().map(|s| (*s).to_string()).collect(),
+            size: None,
             paths: paths.iter().map(|s| (*s).to_string()).collect(),
         }
     }
