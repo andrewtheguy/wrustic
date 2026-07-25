@@ -64,7 +64,7 @@ impl S3ReadOnlyBackend {
         let hex_id = id.to_hex();
         match tpe {
             FileType::Config => "config".to_string(),
-            FileType::Pack => format!("data/{}/{}", &hex_id[..2], &hex_id[..]),
+            FileType::Pack => format!("{}/{}/{}", tpe.dirname(), &hex_id[..2], &hex_id[..]),
             _ => format!("{}/{}", tpe.dirname(), &hex_id[..]),
         }
     }
@@ -92,10 +92,7 @@ impl ReadBackend for S3ReadOnlyBackend {
     fn list_with_size(&self, tpe: FileType) -> RusticResult<Vec<(Id, u32)>> {
         if tpe == FileType::Config {
             return match self.operator.stat("config") {
-                Ok(metadata) => Ok(vec![(
-                    Id::default(),
-                    object_size(&metadata).unwrap_or_default(),
-                )]),
+                Ok(metadata) => Ok(vec![(Id::default(), object_size(&metadata, "config")?)]),
                 Err(err) if err.kind() == opendal::ErrorKind::NotFound => Ok(Vec::new()),
                 Err(err) => Err(backend_error("Reading S3 config metadata failed.", err)),
             };
@@ -111,17 +108,20 @@ impl ReadBackend for S3ReadOnlyBackend {
             .lister_options(&prefix, options)
             .map_err(|err| backend_error("Listing S3 repository objects failed.", err))?;
 
-        Ok(entries
-            .filter_map(|result| {
-                let entry = result.ok()?;
-                if !entry.metadata().is_file() {
-                    return None;
-                }
-                let id = Id::parse_some(entry.name(), tpe)?;
-                let size = object_size(entry.metadata())?;
-                Some((id, size))
-            })
-            .collect())
+        let mut files = Vec::new();
+        for result in entries {
+            let entry = result.map_err(|err| {
+                backend_error("Reading an S3 repository listing entry failed.", err)
+            })?;
+            if !entry.metadata().is_file() {
+                continue;
+            }
+            let Some(id) = Id::parse_some(entry.name(), tpe) else {
+                continue;
+            };
+            files.push((id, object_size(entry.metadata(), entry.path())?));
+        }
+        Ok(files)
     }
 
     fn read_full(&self, tpe: FileType, id: &Id) -> RusticResult<Bytes> {
@@ -195,8 +195,14 @@ fn runtime() -> &'static Runtime {
     })
 }
 
-fn object_size(metadata: &Metadata) -> Option<u32> {
-    metadata.content_length().try_into().ok()
+fn object_size(metadata: &Metadata, path: &str) -> RusticResult<u32> {
+    metadata.content_length().try_into().map_err(|err| {
+        RusticError::with_source(
+            ErrorKind::Backend,
+            format!("S3 repository object `{path}` is too large to list."),
+            err,
+        )
+    })
 }
 
 fn backend_error(message: &'static str, source: opendal::Error) -> Box<RusticError> {
