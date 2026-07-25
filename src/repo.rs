@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::mem;
 
@@ -8,17 +7,19 @@ use rustic_backend::BackendOptions;
 use rustic_core::repofile::{Node, NodeType};
 use rustic_core::{
     Credentials, IndexedFull, IndexedFullStatus, IndexedIdsStatus, Repository, RepositoryOptions,
-    TreeId,
+    RepositoryBackends, TreeId,
 };
 use tokio::sync::mpsc;
 
 use crate::config::Profile;
+use crate::s3_backend::S3ReadOnlyBackend;
 
 pub(crate) struct SnapshotRow {
     pub(crate) id: String,
     pub(crate) time: String,
     pub(crate) host: String,
     pub(crate) tags: Vec<String>,
+    pub(crate) size: Option<u64>,
     pub(crate) paths: Vec<String>,
 }
 
@@ -89,7 +90,7 @@ pub(crate) struct FileDetails {
     pub(crate) content_hashes: Vec<String>,
 }
 
-fn build_backend_opts(profile: &Profile) -> Result<BackendOptions> {
+fn build_backends(profile: &Profile) -> Result<RepositoryBackends> {
     let mut opts = BackendOptions::default();
     match profile {
         Profile::Local { local_path, .. } => {
@@ -125,33 +126,29 @@ fn build_backend_opts(profile: &Profile) -> Result<BackendOptions> {
             s3_secret_key,
             ..
         } => {
-            opts = opts.repository("opendal:s3:");
-            let mut s3_opts = BTreeMap::new();
-            s3_opts.insert("bucket".to_string(), s3_bucket.clone());
-            s3_opts.insert("region".to_string(), s3_region.clone());
-            s3_opts.insert("access_key_id".to_string(), s3_access_key.clone());
-            s3_opts.insert("secret_access_key".to_string(), s3_secret_key.clone());
-            if !s3_endpoint.is_empty() {
-                s3_opts.insert("endpoint".to_string(), s3_endpoint.clone());
-            }
-            if !s3_root.is_empty() {
-                s3_opts.insert("root".to_string(), s3_root.clone());
-            }
-            opts = opts.options(s3_opts);
+            return Ok(S3ReadOnlyBackend::new(
+                s3_endpoint,
+                s3_bucket,
+                s3_region,
+                s3_root,
+                s3_access_key,
+                s3_secret_key,
+            )?
+            .into());
         }
     }
-    Ok(opts)
+    Ok(opts.to_backends()?)
 }
 
 pub(crate) fn verify_profile(profile: &Profile) -> Result<()> {
-    let backends = build_backend_opts(profile)?.to_backends()?;
+    let backends = build_backends(profile)?;
     Repository::new(&RepositoryOptions::default(), &backends)?
         .open(&Credentials::password(profile.password()))?;
     Ok(())
 }
 
 pub(crate) fn load_snapshots(profile: &Profile) -> Result<Vec<SnapshotRow>> {
-    let backends = build_backend_opts(profile)?.to_backends()?;
+    let backends = build_backends(profile)?;
     let repo = Repository::new(&RepositoryOptions::default(), &backends)?
         .open(&Credentials::password(profile.password()))?;
 
@@ -167,13 +164,14 @@ pub(crate) fn load_snapshots(profile: &Profile) -> Result<Vec<SnapshotRow>> {
             time: s.time.strftime("%Y-%m-%d %H:%M:%S").to_string(),
             host: s.hostname.clone(),
             tags: s.tags.iter().cloned().collect(),
+            size: s.summary.as_ref().map(|summary| summary.total_bytes_processed),
             paths: s.paths.iter().cloned().collect(),
         })
         .collect())
 }
 
 pub(crate) fn open_indexed(profile: &Profile) -> Result<Repository<IndexedIdsStatus>> {
-    let backends = build_backend_opts(profile)?.to_backends()?;
+    let backends = build_backends(profile)?;
     let repo = Repository::new(&RepositoryOptions::default(), &backends)?
         .open(&Credentials::password(profile.password()))?
         .to_indexed_ids()?;
@@ -184,7 +182,7 @@ pub(crate) fn open_indexed(profile: &Profile) -> Result<Repository<IndexedIdsSta
 // can be read (Repository::dump). Used by the share-URL server, which needs
 // to stream file contents rather than just metadata.
 pub(crate) fn open_indexed_full(profile: &Profile) -> Result<Repository<IndexedFullStatus>> {
-    let backends = build_backend_opts(profile)?.to_backends()?;
+    let backends = build_backends(profile)?;
     let repo = Repository::new(&RepositoryOptions::default(), &backends)?
         .open(&Credentials::password(profile.password()))?
         .to_indexed()?;

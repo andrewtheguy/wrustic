@@ -1,6 +1,6 @@
 [package]
 name = "wrustic"
-version = "0.0.31"
+version = "0.0.32"
 edition = "2024"
 
 [dependencies]
@@ -14,15 +14,16 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 jiff = "0.2"
+opendal = { version = "0.57.0", default-features = false, features = ["blocking", "layers-retry", "reqwest-rustls-tls", "services-s3"] }
 rand = "0.10.1"
 ratatui = "0.30.0"
-rustic_backend = { version = "0.6.2", default-features = false, features = ["rest", "opendal"] }
+rustic_backend = { version = "0.6.2", default-features = false, features = ["rest"] }
 rustic_core = { version = "0.12.0", default-features = false }
 scrypt = { version = "0.12", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
-tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros"] }
 toml = "1"
 tui-input = { version = "0.15", default-features = false, features = ["crossterm"] }
 url = "2"
