@@ -36,6 +36,7 @@ pub(crate) enum Screen {
     SnapshotDeleteConfirm,
     SnapshotDeleting,
     SnapshotDeleteError(String),
+    ResticUnlocking,
     OpeningSnapshot,
     SnapshotContents,
     LoadingDir,
@@ -1610,9 +1611,17 @@ impl App {
                 _ => {}
             },
 
-            Screen::SnapshotDeleteError(_) => {
-                self.clear_delete_scratch();
-                self.screen = Screen::Snapshots;
+            Screen::SnapshotDeleteError(msg) => {
+                // `u` is only wired up for lock failures — for anything else
+                // (restic missing, metadata mismatch) unlocking is no help, so
+                // every key just dismisses.
+                let offer_unlock = restic::is_lock_error(msg);
+                if offer_unlock && matches!(key.code, KeyCode::Char('u') | KeyCode::Char('U')) {
+                    self.screen = Screen::ResticUnlocking;
+                } else {
+                    self.clear_delete_scratch();
+                    self.screen = Screen::Snapshots;
+                }
             }
 
             Screen::SnapshotContents => match key.code {
@@ -1683,6 +1692,7 @@ impl App {
             | Screen::LoadingFileDetails
             | Screen::SnapshotDeleting
             | Screen::SnapshotDeleteLoading
+            | Screen::ResticUnlocking
             | Screen::SnapshotCompareLoading => {}
 
             Screen::FileDetails => match key.code {

@@ -140,6 +140,10 @@ synchronously on `Screen::PassphraseDerivingKey`.
   compare screen.
 - `snapshot_details_json` — `restic snapshots --json <id>` for the delete
   confirmation screen.
+- `unlock(profile)` — `restic unlock`, offered with `u` on the delete-error
+  screen when `is_lock_error()` matches the failure. restic only removes
+  locks it can prove are dead, so this is safe to trigger from the TUI; on
+  success the delete flow re-runs from the confirmation step.
 
 The split is intentional: anything that touches the on-disk repo state
 goes through the CLI so we don't have to track invariants in two places. If
