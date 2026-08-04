@@ -611,6 +611,20 @@ fn check_for_other_locks(
     Ok(())
 }
 
+/// restic's acquisition-time conflict check without writing a lock file:
+/// would a command that takes a lock of the given kind be blocked right now?
+/// Callers use this to know *before spawning restic* that the repo is locked
+/// (restic itself never auto-removes stale locks during acquisition, so even
+/// a stale lock blocks). The error carries the holder's details and matches
+/// [`is_lock_error`].
+pub(crate) fn check_blocking_locks(
+    backend: &dyn LockBackend,
+    crypto: &RepoCrypto,
+    exclusive: bool,
+) -> Result<()> {
+    check_for_other_locks(backend, crypto, None, exclusive)
+}
+
 fn parse_lock(crypto: &RepoCrypto, raw: &[u8]) -> Result<LockData> {
     let json = crypto.open(raw)?;
     serde_json::from_slice(&json).context("parsing lock file JSON")
@@ -882,6 +896,26 @@ mod tests {
         let _excl = write_lock(backend.as_ref(), &crypto, &LockData::ours(true)).unwrap();
         assert!(check_for_other_locks(backend.as_ref(), &crypto, None, false).is_err());
         assert!(check_for_other_locks(backend.as_ref(), &crypto, None, true).is_err());
+    }
+
+    // The pre-spawn check the restic harness uses (src/restic.rs) — same
+    // rules as acquisition, no lock file written, and a stale lock still
+    // blocks (restic never auto-removes stale locks during acquisition).
+    #[test]
+    fn check_blocking_locks_applies_restic_rules_without_writing() {
+        let backend = MemLockBackend::new();
+        let crypto = test_crypto(true);
+
+        assert!(check_blocking_locks(backend.as_ref(), &crypto, false).is_ok());
+        assert!(check_blocking_locks(backend.as_ref(), &crypto, true).is_ok());
+        assert_eq!(backend.count(), 0, "the check must not create lock files");
+
+        let mut stale = LockData::ours(false);
+        stale.time = Timestamp::now() - jiff::SignedDuration::from_secs(STALE_TIMEOUT_SECS + 300);
+        write_lock(backend.as_ref(), &crypto, &stale).unwrap();
+        assert!(check_blocking_locks(backend.as_ref(), &crypto, false).is_ok());
+        let err = check_blocking_locks(backend.as_ref(), &crypto, true).unwrap_err();
+        assert!(is_lock_error(&format!("{err:#}")), "unexpected error: {err:#}");
     }
 
     #[test]

@@ -290,14 +290,24 @@ pub(crate) fn delete_snapshot(profile: &Profile, snapshot_id: &str) -> Result<()
     Ok(())
 }
 
-/// Removes stale repository locks (native equivalent of `restic unlock`).
-/// Returns how many lock files were removed; live locks are left in place.
-pub(crate) fn unlock(profile: &Profile) -> Result<usize> {
+/// Backend + crypto pair for talking to the repo's `locks/` natively —
+/// everything needed to list, read, or evaluate lock files for a profile.
+/// Opens the repository (no index) to obtain the master key.
+pub(crate) fn lock_context(
+    profile: &Profile,
+) -> Result<(std::sync::Arc<dyn lock::LockBackend>, lock::RepoCrypto)> {
     let backends = build_backends(profile)?;
     let repo = Repository::new(&RepositoryOptions::default(), &backends)?
         .open(&Credentials::password(profile.password()))?;
     let crypto = lock::RepoCrypto::from_repo(&repo)?;
-    lock::remove_stale_locks(lock::backend_for_profile(profile)?.as_ref(), &crypto)
+    Ok((lock::backend_for_profile(profile)?, crypto))
+}
+
+/// Removes stale repository locks (native equivalent of `restic unlock`).
+/// Returns how many lock files were removed; live locks are left in place.
+pub(crate) fn unlock(profile: &Profile) -> Result<usize> {
+    let (backend, crypto) = lock_context(profile)?;
+    lock::remove_stale_locks(backend.as_ref(), &crypto)
 }
 
 // restic/rustic snapshot ids are SHA-256 hashes — 32 bytes = 64 hex chars

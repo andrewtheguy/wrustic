@@ -12,12 +12,16 @@
 //! wrustic.
 //!
 //! Restic checks the repository lock before any of these commands run, so a
-//! leftover lock blocks them with "repository is already locked". Because the
-//! blocked process is restic itself, the unstick path is restic's own
-//! `unlock` (which removes only provably-stale locks) run through this same
-//! harness — not the native stale-lock removal in src/lock.rs, which is for
-//! the native write flows. [`run_unsticking_locks`] packages that flow: run,
-//! and on a lock error unlock and retry once.
+//! leftover lock blocks them with "repository is already locked". wrustic
+//! speaks the lock protocol natively (src/lock.rs), so
+//! [`run_unsticking_locks`] performs restic's own acquisition conflict check
+//! *before* spawning: it maps the subcommand to the lock restic takes for it
+//! ([`lock_requirement`]), evaluates the repo's lock files natively, and only
+//! when blocked runs restic's own `unlock` (which removes only
+//! provably-stale locks) through this same harness and re-checks — never the
+//! native stale-lock removal in src/lock.rs, which is for the native write
+//! flows. restic's in-process check at spawn time remains the authoritative
+//! gate.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -164,24 +168,59 @@ pub(crate) fn unlock(profile: &Profile) -> Result<()> {
     Ok(())
 }
 
+/// The lock restic itself takes for a subcommand — restic 0.19.1's
+/// per-command table (docs/locking.md "Per-command lock usage").
+#[derive(Debug, PartialEq, Eq)]
+enum LockRequirement {
+    None,
+    NonExclusive,
+    Exclusive,
+}
+
+/// Map a harness invocation to the lock its restic subcommand will take, so
+/// the native pre-check in [`run_unsticking_locks`] applies exactly restic's
+/// conflict rules for it. The subcommand is the first non-flag argument.
+fn lock_requirement(args: &[&str]) -> LockRequirement {
+    let Some(cmd) = args.iter().find(|a| !a.starts_with('-')) else {
+        return LockRequirement::None;
+    };
+    match *cmd {
+        // `key add` alone is non-exclusive in restic, but treating all of
+        // `key` as exclusive only makes the pre-check stricter, never wrong.
+        "forget" | "prune" | "tag" | "key" | "check" | "repair" | "migrate" | "recover"
+        | "rewrite" => LockRequirement::Exclusive,
+        "unlock" | "init" | "self-update" | "version" => LockRequirement::None,
+        // backup, copy, restore, ls, snapshots, stats, find, diff, dump, …
+        _ => LockRequirement::NonExclusive,
+    }
+}
+
 /// Run a restic command that takes a repository lock (prune, repair, …),
-/// unsticking the repo first when a leftover lock blocks it.
+/// unsticking the repo first when a leftover lock would block it.
 ///
-/// restic checks the lock before doing any work, so a crashed holder's lock
-/// fails the command with "repository is already locked". When that happens
-/// this runs `restic unlock` — restic's own stale-lock removal, through the
-/// same harness — and retries once. A *live* lock (a running restic or a
-/// wrustic native write) is not removed by unlock, so the retry fails with
-/// the same lock error and that error is returned for the caller to surface.
+/// This mirrors the lock check restic itself performs before doing any work
+/// — the same protocol, evaluated natively (src/lock.rs) against the lock
+/// restic takes for this subcommand — so a blocked spawn is known *before*
+/// restic runs. When blocked, `restic unlock` — restic's own stale-lock
+/// removal, through the same harness — is run and the check repeats. A
+/// *live* lock (a running restic or a wrustic native write) is not removed
+/// by unlock, so the re-check fails with a lock error carrying the holder's
+/// details, returned for the caller to surface. restic re-runs the same
+/// check in-process at startup, so a lock appearing in the window between
+/// our re-check and the spawn still fails safely inside restic.
 #[allow(dead_code)]
 pub(crate) fn run_unsticking_locks(profile: &Profile, args: &[&str]) -> Result<Vec<u8>> {
-    match run(profile, args) {
-        Err(err) if crate::lock::is_lock_error(&format!("{err:#}")) => {
-            unlock(profile)?;
-            run(profile, args)
-        }
-        other => other,
+    let exclusive = match lock_requirement(args) {
+        LockRequirement::None => return run(profile, args),
+        LockRequirement::NonExclusive => false,
+        LockRequirement::Exclusive => true,
+    };
+    let (backend, crypto) = crate::repo::lock_context(profile)?;
+    if crate::lock::check_blocking_locks(backend.as_ref(), &crypto, exclusive).is_err() {
+        unlock(profile)?;
+        crate::lock::check_blocking_locks(backend.as_ref(), &crypto, exclusive)?;
     }
+    run(profile, args)
 }
 
 /// Build a `restic <args>` command for a profile with credentials passed by
@@ -350,6 +389,24 @@ mod tests {
         assert_eq!(parse_version("0.19.1-dev"), Some((0, 19, 1)));
         assert_eq!(parse_version("not-a-version"), None);
         assert_eq!(parse_version("0.19"), None);
+    }
+
+    #[test]
+    fn lock_requirement_matches_restics_per_command_table() {
+        use LockRequirement::*;
+        // Global flags before the subcommand don't confuse the mapping.
+        assert_eq!(lock_requirement(&["--no-cache", "prune", "--json"]), Exclusive);
+        for cmd in ["forget", "prune", "tag", "key", "check", "repair", "migrate", "recover", "rewrite"] {
+            assert_eq!(lock_requirement(&[cmd, "--json"]), Exclusive, "{cmd}");
+        }
+        for cmd in ["unlock", "init", "self-update", "version"] {
+            assert_eq!(lock_requirement(&[cmd, "--json"]), None, "{cmd}");
+        }
+        for cmd in ["backup", "copy", "restore", "ls", "snapshots", "stats", "find", "diff", "dump"] {
+            assert_eq!(lock_requirement(&[cmd, "--json"]), NonExclusive, "{cmd}");
+        }
+        // Flags only (degenerate) → no subcommand, no lock to check.
+        assert_eq!(lock_requirement(&["--json"]), None);
     }
 
     fn test_profile() -> Profile {
@@ -543,8 +600,9 @@ mod tests {
             "expected a lock error, got: {err:#}"
         );
 
-        // The unstick flow: same command through run_unsticking_locks must
-        // run `restic unlock` (removing the stale lock) and succeed on retry.
+        // The unstick flow: the native pre-check must detect the block
+        // before spawning, run `restic unlock` (removing the stale lock),
+        // pass the re-check, and only then spawn forget.
         run_unsticking_locks(&profile, &["forget", &first, "--json"])
             .expect("forget after unstick");
         assert_eq!(
@@ -552,6 +610,31 @@ mod tests {
             0,
             "unlock should have removed the stale lock and forget left none behind"
         );
+
+        // A *live* lock must not be unstuck: hold a native shared lock (as a
+        // concurrent backup would) and the exclusive prune must fail the
+        // native re-check — `restic unlock` SIGHUP-probes our PID and keeps
+        // the lock because we're alive and ignoring SIGHUP while holding it.
+        {
+            let _acquire = crate::lock::test_acquire_guard();
+            let live = crate::lock::RepoLock::acquire_shared(
+                lock_backend.clone(),
+                crypto.clone(),
+            )
+            .expect("shared lock");
+            let err = run_unsticking_locks(&profile, &["prune", "--json"])
+                .expect_err("prune must stay blocked by a live lock");
+            assert!(
+                crate::lock::is_lock_error(&format!("{err:#}")),
+                "expected a lock error, got: {err:#}"
+            );
+            assert_eq!(
+                lock_backend.list().expect("list locks").len(),
+                1,
+                "the live lock must survive the unstick attempt"
+            );
+            drop(live);
+        }
 
         // Prune through the harness — the command this module is kept for.
         run_unsticking_locks(&profile, &["prune", "--json"]).expect("prune");

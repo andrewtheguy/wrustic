@@ -170,15 +170,21 @@ semantics mirror resterm's:
   is never used.
 - restic checks the repository lock before any of these commands run, so
   a leftover (crashed-holder) lock blocks them with "repository is
-  already locked". Because the blocked process is restic itself, the
-  unstick path is restic's own `unlock` run through the same harness
-  (`restic::unlock`), not the native stale-lock removal in `src/lock.rs`
-  (that one backs the TUI's `u` shortcut for *native* write failures).
-  `restic::run_unsticking_locks(profile, args)` packages the flow the
-  delete action used before it went native: run, and on a lock error
-  (`lock::is_lock_error`) run `restic unlock` and retry once. `unlock`
-  removes only provably-stale locks, so a live holder still fails the
-  retry and the error is surfaced.
+  already locked". wrustic speaks the lock protocol natively, so
+  `restic::run_unsticking_locks(profile, args)` performs that same check
+  itself *before* spawning: it maps the subcommand to the lock restic
+  takes for it (restic 0.19.1's per-command table,
+  `restic::lock_requirement`) and evaluates the repo's lock files with
+  `lock::check_blocking_locks` — restic's acquisition conflict rules,
+  without writing a lock. Only when blocked does it run restic's own
+  `unlock` through the same harness (`restic::unlock`) and re-check —
+  never the native stale-lock removal in `src/lock.rs`, which backs the
+  TUI's `u` shortcut for *native* write failures. `unlock` removes only
+  provably-stale locks, so a live holder still fails the re-check and
+  that error (carrying the holder's details) is surfaced without
+  spawning restic at all. restic re-runs the same check in-process at
+  startup, so a lock appearing between our re-check and the spawn still
+  fails safely inside restic.
 
 ## Verification and dev flow
 
