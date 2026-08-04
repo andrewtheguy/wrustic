@@ -1,18 +1,89 @@
+//! Secure harness for running restic CLI commands.
+//!
+//! Snapshot delete and unlock in the TUI are native (src/repo.rs +
+//! src/lock.rs), so no TUI flow shells out to restic anymore — this module is
+//! kept as the one sanctioned way to trigger the restic commands wrustic
+//! deliberately does not reimplement (prune, repair, migrate, dev-flow repo
+//! setup). Launch semantics mirror resterm's: secrets never touch argv — the
+//! master password is piped through the child's stdin (`--password-file
+//! /dev/stdin`), the repo URL and any cloud credentials go through env vars —
+//! and restic's on-disk cache is off (`--no-cache`) unless the user opts in
+//! with `--restic-cache`, which points restic at a directory private to
+//! wrustic.
+//!
+//! Restic checks the repository lock before any of these commands run, so a
+//! leftover lock blocks them with "repository is already locked". wrustic
+//! speaks the lock protocol natively (src/lock.rs), so
+//! [`run_unsticking_locks`] performs restic's own acquisition conflict check
+//! *before* spawning: it maps the subcommand to the lock restic takes for it
+//! ([`lock_requirement`]), evaluates the repo's lock files natively, and only
+//! when blocked runs restic's own `unlock` (which removes only
+//! provably-stale locks) through this same harness and re-checks — never the
+//! native stale-lock removal in src/lock.rs, which is for the native write
+//! flows. restic's in-process check at spawn time remains the authoritative
+//! gate.
+
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
 
 use crate::config::Profile;
 
+// The floor is the 0.19 series — the release whose locking protocol and JSON
+// output shapes wrustic is built against (docs/locking.md targets restic
+// 0.19; restic < 0.19 compatibility is an explicit non-goal).
 const MIN_MAJOR: u32 = 0;
-const MIN_MINOR: u32 = 18;
-const MIN_PATCH: u32 = 1;
+const MIN_MINOR: u32 = 19;
+const MIN_PATCH: u32 = 0;
 
+/// wrustic's own restic cache directory, or `None` when no per-user cache
+/// root can be determined.
+///
+/// `dirs::cache_dir()` is the per-user, per-platform cache root
+/// (`$XDG_CACHE_HOME` or `~/.cache` on Linux). It already sits inside the
+/// calling user's own home, and the `wrustic` component keeps it apart from
+/// restic's default cache, so wrustic never shares cache state with another
+/// restic CLI instance.
+fn cache_dir() -> Option<PathBuf> {
+    Some(dirs::cache_dir()?.join("wrustic"))
+}
+
+/// Whether `--restic-cache` was passed. Off by default: a restic cache costs real
+/// disk space — hundreds of megabytes for a large repository — which is not
+/// always a trade worth making, so wrustic only keeps one when asked.
+static CACHE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Set once from the command line, before any restic call is made.
+pub(crate) fn set_cache_enabled(enabled: bool) {
+    CACHE_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Add the cache flag every restic invocation carries.
+///
+/// Default is `--no-cache`. With `--restic-cache`, restic is pointed at
+/// [`cache_dir`] instead — and if no per-user cache root can be named,
+/// caching stays off rather than falling back to restic's own default, which
+/// wrustic must not share with other restic CLI instances.
+fn apply_cache_flag(cmd: &mut Command) {
+    match cache_dir().filter(|_| CACHE_ENABLED.load(Ordering::Relaxed)) {
+        Some(dir) => {
+            cmd.arg("--cache-dir").arg(dir);
+        }
+        None => {
+            cmd.arg("--no-cache");
+        }
+    }
+}
+
+#[allow(dead_code)] // harness for future flows (prune etc.); not TUI-wired yet
 pub(crate) struct ResticInfo;
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub(crate) enum ResticError {
     NotFound,
     TooOld { found: String },
@@ -20,14 +91,15 @@ pub(crate) enum ResticError {
 }
 
 impl ResticError {
+    #[allow(dead_code)]
     pub(crate) fn user_message(&self) -> String {
         let min = format!("{MIN_MAJOR}.{MIN_MINOR}.{MIN_PATCH}");
         match self {
             ResticError::NotFound => format!(
-                "restic not found on PATH. Install restic >= {min} to delete snapshots."
+                "restic not found on PATH. Install restic >= {min} to run restic commands."
             ),
             ResticError::TooOld { found } => format!(
-                "restic {found} found on PATH, but >= {min} is required to delete snapshots."
+                "restic {found} found on PATH, but >= {min} is required to run restic commands."
             ),
             ResticError::Unparseable { output } => {
                 format!("Could not parse restic version output: {output}")
@@ -36,8 +108,16 @@ impl ResticError {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct VersionDocument {
+    version: String,
+}
+
+#[allow(dead_code)]
 pub(crate) fn detect() -> Result<ResticInfo, ResticError> {
-    let output = match Command::new("restic").arg("version").output() {
+    let mut cmd = Command::new("restic");
+    apply_cache_flag(&mut cmd);
+    let output = match cmd.arg("version").arg("--json").output() {
         Ok(o) => o,
         Err(_) => return Err(ResticError::NotFound),
     };
@@ -47,17 +127,22 @@ pub(crate) fn detect() -> Result<ResticInfo, ResticError> {
         });
     }
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    // Format: "restic 0.18.1 compiled with go1.25.1 on linux/amd64"
-    let version = stdout
-        .split_whitespace()
-        .nth(1)
+    // {"message_type":"version","version":"0.19.1","go_version":"go1.26.4",…}
+    // A restic old enough not to understand `--json` here lands in
+    // `Unparseable`, which is an acceptable message for something that far
+    // below the supported floor.
+    let parsed: VersionDocument = serde_json::from_str(stdout.trim())
+        .map_err(|_| ResticError::Unparseable { output: stdout.clone() })?;
+    let (major, minor, patch) = parse_version(&parsed.version)
         .ok_or_else(|| ResticError::Unparseable { output: stdout.clone() })?;
-    let (major, minor, patch) = parse_version(version)
-        .ok_or_else(|| ResticError::Unparseable { output: stdout.clone() })?;
-    if (major, minor, patch) < (MIN_MAJOR, MIN_MINOR, MIN_PATCH) {
-        return Err(ResticError::TooOld { found: version.to_string() });
+    if !meets_minimum((major, minor, patch)) {
+        return Err(ResticError::TooOld { found: parsed.version });
     }
     Ok(ResticInfo)
+}
+
+fn meets_minimum(found: (u32, u32, u32)) -> bool {
+    found >= (MIN_MAJOR, MIN_MINOR, MIN_PATCH)
 }
 
 fn parse_version(v: &str) -> Option<(u32, u32, u32)> {
@@ -71,117 +156,111 @@ fn parse_version(v: &str) -> Option<(u32, u32, u32)> {
     Some((major, minor, patch))
 }
 
-#[derive(Debug, Deserialize)]
+/// Remove stale repository locks via `restic unlock`. restic only deletes
+/// locks it can prove are dead (owning process gone, or old enough that a
+/// live owner would have refreshed it) — non-stale locks held by a running
+/// process are left in place, which is why restic's own lock error message
+/// points at this command. `--json` is passed so any message restic prints is
+/// structured rather than prose; the exit status is what we act on.
 #[allow(dead_code)]
-pub(crate) struct SnapshotDetails {
-    pub(crate) id: String,
-    pub(crate) short_id: Option<String>,
-    pub(crate) time: Option<String>,
-    pub(crate) hostname: Option<String>,
-    pub(crate) username: Option<String>,
-    #[serde(default)]
-    pub(crate) tags: Vec<String>,
-    #[serde(default)]
-    pub(crate) paths: Vec<String>,
-    pub(crate) parent: Option<String>,
-    pub(crate) tree: Option<String>,
-    pub(crate) program_version: Option<String>,
-    pub(crate) summary: Option<SnapshotSummary>,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub(crate) struct SnapshotSummary {
-    pub(crate) backup_start: Option<String>,
-    pub(crate) backup_end: Option<String>,
-    pub(crate) total_files_processed: Option<u64>,
-    pub(crate) total_bytes_processed: Option<u64>,
-    pub(crate) data_added: Option<u64>,
-    pub(crate) data_added_packed: Option<u64>,
-}
-
-/// `snapshot_id` must be the full 64-char hex hash (enforced — short ids are
-/// rejected to avoid prefix ambiguity). Errors if restic returns zero or more
-/// than one matching snapshot.
-pub(crate) fn snapshot_details_json(
-    profile: &Profile,
-    snapshot_id: &str,
-) -> Result<(SnapshotDetails, String)> {
-    ensure_full_snapshot_id(snapshot_id)?;
-    let output = spawn(profile, &["snapshots", snapshot_id, "--json"])?;
-    let stdout = String::from_utf8_lossy(&output).into_owned();
-    let value: serde_json::Value = serde_json::from_str(&stdout)
-        .map_err(|e| anyhow!("parsing restic snapshots JSON: {e}\nraw: {stdout}"))?;
-    let pretty = serde_json::to_string_pretty(&value)
-        .map_err(|e| anyhow!("pretty-printing JSON: {e}"))?;
-    let first = match value {
-        serde_json::Value::Array(mut arr) => match arr.len() {
-            0 => return Err(anyhow!("restic returned no snapshot matching `{snapshot_id}`")),
-            1 => arr.remove(0),
-            n => {
-                return Err(anyhow!(
-                    "restic returned {n} snapshots matching `{snapshot_id}`, expected exactly one"
-                ));
-            }
-        },
-        _ => return Err(anyhow!("restic snapshots JSON was not an array: {stdout}")),
-    };
-    let one: SnapshotDetails = serde_json::from_value(first)
-        .map_err(|e| anyhow!("converting JSON value to SnapshotDetails: {e}"))?;
-    Ok((one, pretty))
-}
-
-/// `snapshot_id` must be the full 64-char hex hash (enforced — short ids are
-/// rejected to avoid silently forgetting the wrong snapshot when a prefix
-/// matches multiple).
-pub(crate) fn forget(profile: &Profile, snapshot_id: &str) -> Result<()> {
-    ensure_full_snapshot_id(snapshot_id)?;
-    spawn(profile, &["forget", snapshot_id])?;
-    Ok(())
-}
-
-/// Remove stale repository locks. restic only deletes locks it can prove are
-/// dead (owning process gone, or old enough that a live owner would have
-/// refreshed it) — non-stale locks held by a running restic are left in place,
-/// which is why restic's own error message points at this command. `--json` is
-/// passed so any message restic prints is structured rather than prose; the
-/// exit status is what we act on.
 pub(crate) fn unlock(profile: &Profile) -> Result<()> {
-    spawn(profile, &["unlock", "--json"])?;
+    run(profile, &["unlock", "--json"])?;
     Ok(())
 }
 
-/// True when a restic failure was caused by an existing repository lock — i.e.
-/// when offering `restic unlock` is the right next step.
-pub(crate) fn is_lock_error(message: &str) -> bool {
-    let m = message.to_ascii_lowercase();
-    m.contains("unable to create lock") || m.contains("already locked")
+/// The lock restic itself takes for a subcommand — restic 0.19.1's
+/// per-command table (docs/locking.md "Per-command lock usage").
+#[derive(Debug, PartialEq, Eq)]
+enum LockRequirement {
+    None,
+    NonExclusive,
+    Exclusive,
 }
 
-// restic/rustic snapshot ids are SHA-256 hashes — 32 bytes = 64 hex chars
-// (either case accepted; hex is case-insensitive). Restic's CLI accepts
-// shorter prefixes, but we refuse them so callers can't accidentally act on
-// the wrong snapshot if a prefix matches multiple.
-fn ensure_full_snapshot_id(id: &str) -> Result<()> {
-    if id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
-        Ok(())
+/// Map a harness invocation to the lock its restic subcommand will take, so
+/// the native pre-check in [`run_unsticking_locks`] applies exactly restic's
+/// conflict rules for it. The subcommand is found by scanning the non-flag
+/// arguments for a known restic command name — the first non-flag argument
+/// alone would be fooled by a flag's *value* (`["--cache-dir", "foo",
+/// "prune"]`). A flag value that happens to spell a command name can still
+/// match first, which at worst makes the pre-check stricter, and restic's own
+/// in-process check stays authoritative either way.
+fn lock_requirement(args: &[&str]) -> LockRequirement {
+    let mut saw_candidate = false;
+    for arg in args.iter().filter(|a| !a.starts_with('-')) {
+        saw_candidate = true;
+        match *arg {
+            // `key add` alone is non-exclusive in restic, but treating all of
+            // `key` as exclusive only makes the pre-check stricter, never
+            // wrong.
+            "forget" | "prune" | "tag" | "key" | "check" | "repair" | "migrate" | "recover"
+            | "rewrite" => return LockRequirement::Exclusive,
+            "unlock" | "init" | "self-update" | "version" => return LockRequirement::None,
+            "backup" | "copy" | "restore" | "mount" | "ls" | "snapshots" | "stats" | "find"
+            | "diff" | "dump" | "cat" | "list" => return LockRequirement::NonExclusive,
+            _ => {} // a flag's value or a positional (snapshot id, path) — keep looking
+        }
+    }
+    // No recognized command. A non-flag argument means *some* subcommand is
+    // being run — assume the weaker non-exclusive lock; flags-only means
+    // nothing to lock for.
+    if saw_candidate {
+        LockRequirement::NonExclusive
     } else {
-        Err(anyhow!(
-            "expected a full 64-char hex snapshot id, got `{id}` (length {})",
-            id.len()
-        ))
+        LockRequirement::None
     }
 }
 
-// Run `restic <args>` with credentials passed by the safest mechanism each
-// supports. Never put secrets in argv. Master password is piped via the
-// child's stdin (`--password-file /dev/stdin`); the repo URL and any cloud
-// creds go through env vars (override-only — parent env is inherited so PATH,
-// HOME, SSL_CERT_FILE, HTTP_PROXY, etc. still flow through).
-fn spawn(profile: &Profile, args: &[&str]) -> Result<Vec<u8>> {
+/// Run a restic command that takes a repository lock (prune, repair, …),
+/// unsticking the repo first when a leftover lock would block it.
+///
+/// This mirrors the lock check restic itself performs before doing any work
+/// — the same protocol, evaluated natively (src/lock.rs) against the lock
+/// restic takes for this subcommand — so a blocked spawn is known *before*
+/// restic runs. When blocked, `restic unlock` — restic's own stale-lock
+/// removal, through the same harness — is run and the check repeats. A
+/// *live* lock (a running restic or a wrustic native write) is not removed
+/// by unlock, so the re-check fails with a lock error carrying the holder's
+/// details, returned for the caller to surface. restic re-runs the same
+/// check in-process at startup, so a lock appearing in the window between
+/// our re-check and the spawn still fails safely inside restic.
+#[allow(dead_code)]
+pub(crate) fn run_unsticking_locks(profile: &Profile, args: &[&str]) -> Result<Vec<u8>> {
+    let exclusive = match lock_requirement(args) {
+        LockRequirement::None => return run(profile, args),
+        LockRequirement::NonExclusive => false,
+        LockRequirement::Exclusive => true,
+    };
+    let (backend, crypto) = crate::repo::lock_context(profile)?;
+    if crate::lock::check_blocking_locks(backend.as_ref(), &crypto, exclusive).is_err() {
+        unlock(profile)?;
+        crate::lock::check_blocking_locks(backend.as_ref(), &crypto, exclusive)?;
+    }
+    run(profile, args)
+}
+
+/// Build a `restic <args>` command for a profile with credentials passed by
+/// the safest mechanism each supports. Never put secrets in argv. Master
+/// password is piped through an anonymous pipe on the child's stdin
+/// (`--password-file /dev/stdin`); the repo URL and any cloud creds go
+/// through env vars (override-only — parent env is inherited so PATH, HOME,
+/// SSL_CERT_FILE, HTTP_PROXY, etc. still flow through).
+///
+/// Every command built here also carries the cache flag from
+/// [`apply_cache_flag`]: `--no-cache` by default, or `--cache-dir <per-user
+/// path>` under `--restic-cache`. Either way wrustic never lets restic use its
+/// default on-disk cache, which other restic CLI instances share.
+fn command(profile: &Profile, args: &[&str]) -> Result<Command> {
     let mut cmd = Command::new("restic");
+    apply_cache_flag(&mut cmd);
     cmd.arg("--password-file").arg("/dev/stdin");
     cmd.args(args);
+    // An explicit password file wins over these in restic, but removing them
+    // ensures the caller's shell cannot accidentally leak an unrelated secret
+    // into the child process.
+    cmd.env_remove("RESTIC_PASSWORD");
+    cmd.env_remove("RESTIC_PASSWORD_FILE");
+    cmd.env_remove("RESTIC_PASSWORD_COMMAND");
     cmd.env("RESTIC_REPOSITORY", repo_url(profile)?);
     match profile {
         Profile::Local { .. } | Profile::Rest { .. } => {}
@@ -198,22 +277,43 @@ fn spawn(profile: &Profile, args: &[&str]) -> Result<Vec<u8>> {
             }
         }
     }
-    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::piped());
+    Ok(cmd)
+}
 
+fn write_password(child: &mut std::process::Child, profile: &Profile) -> Result<()> {
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("failed to open restic stdin"))?;
+    stdin
+        .write_all(profile.password().as_bytes())
+        .map_err(|e| anyhow!("writing password to restic stdin: {e}"))?;
+    stdin
+        .write_all(b"\n")
+        .map_err(|e| anyhow!("writing newline to restic stdin: {e}"))?;
+    // Closing the pipe is significant: restic's password-file reader waits
+    // for EOF before it can continue.
+    drop(stdin);
+    Ok(())
+}
+
+/// Run `restic <args>` for a profile and return restic's stdout. See
+/// [`command`] for how credentials travel.
+#[allow(dead_code)]
+pub(crate) fn run(profile: &Profile, args: &[&str]) -> Result<Vec<u8>> {
+    let mut cmd = command(profile, args)?;
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd
         .spawn()
         .map_err(|e| anyhow!("failed to spawn `restic`: {e}"))?;
-    {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| anyhow!("failed to open restic stdin"))?;
-        stdin
-            .write_all(profile.password().as_bytes())
-            .map_err(|e| anyhow!("writing password to restic stdin: {e}"))?;
-        stdin
-            .write_all(b"\n")
-            .map_err(|e| anyhow!("writing newline to restic stdin: {e}"))?;
+    if let Err(e) = write_password(&mut child, profile) {
+        // Don't leave a restic waiting forever on a password that will never
+        // arrive (or a zombie once it exits). Cleanup failures are swallowed
+        // so they can't mask the primary error.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e);
     }
     let output = child
         .wait_with_output()
@@ -259,15 +359,17 @@ fn repo_url(profile: &Profile) -> Result<String> {
             // restic accepts `s3:<endpoint>/<bucket>[/<path>]`. When no
             // endpoint is set, default to AWS by using the bucket-only form;
             // restic's S3 backend reads the region from AWS_DEFAULT_REGION.
+            // A scheme-less custom endpoint defaults to https, matching what
+            // the native opendal S3 backend does with the same profile field.
             let endpoint = if s3_endpoint.is_empty() {
                 "s3.amazonaws.com".to_string()
             } else {
-                // Strip scheme + trailing slash so the URL composes cleanly.
-                s3_endpoint
-                    .trim_start_matches("https://")
-                    .trim_start_matches("http://")
-                    .trim_end_matches('/')
-                    .to_string()
+                let endpoint = s3_endpoint.trim_end_matches('/');
+                if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+                    endpoint.to_string()
+                } else {
+                    format!("https://{endpoint}")
+                }
             };
             let root = s3_root.trim_matches('/');
             if root.is_empty() {
@@ -284,12 +386,120 @@ mod tests {
     use super::*;
 
     #[test]
+    fn minimum_is_the_0_19_series() {
+        // The whole 0.19 line is accepted, starting at .0 — the release the
+        // locking protocol (docs/locking.md) is written against.
+        assert!(meets_minimum((0, 19, 0)));
+        assert!(meets_minimum((0, 19, 1)));
+        assert!(meets_minimum((0, 20, 0)));
+        assert!(meets_minimum((1, 0, 0)));
+        // Anything before it is refused.
+        assert!(!meets_minimum((0, 18, 9)));
+        assert!(!meets_minimum((0, 1, 0)));
+    }
+
+    #[test]
+    fn user_message_quotes_the_minimum() {
+        let msg = ResticError::TooOld { found: "0.18.1".into() }.user_message();
+        assert!(msg.contains("0.19.0"), "message should name the floor: {msg}");
+        assert!(msg.contains("0.18.1"), "message should name what was found: {msg}");
+    }
+
+    #[test]
     fn parses_version_string() {
-        assert_eq!(parse_version("0.18.1"), Some((0, 18, 1)));
+        assert_eq!(parse_version("0.19.1"), Some((0, 19, 1)));
         assert_eq!(parse_version("1.2.3"), Some((1, 2, 3)));
-        assert_eq!(parse_version("0.18.1-dev"), Some((0, 18, 1)));
+        assert_eq!(parse_version("0.19.1-dev"), Some((0, 19, 1)));
         assert_eq!(parse_version("not-a-version"), None);
-        assert_eq!(parse_version("0.18"), None);
+        assert_eq!(parse_version("0.19"), None);
+    }
+
+    #[test]
+    fn lock_requirement_matches_restics_per_command_table() {
+        use LockRequirement::*;
+        // Global flags before the subcommand don't confuse the mapping.
+        assert_eq!(lock_requirement(&["--no-cache", "prune", "--json"]), Exclusive);
+        for cmd in ["forget", "prune", "tag", "key", "check", "repair", "migrate", "recover", "rewrite"] {
+            assert_eq!(lock_requirement(&[cmd, "--json"]), Exclusive, "{cmd}");
+        }
+        for cmd in ["unlock", "init", "self-update", "version"] {
+            assert_eq!(lock_requirement(&[cmd, "--json"]), None, "{cmd}");
+        }
+        for cmd in ["backup", "copy", "restore", "ls", "snapshots", "stats", "find", "diff", "dump"] {
+            assert_eq!(lock_requirement(&[cmd, "--json"]), NonExclusive, "{cmd}");
+        }
+        // A flag's value must not be mistaken for the subcommand.
+        assert_eq!(lock_requirement(&["--cache-dir", "foo", "prune"]), Exclusive);
+        assert_eq!(lock_requirement(&["--cache-dir", "foo", "snapshots"]), NonExclusive);
+        // Unknown subcommand → the weaker non-exclusive assumption (restic's
+        // own check stays authoritative).
+        assert_eq!(lock_requirement(&["frobnicate"]), NonExclusive);
+        // Flags only (degenerate) → no subcommand, no lock to check.
+        assert_eq!(lock_requirement(&["--json"]), None);
+    }
+
+    fn test_profile() -> Profile {
+        Profile::Local {
+            password: "pw".into(),
+            local_path: "/var/restic/a".into(),
+        }
+    }
+
+    fn command_args(profile: &Profile) -> Vec<String> {
+        command(profile, &["snapshots", "--json"])
+            .unwrap()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    // Both halves live in one test because the cache switch is process-wide,
+    // and Rust runs tests in the same process on parallel threads — as two
+    // tests they would race over it.
+    #[test]
+    fn cache_is_off_by_default_and_opts_in_to_a_private_per_user_directory() {
+        let args = command_args(&test_profile());
+        let expected: &[&str] = &[
+            "--no-cache",
+            "--password-file",
+            "/dev/stdin",
+            "snapshots",
+            "--json",
+        ];
+        assert_eq!(args, expected);
+        assert!(
+            !args.iter().any(|arg| arg.contains("pw")),
+            "the password must never reach argv: {args:?}"
+        );
+
+        // No per-user cache root on this machine means there is nothing to opt
+        // into, and `--no-cache` above is the whole story.
+        let Some(dir) = cache_dir() else { return };
+        set_cache_enabled(true);
+        let opted_in = command_args(&test_profile());
+        set_cache_enabled(false);
+
+        assert!(
+            !opted_in.iter().any(|arg| arg == "--no-cache"),
+            "opting in must not also disable the cache: {opted_in:?}"
+        );
+        let passed = opted_in
+            .iter()
+            .position(|arg| arg == "--cache-dir")
+            .and_then(|i| opted_in.get(i + 1))
+            .expect("--cache-dir and its path");
+        assert_eq!(passed.as_str(), dir.to_string_lossy());
+        // The per-user cache root sits inside the calling user's own home,
+        // and the `wrustic` leaf keeps this out of restic's own default cache.
+        assert!(
+            dir.starts_with(dirs::cache_dir().expect("cache root")),
+            "{dir:?} must sit under the per-user cache root"
+        );
+        assert!(dir.ends_with("wrustic"), "{dir:?}");
+
+        // Restored, so the default-path assertions above still hold for any
+        // test that runs after this one.
+        assert_eq!(command_args(&test_profile()), args);
     }
 
     #[test]
@@ -351,93 +561,34 @@ mod tests {
             s3_access_key: "AK".into(),
             s3_secret_key: "SK".into(),
         };
-        assert_eq!(repo_url(&p).unwrap(), "s3:127.0.0.1:8333/buk/sub/dir");
+        assert_eq!(
+            repo_url(&p).unwrap(),
+            "s3:http://127.0.0.1:8333/buk/sub/dir"
+        );
     }
 
     #[test]
-    fn snapshot_details_deserializes() {
-        let raw = r#"[{
-            "id": "fullid",
-            "short_id": "abcd1234",
-            "time": "2025-01-01T00:00:00Z",
-            "hostname": "host",
-            "username": "user",
-            "tags": ["weekly"],
-            "paths": ["/home"],
-            "parent": "parentid",
-            "tree": "treeid",
-            "program_version": "restic 0.18.1",
-            "summary": {
-                "backup_start": "2025-01-01T00:00:00Z",
-                "backup_end": "2025-01-01T00:00:05Z",
-                "total_files_processed": 10,
-                "total_bytes_processed": 1024,
-                "data_added": 512,
-                "data_added_packed": 500
-            }
-        }]"#;
-        let arr: Vec<SnapshotDetails> = serde_json::from_str(raw).unwrap();
-        assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0].id, "fullid");
-        assert_eq!(arr[0].short_id.as_deref(), Some("abcd1234"));
-        assert_eq!(arr[0].tags, vec!["weekly"]);
-        let sum = arr[0].summary.as_ref().unwrap();
-        assert_eq!(sum.total_files_processed, Some(10));
-    }
-
-    #[test]
-    fn detects_lock_errors() {
-        // Verbatim shape of what restic 0.18/0.19 writes to stderr.
-        let real = "restic exited with status exit status: 11: unable to create lock in \
-                    backend: repository is already locked by PID 7344 on it3s-MBP-4 by it3 \
-                    (UID 501, GID 20)\nlock was created at 2026-07-25 10:10:31 \
-                    (20h42m24.765658s ago)\nstorage ID 245b8820\nthe `unlock` command can be \
-                    used to remove stale locks";
-        assert!(is_lock_error(real));
-        assert!(is_lock_error("Fatal: unable to create lock in backend: circuit breaker open"));
-        assert!(!is_lock_error(
-            "restic not found on PATH. Install restic >= 0.18.1 to delete snapshots."
-        ));
-        assert!(!is_lock_error(
-            "rustic and restic disagree on snapshot metadata (possible rustic bug)"
-        ));
-    }
-
-    #[test]
-    fn full_snapshot_id_accepts_64_hex() {
-        let full = "ceedd62f4a63412571eac929f67931fb9702f31b681387e446e61cae3e039e73";
-        assert!(ensure_full_snapshot_id(full).is_ok());
-    }
-
-    #[test]
-    fn full_snapshot_id_rejects_short_and_nonhex() {
-        assert!(ensure_full_snapshot_id("ceedd62f").is_err());
-        assert!(ensure_full_snapshot_id("").is_err());
-        // 64 chars but not all hex.
-        let mut bad = "z".repeat(64);
-        assert!(ensure_full_snapshot_id(&bad).is_err());
-        // 63 hex chars (just one short).
-        bad = "a".repeat(63);
-        assert!(ensure_full_snapshot_id(&bad).is_err());
-        // 65 hex chars.
-        bad = "a".repeat(65);
-        assert!(ensure_full_snapshot_id(&bad).is_err());
-    }
-
-    #[test]
-    fn snapshot_details_tolerates_missing_summary() {
-        let raw = r#"[{ "id": "id1", "paths": [], "tags": [] }]"#;
-        let arr: Vec<SnapshotDetails> = serde_json::from_str(raw).unwrap();
-        assert!(arr[0].summary.is_none());
+    fn repo_url_s3_custom_endpoint_defaults_to_https() {
+        let p = Profile::S3 {
+            password: "pw".into(),
+            s3_endpoint: "garage.example.com/".into(),
+            s3_bucket: "buk".into(),
+            s3_region: "garage".into(),
+            s3_root: String::new(),
+            s3_access_key: "AK".into(),
+            s3_secret_key: "SK".into(),
+        };
+        assert_eq!(repo_url(&p).unwrap(), "s3:https://garage.example.com/buk");
     }
 
     // End-to-end: actually shells out to `restic` against a fresh local repo.
     // Marked #[ignore] so it doesn't run unless requested
     // (`cargo test -- --ignored`). Validates the stdin password channel, env
-    // var wiring, JSON parsing, and forget — i.e. the full spawn() pipeline.
+    // var wiring, and a real `prune` — i.e. the full run() pipeline for the
+    // kind of command this harness exists for.
     #[test]
     #[ignore]
-    fn live_restic_delete_round_trip() {
+    fn live_restic_run_snapshots_and_prune() {
         use std::fs;
         use std::path::PathBuf;
 
@@ -447,48 +598,80 @@ mod tests {
         fs::create_dir_all(&source).unwrap();
         fs::write(source.join("a.txt"), b"hello\n").unwrap();
 
-        let init = Command::new("restic")
-            .arg("init")
-            .env("RESTIC_REPOSITORY", &repo)
-            .env("RESTIC_PASSWORD", "pw")
-            .output()
-            .expect("init");
-        assert!(init.status.success(), "init failed: {init:?}");
-
-        let backup = Command::new("restic")
-            .arg("backup")
-            .arg(&source)
-            .env("RESTIC_REPOSITORY", &repo)
-            .env("RESTIC_PASSWORD", "pw")
-            .output()
-            .expect("backup");
-        assert!(backup.status.success(), "backup failed: {backup:?}");
-
         let profile = Profile::Local {
             password: "pw".into(),
             local_path: repo.to_string_lossy().into_owned(),
         };
+        run(&profile, &["init", "--json"]).expect("init");
+        run(&profile, &["backup", source.to_str().unwrap(), "--json"]).expect("backup");
+        fs::write(source.join("a.txt"), b"hello again\n").unwrap();
+        run(&profile, &["backup", source.to_str().unwrap(), "--json"]).expect("backup 2");
 
-        // List snapshots via restic CLI (also exercises stdin-password path).
-        let list = spawn(&profile, &["snapshots", "--json"]).expect("list");
-        let arr: Vec<SnapshotDetails> = serde_json::from_slice(&list).expect("parse list");
-        assert_eq!(arr.len(), 1, "expected one snapshot");
-        let id = arr[0].id.clone();
+        // List snapshots through the harness (exercises stdin-password path).
+        let list = run(&profile, &["snapshots", "--json"]).expect("snapshots");
+        let arr: serde_json::Value = serde_json::from_slice(&list).expect("parse list");
+        let snaps = arr.as_array().expect("snapshot array");
+        assert_eq!(snaps.len(), 2, "expected two snapshots");
+        let first = snaps[0]["id"].as_str().expect("snapshot id").to_string();
 
-        // Fetch details for the specific snapshot.
-        let (parsed, raw_pretty) = snapshot_details_json(&profile, &id).expect("details");
-        assert_eq!(parsed.id, id);
-        assert!(raw_pretty.contains(&id), "raw JSON should mention the id");
+        // Plant an age-stale lock (well past restic's 30-minute staleness
+        // timeout, so restic never PID-probes it — meaning no SIGHUP lands on
+        // this test process). Plain `forget` must be blocked by it: restic
+        // 0.19 never auto-removes stale locks during acquisition.
+        let opened = crate::repo::open_indexed(&profile).expect("open for crypto");
+        let crypto = crate::lock::RepoCrypto::from_repo(&opened).expect("crypto");
+        let lock_backend = crate::lock::backend_for_profile(&profile).expect("lock backend");
+        crate::lock::write_stale_lock_for_tests(lock_backend.as_ref(), &crypto);
+        let err = run(&profile, &["forget", &first, "--json"])
+            .expect_err("forget should be blocked by the stale lock");
+        assert!(
+            crate::lock::is_lock_error(&format!("{err:#}")),
+            "expected a lock error, got: {err:#}"
+        );
 
-        // Forget it.
-        forget(&profile, &id).expect("forget");
+        // The unstick flow: the native pre-check must detect the block
+        // before spawning, run `restic unlock` (removing the stale lock),
+        // pass the re-check, and only then spawn forget.
+        run_unsticking_locks(&profile, &["forget", &first, "--json"])
+            .expect("forget after unstick");
+        assert_eq!(
+            lock_backend.list().expect("list locks").len(),
+            0,
+            "unlock should have removed the stale lock and forget left none behind"
+        );
 
-        // Confirm it's gone.
-        let after = spawn(&profile, &["snapshots", "--json"]).expect("after-list");
-        let arr_after: Vec<SnapshotDetails> = serde_json::from_slice(&after).expect("parse after");
-        assert!(arr_after.is_empty(), "snapshot should be deleted");
+        // A *live* lock must not be unstuck: hold a native shared lock (as a
+        // concurrent backup would) and the exclusive prune must fail the
+        // native re-check — `restic unlock` SIGHUP-probes our PID and keeps
+        // the lock because we're alive and ignoring SIGHUP while holding it.
+        {
+            let _acquire = crate::lock::test_acquire_guard();
+            let live = crate::lock::RepoLock::acquire_shared(
+                lock_backend.clone(),
+                crypto.clone(),
+            )
+            .expect("shared lock");
+            let err = run_unsticking_locks(&profile, &["prune", "--json"])
+                .expect_err("prune must stay blocked by a live lock");
+            assert!(
+                crate::lock::is_lock_error(&format!("{err:#}")),
+                "expected a lock error, got: {err:#}"
+            );
+            assert_eq!(
+                lock_backend.list().expect("list locks").len(),
+                1,
+                "the live lock must survive the unstick attempt"
+            );
+            drop(live);
+        }
+
+        // Prune through the harness — the command this module is kept for.
+        run_unsticking_locks(&profile, &["prune", "--json"]).expect("prune");
+
+        let after = run(&profile, &["snapshots", "--json"]).expect("after-list");
+        let arr_after: serde_json::Value = serde_json::from_slice(&after).expect("parse after");
+        assert_eq!(arr_after.as_array().map(Vec::len), Some(1));
 
         fs::remove_dir_all(&root).ok();
     }
-
 }

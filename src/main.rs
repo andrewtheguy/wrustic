@@ -5,6 +5,7 @@ mod crypto;
 #[cfg(feature = "keychain")]
 mod keychain;
 mod local_server;
+mod lock;
 mod passphrase;
 mod repo;
 mod restic;
@@ -27,8 +28,9 @@ use ratatui::widgets::TableState;
 use crate::app::{App, BrowseFrame, Screen};
 use crate::cli::{USAGE, parse_cli};
 use crate::repo::{
-    ContentRow, diff_snapshots, get_file_details, list_tree, load_snapshots, open_indexed,
-    preview_snapshot_contents, snapshot_delete_info, snapshot_root_tree, verify_profile,
+    ContentRow, delete_snapshot, diff_snapshots, get_file_details, list_tree, load_snapshots,
+    open_indexed, preview_snapshot_contents, snapshot_delete_info, snapshot_root_tree,
+    unlock, verify_profile,
 };
 use crate::ui::render;
 
@@ -49,6 +51,8 @@ fn main() -> Result<()> {
         println!("{USAGE}");
         return Ok(());
     }
+
+    restic::set_cache_enabled(cli.restic_cache);
 
     #[cfg(feature = "keychain")]
     let no_keychain = cli.no_keychain || !keychain::init_store();
@@ -169,55 +173,14 @@ fn run(
                 } else {
                     None
                 };
-                let restic_details = if need_details {
-                    Some(restic::snapshot_details_json(profile, &snap_id)?)
-                } else {
-                    None
-                };
-                if let (Some(info), Some((parsed, _))) = (&info, &restic_details) {
-                    let mut mismatches = Vec::new();
-                    if let Some(rh) = &parsed.hostname
-                        && *rh != info.hostname
-                    {
-                        mismatches.push(format!(
-                            "hostname: rustic={:?}, restic={:?}",
-                            info.hostname, rh
-                        ));
-                    }
-                    if let Some(rt) = &parsed.tree
-                        && *rt != info.tree
-                    {
-                        mismatches.push(format!(
-                            "tree: rustic={:?}, restic={:?}",
-                            info.tree, rt
-                        ));
-                    }
-                    if parsed.paths != info.paths {
-                        mismatches.push(format!(
-                            "paths: rustic={:?}, restic={:?}",
-                            info.paths, parsed.paths
-                        ));
-                    }
-                    if !mismatches.is_empty() {
-                        anyhow::bail!(
-                            "rustic and restic disagree on snapshot metadata \
-                             (possible rustic bug, unsafe to proceed):\n{}",
-                            mismatches.join("\n")
-                        );
-                    }
-                }
                 let preview = preview_snapshot_contents(&repo, &snap_id, limit)?;
-                Ok((info, restic_details, preview))
+                Ok((info, preview))
             })();
             match result {
-                Ok((info, restic_details, preview)) => {
+                Ok((info, preview)) => {
                     let has_entries = !preview.entries.is_empty();
                     if let Some(info) = info {
                         app.delete_info = Some(info);
-                    }
-                    if let Some((parsed, raw)) = restic_details {
-                        app.delete_details_parsed = Some(parsed);
-                        app.delete_details_raw = Some(raw);
                     }
                     app.delete_root_listing = Some(preview);
                     app.delete_preview_state = TableState::default();
@@ -247,17 +210,13 @@ fn run(
                 );
                 continue;
             };
-            match restic::forget(profile, &snapshot_id) {
+            match delete_snapshot(profile, &snapshot_id) {
                 Ok(()) => {
                     app.post_delete_select = app.list_state.selected();
-                    app.delete_details_parsed = None;
-                    app.delete_details_raw = None;
                     app.snapshots.clear();
                     app.screen = Screen::Loading;
                 }
                 Err(e) => {
-                    app.delete_details_parsed = None;
-                    app.delete_details_raw = None;
                     // Keep the target so an `unlock`-and-retry from the error
                     // screen lands back on the same snapshot.
                     app.delete_target = Some(snapshot_id);
@@ -267,7 +226,7 @@ fn run(
             continue;
         }
 
-        if matches!(app.screen, Screen::ResticUnlocking) {
+        if matches!(app.screen, Screen::Unlocking) {
             let idx = app.loading_index;
             let Some((_, profile)) = app.config.profile_at(idx) else {
                 app.screen = Screen::SnapshotDeleteError(
@@ -275,14 +234,12 @@ fn run(
                 );
                 continue;
             };
-            match restic::unlock(profile) {
+            match unlock(profile) {
                 // Re-enter the delete flow so details/preview are rebuilt and
                 // the confirmation is asked again; without a pending target
                 // there is nothing to retry, so just refresh the list.
-                Ok(()) => {
+                Ok(_removed) => {
                     app.delete_info = None;
-                    app.delete_details_parsed = None;
-                    app.delete_details_raw = None;
                     app.screen = if app.delete_target.is_some() {
                         Screen::SnapshotDeleteLoading
                     } else {
@@ -290,8 +247,7 @@ fn run(
                     };
                 }
                 Err(e) => {
-                    app.screen =
-                        Screen::SnapshotDeleteError(format!("restic unlock failed: {e:#}"));
+                    app.screen = Screen::SnapshotDeleteError(format!("unlock failed: {e:#}"));
                 }
             }
             continue;

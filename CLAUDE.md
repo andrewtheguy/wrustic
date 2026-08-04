@@ -1,5 +1,5 @@
 - no backward compatibility of any kind since it is a private and personal project.
-- use restic cli only for write operations in dev flows (init, backup, forget, etc.). All read operations should use rustic_core natively, not shell out to restic
+- all read operations use rustic_core natively, never shell out to restic. Native write operations are allowed only under the restic-compatible lock module (src/lock.rs, docs/locking.md): currently snapshot delete + unlock. Everything else that writes (init, backup, prune, key management, dev-flow repo setup) stays on the restic cli — from code, always via the secure spawn harness in src/restic.rs (restic::run pipes the password over stdin and credentials over env; never put secrets on argv)
 - use restic --json output for parsing and avoid parsing human-readable output
 - use this project root's tmp/ folder for dev/test data and workspace to avoid permission issues
 - run cargo clippy and cargo test with --all-features after rust code changes, don't run cargo fmt because it affects diff

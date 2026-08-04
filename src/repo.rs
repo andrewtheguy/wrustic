@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::mem;
 
@@ -12,7 +13,7 @@ use rustic_core::{
 use tokio::sync::mpsc;
 
 use crate::config::Profile;
-use crate::s3_backend::S3ReadOnlyBackend;
+use crate::lock;
 
 pub(crate) struct SnapshotRow {
     pub(crate) id: String,
@@ -66,7 +67,10 @@ pub(crate) struct DeleteSnapshotInfo {
     pub(crate) hostname: String,
     pub(crate) paths: Vec<String>,
     pub(crate) tags: Vec<String>,
-    pub(crate) tree: String,
+    pub(crate) files: Option<u64>,
+    pub(crate) bytes: Option<u64>,
+    // Pretty-printed JSON of the snapshot file, for the raw-details view.
+    pub(crate) raw_json: String,
 }
 
 pub(crate) struct FileDetails {
@@ -90,6 +94,9 @@ pub(crate) struct FileDetails {
     pub(crate) content_hashes: Vec<String>,
 }
 
+// All backends are write-capable; keeping write operations safe against
+// concurrent restic processes is the lock module's job (docs/locking.md),
+// not the backend's.
 fn build_backends(profile: &Profile) -> Result<RepositoryBackends> {
     let mut opts = BackendOptions::default();
     match profile {
@@ -126,15 +133,19 @@ fn build_backends(profile: &Profile) -> Result<RepositoryBackends> {
             s3_secret_key,
             ..
         } => {
-            return Ok(S3ReadOnlyBackend::new(
-                s3_endpoint,
-                s3_bucket,
-                s3_region,
-                s3_root,
-                s3_access_key,
-                s3_secret_key,
-            )?
-            .into());
+            opts = opts.repository("opendal:s3:");
+            let mut s3_opts = BTreeMap::new();
+            s3_opts.insert("bucket".to_string(), s3_bucket.clone());
+            s3_opts.insert("region".to_string(), s3_region.clone());
+            s3_opts.insert("access_key_id".to_string(), s3_access_key.clone());
+            s3_opts.insert("secret_access_key".to_string(), s3_secret_key.clone());
+            if !s3_endpoint.is_empty() {
+                s3_opts.insert("endpoint".to_string(), s3_endpoint.clone());
+            }
+            if !s3_root.is_empty() {
+                s3_opts.insert("root".to_string(), s3_root.clone());
+            }
+            opts = opts.options(s3_opts);
         }
     }
     Ok(opts.to_backends()?)
@@ -248,12 +259,68 @@ pub(crate) fn snapshot_delete_info(
     snapshot_id: &str,
 ) -> Result<DeleteSnapshotInfo> {
     let snap = repo.get_snapshot_from_str(snapshot_id, |_| true)?;
+    let raw_json = serde_json::to_string_pretty(&snap)
+        .unwrap_or_else(|e| format!("(failed to serialize snapshot: {e})"));
     Ok(DeleteSnapshotInfo {
         hostname: snap.hostname.clone(),
         paths: snap.paths.iter().cloned().collect(),
         tags: snap.tags.iter().cloned().collect(),
-        tree: snap.tree.to_hex().as_str().to_string(),
+        files: snap.summary.as_ref().map(|s| s.total_files_processed),
+        bytes: snap.summary.as_ref().map(|s| s.total_bytes_processed),
+        raw_json,
     })
+}
+
+/// Deletes one snapshot file natively, under an exclusive restic-compatible
+/// repository lock — the same lock `restic forget` takes, so concurrent
+/// restic processes either block us or are blocked by us, never corrupted.
+/// `snapshot_id` must be the full 64-char hex hash (enforced — short ids are
+/// rejected to avoid acting on the wrong snapshot when a prefix matches
+/// multiple).
+pub(crate) fn delete_snapshot(profile: &Profile, snapshot_id: &str) -> Result<()> {
+    ensure_full_snapshot_id(snapshot_id)?;
+    let backends = build_backends(profile)?;
+    let repo = Repository::new(&RepositoryOptions::default(), &backends)?
+        .open(&Credentials::password(profile.password()))?;
+    let crypto = lock::RepoCrypto::from_repo(&repo)?;
+    let _lock = lock::RepoLock::acquire_exclusive(lock::backend_for_profile(profile)?, crypto)?;
+    // Resolve the id under the lock, like restic does.
+    let snap = repo.get_snapshot_from_str(snapshot_id, |_| true)?;
+    repo.delete_snapshots(&[snap.id])?;
+    Ok(())
+}
+
+/// Backend + crypto pair for talking to the repo's `locks/` natively —
+/// everything needed to list, read, or evaluate lock files for a profile.
+/// Opens the repository (no index) to obtain the master key.
+pub(crate) fn lock_context(
+    profile: &Profile,
+) -> Result<(std::sync::Arc<dyn lock::LockBackend>, lock::RepoCrypto)> {
+    let backends = build_backends(profile)?;
+    let repo = Repository::new(&RepositoryOptions::default(), &backends)?
+        .open(&Credentials::password(profile.password()))?;
+    let crypto = lock::RepoCrypto::from_repo(&repo)?;
+    Ok((lock::backend_for_profile(profile)?, crypto))
+}
+
+/// Removes stale repository locks (native equivalent of `restic unlock`).
+/// Returns how many lock files were removed; live locks are left in place.
+pub(crate) fn unlock(profile: &Profile) -> Result<usize> {
+    let (backend, crypto) = lock_context(profile)?;
+    lock::remove_stale_locks(backend.as_ref(), &crypto)
+}
+
+// restic/rustic snapshot ids are SHA-256 hashes — 32 bytes = 64 hex chars
+// (either case accepted; hex is case-insensitive).
+fn ensure_full_snapshot_id(id: &str) -> Result<()> {
+    if id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "expected a full 64-char hex snapshot id, got `{id}` (length {})",
+            id.len()
+        ))
+    }
 }
 
 pub(crate) fn list_tree(
@@ -638,6 +705,116 @@ fn collect_all_as(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_snapshot_id_accepts_64_hex() {
+        let full = "ceedd62f4a63412571eac929f67931fb9702f31b681387e446e61cae3e039e73";
+        assert!(ensure_full_snapshot_id(full).is_ok());
+    }
+
+    #[test]
+    fn full_snapshot_id_rejects_short_and_nonhex() {
+        assert!(ensure_full_snapshot_id("ceedd62f").is_err());
+        assert!(ensure_full_snapshot_id("").is_err());
+        // 64 chars but not all hex.
+        let mut bad = "z".repeat(64);
+        assert!(ensure_full_snapshot_id(&bad).is_err());
+        // 63 hex chars (just one short).
+        bad = "a".repeat(63);
+        assert!(ensure_full_snapshot_id(&bad).is_err());
+        // 65 hex chars.
+        bad = "a".repeat(65);
+        assert!(ensure_full_snapshot_id(&bad).is_err());
+    }
+
+    // End-to-end interop with the restic CLI against a fresh local repo:
+    // restic must see (and be blocked by) wrustic's native lock, `restic
+    // unlock` must not remove it while fresh, and the native delete must
+    // work. restic CLI is used only for repo setup (init/backup — dev-flow
+    // write ops) and for observing lock behavior from restic's side.
+    // Marked #[ignore]; run with `cargo test -- --ignored` (needs restic on
+    // PATH).
+    #[test]
+    #[ignore]
+    fn live_native_lock_and_delete_interop_with_restic() {
+        // Acquires RepoLocks — serialize with other acquiring tests (SIGHUP
+        // disposition is process-global).
+        let _guard = lock::test_acquire_guard();
+
+        let root = std::path::PathBuf::from("tmp")
+            .join(format!("lock-it-{}", std::process::id()));
+        let repo_path = root.join("repo");
+        let source = root.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("a.txt"), b"hello\n").unwrap();
+
+        let profile = Profile::Local {
+            password: "pw".into(),
+            local_path: repo_path.to_string_lossy().into_owned(),
+        };
+        // Dev-flow writes (init/backup) and the restic-side observations
+        // below all go through the secure spawn harness — never a bare
+        // `restic` with the password exported into the child environment.
+        crate::restic::run(&profile, &["init", "--json"]).expect("restic init");
+        crate::restic::run(&profile, &["backup", source.to_str().unwrap(), "--json"])
+            .expect("restic backup");
+
+        let snapshots = load_snapshots(&profile).expect("list snapshots");
+        assert_eq!(snapshots.len(), 1);
+        let snap_id = snapshots[0].id.clone();
+
+        // Acquire an exclusive native lock; restic must refuse to forget.
+        let backends = build_backends(&profile).unwrap();
+        let repo = Repository::new(&RepositoryOptions::default(), &backends)
+            .unwrap()
+            .open(&Credentials::password(profile.password()))
+            .unwrap();
+        let crypto = lock::RepoCrypto::from_repo(&repo).unwrap();
+        let held = lock::RepoLock::acquire_exclusive(
+            lock::backend_for_profile(&profile).unwrap(),
+            crypto.clone(),
+        )
+        .expect("acquire exclusive lock");
+
+        let forget_err = crate::restic::run(&profile, &["forget", &snap_id, "--json"])
+            .expect_err("restic forget should hit our lock");
+        assert!(
+            lock::is_lock_error(&format!("{forget_err:#}")),
+            "restic should report a lock conflict, got: {forget_err:#}"
+        );
+
+        // `restic unlock` removes stale locks only — ours is fresh.
+        crate::restic::run(&profile, &["unlock", "--json"]).expect("restic unlock");
+        let locks_dir = repo_path.join("locks");
+        let live_locks = std::fs::read_dir(&locks_dir).unwrap().count();
+        assert_eq!(live_locks, 1, "our fresh lock must survive restic unlock");
+
+        // Releasing the lock removes the file; restic can lock again.
+        drop(held);
+        let after = std::fs::read_dir(&locks_dir).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(after, 0, "dropping the lock must remove its file");
+
+        // Native stale-lock removal: plant a restic-left lock by killing a
+        // slow restic mid-operation is flaky, so simulate the same result —
+        // an old lock file — through our own writer, then unlock natively.
+        {
+            let lb = lock::backend_for_profile(&profile).unwrap();
+            lock::write_stale_lock_for_tests(lb.as_ref(), &crypto);
+            assert_eq!(unlock(&profile).expect("native unlock"), 1);
+        }
+
+        // Native delete under the exclusive lock; snapshot must be gone for
+        // both rustic and restic afterwards.
+        delete_snapshot(&profile, &snap_id).expect("native delete");
+        assert!(load_snapshots(&profile).expect("list after delete").is_empty());
+        let restic_list = crate::restic::run(&profile, &["snapshots", "--json"])
+            .expect("restic snapshots");
+        let listed: serde_json::Value =
+            serde_json::from_slice(&restic_list).expect("restic snapshots json");
+        assert_eq!(listed, serde_json::json!([]));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     #[test]
     #[ignore]

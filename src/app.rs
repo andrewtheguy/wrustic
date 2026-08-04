@@ -16,7 +16,6 @@ use crate::config::{self, BackendKind, Config, PassphraseMeta, Paths, Profile};
 use crate::crypto::Cipher;
 use crate::passphrase::{self, PassphrasePhase};
 use crate::repo::{ContentKind, ContentRow, ContentsPreview, DeleteSnapshotInfo, DiffChange, DiffSummary, FileDetails, SnapshotRow};
-use crate::restic::{self, ResticError, ResticInfo, SnapshotDetails};
 use crate::share::{self, SHARE_TTL, ShareHandle, ShareTarget};
 
 pub(crate) const BACKEND_ORDER: [BackendKind; 3] =
@@ -36,7 +35,7 @@ pub(crate) enum Screen {
     SnapshotDeleteConfirm,
     SnapshotDeleting,
     SnapshotDeleteError(String),
-    ResticUnlocking,
+    Unlocking,
     OpeningSnapshot,
     SnapshotContents,
     LoadingDir,
@@ -297,15 +296,12 @@ pub(crate) struct App {
     pub(crate) error_is_fatal: bool,
     pub(crate) quit: bool,
 
-    pub(crate) restic_check: Option<Result<ResticInfo, ResticError>>,
     pub(crate) delete_target: Option<String>,
     pub(crate) delete_info: Option<DeleteSnapshotInfo>,
     pub(crate) delete_show_json: bool,
     pub(crate) delete_preview_state: TableState,
     pub(crate) delete_preview_limit: usize,
     pub(crate) post_delete_select: Option<usize>,
-    pub(crate) delete_details_parsed: Option<SnapshotDetails>,
-    pub(crate) delete_details_raw: Option<String>,
     pub(crate) delete_root_listing: Option<ContentsPreview>,
 
     pub(crate) compare_first_id: Option<String>,
@@ -404,15 +400,12 @@ impl App {
             share_error: None,
             error_is_fatal: false,
             quit: false,
-            restic_check: None,
             delete_target: None,
             delete_info: None,
             delete_show_json: false,
             delete_preview_state: TableState::default(),
             delete_preview_limit: 50,
             post_delete_select: None,
-            delete_details_parsed: None,
-            delete_details_raw: None,
             delete_root_listing: None,
             compare_first_id: None,
             compare_first_row_idx: None,
@@ -905,8 +898,6 @@ impl App {
         self.delete_show_json = false;
         self.delete_preview_state = TableState::default();
         self.delete_preview_limit = 50;
-        self.delete_details_parsed = None;
-        self.delete_details_raw = None;
         self.delete_root_listing = None;
     }
 
@@ -953,13 +944,6 @@ impl App {
     }
 
     fn begin_delete_flow(&mut self, snapshot_id: String) {
-        if self.restic_check.is_none() {
-            self.restic_check = Some(restic::detect());
-        }
-        if let Some(Err(e)) = &self.restic_check {
-            self.screen = Screen::SnapshotDeleteError(e.user_message());
-            return;
-        }
         self.delete_target = Some(snapshot_id);
         self.delete_show_json = false;
         self.screen = Screen::SnapshotDeleteLoading;
@@ -1615,9 +1599,9 @@ impl App {
                 // `u` is only wired up for lock failures — for anything else
                 // (restic missing, metadata mismatch) unlocking is no help, so
                 // every key just dismisses.
-                let offer_unlock = restic::is_lock_error(msg);
+                let offer_unlock = crate::lock::is_lock_error(msg);
                 if offer_unlock && matches!(key.code, KeyCode::Char('u') | KeyCode::Char('U')) {
-                    self.screen = Screen::ResticUnlocking;
+                    self.screen = Screen::Unlocking;
                 } else {
                     self.clear_delete_scratch();
                     self.screen = Screen::Snapshots;
@@ -1692,7 +1676,7 @@ impl App {
             | Screen::LoadingFileDetails
             | Screen::SnapshotDeleting
             | Screen::SnapshotDeleteLoading
-            | Screen::ResticUnlocking
+            | Screen::Unlocking
             | Screen::SnapshotCompareLoading => {}
 
             Screen::FileDetails => match key.code {

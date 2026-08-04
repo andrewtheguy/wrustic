@@ -13,6 +13,17 @@ Options:
                               The directory will be created on first run.
   -p, --port <N>              Localhost port for the file-share dialog.
                               Default: 7834.
+      --restic-cache          Let restic keep its on-disk cache, in a directory
+                              private to wrustic and to your user account:
+                              $XDG_CACHE_HOME/wrustic if that is set, otherwise
+                              ~/.cache/wrustic. Only affects the restic CLI
+                              commands wrustic shells out for (prune-class);
+                              native reads/writes never use a restic cache.
+                              Speeds up repeated restic work against a remote
+                              repository at the cost of disk space. To prune it,
+                              point restic at the same directory:
+                              'restic --cache-dir <that path> cache --cleanup'.
+                              Off by default: every restic call runs --no-cache.
       --no-mouse              Disable mouse reporting (useful for QA / copy-paste).
       --no-keychain           Disable keychain integration even when the binary
                               was built with the 'keychain' feature.
@@ -23,6 +34,7 @@ Options:
 pub(crate) struct Cli {
     pub(crate) config_dir: Option<PathBuf>,
     pub(crate) port: u16,
+    pub(crate) restic_cache: bool,
     pub(crate) no_mouse: bool,
     pub(crate) no_keychain: bool,
     pub(crate) show_version: bool,
@@ -34,6 +46,7 @@ impl Default for Cli {
         Self {
             config_dir: None,
             port: DEFAULT_SERVER_PORT,
+            restic_cache: false,
             no_mouse: false,
             no_keychain: false,
             show_version: false,
@@ -49,6 +62,7 @@ pub(crate) fn parse_cli() -> Result<Cli> {
         match arg.as_str() {
             "-h" | "--help" => cli.show_help = true,
             "-V" | "--version" | "version" => cli.show_version = true,
+            "--restic-cache" => cli.restic_cache = true,
             "--no-mouse" => cli.no_mouse = true,
             "--no-keychain" => cli.no_keychain = true,
             "-c" | "--config-dir" => {
