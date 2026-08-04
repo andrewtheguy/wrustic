@@ -18,7 +18,6 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 jiff = { version = "0.2", features = ["serde"] }
-libc = "0.2"
 opendal = { version = "0.57.0", default-features = false, features = ["blocking", "layers-retry", "reqwest-rustls-tls", "services-s3"] }
 rand = "0.10.1"
 # Direct HTTP access to the rest-server `locks/` endpoints (rustic_backend's
@@ -39,11 +38,30 @@ url = "2"
 zstd = "0.13"
 keyring-core = { version = "1", optional = true }
 
+[target.'cfg(unix)'.dependencies]
+# uid/gid for restic-compatible lock files, kill(pid, 0) staleness probes, and
+# the SIGHUP disposition dance (see docs/locking.md). All Unix-only concepts;
+# the Windows build has its own equivalents via windows-sys.
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# OpenProcess-based liveness probe for same-host lock staleness — the Windows
+# counterpart of kill(pid, 0), mirroring restic's os.FindProcess use.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1", features = ["keychain"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 dbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"], optional = true }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = { version = "1", optional = true }
+
 [features]
-keychain = ["dep:keyring-core", "dep:apple-native-keyring-store", "dep:dbus-secret-service-keyring-store"]
+keychain = [
+    "dep:keyring-core",
+    "dep:apple-native-keyring-store",
+    "dep:dbus-secret-service-keyring-store",
+    "dep:windows-native-keyring-store",
+]

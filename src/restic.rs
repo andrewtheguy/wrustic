@@ -6,7 +6,8 @@
 //! deliberately does not reimplement (prune, repair, migrate, dev-flow repo
 //! setup). Launch semantics mirror resterm's: secrets never touch argv — the
 //! master password is piped through the child's stdin (`--password-file
-//! /dev/stdin`), the repo URL and any cloud credentials go through env vars —
+//! /dev/stdin` on Unix; on Windows restic reads its non-terminal stdin
+//! directly), the repo URL and any cloud credentials go through env vars —
 //! and restic's on-disk cache is off (`--no-cache`) unless the user opts in
 //! with `--restic-cache`, which points restic at a directory private to
 //! wrustic.
@@ -241,10 +242,10 @@ pub(crate) fn run_unsticking_locks(profile: &Profile, args: &[&str]) -> Result<V
 
 /// Build a `restic <args>` command for a profile with credentials passed by
 /// the safest mechanism each supports. Never put secrets in argv. Master
-/// password is piped through an anonymous pipe on the child's stdin
-/// (`--password-file /dev/stdin`); the repo URL and any cloud creds go
-/// through env vars (override-only — parent env is inherited so PATH, HOME,
-/// SSL_CERT_FILE, HTTP_PROXY, etc. still flow through).
+/// password is piped through an anonymous pipe on the child's stdin; the repo
+/// URL and any cloud creds go through env vars (override-only — parent env is
+/// inherited so PATH, HOME, SSL_CERT_FILE, HTTP_PROXY, etc. still flow
+/// through).
 ///
 /// Every command built here also carries the cache flag from
 /// [`apply_cache_flag`]: `--no-cache` by default, or `--cache-dir <per-user
@@ -253,6 +254,12 @@ pub(crate) fn run_unsticking_locks(profile: &Profile, args: &[&str]) -> Result<V
 fn command(profile: &Profile, args: &[&str]) -> Result<Command> {
     let mut cmd = Command::new("restic");
     apply_cache_flag(&mut cmd);
+    // Windows has no `/dev/stdin` path for restic to open. It doesn't need
+    // one: when stdin is not a terminal — which it never is here, since
+    // `command` always pipes it — restic falls back to reading the password
+    // straight off stdin. So the flag is Unix-only and both platforms carry
+    // the password over the same anonymous pipe.
+    #[cfg(unix)]
     cmd.arg("--password-file").arg("/dev/stdin");
     cmd.args(args);
     // An explicit password file wins over these in restic, but removing them
@@ -459,6 +466,7 @@ mod tests {
     #[test]
     fn cache_is_off_by_default_and_opts_in_to_a_private_per_user_directory() {
         let args = command_args(&test_profile());
+        #[cfg(unix)]
         let expected: &[&str] = &[
             "--no-cache",
             "--password-file",
@@ -466,6 +474,10 @@ mod tests {
             "snapshots",
             "--json",
         ];
+        // No `--password-file` on Windows: the password rides restic's
+        // non-terminal stdin fallback instead. See `command`.
+        #[cfg(windows)]
+        let expected: &[&str] = &["--no-cache", "snapshots", "--json"];
         assert_eq!(args, expected);
         assert!(
             !args.iter().any(|arg| arg.contains("pw")),

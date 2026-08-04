@@ -70,10 +70,11 @@ impl LockData {
             hostname: our_hostname(),
             username: std::env::var("USER")
                 .or_else(|_| std::env::var("LOGNAME"))
+                .or_else(|_| std::env::var("USERNAME")) // Windows
                 .unwrap_or_default(),
             pid: std::process::id() as i32,
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
+            uid: our_uid(),
+            gid: our_gid(),
         }
     }
 
@@ -110,6 +111,29 @@ fn our_hostname() -> String {
     gethostname::gethostname().to_string_lossy().into_owned()
 }
 
+#[cfg(unix)]
+fn our_uid() -> u32 {
+    unsafe { libc::getuid() }
+}
+
+#[cfg(unix)]
+fn our_gid() -> u32 {
+    unsafe { libc::getgid() }
+}
+
+// Windows has no numeric uid/gid; restic writes 0 for both there
+// (`internal/restic/lock_windows.go` uidGidInt), and so do we.
+#[cfg(windows)]
+fn our_uid() -> u32 {
+    0
+}
+
+#[cfg(windows)]
+fn our_gid() -> u32 {
+    0
+}
+
+#[cfg(unix)]
 fn process_exists(pid: i32) -> bool {
     if pid <= 0 {
         return false;
@@ -119,6 +143,26 @@ fn process_exists(pid: i32) -> bool {
     }
     // EPERM: the process exists but belongs to someone else.
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+// Mirrors restic's Windows probe (`lock_windows.go` processExists via
+// os.FindProcess = OpenProcess): a PID we can open a handle to is alive, a PID
+// the kernel refuses to resolve is not.
+#[cfg(windows)]
+fn process_exists(pid: i32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    if pid <= 0 {
+        return false;
+    }
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32) };
+    if handle.is_null() {
+        return false;
+    }
+    unsafe { CloseHandle(handle) };
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -692,12 +736,18 @@ pub(crate) fn is_lock_error(message: &str) -> bool {
 
 // ---------------------------------------------------------------------------
 // SIGHUP handling — see the RepoLock doc comment.
+//
+// Unix-only concept: a same-host `restic unlock` probes the holder PID with
+// SIGHUP, which would kill us unless ignored. restic on Windows probes with
+// OpenProcess instead (`lock_windows.go`), so there is nothing to guard —
+// the counter still runs so both platforms share one code path.
 // ---------------------------------------------------------------------------
 
 static LOCKS_HELD: AtomicUsize = AtomicUsize::new(0);
 
 fn sighup_ignore_acquire() {
     if LOCKS_HELD.fetch_add(1, Ordering::SeqCst) == 0 {
+        #[cfg(unix)]
         unsafe {
             let _ = libc::signal(libc::SIGHUP, libc::SIG_IGN);
         }
@@ -706,6 +756,7 @@ fn sighup_ignore_acquire() {
 
 fn sighup_ignore_release() {
     if LOCKS_HELD.fetch_sub(1, Ordering::SeqCst) == 1 {
+        #[cfg(unix)]
         unsafe {
             let _ = libc::signal(libc::SIGHUP, libc::SIG_DFL);
         }
@@ -1136,6 +1187,9 @@ mod tests {
         }
     }
 
+    // Unix-only: on Windows there is no SIGHUP probe to defend against, and
+    // the acquire/release helpers are deliberate no-ops there.
+    #[cfg(unix)]
     #[test]
     fn sighup_ignored_while_any_lock_held_and_restored_after() {
         let _guard = test_acquire_guard();
