@@ -25,12 +25,15 @@ are native too, guarded by restic-compatible repository locks
 - **Keyboard and mouse navigation**: Vim-style keys, arrow keys, PgUp/PgDn,
   mouse click/scroll; `--no-mouse` to disable
 - **Passphrase entry**: masked TUI input, with optional keychain auto-unlock
-- **Keychain integration** (macOS): optionally save the passphrase to the OS
-  keychain for auto-unlock; see [`docs/keychain.md`](docs/keychain.md)
+- **Keychain integration** (macOS, Windows, Linux desktop): optionally save
+  the passphrase to the OS credential store for auto-unlock; see
+  [`docs/keychain.md`](docs/keychain.md)
 
 See [`docs/roadmap.md`](docs/roadmap.md) for planned features.
 
 ## Install (prebuilt binary)
+
+### Linux / macOS
 
 A convenience script downloads the latest release binary from GitHub and
 drops it at `$HOME/.local/bin/wrustic` — no `sudo`, no system-wide install.
@@ -53,11 +56,44 @@ binary's `--help` once to confirm it loads on the host. If `$HOME/.local/bin`
 is not on your `$PATH`, the script prints the line you need to add to your
 shell profile.
 
+### Windows
+
+`install.ps1` is the PowerShell equivalent (adapted from the beam-rs
+installer). It installs `wrustic.exe` to
+`%LOCALAPPDATA%\Programs\wrustic` and adds that directory to the **user**
+PATH — no admin rights, and the script refuses to run elevated unless you pass
+`-Admin`. Target: `windows-amd64`.
+
+```powershell
+irm https://raw.githubusercontent.com/andrewtheguy/wrustic/main/install.ps1 | iex
+```
+
+Or clone the repo and run `.\install.ps1` directly. Useful flags:
+
+- `.\install.ps1 <release-tag>` — install a specific release tag
+- `.\install.ps1 -PreRelease` — grab the latest prerelease
+- `.\install.ps1 -DownloadOnly` — drop the binary in the current directory
+- `$env:RELEASE_TAG='<release-tag>'; .\install.ps1` — same as passing the tag
+
+A piped `iex` one-liner cannot take arguments, so set
+`$env:WRUSTIC_INSTALL_ARGS` instead:
+
+```powershell
+$env:WRUSTIC_INSTALL_ARGS='-PreRelease'; irm https://raw.githubusercontent.com/andrewtheguy/wrustic/main/install.ps1 | iex
+```
+
+Like the shell script it verifies the SHA-256 against the digest GitHub
+publishes in the release metadata, then runs the binary once before installing
+it. It also checks for restic on `PATH` afterwards — wrustic runs without it,
+but the maintenance commands it leaves to the restic CLI need it — and points
+at `winget install restic.restic` if it's missing.
+
 ## Build & run
 
-Requires a Rust toolchain (developed against rustc 1.93).
+Requires a Rust toolchain (rustc >= 1.89 for `std::fs::File::try_lock`;
+developed against 1.93).
 
-Platform: Linux / macOS only.
+Platform: Linux, macOS, and Windows.
 
 ```sh
 cargo run
@@ -70,9 +106,9 @@ wrustic [-c|--config-dir <PATH>] [-p|--port <N>] [--restic-cache] [--no-keychain
 ```
 
 `--config-dir <PATH>` overrides the default config location —
-`~/.config/wrustic` on Linux, `~/Library/Application Support/wrustic` on
-macOS. Useful for keeping separate profile sets, running tests, or driving
-an automation/CI flow against a throwaway directory:
+`~/.config/wrustic` on Linux, `~/Library/Application Support/wrustic` on macOS,
+`%APPDATA%\wrustic` on Windows. Useful for keeping separate profile sets,
+running tests, or driving an automation/CI flow against a throwaway directory:
 
 ```sh
 cargo run -- --config-dir ./tmp/wrustic-sandbox
@@ -86,6 +122,10 @@ self-contained, so that file plus your passphrase is all a restore needs:
 ```sh
 cp "${XDG_CONFIG_HOME:-$HOME/.config}/wrustic/config.toml" ~/backups/   # Linux
 cp "$HOME/Library/Application Support/wrustic/config.toml" ~/backups/   # macOS
+```
+
+```powershell
+Copy-Item "$env:APPDATA\wrustic\config.toml" "$HOME\backups\"           # Windows
 ```
 
 Nothing else in the directory needs copying. See

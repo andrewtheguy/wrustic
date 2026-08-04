@@ -81,6 +81,12 @@ wrustic TUI*. wrustic must ignore SIGHUP while it holds any lock (and
 restore the default disposition afterwards, so closing the terminal still
 terminates the app normally).
 
+Windows has no SIGHUP: restic probes liveness with `OpenProcess` there
+(`internal/restic/lock_windows.go`) and writes uid/gid 0 into its lock
+files (no numeric user IDs on Windows). wrustic's Windows build mirrors
+both — OpenProcess for the same-host staleness probe, uid/gid 0 in the
+locks it writes, and no signal handling at all.
+
 ### Per-command lock usage (restic 0.19.1)
 
 | Lock taken | Commands |

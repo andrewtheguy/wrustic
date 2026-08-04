@@ -91,9 +91,9 @@ at startup and holds it for the process lifetime, stored on `App` as
 wholesale on every save, so a second instance on the same directory would
 silently drop the first one's profiles; it is refused before the TUI starts
 instead. The lock is `std::fs::File::try_lock` (stable since Rust 1.89) —
-`flock(LOCK_EX | LOCK_NB)` on the Unix platforms wrustic supports. No
-third-party crate, and no stale-lock cleanup, because the kernel releases it
-when the process dies for any reason.
+`flock(LOCK_EX | LOCK_NB)` on Unix, `LockFileEx` on Windows. No third-party
+crate, and no stale-lock cleanup, because the kernel releases it when the
+process dies for any reason.
 
 Encryption is per-value (not whole-file) so non-secret edits diff cleanly.
 For schema details, key derivation, threat model, and
