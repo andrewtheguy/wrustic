@@ -69,15 +69,36 @@ cargo run
 wrustic [-c|--config-dir <PATH>] [-p|--port <N>] [--restic-cache] [--no-keychain] [-h|--help]
 ```
 
-`--config-dir <PATH>` overrides the default config location
-(`~/.config/wrustic`). Useful for keeping separate profile sets, running
-tests, or driving an automation/CI flow against a throwaway directory:
+`--config-dir <PATH>` overrides the default config location —
+`~/.config/wrustic` on Linux, `~/Library/Application Support/wrustic` on
+macOS. Useful for keeping separate profile sets, running tests, or driving
+an automation/CI flow against a throwaway directory:
 
 ```sh
 cargo run -- --config-dir ./tmp/wrustic-sandbox
 ```
 
 The directory is created on first run if it doesn't exist.
+
+To back up your profiles, copy `config.toml` out of that directory — it is
+self-contained, so that file plus your passphrase is all a restore needs:
+
+```sh
+cp "${XDG_CONFIG_HOME:-$HOME/.config}/wrustic/config.toml" ~/backups/   # Linux
+cp "$HOME/Library/Application Support/wrustic/config.toml" ~/backups/   # macOS
+```
+
+Nothing else in the directory needs copying. See
+[`docs/encryption.md`](docs/encryption.md) for restore caveats (keychain
+entries live in the OS credential store, not in the file) and for what a
+leaked backup would expose.
+
+Only one wrustic can use a config directory at a time. Startup takes an
+exclusive lock on `<config-dir>/config.lock` and holds it until exit; a second
+instance on the same directory exits with an error rather than overwriting the
+first one's profiles when either saves. The lock is released by the OS even if
+the process is killed, so there is nothing to clean up. To run two at once,
+give each its own `--config-dir`.
 
 `--port <N>` selects the localhost port for the file-share dialog
 (default: 7834).

@@ -31,8 +31,10 @@ It is intentionally **not** a restic replacement:
 
 ```
 main()
- └── App::boot(config_dir, port, no_keychain)  // app.rs
-      ├── config::paths(override) → Paths { config }
+ ├── config::paths(override) → Paths { dir, config, lock }
+ ├── config::acquire_lock(paths) → ConfigLock   // refuse a second instance
+ │                                              // before the TUI starts
+ └── App::boot(paths, config_lock, port, no_keychain)  // app.rs
       ├── start_passphrase_flow()           // app.rs + passphrase.rs
       └── load_config_or_set_fatal()
             └── config::load(paths, cipher) → Config (with profiles decrypted)
@@ -82,6 +84,16 @@ Keypress handling is concentrated in `App::handle_key` (single big match on
 `src/config.rs` owns the TOML schema (`Config`, `Profile`,
 `PassphraseMeta`) and the atomic save: write `config.toml.tmp` at mode
 0600, then `rename(2)` over the target.
+
+`config::acquire_lock` takes an exclusive lock on `<config-dir>/config.lock`
+at startup and holds it for the process lifetime, stored on `App` as
+`config_lock`. wrustic keeps the whole config in memory and rewrites the file
+wholesale on every save, so a second instance on the same directory would
+silently drop the first one's profiles; it is refused before the TUI starts
+instead. The lock is `std::fs::File::try_lock` (stable since Rust 1.89) —
+`flock(LOCK_EX | LOCK_NB)` on the Unix platforms wrustic supports. No
+third-party crate, and no stale-lock cleanup, because the kernel releases it
+when the process dies for any reason.
 
 Encryption is per-value (not whole-file) so non-secret edits diff cleanly.
 For schema details, key derivation, threat model, and

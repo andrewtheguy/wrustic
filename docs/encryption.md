@@ -109,6 +109,65 @@ leaving the device (cloud sync of a config dir, included in a backup,
 copied to another machine) rather than another local account reading it
 in place. Disk encryption is your responsibility.
 
+## Config-directory lock
+
+Only one wrustic may hold a given config directory at a time. Startup takes an
+exclusive lock on `<config-dir>/config.lock` via `std::fs::File::try_lock`
+(`flock` on the Unix platforms wrustic supports) and holds it until the
+process exits; a second instance exits with an error instead of racing the
+first one's saves. This protects against lost updates, not against an
+attacker — the lock is advisory and anything that writes `config.toml`
+without taking it still wins.
+
+## Backing up `config.toml`
+
+The config directory is `dirs::config_dir()` + `wrustic`, so its location is
+platform-dependent:
+
+| OS | Config directory |
+|---|---|
+| Linux | `$XDG_CONFIG_HOME/wrustic`, else `~/.config/wrustic` |
+| macOS | `~/Library/Application Support/wrustic` |
+
+**Copy `config.toml` and nothing else.** The directory also holds
+`config.lock`, a zero-byte marker recreated on every launch, and
+`config.toml.tmp`, which exists only for the instant between write and
+rename.
+
+```sh
+# Linux
+cp "${XDG_CONFIG_HOME:-$HOME/.config}/wrustic/config.toml" ~/backups/
+
+# macOS
+cp "$HOME/Library/Application Support/wrustic/config.toml" ~/backups/
+```
+
+To avoid the per-platform paths entirely, keep the config somewhere
+path-stable and point wrustic at it — the directory is created on first
+use:
+
+```sh
+wrustic --config-dir ~/Sync/wrustic
+```
+
+Restoring is the reverse copy. Three things to know:
+
+- **The file is self-contained.** The scrypt `salt` and `instance_sig` live
+  inside `config.toml`, so the file plus your passphrase is everything
+  needed to decrypt. There is no separate key material to lose.
+- **The keychain entry is not in the file.** If you use keychain
+  auto-unlock, that credential lives in the OS credential store. On a
+  restored machine you enter the passphrase manually, then opt back into
+  saving it to that machine's keychain.
+- **There are no migrations.** `load` rejects any file whose `version` is
+  not the one the binary expects, rather than upgrading it, so note which
+  wrustic version a backup came from.
+
+Copying while wrustic is running is safe to *read* — saves are atomic
+(write temp, rename), so a copy sees either the old file or the new one,
+never a half-written one. The lock file guards concurrent writers, not
+readers.
+
 ## Is `config.toml` safe to back up unencrypted?
 
 **Short answer:** the *secret* fields are safe — they're already AEAD-
