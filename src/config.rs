@@ -628,8 +628,12 @@ mod tests {
     #[test]
     #[ignore = "spawned as a child process by lock_is_exclusive_across_processes"]
     fn lock_contention_child() {
-        let dir = std::env::var(CHILD_DIR_ENV)
-            .unwrap_or_else(|_| panic!("child requires {CHILD_DIR_ENV}"));
+        // A bare `cargo test -- --ignored` also lands here, with no directory
+        // to lock — do nothing then. The parent asserts on this process's
+        // stdout, so a silently-passing child can never mask a broken lock.
+        let Ok(dir) = std::env::var(CHILD_DIR_ENV) else {
+            return;
+        };
         let paths = test_paths(std::path::Path::new(&dir));
         match acquire_lock(&paths) {
             // Hold the guard only until this scope ends; the parent waits for

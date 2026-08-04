@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::mem;
 
@@ -133,19 +132,18 @@ fn build_backends(profile: &Profile) -> Result<RepositoryBackends> {
             s3_secret_key,
             ..
         } => {
-            opts = opts.repository("opendal:s3:");
-            let mut s3_opts = BTreeMap::new();
-            s3_opts.insert("bucket".to_string(), s3_bucket.clone());
-            s3_opts.insert("region".to_string(), s3_region.clone());
-            s3_opts.insert("access_key_id".to_string(), s3_access_key.clone());
-            s3_opts.insert("secret_access_key".to_string(), s3_secret_key.clone());
-            if !s3_endpoint.is_empty() {
-                s3_opts.insert("endpoint".to_string(), s3_endpoint.clone());
-            }
-            if !s3_root.is_empty() {
-                s3_opts.insert("root".to_string(), s3_root.clone());
-            }
-            opts = opts.options(s3_opts);
+            // wrustic's own S3 backend, not rustic_backend's generic opendal
+            // one: rustic_backend's `opendal` feature has no per-service
+            // knob and compiles every opendal service (see src/s3_backend.rs).
+            let backend = crate::s3_backend::S3DataBackend::new(
+                s3_endpoint,
+                s3_bucket,
+                s3_region,
+                s3_root,
+                s3_access_key,
+                s3_secret_key,
+            )?;
+            return Ok(RepositoryBackends::new(std::sync::Arc::new(backend), None));
         }
     }
     Ok(opts.to_backends()?)

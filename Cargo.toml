@@ -25,7 +25,10 @@ rand = "0.10.1"
 # same features rustic_backend already compiles reqwest with.
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 ratatui = "0.30.0"
-rustic_backend = { version = "0.6.2", default-features = false, features = ["rest", "opendal"] }
+# No `opendal` feature: it has no per-service knob and compiles every opendal
+# service crate (~150 packages). S3 repo data goes through wrustic's own
+# rustic_core backend over `opendal-service-s3` instead (src/s3_backend.rs).
+rustic_backend = { version = "0.6.2", default-features = false, features = ["rest"] }
 rustic_core = { version = "0.12.0", default-features = false }
 scrypt = { version = "0.12", default-features = false }
 serde = { version = "1", features = ["derive"] }
