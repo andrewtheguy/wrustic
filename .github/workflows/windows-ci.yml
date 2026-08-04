@@ -1,0 +1,16 @@
+name: Windows CI
+
+# Build-and-test only — no release steps. Lives on main so GitHub registers
+# the workflow; dispatch it against a feature branch to test that branch:
+#   gh workflow run windows-ci.yml --ref <branch>
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Placeholder
+        run: echo "Placeholder on main — dispatch this workflow with --ref <branch> to CI a Windows-capable branch."
