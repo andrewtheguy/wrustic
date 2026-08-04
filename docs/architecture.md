@@ -158,10 +158,27 @@ No TUI flow shells out to restic anymore, and the binary is not required
 to run wrustic. Write operations without a native + locked implementation
 (init, backup, prune, key management) stay on the restic CLI — when code
 needs to trigger one of those (e.g. a future prune action), it goes
-through the secure spawn harness kept in `src/restic.rs`:
-`restic::run(profile, args)` pipes the master password via the child's
-stdin (`--password-file /dev/stdin`) and passes the repo URL and cloud
-credentials via env vars, so secrets never appear on argv.
+through the secure spawn harness kept in `src/restic.rs`, whose launch
+semantics mirror resterm's:
+- `restic::run(profile, args)` pipes the master password via the child's
+  stdin (`--password-file /dev/stdin`) and passes the repo URL and cloud
+  credentials via env vars, so secrets never appear on argv; inherited
+  `RESTIC_PASSWORD*` variables are scrubbed from the child environment.
+- Every call carries `--no-cache` unless the user opted in with the
+  `--restic-cache` CLI flag, which points restic at a per-user directory
+  private to wrustic (`~/.cache/wrustic`) — restic's default shared cache
+  is never used.
+- restic checks the repository lock before any of these commands run, so
+  a leftover (crashed-holder) lock blocks them with "repository is
+  already locked". Because the blocked process is restic itself, the
+  unstick path is restic's own `unlock` run through the same harness
+  (`restic::unlock`), not the native stale-lock removal in `src/lock.rs`
+  (that one backs the TUI's `u` shortcut for *native* write failures).
+  `restic::run_unsticking_locks(profile, args)` packages the flow the
+  delete action used before it went native: run, and on a lock error
+  (`lock::is_lock_error`) run `restic unlock` and retry once. `unlock`
+  removes only provably-stale locks, so a live holder still fails the
+  retry and the error is surfaced.
 
 ## Verification and dev flow
 

@@ -52,6 +52,8 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    restic::set_cache_enabled(cli.restic_cache);
+
     #[cfg(feature = "keychain")]
     let no_keychain = cli.no_keychain || !keychain::init_store();
     #[cfg(not(feature = "keychain"))]

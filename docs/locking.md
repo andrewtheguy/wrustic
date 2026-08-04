@@ -213,9 +213,16 @@ A `RepoLock` guard type that mirrors restic exactly:
    The restic/rustic metadata cross-check and `restic snapshots --json`
    fetch went away with it; no wrustic feature needs the restic binary at
    runtime anymore. `src/restic.rs` survives only as the secure spawn
-   harness (stdin-piped password, env-var credentials) for triggering the
-   restic commands wrustic deliberately does not reimplement — prune and
-   friends (Tier 3).
+   harness (stdin-piped password, env-var credentials, resterm's launch
+   semantics including the opt-in `--restic-cache` flag) for triggering
+   the restic commands wrustic deliberately does not reimplement — prune
+   and friends (Tier 3). Those commands are lock-checked by restic
+   itself, so when a leftover lock blocks one, the unstick is restic's
+   own `unlock` through the same harness — not native stale-lock
+   removal, which serves the native flows.
+   `restic::run_unsticking_locks` runs a command and, on a lock error,
+   unlocks and retries once; a live lock still fails the retry, exactly
+   like restic's own conflict handling.
 3. **Native backup** under a non-exclusive lock (the headline win:
    wrustic backups running concurrently with restic cron backups), then
    copy / key add as wanted. This phase also needs the

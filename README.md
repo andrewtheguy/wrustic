@@ -64,7 +64,7 @@ cargo run
 ### CLI flags
 
 ```text
-wrustic [-c|--config-dir <PATH>] [-p|--port <N>] [--no-keychain] [-h|--help]
+wrustic [-c|--config-dir <PATH>] [-p|--port <N>] [--restic-cache] [--no-keychain] [-h|--help]
 ```
 
 `--config-dir <PATH>` overrides the default config location
@@ -79,6 +79,15 @@ The directory is created on first run if it doesn't exist.
 
 `--port <N>` selects the localhost port for the file-share dialog
 (default: 7834).
+
+`--restic-cache` lets the restic CLI commands wrustic shells out for
+(prune-class operations) keep an on-disk cache, in a directory private to
+wrustic and to your user account (`$XDG_CACHE_HOME/wrustic`, otherwise
+`~/.cache/wrustic`). Off by default: every restic call runs `--no-cache`,
+because a restic cache can reach hundreds of megabytes for a large
+repository. Native reads/writes never use a restic cache either way. To
+prune an opted-in cache, point restic at the same directory:
+`restic --cache-dir <that path> cache --cleanup`.
 
 `--no-keychain` disables keychain integration at runtime, even when the
 binary was built with the `keychain` feature. See
