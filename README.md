@@ -106,7 +106,8 @@ wrustic [-c|--config-dir <PATH>] [-p|--port <N>] [--restic-cache] [--no-keychain
 ```
 
 `--config-dir <PATH>` overrides the default config location —
-`~/.config/wrustic` on Linux, `~/Library/Application Support/wrustic` on macOS,
+`$XDG_CONFIG_HOME/wrustic` (else `~/.config/wrustic`) on Linux,
+`~/Library/Application Support/wrustic` on macOS,
 `%APPDATA%\wrustic` on Windows. Useful for keeping separate profile sets,
 running tests, or driving an automation/CI flow against a throwaway directory:
 

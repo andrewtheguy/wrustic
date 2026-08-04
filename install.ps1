@@ -58,28 +58,40 @@ function Get-LatestReleaseTag {
     return $release.tag_name
 }
 
-# Fetch the latest prerelease tag
+# Fetch the latest prerelease tag. The releases list is newest-first but
+# paginated, so follow the Link header's rel="next" pages until a prerelease
+# turns up or the pages run out.
 function Get-LatestPrereleaseTag {
-    $apiUrl = "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/releases?per_page=30"
+    $uri = "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/releases?per_page=30"
 
-    try {
-        $releases = Invoke-RestMethod -Uri $apiUrl -Method Get
+    while ($uri) {
+        try {
+            $response = Invoke-WebRequest -Uri $uri -Method Get -UseBasicParsing
+        }
+        catch {
+            Print-Error "Failed to fetch releases from GitHub: $_"
+            exit 1
+        }
+
+        $releases = $response.Content | ConvertFrom-Json
+        $latestPrerelease = $releases |
+            Where-Object { $_.prerelease -eq $true } |
+            Select-Object -First 1 -ExpandProperty tag_name
+        if ($latestPrerelease) {
+            return $latestPrerelease
+        }
+
+        # Windows PowerShell hands the Link header back as one string, pwsh as
+        # a string array — joining first makes the match work on both.
+        $uri = $null
+        $link = $response.Headers['Link']
+        if ($link -and (($link -join ', ') -match '<([^>]+)>;\s*rel="next"')) {
+            $uri = $matches[1]
+        }
     }
-    catch {
-        Print-Error "Failed to fetch releases from GitHub: $_"
-        exit 1
-    }
 
-    $latestPrerelease = $releases |
-        Where-Object { $_.prerelease -eq $true } |
-        Select-Object -First 1 -ExpandProperty tag_name
-
-    if (-not $latestPrerelease) {
-        Print-Error "Could not find any prerelease on GitHub"
-        exit 1
-    }
-
-    return $latestPrerelease
+    Print-Error "Could not find any prerelease on GitHub"
+    exit 1
 }
 
 # Fetch full release info (including asset checksums) from the GitHub API
@@ -163,7 +175,12 @@ function Test-Checksum {
 
 # Detect architecture. The release workflow only builds windows-amd64.
 function Get-Architecture {
-    $arch = [System.Environment]::GetEnvironmentVariable("PROCESSOR_ARCHITECTURE")
+    # A 32-bit PowerShell on a 64-bit OS reports PROCESSOR_ARCHITECTURE=x86;
+    # the real machine architecture is in PROCESSOR_ARCHITEW6432 then.
+    $arch = [System.Environment]::GetEnvironmentVariable("PROCESSOR_ARCHITEW6432")
+    if (-not $arch) {
+        $arch = [System.Environment]::GetEnvironmentVariable("PROCESSOR_ARCHITECTURE")
+    }
 
     if ($arch -ne "AMD64") {
         Print-Error "Unsupported architecture: $arch"
@@ -381,9 +398,15 @@ function Install-Binary {
 
         Print-Info "Binary installed successfully to $finalPath"
 
-        # Add to PATH if not already there
+        # Add to PATH if not already there. Compare whole entries, not
+        # substrings — a sibling like ...\Programs\wrustic-old must not count
+        # as this directory being present.
         $userPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
-        if ($userPath -notlike "*$installDir*") {
+        $pathEntries = if ($userPath) { $userPath -split ';' } else { @() }
+        $alreadyPresent = $pathEntries |
+            Where-Object { $_.TrimEnd('\') -eq $installDir.TrimEnd('\') } |
+            Select-Object -First 1
+        if (-not $alreadyPresent) {
             Print-Warn "$installDir is not in your PATH"
             Print-Warn "Adding to user PATH..."
 

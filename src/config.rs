@@ -174,7 +174,18 @@ impl Drop for ConfigLock {
 }
 
 pub fn acquire_lock(paths: &Paths) -> Result<ConfigLock> {
-    fs::create_dir_all(&paths.dir)
+    // Owner-only on Unix, like the files inside it. The mode applies only to
+    // directories this call creates — an existing config dir keeps its
+    // permissions. Windows: same parent-ACL story as `owner_only`.
+    let mut dir_builder = fs::DirBuilder::new();
+    dir_builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        dir_builder.mode(0o700);
+    }
+    dir_builder
+        .create(&paths.dir)
         .with_context(|| format!("creating {}", paths.dir.display()))?;
     // `truncate(false)`: the lock file is a zero-byte marker that outlives the
     // process, and truncating it is not the point — holding it is.

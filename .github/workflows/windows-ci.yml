@@ -16,7 +16,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Clippy
-        run: cargo clippy --all-features --all-targets
+        run: cargo clippy --all-features --all-targets -- -D warnings
 
       # The live tests (#[ignore]) need a restic binary / S3 server / OS
       # credential store and stay out of CI; everything else runs.

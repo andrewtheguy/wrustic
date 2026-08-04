@@ -67,7 +67,8 @@ and passphrase dialog. Every screen is rendered by a corresponding
 This is deliberate — wrustic is small enough that a fat struct + an enum
 discriminator is more legible than a nested per-screen state machine. The
 struct includes:
-- Always-present: `screen`, `paths`, `config`, `cipher`, `server_port`.
+- Always-present: `screen`, `paths`, `config_lock`, `config`, `cipher`,
+  `server_port`.
 - Profile-creation scratch (`new_profile_name`, `local_path`, …) cleared
   whenever `enter_home()` runs.
 - Snapshot browse state: `snapshots`, `repo_session`, `browse_stack`,

@@ -118,9 +118,9 @@ Only one wrustic may hold a given config directory at a time. Startup takes an
 exclusive lock on `<config-dir>/config.lock` via `std::fs::File::try_lock`
 (`flock` on Unix, `LockFileEx` on Windows) and holds it until the process
 exits; a second instance exits with an error instead of racing the first one's
-saves. This protects against lost updates, not against an
-attacker — the lock is advisory and anything that writes `config.toml`
-without taking it still wins.
+saves. This protects against lost updates, not against an attacker — the
+locking protocol is advisory, so anything that writes `config.toml` without
+taking the lock still wins.
 
 ## Backing up `config.toml`
 
@@ -135,8 +135,10 @@ platform-dependent:
 
 **Copy `config.toml` and nothing else.** The directory also holds
 `config.lock`, a zero-byte marker recreated on every launch, and
-`config.toml.tmp`, which exists only for the instant between write and
-rename.
+`config.toml.tmp`, which normally exists only for the instant between
+write and rename (a save killed mid-write can leave one behind). Backups
+must not include either file, and a restore must never copy a
+`config.toml.tmp` back — it may be a truncated half-write.
 
 ```sh
 # Linux
@@ -159,7 +161,18 @@ use:
 wrustic --config-dir ~/Sync/wrustic
 ```
 
-Restoring is the reverse copy. Three things to know:
+If that path is inside a sync service, be aware the config-directory lock
+is per-machine only — file locks do not travel across devices, so two
+wrustics on different machines can still overwrite each other's saves
+(last sync wins, profiles silently lost). Run wrustic against a synced
+directory on only one device at a time.
+
+Restoring is the reverse copy — with wrustic **not running**. A running
+instance holds the whole config in memory and rewrites the file wholesale
+on its next save, silently overwriting what you just restored; the
+config-directory lock guards against other wrustic instances, not against
+you replacing the file under a live one. Exit wrustic, copy the backup
+into place, then start it again. Three more things to know:
 
 - **The file is self-contained.** The scrypt `salt` and `instance_sig` live
   inside `config.toml`, so the file plus your passphrase is everything

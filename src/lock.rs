@@ -145,12 +145,15 @@ fn process_exists(pid: i32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-// Mirrors restic's Windows probe (`lock_windows.go` processExists via
-// os.FindProcess = OpenProcess): a PID we can open a handle to is alive, a PID
-// the kernel refuses to resolve is not.
+// Windows probe via OpenProcess (restic uses the same call through
+// os.FindProcess, `lock_windows.go`): a PID we can open a handle to is alive.
+// ACCESS_DENIED means the process exists but belongs to someone else — the
+// exact analog of EPERM in the Unix probe above, and like there it counts as
+// alive so a live lock is never judged stale. Any other failure (notably
+// ERROR_INVALID_PARAMETER) means the PID doesn't resolve.
 #[cfg(windows)]
 fn process_exists(pid: i32) -> bool {
-    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, GetLastError};
     use windows_sys::Win32::System::Threading::{
         OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
@@ -159,7 +162,7 @@ fn process_exists(pid: i32) -> bool {
     }
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32) };
     if handle.is_null() {
-        return false;
+        return unsafe { GetLastError() } == ERROR_ACCESS_DENIED;
     }
     unsafe { CloseHandle(handle) };
     true

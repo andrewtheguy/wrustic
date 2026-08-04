@@ -194,7 +194,13 @@ impl ReadBackend for S3DataBackend {
         if tpe == FileType::Config {
             return match self.operator.stat("config") {
                 Ok(meta) => {
-                    let length = u32::try_from(meta.content_length()).unwrap_or_default();
+                    let Ok(length) = u32::try_from(meta.content_length()) else {
+                        return Err(RusticError::new(
+                            ErrorKind::Backend,
+                            "S3 backend: file `{path}` is too large for a u32 length",
+                        )
+                        .attach_context("path", "config".to_string()));
+                    };
                     Ok(vec![(Id::default(), length)])
                 }
                 Err(err) if err.kind() == opendal::ErrorKind::NotFound => Ok(Vec::new()),
