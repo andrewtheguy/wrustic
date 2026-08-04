@@ -81,6 +81,12 @@ wrustic TUI*. wrustic must ignore SIGHUP while it holds any lock (and
 restore the default disposition afterwards, so closing the terminal still
 terminates the app normally).
 
+Windows has no SIGHUP: restic probes liveness with `OpenProcess` there
+(`internal/restic/lock_windows.go`) and writes uid/gid 0 into its lock
+files (no numeric user IDs on Windows). wrustic's Windows build mirrors
+both — OpenProcess for the same-host staleness probe, uid/gid 0 in the
+locks it writes, and no signal handling at all.
+
 ### Per-command lock usage (restic 0.19.1)
 
 | Lock taken | Commands |
@@ -164,10 +170,11 @@ read / write / delete a lock file) with one impl per profile type:
   (`GET /locks/` list — API v2 with a v1 fallback —,
   `GET|POST|DELETE /locks/<id>`), same credentials as the profile
 - **S3**: a small opendal S3 client dedicated to `locks/`
-  (`src/s3_backend.rs`). Repository *data* on S3 goes through
-  rustic_backend's opendal backend (fully read/write) — the earlier
-  read-only custom S3 backend was a temporary slim-down from when wrustic
-  had no write support at all.
+  (`src/s3_backend.rs`). Repository *data* on S3 goes through wrustic's
+  own `S3DataBackend` in the same file — a read/write rustic_core backend
+  over `opendal-service-s3`, sharing its operator construction with the
+  lock client. It replaced rustic_backend's generic opendal backend,
+  whose all-services feature pulled in ~150 crates wrustic never uses.
 
 ### Protocol implementation
 

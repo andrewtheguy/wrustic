@@ -97,17 +97,98 @@ cipher."
 
 ## Atomic save
 
-`config::save` writes `config.toml.tmp` with `mode 0600`, then `rename(2)`s
-over `config.toml`. POSIX rename is atomic within a filesystem, so a
-process killed mid-save leaves the previous config intact rather than a
-truncated one. The temp file is in the same directory as the target so
-the rename can't cross filesystems.
+`config::save` writes `config.toml.tmp`, then renames it over `config.toml`.
+POSIX rename is atomic within a filesystem, so a process killed mid-save leaves
+the previous config intact rather than a truncated one; on Windows the same
+call becomes `MoveFileEx` with `MOVEFILE_REPLACE_EXISTING`. The temp file is in
+the same directory as the target so the rename can't cross filesystems.
 
-`mode 0600` here is mostly convention given the single-user scope — the
-practical attacks the encryption is built against involve the file
-leaving the device (cloud sync of a config dir, included in a backup,
-copied to another machine) rather than another local account reading it
-in place. Disk encryption is your responsibility.
+The temp file is created with `mode 0600` on Unix. Windows has no chmod: a new
+file inherits the ACL of its parent, and the config directory sits under
+`%APPDATA%`, which already grants only the owner (plus SYSTEM and
+Administrators). Either way this is mostly convention given the single-user
+scope — the practical attacks the encryption is built against involve the file
+leaving the device (cloud sync of a config dir, included in a backup, copied to
+another machine) rather than another local account reading it in place. Disk
+encryption is your responsibility.
+
+## Config-directory lock
+
+Only one wrustic may hold a given config directory at a time. Startup takes an
+exclusive lock on `<config-dir>/config.lock` via `std::fs::File::try_lock`
+(`flock` on Unix, `LockFileEx` on Windows) and holds it until the process
+exits; a second instance exits with an error instead of racing the first one's
+saves. This protects against lost updates, not against an attacker — the
+locking protocol is advisory, so anything that writes `config.toml` without
+taking the lock still wins.
+
+## Backing up `config.toml`
+
+The config directory is `dirs::config_dir()` + `wrustic`, so its location is
+platform-dependent:
+
+| OS | Config directory |
+|---|---|
+| Linux | `$XDG_CONFIG_HOME/wrustic`, else `~/.config/wrustic` |
+| macOS | `~/Library/Application Support/wrustic` |
+| Windows | `%APPDATA%\wrustic` (`C:\Users\<you>\AppData\Roaming\wrustic`) |
+
+**Copy `config.toml` and nothing else.** The directory also holds
+`config.lock`, a zero-byte marker recreated on every launch, and
+`config.toml.tmp`, which normally exists only for the instant between
+write and rename (a save killed mid-write can leave one behind). Backups
+must not include either file, and a restore must never copy a
+`config.toml.tmp` back — it may be a truncated half-write.
+
+```sh
+# Linux
+cp "${XDG_CONFIG_HOME:-$HOME/.config}/wrustic/config.toml" ~/backups/
+
+# macOS
+cp "$HOME/Library/Application Support/wrustic/config.toml" ~/backups/
+```
+
+```powershell
+# Windows
+Copy-Item "$env:APPDATA\wrustic\config.toml" "$HOME\backups\"
+```
+
+To avoid the per-platform paths entirely, keep the config somewhere
+path-stable and point wrustic at it — the directory is created on first
+use:
+
+```sh
+wrustic --config-dir ~/Sync/wrustic
+```
+
+If that path is inside a sync service, be aware the config-directory lock
+is per-machine only — file locks do not travel across devices, so two
+wrustics on different machines can still overwrite each other's saves
+(last sync wins, profiles silently lost). Run wrustic against a synced
+directory on only one device at a time.
+
+Restoring is the reverse copy — with wrustic **not running**. A running
+instance holds the whole config in memory and rewrites the file wholesale
+on its next save, silently overwriting what you just restored; the
+config-directory lock guards against other wrustic instances, not against
+you replacing the file under a live one. Exit wrustic, copy the backup
+into place, then start it again. Three more things to know:
+
+- **The file is self-contained.** The scrypt `salt` and `instance_sig` live
+  inside `config.toml`, so the file plus your passphrase is everything
+  needed to decrypt. There is no separate key material to lose.
+- **The keychain entry is not in the file.** If you use keychain
+  auto-unlock, that credential lives in the OS credential store. On a
+  restored machine you enter the passphrase manually, then opt back into
+  saving it to that machine's keychain.
+- **There are no migrations.** `load` rejects any file whose `version` is
+  not the one the binary expects, rather than upgrading it, so note which
+  wrustic version a backup came from.
+
+Copying while wrustic is running is safe to *read* — saves are atomic
+(write temp, rename), so a copy sees either the old file or the new one,
+never a half-written one. The lock file guards concurrent writers, not
+readers.
 
 ## Is `config.toml` safe to back up unencrypted?
 

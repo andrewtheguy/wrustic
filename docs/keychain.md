@@ -6,7 +6,8 @@ subsequent launches unlock automatically without prompting.
 ## Compile-time feature
 
 Keychain support is behind the `keychain` Cargo feature and is **not enabled by
-default**. The prebuilt macOS binary ships with it; the Linux binaries do not.
+default**. The prebuilt macOS and Windows binaries ship with it; the Linux
+binaries do not.
 
 ```sh
 cargo build --release --features keychain
@@ -14,7 +15,9 @@ cargo build --release --features keychain
 
 The feature uses `keyring-core` with platform-specific credential stores:
 `apple-native-keyring-store` on macOS, `dbus-secret-service-keyring-store` on
-Linux.
+Linux, `windows-native-keyring-store` on Windows. Windows Credential Manager
+is part of the OS — no build or runtime dependency to install — which is why
+the Windows build can ship with the feature enabled, like macOS.
 
 ### Why not enabled on Linux by default
 
@@ -75,3 +78,4 @@ Platform credential stores (via `keyring-core`):
 |----------|-------------|---------|
 | macOS    | `apple-native-keyring-store` | macOS Keychain (Security.framework) |
 | Linux    | `dbus-secret-service-keyring-store` | D-Bus secret-service (GNOME Keyring / KDE Wallet) |
+| Windows  | `windows-native-keyring-store` | Windows Credential Manager ("Generic Credentials") |
