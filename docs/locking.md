@@ -95,23 +95,28 @@ both map to non-exclusive today.
 
 ## What writes wrustic can safely support
 
-Restic's own table above *is* the safety map. Tiered by lock type:
+Restic's own table above *is* the safety map. Tiered by lock type, with
+each operation's implementation status (see Phases below for the history).
+Implemented today: **forget / delete snapshots** (`repo::delete_snapshot`,
+the TUI delete flow) and — outside these tables because it takes no lock —
+**unlock** (`repo::unlock`, native stale-lock removal behind the TUI's `u`
+shortcut, plus the pre-spawn unstick in `restic::run_unsticking_locks`).
 
 **Tier 1 — non-exclusive lock (coexists with running restic backups):**
 
-| Operation | rustic_core API | Why safe |
-|---|---|---|
-| backup | `Repository::backup` | pure append: packs → index → snapshot, the ordering the design doc requires for concurrent-append safety |
-| copy into repo | `Repository::copy` (dest side) | append-only |
-| key add | `Repository::add_key` | writes one new key file |
+| Operation | rustic_core API | Status | Why safe |
+|---|---|---|---|
+| backup | `Repository::backup` | planned — phase 3, next up | pure append: packs → index → snapshot, the ordering the design doc requires for concurrent-append safety |
+| copy into repo | `Repository::copy` (dest side) | planned — after backup | append-only |
+| key add | `Repository::add_key` | planned — after backup | writes one new key file |
 
 **Tier 2 — exclusive lock (blocks restic briefly; fully safe):**
 
-| Operation | rustic_core API |
-|---|---|
-| forget / delete snapshots | `delete_snapshots` |
-| tag / description edits | `save_snapshots` + `delete_snapshots` |
-| key remove | `delete_key` |
+| Operation | rustic_core API | Status |
+|---|---|---|
+| forget / delete snapshots | `delete_snapshots` | **implemented** — `repo::delete_snapshot` (phase 2) |
+| tag / description edits | `save_snapshots` + `delete_snapshots` | not planned yet |
+| key remove | `delete_key` | not planned yet |
 
 These have tiny critical sections (seconds); a concurrent restic command
 gets the ordinary "repository is already locked" error it is designed to
