@@ -21,8 +21,10 @@ flat `App` struct.
 
 It is intentionally **not** a restic replacement:
 - Reads go through `rustic_core` directly (no subprocess).
-- Write operations that wrustic exposes (only `forget` today) shell out to the
-  `restic` CLI rather than reimplementing them. Anything more complex (backup,
+- The write operations wrustic exposes (snapshot delete + stale-lock
+  removal today) are native too, guarded by restic-compatible repository
+  locks (docs/locking.md) so they coexist safely with concurrent restic
+  processes. Anything without a native + locked implementation (backup,
   prune, init, key add) is out of scope — use the `restic` CLI for those.
 
 ## Runtime shape
@@ -122,33 +124,40 @@ No server is started. `passphrase.rs` exposes
 `passphrase_policy_error` for direct use by `app.rs`. Key derivation runs
 synchronously on `Screen::PassphraseDerivingKey`.
 
-## Repository access (`src/repo.rs`, `src/restic.rs`)
+## Repository access (`src/repo.rs`, `src/lock.rs`)
 
-`repo.rs` is the read path through `rustic_core`:
+`repo.rs` is the rustic_core path — reads and the (lock-guarded) writes:
 - `open_indexed(profile)` — opens with the lightweight id-only index, used
   for listing snapshots and walking trees.
 - `open_indexed_full(profile)` — opens with the full blob index, used by
   the share dialog (needs to read blob bytes).
 - `load_snapshots`, `list_tree`, `get_file_details`, `stream_file_content`,
   `preview_snapshot_contents`, `snapshot_root_tree`.
+- `delete_snapshot(profile, id)` — native snapshot delete
+  (`Repository::delete_snapshots`) under an exclusive restic-compatible
+  repository lock. Full 64-char hex ids are enforced so a prefix can never
+  match the wrong snapshot.
+- `unlock(profile)` — native stale-lock removal, offered with `u` on the
+  delete-error screen when `lock::is_lock_error()` matches the failure.
+  Only locks that are provably dead are removed (older than restic's
+  30-minute staleness timeout, or same-host with a gone PID); live locks —
+  including a running restic's — are left alone. On success the delete
+  flow re-runs from the confirmation step.
 
-`restic.rs` is the write path (via subprocess):
-- `detect()` — checks `restic version` is on PATH; surfaced to the TUI in
-  the verify dialog.
-- `forget(profile, snapshot_id)` — `restic forget <id>` (snapshot delete).
-- `diff(profile, a, b)` — `restic diff` parser; the result populates the
-  compare screen.
-- `snapshot_details_json` — `restic snapshots --json <id>` for the delete
-  confirmation screen.
-- `unlock(profile)` — `restic unlock`, offered with `u` on the delete-error
-  screen when `is_lock_error()` matches the failure. restic only removes
-  locks it can prove are dead, so this is safe to trigger from the TUI; on
-  success the delete flow re-runs from the confirmation step.
+`lock.rs` implements restic 0.19's cooperative locking protocol so native
+writes and concurrent restic processes block each other instead of
+corrupting the repo — lock files under `locks/` are written/read in
+restic's exact format (encrypted + zstd), acquisition/refresh timing
+matches restic's constants, and while a lock is held the process ignores
+SIGHUP (restic's staleness probe would otherwise kill the TUI). See
+docs/locking.md for the full design. rustic_core itself is lock-oblivious,
+so every native write MUST hold a `lock::RepoLock` — that discipline lives
+in `repo.rs`, not in rustic_core.
 
-The split is intentional: anything that touches the on-disk repo state
-goes through the CLI so we don't have to track invariants in two places. If
-a write needs to grow beyond what `restic` itself can do, that's a signal
-the work belongs upstream, not in wrustic.
+The restic binary is no longer used at runtime. Write operations without a
+native + locked implementation (init, backup, prune, key management) are
+out of scope in the TUI — use the restic CLI for those, as the dev flows
+do.
 
 ## Verification and dev flow
 

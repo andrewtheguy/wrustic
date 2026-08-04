@@ -133,17 +133,19 @@ where the real blast radius lives. No plan to go native here.
 (`repofile/keyfile.rs:324`): `encrypt` (32-byte AES-256 key) and `mac.k`
 / `mac.r` (Poly1305-AES MAC keys). rustic_core's own
 `encrypt_data`/`decrypt_data` are `pub(crate)` and not reachable, so
-wrustic implements the small envelope itself:
+wrustic implements the small envelope itself (in `src/lock.rs`, using the
+same `aes256ctr_poly1305aes` crate rustic_core uses — no hand-rolled
+primitives):
 
 - encrypted file = `nonce(16) ‖ AES-256-CTR(ciphertext) ‖ Poly1305-AES tag(16)`
   (tag over the ciphertext, mask = AES(k, nonce))
-- repo v2: plaintext is zstd-compressed with restic's unpacked-file
-  framing; repo v1: raw JSON (mirror what rustic_core's
-  `backend/decrypt.rs` does — the implementation must match it exactly)
+- repo v2: plaintext is `0x02 ‖ zstd(JSON)`; repo v1: raw JSON —
+  distinguished on read by the first decrypted byte, exactly like
+  rustic_core's `backend/decrypt.rs`
 
 An alternative — carrying a cargo `[patch]` fork of rustic_core that adds
-`FileType::Lock` — was considered and rejected for now: the envelope is
-~100 lines, while a fork is a standing maintenance cost.
+`FileType::Lock` — was considered and rejected: the envelope is ~60
+lines, while a fork is a standing maintenance cost.
 
 ### Backend access to `locks/`
 
@@ -151,15 +153,16 @@ rustic_backend's backends are `FileType`-addressed and can't reach
 `locks/`, so wrustic carries a tiny `LockBackend` abstraction (list /
 read / write / delete a lock file) with one impl per profile type:
 
-- **local**: `std::fs` on `<repo>/locks/`
+- **local**: `std::fs` on `<repo>/locks/` (write-then-rename so other
+  processes never observe a partial lock file)
 - **REST**: direct HTTP against the rest-server lock endpoints
-  (`GET /locks/` list, `GET|POST|DELETE /locks/<id>`), same credentials
-  as the profile
-- **S3**: extend `src/s3_backend.rs` with lock object operations. The
-  backend's rustic-facing `WriteBackend` impl stays read-only; lock
-  writes go through separate methods that are not part of that trait, so
-  the "repository writes must use restic CLI" invariant is narrowed to
-  "repository *data* writes" — locks are coordination metadata, not data.
+  (`GET /locks/` list — API v2 with a v1 fallback —,
+  `GET|POST|DELETE /locks/<id>`), same credentials as the profile
+- **S3**: a small opendal S3 client dedicated to `locks/`
+  (`src/s3_backend.rs`). Repository *data* on S3 goes through
+  rustic_backend's opendal backend (fully read/write) — the earlier
+  read-only custom S3 backend was a temporary slim-down from when wrustic
+  had no write support at all.
 
 ### Protocol implementation
 
@@ -182,29 +185,28 @@ A `RepoLock` guard type that mirrors restic exactly:
 
 ## Phases
 
-1. **Lock module** (`src/lock.rs` + `LockBackend` impls): everything
-   above, with unit tests against fixtures and a round-trip test that
-   restic itself can read wrustic's lock files (dev-flow: create lock via
-   wrustic, run `restic forget --dry-run` expecting the lock error… write
-   ops in dev flows still use the restic CLI per CLAUDE.md until this
-   lands).
-2. **Native forget/delete — immediate next step once locks work**:
-   replace the delete flow's `restic forget` subprocess with
-   `Repository::delete_snapshots` under a native exclusive lock, and the
-   `u`-shortcut's `restic unlock` subprocess with native stale-lock
-   removal. The restic/rustic metadata cross-check and the
-   `restic snapshots --json` fetch go away with it — the delete path
-   becomes rustic-only, and the restic binary is no longer needed at
-   runtime for any current wrustic feature.
+1. **Lock module** — DONE (`src/lock.rs` + `LockBackend` impls in
+   `src/lock.rs`/`src/s3_backend.rs`). Unit tests cover the envelope,
+   restic's JSON schema, conflict rules, and staleness; the live
+   integration test (`live_native_lock_and_delete_interop_with_restic`,
+   `cargo test -- --ignored`, needs restic on PATH) proves interop from
+   restic's side: `restic forget` is blocked by our exclusive lock with
+   "already locked" (so restic lists *and decrypts* our lock files), and
+   `restic unlock` leaves our fresh lock in place.
+2. **Native forget/delete** — DONE. The delete flow's `restic forget`
+   subprocess became `Repository::delete_snapshots` under a native
+   exclusive lock (`repo::delete_snapshot`), and the `u` shortcut's
+   `restic unlock` became native stale-lock removal (`repo::unlock`).
+   The restic/rustic metadata cross-check and `restic snapshots --json`
+   fetch went away with it; `src/restic.rs` is deleted and the restic
+   binary is no longer needed at runtime for any wrustic feature.
 3. **Native backup** under a non-exclusive lock (the headline win:
    wrustic backups running concurrently with restic cron backups), then
-   copy / key add as wanted.
+   copy / key add as wanted. This phase also needs the
+   refreshability-abort rule (stop the operation when the lock could not
+   be refreshed for 22.5 minutes) — deferred so far because delete's
+   critical section lasts seconds.
 
 Non-goals: native prune/repair/migrate (Tier 3), multi-host clock-skew
 mitigation beyond what restic itself does, and any restic < 0.19
 compatibility.
-
-Once phase 2 lands, the CLAUDE.md rule "use restic cli only for write
-operations" changes to: *native writes are allowed for operations covered
-by the lock module; prune/repair/migrate and dev-flow repo setup stay on
-the restic CLI.*

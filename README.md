@@ -16,8 +16,9 @@ backlog item.
 - **Snapshot browsing**: list snapshots, navigate the file tree, view file
   details, and compare two snapshots side-by-side
 - **Snapshot filtering**: narrow by host, tag, or path
-- **Snapshot deletion** via `restic forget`; when the repo is locked, `u` on
-  the error screen runs `restic unlock` and retries
+- **Snapshot deletion**, native and guarded by a restic-compatible exclusive
+  repository lock; when the repo is locked, `u` on the error screen removes
+  stale locks (live ones are kept) and retries
 - **File sharing**: one-time signed download URLs served from localhost
 - **Keyboard and mouse navigation**: Vim-style keys, arrow keys, PgUp/PgDn,
   mouse click/scroll; `--no-mouse` to disable
@@ -114,13 +115,16 @@ Then in the TUI:
 ## Relationship to the `restic` binary
 
 `wrustic` does **not** call out to the `restic` executable for anything it
-supports — `rustic_core` reads the on-disk repository format natively. You do
-not need `restic` installed to run `wrustic`.
+supports — `rustic_core` reads the on-disk repository format natively, and
+the write operations wrustic exposes (snapshot delete, stale-lock removal)
+are native too, protected by restic-compatible repository locks
+(docs/locking.md). You do not need `restic` installed to run `wrustic`.
 
 You *will* want `restic` (>= 0.18.1) on your `$PATH` for development. Use it
 for:
 
-- **All write operations** (init, backup, forget, prune, copy, key management, …).
+- **Write operations wrustic doesn't expose** (init, backup, prune, copy, key
+  management, …).
 - Any read operation not yet wired up in the TUI.
 
 All dev/test artifacts in the snippets below go under the project's `./tmp/`

@@ -12,7 +12,8 @@
 
 ## Ideas (Currently out of scope but worth considering for the future)
 
-- Native write operations via rustic_core (backup, forget, etc.) if
-  rustic_core's write path matures to production stability, removing the
-  dependency on the restic CLI entirely
+- More native write operations via rustic_core under the restic-compatible
+  lock module (docs/locking.md) — snapshot delete and unlock are already
+  native; next is backup under a non-exclusive lock, then copy / key add.
+  prune/repair/migrate stay on the restic CLI
 - Search text file contents across snapshots (requires indexing and is a much larger project)

@@ -1,32 +1,31 @@
-use std::sync::{Arc, OnceLock};
+//! S3 access to the repository's `locks/` directory.
+//!
+//! Repository data on S3 goes through rustic_backend's opendal backend
+//! (`opendal:s3:` in `repo::build_backends`), which is fully read/write.
+//! Lock files are outside rustic_core's `FileType`-addressed world entirely
+//! (its enum has no `Lock` variant), so this small client reaches the
+//! `locks/` prefix directly. See docs/locking.md.
 
-use bytes::Bytes;
+use std::sync::OnceLock;
+
+use anyhow::{Context, Result, anyhow};
 use opendal::{
-    Metadata,
     blocking::Operator,
     layers::RetryLayer,
-    options::{ListOptions, ReadOptions},
+    options::ListOptions,
     services::S3,
-};
-use rustic_core::{
-    ErrorKind, FileType, Id, ReadBackend, RepositoryBackends, RusticError, RusticResult,
-    WriteBackend,
 };
 use tokio::runtime::Runtime;
 
+use crate::lock::LockBackend;
+
 const DEFAULT_RETRIES: usize = 5;
 
-/// Native, read-only S3 repository backend.
-///
-/// `rustic_core` currently models repository backends through `WriteBackend`,
-/// even when callers only open and read a repository. The mutation methods
-/// below therefore reject every operation; wrustic uses restic CLI for writes.
-#[derive(Clone, Debug)]
-pub(crate) struct S3ReadOnlyBackend {
+pub(crate) struct S3LockBackend {
     operator: Operator,
 }
 
-impl S3ReadOnlyBackend {
+impl S3LockBackend {
     pub(crate) fn new(
         endpoint: &str,
         bucket: &str,
@@ -34,7 +33,7 @@ impl S3ReadOnlyBackend {
         root: &str,
         access_key: &str,
         secret_key: &str,
-    ) -> RusticResult<Self> {
+    ) -> Result<Self> {
         let mut builder = S3::default()
             .bucket(bucket)
             .region(region)
@@ -46,7 +45,7 @@ impl S3ReadOnlyBackend {
         }
 
         let operator = opendal::Operator::new(builder)
-            .map_err(|err| backend_error("Creating the S3 backend failed.", err))?
+            .context("creating the S3 lock backend")?
             .layer(
                 RetryLayer::new()
                     .with_max_times(DEFAULT_RETRIES)
@@ -55,133 +54,53 @@ impl S3ReadOnlyBackend {
             .finish();
 
         let _guard = runtime().enter();
-        let operator = Operator::new(operator)
-            .map_err(|err| backend_error("Creating the blocking S3 backend failed.", err))?;
+        let operator =
+            Operator::new(operator).context("creating the blocking S3 lock backend")?;
         Ok(Self { operator })
     }
-
-    fn path(&self, tpe: FileType, id: &Id) -> String {
-        let hex_id = id.to_hex();
-        match tpe {
-            FileType::Config => "config".to_string(),
-            FileType::Pack => format!("{}/{}/{}", tpe.dirname(), &hex_id[..2], &hex_id[..]),
-            _ => format!("{}/{}", tpe.dirname(), &hex_id[..]),
-        }
-    }
-
-    fn write_rejected() -> Box<RusticError> {
-        RusticError::new(
-            ErrorKind::Unsupported,
-            "wrustic's native S3 backend is read-only; repository writes must use restic CLI.",
-        )
-    }
 }
 
-impl From<S3ReadOnlyBackend> for RepositoryBackends {
-    fn from(backend: S3ReadOnlyBackend) -> Self {
-        Self::new(Arc::new(backend), None)
-    }
-}
-
-impl ReadBackend for S3ReadOnlyBackend {
-    fn location(&self) -> String {
-        let info = self.operator.info();
-        format!("opendal:{}:{}", info.scheme(), info.name())
-    }
-
-    fn list_with_size(&self, tpe: FileType) -> RusticResult<Vec<(Id, u32)>> {
-        if tpe == FileType::Config {
-            return match self.operator.stat("config") {
-                Ok(metadata) => Ok(vec![(Id::default(), object_size(&metadata, "config")?)]),
-                Err(err) if err.kind() == opendal::ErrorKind::NotFound => Ok(Vec::new()),
-                Err(err) => Err(backend_error("Reading S3 config metadata failed.", err)),
-            };
-        }
-
-        let prefix = format!("{}/", tpe.dirname());
+impl LockBackend for S3LockBackend {
+    fn list(&self) -> Result<Vec<(String, u64)>> {
         let options = ListOptions {
             recursive: true,
             ..Default::default()
         };
         let entries = self
             .operator
-            .lister_options(&prefix, options)
-            .map_err(|err| backend_error("Listing S3 repository objects failed.", err))?;
-
-        let mut files = Vec::new();
+            .lister_options("locks/", options)
+            .map_err(|err| anyhow!("listing S3 locks: {err}"))?;
+        let mut out = Vec::new();
         for result in entries {
-            let entry = result.map_err(|err| {
-                backend_error("Reading an S3 repository listing entry failed.", err)
-            })?;
-            if !entry.metadata().is_file() {
-                continue;
+            let entry = result.map_err(|err| anyhow!("reading S3 lock listing: {err}"))?;
+            if entry.metadata().is_file() {
+                out.push((entry.name().to_string(), entry.metadata().content_length()));
             }
-            let Some(id) = Id::parse_some(entry.name(), tpe) else {
-                continue;
-            };
-            files.push((id, object_size(entry.metadata(), entry.path())?));
         }
-        Ok(files)
+        Ok(out)
     }
 
-    fn read_full(&self, tpe: FileType, id: &Id) -> RusticResult<Bytes> {
-        let path = self.path(tpe, id);
-        Ok(self
-            .operator
-            .read(&path)
-            .map_err(|err| backend_error("Reading an S3 repository object failed.", err))?
-            .to_bytes())
-    }
-
-    fn read_partial(
-        &self,
-        tpe: FileType,
-        id: &Id,
-        _cacheable: bool,
-        offset: u32,
-        length: u32,
-    ) -> RusticResult<Bytes> {
-        let path = self.path(tpe, id);
-        let start = u64::from(offset);
-        let options = ReadOptions {
-            range: (start..start + u64::from(length)).into(),
-            ..Default::default()
-        };
-        Ok(self
-            .operator
-            .read_options(&path, options)
-            .map_err(|err| backend_error("Reading part of an S3 repository object failed.", err))?
-            .to_bytes())
-    }
-
-    fn warmup_path(&self, tpe: FileType, id: &Id) -> String {
-        let root = self.operator.info().root().trim_matches('/').to_string();
-        let relative = self.path(tpe, id);
-        if root.is_empty() {
-            relative
-        } else {
-            format!("{root}/{relative}")
+    fn read(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        match self.operator.read(&format!("locks/{name}")) {
+            Ok(buf) => Ok(Some(buf.to_bytes().to_vec())),
+            Err(err) if err.kind() == opendal::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(anyhow!("reading S3 lock {name}: {err}")),
         }
     }
-}
 
-impl WriteBackend for S3ReadOnlyBackend {
-    fn create(&self) -> RusticResult<()> {
-        Err(Self::write_rejected())
+    fn write(&self, name: &str, data: &[u8]) -> Result<()> {
+        self.operator
+            .write(&format!("locks/{name}"), data.to_vec())
+            .map_err(|err| anyhow!("writing S3 lock {name}: {err}"))?;
+        Ok(())
     }
 
-    fn write_bytes(
-        &self,
-        _tpe: FileType,
-        _id: &Id,
-        _cacheable: bool,
-        _buf: Bytes,
-    ) -> RusticResult<()> {
-        Err(Self::write_rejected())
-    }
-
-    fn remove(&self, _tpe: FileType, _id: &Id, _cacheable: bool) -> RusticResult<()> {
-        Err(Self::write_rejected())
+    fn remove(&self, name: &str) -> Result<()> {
+        match self.operator.delete(&format!("locks/{name}")) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == opendal::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(anyhow!("removing S3 lock {name}: {err}")),
+        }
     }
 }
 
@@ -193,18 +112,4 @@ fn runtime() -> &'static Runtime {
             .build()
             .expect("building the S3 runtime")
     })
-}
-
-fn object_size(metadata: &Metadata, path: &str) -> RusticResult<u32> {
-    metadata.content_length().try_into().map_err(|err| {
-        RusticError::with_source(
-            ErrorKind::Backend,
-            format!("S3 repository object `{path}` is too large to list."),
-            err,
-        )
-    })
-}
-
-fn backend_error(message: &'static str, source: opendal::Error) -> Box<RusticError> {
-    RusticError::with_source(ErrorKind::Backend, message, source)
 }

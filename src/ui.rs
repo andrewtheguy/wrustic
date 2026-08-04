@@ -89,8 +89,8 @@ fn bottom_bar_text(app: &App) -> &'static str {
             "y confirm delete  Up/Dn scroll  PgUp/PgDn page  r raw JSON  n/Esc cancel"
         }
         Screen::SnapshotDeleteError(msg) => {
-            if crate::restic::is_lock_error(msg) {
-                "u run `restic unlock` and retry  any other key to continue"
+            if crate::lock::is_lock_error(msg) {
+                "u remove stale locks and retry  any other key to continue"
             } else {
                 "any key to continue"
             }
@@ -126,7 +126,7 @@ fn bottom_bar_text(app: &App) -> &'static str {
         | Screen::Verifying
         | Screen::SnapshotDeleting
         | Screen::SnapshotDeleteLoading
-        | Screen::ResticUnlocking
+        | Screen::Unlocking
         | Screen::SnapshotCompareLoading => "working…",
         Screen::CreateProfileName => "type  Enter submit  Esc cancel",
         Screen::BackendChoice => "Up/Dn move  PgUp/PgDn page  Enter pick  Esc back",
@@ -214,7 +214,7 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
         Screen::SnapshotFilterValue => render_filter_value(frame, app, area),
         Screen::SnapshotDeleteConfirm => render_snapshot_delete_confirm(frame, &mut *app, area),
         Screen::SnapshotDeleting => {
-            let para = Paragraph::new("Running `restic forget`…")
+            let para = Paragraph::new("Deleting snapshot under an exclusive repository lock…")
                 .block(Block::bordered().title("Deleting snapshot"));
             frame.render_widget(para, area);
         }
@@ -224,10 +224,10 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
             frame.render_widget(para, area);
         }
         Screen::SnapshotDeleteError(msg) => {
-            let body = if crate::restic::is_lock_error(msg) {
+            let body = if crate::lock::is_lock_error(msg) {
                 format!(
-                    "{msg}\n\nPress u to run `restic unlock` (removes stale locks only) \
-                     and retry, or any other key to return to the snapshot list."
+                    "{msg}\n\nPress u to remove stale repository locks (live locks are \
+                     kept) and retry, or any other key to return to the snapshot list."
                 )
             } else {
                 format!("{msg}\n\nPress any key to return to the snapshot list.")
@@ -238,8 +238,8 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
                 .block(Block::bordered().title("Delete unavailable"));
             frame.render_widget(para, area);
         }
-        Screen::ResticUnlocking => {
-            let para = Paragraph::new("Running `restic unlock` — removing stale locks…")
+        Screen::Unlocking => {
+            let para = Paragraph::new("Removing stale repository locks…")
                 .block(Block::bordered().title("Unlocking repository"));
             frame.render_widget(para, area);
         }
@@ -1140,19 +1140,13 @@ fn render_snapshot_delete_confirm(frame: &mut Frame, app: &mut App, area: Rect) 
     if let Some(tags) = tags {
         summary.push_str(&format!("\nTags: {tags}"));
     }
-    if let Some(sum) = app.delete_details_parsed.as_ref().and_then(|p| p.summary.as_ref()) {
-        let files = sum
-            .total_files_processed
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "?".into());
-        let bytes = sum
-            .total_bytes_processed
-            .map(human_size)
-            .unwrap_or_else(|| "?".into());
+    if let Some(info) = info {
+        let files = info.files.map(|n| n.to_string()).unwrap_or_else(|| "?".into());
+        let bytes = info.bytes.map(human_size).unwrap_or_else(|| "?".into());
         summary.push_str(&format!("\n\nContents: {files} files, {bytes}"));
     }
     summary.push_str(&format!(
-        "\n\nThis runs `restic forget {id}` (no prune)."
+        "\n\nThis deletes snapshot {id} under an exclusive repository lock (no prune)."
     ));
     let header_para = Paragraph::new(summary)
         .style(Style::new().fg(Color::Yellow))
@@ -1160,10 +1154,10 @@ fn render_snapshot_delete_confirm(frame: &mut Frame, app: &mut App, area: Rect) 
     frame.render_widget(header_para, header);
 
     if app.delete_show_json {
-        let raw = app.delete_details_raw.as_deref().unwrap_or("(no raw JSON)");
+        let raw = info.map(|i| i.raw_json.as_str()).unwrap_or("(no raw JSON)");
         let raw_para = Paragraph::new(raw)
             .wrap(Wrap { trim: false })
-            .block(Block::bordered().title("Raw `restic snapshots --json`"));
+            .block(Block::bordered().title("Raw snapshot JSON"));
         frame.render_widget(raw_para, body);
         return;
     }

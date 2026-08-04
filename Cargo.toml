@@ -5,19 +5,28 @@ edition = "2024"
 
 [dependencies]
 aes-gcm = "0.10"
+# Same crate rustic_core uses for restic's AEAD (AES-256-CTR + Poly1305-AES);
+# needed to write/read restic-compatible lock files (see docs/locking.md).
+aes256ctr_poly1305aes = "0.2"
 anyhow = "1"
 base64 = "0.22"
 bytes = "1"
 dirs = "6"
+gethostname = "1"
 hmac = "0.13"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
-jiff = "0.2"
+jiff = { version = "0.2", features = ["serde"] }
+libc = "0.2"
 opendal = { version = "0.57.0", default-features = false, features = ["blocking", "layers-retry", "reqwest-rustls-tls", "services-s3"] }
 rand = "0.10.1"
+# Direct HTTP access to the rest-server `locks/` endpoints (rustic_backend's
+# REST backend is FileType-addressed and cannot reach them). Blocking client;
+# same features rustic_backend already compiles reqwest with.
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 ratatui = "0.30.0"
-rustic_backend = { version = "0.6.2", default-features = false, features = ["rest"] }
+rustic_backend = { version = "0.6.2", default-features = false, features = ["rest", "opendal"] }
 rustic_core = { version = "0.12.0", default-features = false }
 scrypt = { version = "0.12", default-features = false }
 serde = { version = "1", features = ["derive"] }
@@ -27,6 +36,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync"
 toml = "1"
 tui-input = { version = "0.15", default-features = false, features = ["crossterm"] }
 url = "2"
+zstd = "0.13"
 keyring-core = { version = "1", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
