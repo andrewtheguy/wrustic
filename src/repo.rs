@@ -729,6 +729,10 @@ mod tests {
     fn live_native_lock_and_delete_interop_with_restic() {
         use std::process::Command;
 
+        // Acquires RepoLocks — serialize with other acquiring tests (SIGHUP
+        // disposition is process-global).
+        let _guard = lock::test_acquire_guard();
+
         let root = std::path::PathBuf::from("tmp")
             .join(format!("lock-it-{}", std::process::id()));
         let repo_path = root.join("repo");

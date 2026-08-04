@@ -444,7 +444,7 @@ impl RepoLock {
         backend: Arc<dyn LockBackend>,
         crypto: RepoCrypto,
     ) -> Result<Self> {
-        Self::acquire(backend, crypto, true)
+        Self::acquire(backend, crypto, true, REFRESH_INTERVAL)
     }
 
     #[allow(dead_code)] // for append-only operations (native backup, phase 3)
@@ -452,10 +452,26 @@ impl RepoLock {
         backend: Arc<dyn LockBackend>,
         crypto: RepoCrypto,
     ) -> Result<Self> {
-        Self::acquire(backend, crypto, false)
+        Self::acquire(backend, crypto, false, REFRESH_INTERVAL)
     }
 
-    fn acquire(backend: Arc<dyn LockBackend>, crypto: RepoCrypto, exclusive: bool) -> Result<Self> {
+    // The refresh interval is a protocol constant; overriding it exists only
+    // so tests can watch a refresh happen without waiting five minutes.
+    #[cfg(test)]
+    fn acquire_exclusive_with_refresh_interval(
+        backend: Arc<dyn LockBackend>,
+        crypto: RepoCrypto,
+        refresh_interval: Duration,
+    ) -> Result<Self> {
+        Self::acquire(backend, crypto, true, refresh_interval)
+    }
+
+    fn acquire(
+        backend: Arc<dyn LockBackend>,
+        crypto: RepoCrypto,
+        exclusive: bool,
+        refresh_interval: Duration,
+    ) -> Result<Self> {
         check_for_other_locks(backend.as_ref(), &crypto, None, exclusive)?;
         sighup_ignore_acquire();
         let name = match Self::write_then_recheck(backend.as_ref(), &crypto, exclusive) {
@@ -473,7 +489,9 @@ impl RepoLock {
         let refresher = {
             let backend = Arc::clone(&backend);
             let shared = Arc::clone(&shared);
-            std::thread::spawn(move || refresh_loop(&backend, &crypto, exclusive, &shared))
+            std::thread::spawn(move || {
+                refresh_loop(&backend, &crypto, exclusive, refresh_interval, &shared);
+            })
         };
         Ok(Self { backend, shared, refresher: Some(refresher) })
     }
@@ -516,13 +534,14 @@ fn refresh_loop(
     backend: &Arc<dyn LockBackend>,
     crypto: &RepoCrypto,
     exclusive: bool,
+    refresh_interval: Duration,
     shared: &Arc<(Mutex<LockShared>, Condvar)>,
 ) {
     let (state, cv) = &**shared;
     loop {
         let guard = state.lock().expect("lock state poisoned");
         let (guard, timeout) = cv
-            .wait_timeout_while(guard, REFRESH_INTERVAL, |s| !s.stop)
+            .wait_timeout_while(guard, refresh_interval, |s| !s.stop)
             .expect("lock state poisoned");
         if !timeout.timed_out() {
             return; // stop requested
@@ -669,23 +688,45 @@ fn sighup_ignore_release() {
     }
 }
 
+// Signal disposition and LOCKS_HELD are process-global, and the test harness
+// runs tests on parallel threads — so every test (in any module) that
+// acquires a RepoLock must hold this guard, or the SIGHUP assertions would
+// race with other acquiring tests.
+#[cfg(test)]
+pub(crate) fn test_acquire_guard() -> std::sync::MutexGuard<'static, ()> {
+    static ACQUIRING: Mutex<()> = Mutex::new(());
+    ACQUIRING.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
     use super::*;
 
+    type WriteHook = Box<dyn FnOnce(&MemLockBackend) + Send>;
+
     struct MemLockBackend {
         files: Mutex<HashMap<String, Vec<u8>>>,
+        // Fired once, right after the next write completes — lets a test
+        // inject a competing lock inside acquisition's 200 ms grace window.
+        on_write: Mutex<Option<WriteHook>>,
     }
 
     impl MemLockBackend {
         fn new() -> Arc<Self> {
-            Arc::new(Self { files: Mutex::new(HashMap::new()) })
+            Arc::new(Self {
+                files: Mutex::new(HashMap::new()),
+                on_write: Mutex::new(None),
+            })
         }
 
         fn count(&self) -> usize {
             self.files.lock().unwrap().len()
+        }
+
+        fn set_write_hook(&self, hook: WriteHook) {
+            *self.on_write.lock().unwrap() = Some(hook);
         }
     }
 
@@ -706,6 +747,10 @@ mod tests {
 
         fn write(&self, name: &str, data: &[u8]) -> Result<()> {
             let _ = self.files.lock().unwrap().insert(name.to_string(), data.to_vec());
+            let hook = self.on_write.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook(self);
+            }
             Ok(())
         }
 
@@ -841,6 +886,7 @@ mod tests {
 
     #[test]
     fn acquire_writes_lock_and_drop_removes_it() {
+        let _guard = test_acquire_guard();
         let backend = MemLockBackend::new();
         let crypto = test_crypto(true);
         let lock = RepoLock::acquire_exclusive(
@@ -926,5 +972,410 @@ mod tests {
         assert!(is_lock_error(restic));
         assert!(is_lock_error("Fatal: unable to create lock in backend: circuit breaker open"));
         assert!(!is_lock_error("rustic and restic disagree on snapshot metadata"));
+    }
+
+    #[test]
+    fn refresh_replaces_lock_file_and_never_leaves_zero_locks() {
+        let _guard = test_acquire_guard();
+        let backend = MemLockBackend::new();
+        let crypto = test_crypto(true);
+        let lock = RepoLock::acquire_exclusive_with_refresh_interval(
+            Arc::clone(&backend) as Arc<dyn LockBackend>,
+            crypto.clone(),
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        let first = backend.list().unwrap()[0].0.clone();
+
+        // Wait for a refresh: a lock file with a new storage id appears. In
+        // restic's refresh order (write new, then remove old) there may
+        // transiently be two locks, but never zero.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let refreshed = loop {
+            let names: Vec<String> =
+                backend.list().unwrap().into_iter().map(|(n, _)| n).collect();
+            assert!(!names.is_empty(), "refresh must never leave the repo unlocked");
+            assert!(names.len() <= 2, "more than two lock files during refresh: {names:?}");
+            if let Some(new) = names.iter().find(|n| **n != first) {
+                break new.clone();
+            }
+            assert!(std::time::Instant::now() < deadline, "lock was never refreshed");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+
+        // The old file is removed right after the new one is written, and the
+        // refreshed lock still parses as our exclusive lock.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while backend.read(&first).unwrap().is_some() {
+            assert!(std::time::Instant::now() < deadline, "old lock file was never removed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let raw = backend.read(&refreshed).unwrap().expect("refreshed lock exists");
+        let data = parse_lock(&crypto, &raw).unwrap();
+        assert!(data.exclusive);
+        assert_eq!(data.pid, std::process::id() as i32);
+
+        drop(lock);
+        assert_eq!(backend.count(), 0, "drop must remove the *current* (refreshed) lock");
+    }
+
+    #[test]
+    fn competing_lock_in_grace_window_backs_off_and_removes_own_lock() {
+        let _guard = test_acquire_guard();
+        let backend = MemLockBackend::new();
+        let crypto = test_crypto(true);
+
+        // The instant our lock file lands, a competing exclusive lock appears
+        // — after the initial conflict check, inside the 200 ms wait. The
+        // re-check must spot it, remove our own lock, and fail.
+        let planted = crypto.clone();
+        backend.set_write_hook(Box::new(move |b| {
+            let mut other = LockData::ours(true);
+            other.pid = 1; // some other process
+            write_lock(b, &planted, &other).unwrap();
+        }));
+
+        let err = RepoLock::acquire_exclusive(
+            Arc::clone(&backend) as Arc<dyn LockBackend>,
+            crypto.clone(),
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert!(is_lock_error(&format!("{err:#}")), "unexpected error: {err:#}");
+
+        // Only the competitor's lock remains — ours was backed off.
+        let remaining = backend.list().unwrap();
+        assert_eq!(remaining.len(), 1);
+        let data =
+            parse_lock(&crypto, &backend.read(&remaining[0].0).unwrap().unwrap()).unwrap();
+        assert_eq!(data.pid, 1);
+    }
+
+    #[test]
+    fn simultaneous_exclusive_acquisitions_never_both_succeed() {
+        let _guard = test_acquire_guard();
+        let backend = MemLockBackend::new();
+        let crypto = test_crypto(true);
+
+        // Both threads race the full protocol. Valid outcomes per restic's
+        // rules: one winner, or both back off (each saw the other's lock in
+        // the re-check). Never two holders, never leftover lock files.
+        for round in 0..3 {
+            let barrier = std::sync::Barrier::new(2);
+            let results: Vec<Result<RepoLock>> = std::thread::scope(|s| {
+                let handles: Vec<_> = (0..2)
+                    .map(|_| {
+                        let b = Arc::clone(&backend) as Arc<dyn LockBackend>;
+                        let c = crypto.clone();
+                        let barrier = &barrier;
+                        s.spawn(move || {
+                            barrier.wait();
+                            RepoLock::acquire_exclusive(b, c)
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+
+            let winners = results.iter().filter(|r| r.is_ok()).count();
+            assert!(winners <= 1, "round {round}: two holders of an exclusive lock");
+            for failed in results.iter().filter_map(|r| r.as_ref().err()) {
+                assert!(is_lock_error(&format!("{failed:#}")), "round {round}: {failed:#}");
+            }
+            assert_eq!(
+                backend.count(),
+                winners,
+                "round {round}: losers must remove their own lock files"
+            );
+            drop(results);
+            assert_eq!(backend.count(), 0, "round {round}: lock file left after release");
+        }
+    }
+
+    #[test]
+    fn sighup_ignored_while_any_lock_held_and_restored_after() {
+        let _guard = test_acquire_guard();
+
+        fn disposition() -> libc::sighandler_t {
+            unsafe {
+                let mut old: libc::sigaction = std::mem::zeroed();
+                assert_eq!(libc::sigaction(libc::SIGHUP, std::ptr::null(), &mut old), 0);
+                old.sa_sigaction
+            }
+        }
+
+        assert_eq!(disposition(), libc::SIG_DFL, "no lock held yet");
+
+        let crypto = test_crypto(true);
+        let backend_a = MemLockBackend::new();
+        let exclusive = RepoLock::acquire_exclusive(
+            Arc::clone(&backend_a) as Arc<dyn LockBackend>,
+            crypto.clone(),
+        )
+        .unwrap();
+        assert_eq!(disposition(), libc::SIG_IGN, "SIGHUP must be ignored while holding a lock");
+
+        // restic's same-host staleness probe (`restic unlock`) delivers a real
+        // SIGHUP to the holder PID — the process must survive it.
+        unsafe {
+            assert_eq!(libc::raise(libc::SIGHUP), 0);
+        }
+
+        // A second held lock (different repo) keeps SIGHUP ignored until the
+        // *last* lock is released.
+        let backend_b = MemLockBackend::new();
+        let shared =
+            RepoLock::acquire_shared(Arc::clone(&backend_b) as Arc<dyn LockBackend>, crypto)
+                .unwrap();
+        drop(exclusive);
+        assert_eq!(disposition(), libc::SIG_IGN, "still holding one lock");
+        drop(shared);
+        assert_eq!(disposition(), libc::SIG_DFL, "all locks released");
+    }
+
+    // -----------------------------------------------------------------------
+    // RestLockBackend against a minimal in-process rest-server mock.
+    // -----------------------------------------------------------------------
+
+    struct RestMock {
+        base_url: String,
+        auths: Arc<Mutex<Vec<Option<String>>>>,
+        accepts: Arc<Mutex<Vec<Option<String>>>>,
+    }
+
+    impl RestMock {
+        // `v1_list` makes GET /locks/ answer with the API-v1 plain name array
+        // regardless of the Accept header (an old rest-server).
+        fn start(v1_list: bool) -> Self {
+            use std::io::{BufRead, BufReader, Read, Write};
+            use std::net::{TcpListener, TcpStream};
+
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let files: Arc<Mutex<HashMap<String, Vec<u8>>>> = Arc::default();
+            let auths: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+            let accepts: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+
+            fn serve(
+                stream: TcpStream,
+                files: &Mutex<HashMap<String, Vec<u8>>>,
+                auths: &Mutex<Vec<Option<String>>>,
+                accepts: &Mutex<Vec<Option<String>>>,
+                v1_list: bool,
+            ) -> std::io::Result<()> {
+                let mut writer = stream.try_clone()?;
+                let mut reader = BufReader::new(stream);
+                // reqwest keeps connections alive: serve requests until EOF.
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line)? == 0 {
+                        return Ok(());
+                    }
+                    let mut parts = line.split_whitespace();
+                    let method = parts.next().unwrap_or("").to_string();
+                    let path = parts.next().unwrap_or("").to_string();
+                    let (mut len, mut auth, mut accept) = (0_usize, None, None);
+                    loop {
+                        let mut h = String::new();
+                        reader.read_line(&mut h)?;
+                        let h = h.trim_end();
+                        if h.is_empty() {
+                            break;
+                        }
+                        let Some((k, v)) = h.split_once(':') else { continue };
+                        let v = v.trim();
+                        match k.to_ascii_lowercase().as_str() {
+                            "content-length" => len = v.parse().unwrap_or(0),
+                            "authorization" => auth = Some(v.to_string()),
+                            "accept" => accept = Some(v.to_string()),
+                            _ => {}
+                        }
+                    }
+                    let mut body = vec![0_u8; len];
+                    reader.read_exact(&mut body)?;
+                    auths.lock().unwrap().push(auth);
+                    accepts.lock().unwrap().push(accept.clone());
+
+                    let (status, resp): (u16, Vec<u8>) = if let Some(name) =
+                        path.strip_prefix("/repo/locks/")
+                    {
+                        match (method.as_str(), name) {
+                            ("GET", "") => {
+                                let files = files.lock().unwrap();
+                                let v2 = accept.as_deref()
+                                    == Some("application/vnd.x.restic.rest.v2");
+                                let json = if v2 && !v1_list {
+                                    serde_json::Value::Array(
+                                        files
+                                            .iter()
+                                            .map(|(k, v)| {
+                                                serde_json::json!({"name": k, "size": v.len()})
+                                            })
+                                            .collect(),
+                                    )
+                                } else {
+                                    serde_json::json!(files.keys().collect::<Vec<_>>())
+                                };
+                                (200, json.to_string().into_bytes())
+                            }
+                            ("GET", name) => files
+                                .lock()
+                                .unwrap()
+                                .get(name)
+                                .map_or((404, Vec::new()), |d| (200, d.clone())),
+                            ("POST", name) => {
+                                let _ = files.lock().unwrap().insert(name.to_string(), body);
+                                (200, Vec::new())
+                            }
+                            ("DELETE", name) => {
+                                if files.lock().unwrap().remove(name).is_some() {
+                                    (200, Vec::new())
+                                } else {
+                                    (404, Vec::new())
+                                }
+                            }
+                            _ => (405, Vec::new()),
+                        }
+                    } else {
+                        (404, Vec::new())
+                    };
+                    let head = format!(
+                        "HTTP/1.1 {status} status\r\nContent-Length: {}\r\n\
+                         Content-Type: application/octet-stream\r\n\r\n",
+                        resp.len()
+                    );
+                    writer.write_all(head.as_bytes())?;
+                    writer.write_all(&resp)?;
+                    writer.flush()?;
+                }
+            }
+
+            {
+                let (files, auths, accepts) =
+                    (Arc::clone(&files), Arc::clone(&auths), Arc::clone(&accepts));
+                std::thread::spawn(move || {
+                    for conn in listener.incoming() {
+                        let Ok(stream) = conn else { return };
+                        let (files, auths, accepts) =
+                            (Arc::clone(&files), Arc::clone(&auths), Arc::clone(&accepts));
+                        std::thread::spawn(move || {
+                            let _ = serve(stream, &files, &auths, &accepts, v1_list);
+                        });
+                    }
+                });
+            }
+            Self { base_url: format!("http://127.0.0.1:{port}/repo/"), auths, accepts }
+        }
+    }
+
+    #[test]
+    fn rest_backend_v2_full_cycle_with_basic_auth() {
+        let mock = RestMock::start(false);
+        let backend = RestLockBackend::new(&mock.base_url, "andrew", "hunter2").unwrap();
+
+        assert!(backend.list().unwrap().is_empty());
+        backend.write("aaaa", b"data-1").unwrap();
+        backend.write("bbbb", b"data-two").unwrap();
+        let mut listed = backend.list().unwrap();
+        listed.sort();
+        assert_eq!(
+            listed,
+            vec![("aaaa".to_string(), 6), ("bbbb".to_string(), 8)],
+            "v2 list must carry real sizes"
+        );
+        assert_eq!(backend.read("aaaa").unwrap(), Some(b"data-1".to_vec()));
+        assert_eq!(backend.read("missing").unwrap(), None, "404 read maps to None");
+        backend.remove("aaaa").unwrap();
+        backend.remove("aaaa").unwrap(); // removing a missing lock is not an error
+        assert_eq!(backend.list().unwrap(), vec![("bbbb".to_string(), 8)]);
+
+        // Every request carried basic auth; every list asked for API v2.
+        let auths = mock.auths.lock().unwrap();
+        assert!(!auths.is_empty());
+        assert!(
+            auths.iter().all(|a| a.as_deref() == Some("Basic YW5kcmV3Omh1bnRlcjI=")),
+            "unexpected auth headers: {auths:?}"
+        );
+        assert!(
+            mock.accepts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|a| a.as_deref() == Some("application/vnd.x.restic.rest.v2"))
+        );
+    }
+
+    #[test]
+    fn rest_backend_v1_list_fallback_and_no_auth_without_user() {
+        let mock = RestMock::start(true);
+        let backend = RestLockBackend::new(&mock.base_url, "", "").unwrap();
+
+        backend.write("cccc", b"x").unwrap();
+        // v1 answers with names only — size is unknown, reported as u64::MAX
+        // so the entry is still read instead of skipped as a 0-byte upload.
+        assert_eq!(backend.list().unwrap(), vec![("cccc".to_string(), u64::MAX)]);
+
+        let auths = mock.auths.lock().unwrap();
+        assert!(auths.iter().all(Option::is_none), "no user configured, no auth header");
+    }
+
+    #[test]
+    fn rest_backend_list_404_means_no_locks() {
+        // rest-server answers 404 for a repo without a locks/ dir yet; the
+        // mock 404s everything outside /repo/.
+        let mock = RestMock::start(false);
+        let url = mock.base_url.replace("/repo/", "/uninitialized/");
+        let backend = RestLockBackend::new(&url, "", "").unwrap();
+        assert!(backend.list().unwrap().is_empty());
+        // Writes must NOT swallow errors the same way.
+        assert!(backend.write("aaaa", b"x").is_err());
+    }
+
+    // Live: full LockBackend + RepoLock protocol cycle against a real Garage
+    // S3 server (scripts/garage-test-server.sh). Uses a per-run root so the
+    // seeded read-test repository is never touched.
+    #[test]
+    #[ignore]
+    fn live_garage_s3_lock_backend_cycle() {
+        let _guard = test_acquire_guard();
+        let endpoint = std::env::var("WRUSTIC_GARAGE_ENDPOINT")
+            .unwrap_or_else(|_| "http://127.0.0.1:3900".into());
+        let backend: Arc<dyn LockBackend> = Arc::new(
+            crate::s3_backend::S3LockBackend::new(
+                &endpoint,
+                "wrustic-it",
+                "garage",
+                &format!("lock-backend-it-{}", std::process::id()),
+                "GK22222222222222222222222222222222",
+                "3333333333333333333333333333333333333333333333333333333333333333",
+            )
+            .unwrap(),
+        );
+        let crypto = test_crypto(true);
+
+        // Raw file operations on the locks/ prefix.
+        assert!(backend.list().unwrap().is_empty());
+        backend.write("feedface", b"payload").unwrap();
+        assert_eq!(backend.list().unwrap(), vec![("feedface".to_string(), 7)]);
+        assert_eq!(backend.read("feedface").unwrap(), Some(b"payload".to_vec()));
+        assert_eq!(backend.read("missing").unwrap(), None);
+        backend.remove("feedface").unwrap();
+        backend.remove("feedface").unwrap(); // idempotent
+        assert!(backend.list().unwrap().is_empty());
+
+        // Full protocol over S3: acquire, conflict, release.
+        let lock =
+            RepoLock::acquire_exclusive(Arc::clone(&backend), crypto.clone()).unwrap();
+        let err = RepoLock::acquire_exclusive(Arc::clone(&backend), crypto.clone())
+            .map(|_| ())
+            .unwrap_err();
+        assert!(is_lock_error(&format!("{err:#}")), "unexpected error: {err:#}");
+        drop(lock);
+        assert!(backend.list().unwrap().is_empty(), "release must remove the S3 lock");
+
+        // Stale-lock removal over S3.
+        write_stale_lock_for_tests(backend.as_ref(), &crypto);
+        assert_eq!(remove_stale_locks(backend.as_ref(), &crypto).unwrap(), 1);
+        assert!(backend.list().unwrap().is_empty());
     }
 }

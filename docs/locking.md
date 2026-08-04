@@ -187,12 +187,25 @@ A `RepoLock` guard type that mirrors restic exactly:
 
 1. **Lock module** — DONE (`src/lock.rs` + `LockBackend` impls in
    `src/lock.rs`/`src/s3_backend.rs`). Unit tests cover the envelope,
-   restic's JSON schema, conflict rules, and staleness; the live
-   integration test (`live_native_lock_and_delete_interop_with_restic`,
-   `cargo test -- --ignored`, needs restic on PATH) proves interop from
-   restic's side: `restic forget` is blocked by our exclusive lock with
+   restic's JSON schema, conflict rules, staleness, the refresh cycle
+   (via a test-only shortened interval: new file appears, old removed,
+   never zero locks), the grace-window back-off (a competing lock planted
+   between write and re-check makes acquisition remove its own lock and
+   fail), simultaneous two-thread acquisition (never two holders, no
+   orphaned lock files), SIGHUP disposition (ignored while any lock is
+   held — the process survives a raised SIGHUP — restored after the last
+   release), and `RestLockBackend` against an in-process rest-server mock
+   (API v2 list with sizes, v1 name-array fallback, 404 semantics, basic
+   auth on every request). Because signal disposition is process-global,
+   every test that acquires a `RepoLock` serializes on
+   `lock::test_acquire_guard()`. Live tests (`cargo test -- --ignored`):
+   `live_native_lock_and_delete_interop_with_restic` proves interop from
+   restic's side — `restic forget` is blocked by our exclusive lock with
    "already locked" (so restic lists *and decrypts* our lock files), and
-   `restic unlock` leaves our fresh lock in place.
+   `restic unlock` leaves our fresh lock in place — and
+   `live_garage_s3_lock_backend_cycle` runs the raw file ops plus the
+   full acquire/conflict/release/stale-removal protocol against a real
+   Garage S3 server (`scripts/garage-test-server.sh`).
 2. **Native forget/delete** — DONE. The delete flow's `restic forget`
    subprocess became `Repository::delete_snapshots` under a native
    exclusive lock (`repo::delete_snapshot`), and the `u` shortcut's

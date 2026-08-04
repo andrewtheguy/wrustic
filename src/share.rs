@@ -630,9 +630,14 @@ mod tests {
     }
 
     // End-to-end smoke test against a real local restic repo prepared under
-    // tmp/share-test (see the CLI commands in the implementation log).
-    // Marked #[ignore] so `cargo test` doesn't depend on the fixture; run
-    // explicitly with `cargo test share::tests::e2e -- --ignored`.
+    // tmp/share-test. Seed it (from the project root) with:
+    //   mkdir -p tmp/share-test/source
+    //   printf 'hello signed-url world\n' > tmp/share-test/source/greeting.txt
+    //   cd tmp/share-test && export RESTIC_REPOSITORY=restic-repo RESTIC_PASSWORD=sandbox
+    //   restic init && restic backup source
+    // Keep it at ONE snapshot — the test grabs `.last()` of an unordered
+    // snapshot list. Marked #[ignore] so `cargo test` doesn't depend on the
+    // fixture; run explicitly with `cargo test share::tests::e2e -- --ignored`.
     #[test]
     #[ignore]
     fn e2e_serves_and_validates_signed_url() {
