@@ -737,8 +737,6 @@ mod tests {
     #[test]
     #[ignore]
     fn live_native_lock_and_delete_interop_with_restic() {
-        use std::process::Command;
-
         // Acquires RepoLocks — serialize with other acquiring tests (SIGHUP
         // disposition is process-global).
         let _guard = lock::test_acquire_guard();
@@ -750,24 +748,17 @@ mod tests {
         std::fs::create_dir_all(&source).unwrap();
         std::fs::write(source.join("a.txt"), b"hello\n").unwrap();
 
-        let restic = |args: &[&str]| {
-            Command::new("restic")
-                .args(args)
-                .env("RESTIC_REPOSITORY", &repo_path)
-                .env("RESTIC_PASSWORD", "pw")
-                .output()
-                .expect("running restic")
-        };
-        assert!(restic(&["init"]).status.success(), "restic init failed");
-        assert!(
-            restic(&["backup", source.to_str().unwrap()]).status.success(),
-            "restic backup failed"
-        );
-
         let profile = Profile::Local {
             password: "pw".into(),
             local_path: repo_path.to_string_lossy().into_owned(),
         };
+        // Dev-flow writes (init/backup) and the restic-side observations
+        // below all go through the secure spawn harness — never a bare
+        // `restic` with the password exported into the child environment.
+        crate::restic::run(&profile, &["init", "--json"]).expect("restic init");
+        crate::restic::run(&profile, &["backup", source.to_str().unwrap(), "--json"])
+            .expect("restic backup");
+
         let snapshots = load_snapshots(&profile).expect("list snapshots");
         assert_eq!(snapshots.len(), 1);
         let snap_id = snapshots[0].id.clone();
@@ -785,16 +776,15 @@ mod tests {
         )
         .expect("acquire exclusive lock");
 
-        let forget = restic(&["forget", &snap_id]);
-        assert!(!forget.status.success(), "restic forget should hit our lock");
-        let stderr = String::from_utf8_lossy(&forget.stderr).to_ascii_lowercase();
+        let forget_err = crate::restic::run(&profile, &["forget", &snap_id, "--json"])
+            .expect_err("restic forget should hit our lock");
         assert!(
-            stderr.contains("already locked"),
-            "restic should report a lock conflict, got: {stderr}"
+            lock::is_lock_error(&format!("{forget_err:#}")),
+            "restic should report a lock conflict, got: {forget_err:#}"
         );
 
         // `restic unlock` removes stale locks only — ours is fresh.
-        assert!(restic(&["unlock"]).status.success(), "restic unlock failed");
+        crate::restic::run(&profile, &["unlock", "--json"]).expect("restic unlock");
         let locks_dir = repo_path.join("locks");
         let live_locks = std::fs::read_dir(&locks_dir).unwrap().count();
         assert_eq!(live_locks, 1, "our fresh lock must survive restic unlock");
@@ -817,10 +807,10 @@ mod tests {
         // both rustic and restic afterwards.
         delete_snapshot(&profile, &snap_id).expect("native delete");
         assert!(load_snapshots(&profile).expect("list after delete").is_empty());
-        let restic_list = restic(&["snapshots", "--json"]);
-        assert!(restic_list.status.success());
+        let restic_list = crate::restic::run(&profile, &["snapshots", "--json"])
+            .expect("restic snapshots");
         let listed: serde_json::Value =
-            serde_json::from_slice(&restic_list.stdout).expect("restic snapshots json");
+            serde_json::from_slice(&restic_list).expect("restic snapshots json");
         assert_eq!(listed, serde_json::json!([]));
 
         std::fs::remove_dir_all(&root).ok();

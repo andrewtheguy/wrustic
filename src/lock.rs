@@ -516,15 +516,25 @@ impl RepoLock {
 
 impl Drop for RepoLock {
     fn drop(&mut self) {
+        // A panic here during unwinding would abort the process, and a
+        // poisoned state must not stop cleanup — the lock file has to go and
+        // the SIGHUP disposition has to be restored regardless.
+        use std::sync::PoisonError;
         {
             let (state, cv) = &*self.shared;
-            state.lock().expect("lock state poisoned").stop = true;
+            state.lock().unwrap_or_else(PoisonError::into_inner).stop = true;
             cv.notify_all();
         }
         if let Some(handle) = self.refresher.take() {
             let _ = handle.join();
         }
-        let name = self.shared.0.lock().expect("lock state poisoned").current_name.clone();
+        let name = self
+            .shared
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .current_name
+            .clone();
         let _ = self.backend.remove(&name);
         sighup_ignore_release();
     }

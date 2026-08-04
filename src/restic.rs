@@ -179,19 +179,35 @@ enum LockRequirement {
 
 /// Map a harness invocation to the lock its restic subcommand will take, so
 /// the native pre-check in [`run_unsticking_locks`] applies exactly restic's
-/// conflict rules for it. The subcommand is the first non-flag argument.
+/// conflict rules for it. The subcommand is found by scanning the non-flag
+/// arguments for a known restic command name — the first non-flag argument
+/// alone would be fooled by a flag's *value* (`["--cache-dir", "foo",
+/// "prune"]`). A flag value that happens to spell a command name can still
+/// match first, which at worst makes the pre-check stricter, and restic's own
+/// in-process check stays authoritative either way.
 fn lock_requirement(args: &[&str]) -> LockRequirement {
-    let Some(cmd) = args.iter().find(|a| !a.starts_with('-')) else {
-        return LockRequirement::None;
-    };
-    match *cmd {
-        // `key add` alone is non-exclusive in restic, but treating all of
-        // `key` as exclusive only makes the pre-check stricter, never wrong.
-        "forget" | "prune" | "tag" | "key" | "check" | "repair" | "migrate" | "recover"
-        | "rewrite" => LockRequirement::Exclusive,
-        "unlock" | "init" | "self-update" | "version" => LockRequirement::None,
-        // backup, copy, restore, ls, snapshots, stats, find, diff, dump, …
-        _ => LockRequirement::NonExclusive,
+    let mut saw_candidate = false;
+    for arg in args.iter().filter(|a| !a.starts_with('-')) {
+        saw_candidate = true;
+        match *arg {
+            // `key add` alone is non-exclusive in restic, but treating all of
+            // `key` as exclusive only makes the pre-check stricter, never
+            // wrong.
+            "forget" | "prune" | "tag" | "key" | "check" | "repair" | "migrate" | "recover"
+            | "rewrite" => return LockRequirement::Exclusive,
+            "unlock" | "init" | "self-update" | "version" => return LockRequirement::None,
+            "backup" | "copy" | "restore" | "mount" | "ls" | "snapshots" | "stats" | "find"
+            | "diff" | "dump" | "cat" | "list" => return LockRequirement::NonExclusive,
+            _ => {} // a flag's value or a positional (snapshot id, path) — keep looking
+        }
+    }
+    // No recognized command. A non-flag argument means *some* subcommand is
+    // being run — assume the weaker non-exclusive lock; flags-only means
+    // nothing to lock for.
+    if saw_candidate {
+        LockRequirement::NonExclusive
+    } else {
+        LockRequirement::None
     }
 }
 
@@ -291,7 +307,14 @@ pub(crate) fn run(profile: &Profile, args: &[&str]) -> Result<Vec<u8>> {
     let mut child = cmd
         .spawn()
         .map_err(|e| anyhow!("failed to spawn `restic`: {e}"))?;
-    write_password(&mut child, profile)?;
+    if let Err(e) = write_password(&mut child, profile) {
+        // Don't leave a restic waiting forever on a password that will never
+        // arrive (or a zombie once it exits). Cleanup failures are swallowed
+        // so they can't mask the primary error.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e);
+    }
     let output = child
         .wait_with_output()
         .map_err(|e| anyhow!("waiting on restic: {e}"))?;
@@ -405,6 +428,12 @@ mod tests {
         for cmd in ["backup", "copy", "restore", "ls", "snapshots", "stats", "find", "diff", "dump"] {
             assert_eq!(lock_requirement(&[cmd, "--json"]), NonExclusive, "{cmd}");
         }
+        // A flag's value must not be mistaken for the subcommand.
+        assert_eq!(lock_requirement(&["--cache-dir", "foo", "prune"]), Exclusive);
+        assert_eq!(lock_requirement(&["--cache-dir", "foo", "snapshots"]), NonExclusive);
+        // Unknown subcommand → the weaker non-exclusive assumption (restic's
+        // own check stays authoritative).
+        assert_eq!(lock_requirement(&["frobnicate"]), NonExclusive);
         // Flags only (degenerate) → no subcommand, no lock to check.
         assert_eq!(lock_requirement(&["--json"]), None);
     }

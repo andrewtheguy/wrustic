@@ -1,11 +1,13 @@
 # wrustic
 
-A minimal read-only terminal UI for [restic](https://restic.net/)-format backup
+A minimal terminal UI for [restic](https://restic.net/)-format backup
 repositories, built on [`rustic_core`](https://crates.io/crates/rustic_core)
 and [`ratatui`](https://crates.io/crates/ratatui).
 
-`wrustic` is read-only by design — write operations are out of scope, not a
-backlog item.
+`wrustic` is read-mostly by design: reads are native via `rustic_core`, and
+the few write operations it exposes (snapshot delete, stale-lock removal)
+are native too, guarded by restic-compatible repository locks
+(docs/locking.md). Everything else that writes stays on the `restic` CLI.
 
 ## Features
 
@@ -129,7 +131,8 @@ the write operations wrustic exposes (snapshot delete, stale-lock removal)
 are native too, protected by restic-compatible repository locks
 (docs/locking.md). You do not need `restic` installed to run `wrustic`.
 
-You *will* want `restic` (>= 0.18.1) on your `$PATH` for development. Use it
+You *will* want `restic` (>= 0.19.0 — the release whose locking protocol and
+JSON output wrustic is built against) on your `$PATH` for development. Use it
 for:
 
 - **Write operations wrustic doesn't expose** (init, backup, prune, copy, key
