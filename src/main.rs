@@ -8,6 +8,7 @@ mod local_server;
 mod lock;
 mod passphrase;
 mod repo;
+mod restic;
 mod s3_backend;
 mod share;
 mod ui;

@@ -154,10 +154,14 @@ docs/locking.md for the full design. rustic_core itself is lock-oblivious,
 so every native write MUST hold a `lock::RepoLock` — that discipline lives
 in `repo.rs`, not in rustic_core.
 
-The restic binary is no longer used at runtime. Write operations without a
-native + locked implementation (init, backup, prune, key management) are
-out of scope in the TUI — use the restic CLI for those, as the dev flows
-do.
+No TUI flow shells out to restic anymore, and the binary is not required
+to run wrustic. Write operations without a native + locked implementation
+(init, backup, prune, key management) stay on the restic CLI — when code
+needs to trigger one of those (e.g. a future prune action), it goes
+through the secure spawn harness kept in `src/restic.rs`:
+`restic::run(profile, args)` pipes the master password via the child's
+stdin (`--password-file /dev/stdin`) and passes the repo URL and cloud
+credentials via env vars, so secrets never appear on argv.
 
 ## Verification and dev flow
 

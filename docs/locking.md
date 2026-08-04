@@ -198,8 +198,11 @@ A `RepoLock` guard type that mirrors restic exactly:
    exclusive lock (`repo::delete_snapshot`), and the `u` shortcut's
    `restic unlock` became native stale-lock removal (`repo::unlock`).
    The restic/rustic metadata cross-check and `restic snapshots --json`
-   fetch went away with it; `src/restic.rs` is deleted and the restic
-   binary is no longer needed at runtime for any wrustic feature.
+   fetch went away with it; no wrustic feature needs the restic binary at
+   runtime anymore. `src/restic.rs` survives only as the secure spawn
+   harness (stdin-piped password, env-var credentials) for triggering the
+   restic commands wrustic deliberately does not reimplement — prune and
+   friends (Tier 3).
 3. **Native backup** under a non-exclusive lock (the headline win:
    wrustic backups running concurrently with restic cron backups), then
    copy / key add as wanted. This phase also needs the
