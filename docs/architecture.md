@@ -189,8 +189,10 @@ whose launch semantics mirror resterm's:
   restic's default shared cache is never used either way. The cache path
   is independent of `--config-dir`, so instances on different config
   directories share it; that is safe, and so is the sweep, because restic
-  refreshes a subdirectory's timestamp when it opens that repository, and
-  a cache in use is therefore never old enough to sweep. `restic cache`
+  stamps a subdirectory's timestamp when it *opens* that repository — the
+  stamp is not refreshed as the command runs, so the 30-day threshold is
+  what keeps an in-use cache out of reach, not the fact of it being in
+  use. Lowering the threshold by hand erodes that. `restic cache`
   itself never opens the repository (no `--repo`, no password, no lock) —
   the only way to break a running command is a manual
   `cache --cleanup --max-age 0`, which ignores the in-use exemption.

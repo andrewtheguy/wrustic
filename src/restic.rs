@@ -68,9 +68,11 @@ pub(crate) fn set_cache_enabled(enabled: bool) {
 }
 
 /// Whether the restic cache is on — the prune confirmation screen tells the
-/// user which cache mode the run will carry.
+/// user which cache mode the run will carry, so this reports the mode
+/// [`apply_cache_flag`] will actually pass: a machine with no per-user cache
+/// root gets `--no-cache` even though the flag was never given.
 pub(crate) fn cache_enabled() -> bool {
-    CACHE_ENABLED.load(Ordering::Relaxed)
+    CACHE_ENABLED.load(Ordering::Relaxed) && cache_dir().is_some()
 }
 
 /// Add the cache flags every restic invocation carries.
@@ -658,6 +660,8 @@ mod tests {
             !args.iter().any(|arg| arg.contains("pw")),
             "the password must never reach argv: {args:?}"
         );
+        // What the prune screen reports must be the mode actually passed.
+        assert_eq!(cache_enabled(), cache_dir().is_some());
 
         match cache_dir() {
             // The default: restic caches into a directory private to wrustic,
@@ -690,6 +694,7 @@ mod tests {
 
         // `--no-restic-cache` turns caching off outright.
         set_cache_enabled(false);
+        assert!(!cache_enabled());
         let opted_out = command_args(&test_profile());
         // Restored, so the default-path assertions above still hold for any
         // test that runs after this one.

@@ -19,12 +19,16 @@ Options:
                               platform's per-user cache root, private to your
                               account: $XDG_CACHE_HOME or ~/.cache on Linux,
                               ~/Library/Caches on macOS, %LOCALAPPDATA% on
-                              Windows. Only affects the restic CLI commands
+                              Windows. On a machine where no such root can be
+                              determined, --no-cache is passed anyway rather
+                              than falling back to restic's shared default
+                              cache. Only affects the restic CLI commands
                               wrustic shells out for (prune-class); native
-                              reads/writes never use a restic cache. The cache speeds up repeated restic
-                              work against a remote repository at the cost of
-                              disk space — it can reach hundreds of megabytes
-                              for a large repository. Cached calls also pass
+                              reads/writes never use a restic cache. The cache
+                              speeds up repeated restic work against a remote
+                              repository at the cost of disk space — it can
+                              reach hundreds of megabytes for a large
+                              repository. Cached calls also pass
                               --cleanup-cache, so restic itself drops the
                               per-repository subdirectories there that go 30
                               days unused. To clean it out by hand, point restic
