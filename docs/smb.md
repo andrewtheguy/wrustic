@@ -145,6 +145,12 @@ refused with a specific NTSTATUS.
   Regular files and directories round-trip exactly.
 - **No reparse points, no extended attributes, no alternate data streams.**
 - **One snapshot per server.** The share is bound at startup.
+- **A filename SMB2 cannot express is listed with its offending characters
+  replaced by U+FFFD, and cannot be opened.** SMB2 filenames carry no path
+  separator; macOS filenames may contain a backslash. Substituting is not
+  cosmetic caution — the Windows redirector answers a listing that carries one
+  by discarding the *whole response*, so one such file would hide every other
+  file in its directory.
 
 ## Module map
 
@@ -157,7 +163,8 @@ refused with a specific NTSTATUS.
 | `ntlm.rs` | NTLMv2 challenge/response, session key derivation |
 | `sign.rs` | HMAC-SHA256 signing and verification over compound chains |
 | `path.rs` | the trust boundary — SMB path parsing and rejection |
-| `backing.rs` | the `Backing`/`FileReader` seam over `rustic_core::vfs` |
+| `name.rs` | filenames as restic quotes them, and back |
+| `backing.rs` | the `Backing`/`FileReader` seam over the repository |
 | `info.rs` | MS-FSCC info-class encoders |
 | `files.rs` | CREATE / CLOSE / READ / QUERY_DIRECTORY / QUERY_INFO, handle table |
 
@@ -166,6 +173,29 @@ in-memory tree without a restic repository. `SnapshotBacking` is the real
 implementation, over a `Repository<IndexedFullStatus>` opened once at startup —
 a snapshot is immutable, so concurrent readers need no coordination beyond an
 `Arc`.
+
+### Filenames
+
+restic stores every node name **quoted**, Go `strconv.Quote` style: a real EN
+SPACE becomes a six-character unicode escape, a real backslash is doubled, a
+byte that is not UTF-8 becomes a hex escape (restic `internal/data/node.go`).
+Consumers have to undo that, and `rustic_core::repofile::Node::name()` does —
+except on Windows, where its `unescape_filename` is the identity function. So
+the share reads `Node.name`, the raw stored string, and decodes it itself in
+`name.rs`; the result is the same on every platform, which the accessor is not.
+
+This is not a display nicety. The quoted form of an ordinary macOS filename
+contains a backslash, and one backslash in a directory listing makes a Windows
+client discard the entire response — the directory reads as "not accessible"
+with every file in it gone.
+
+Paths are resolved by walking trees (`SnapshotBacking::lookup`) rather than
+through `rustic_core::vfs`, whose entry points take a `std::path::Path` and
+split it with `Path::components`. On Windows that treats a backslash as a
+separator, so a quoted name can never survive the trip and every file with one
+would be unreachable. A component is matched against both the quoted spelling
+and the literal one: a repository written by rustic on Windows stores names
+unquoted, so both occur, and neither can be told from the other without looking.
 
 ## Testing against a real client
 
@@ -239,7 +269,14 @@ Rejections name the command and the reason:
 [smb 04:41:07.884] conn 4: SESSION_SETUP: user "andrew" (domain "") is not "wrustic"
 [smb 04:41:07.902] conn 4: SESSION_SETUP: wrong password for user "wrustic"
 [smb 04:41:07.915] conn 4: SESSION_SETUP: anonymous logon refused
-[smb 04:41:09.006] conn 5: stat "/Users/andrew/Documents" failed: <the repository error>
+[smb 04:41:09.006] conn 5: stat "\Users\andrew\Documents" failed: <the repository error>
+```
+
+A name the share had to alter to put it on the wire says so, once per listing
+that contains it:
+
+```
+[smb 04:41:11.220] conn 5: listing "od\\d" as "od\u{fffd}d": SMB filenames cannot hold a separator
 ```
 
 A logon failure names the identity that was offered, never the response or the
