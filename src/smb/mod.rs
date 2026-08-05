@@ -992,10 +992,28 @@ mod tests {
             password,
             local_path: repo,
         };
+        // Long enough to mount, poke around and unmount by hand. Bounded rather
+        // than infinite so a forgotten server does not hold the port for ever.
+        let secs: u64 = std::env::var("WRUSTIC_SMB_SECONDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1200);
+
         let handle =
             start_snapshot_share(port, &profile, &snapshot).expect("snapshot share starts");
-        eprintln!("serving snapshot {snapshot} on port {}", handle.port);
-        std::thread::sleep(std::time::Duration::from_secs(120));
+        eprintln!(
+            "serving snapshot {snapshot} on 127.0.0.1:{} for {secs}s",
+            handle.port
+        );
+        eprintln!(
+            "  Linux  sudo mount -t cifs -o port={},vers=2.1,sec=none,guest,ro,uid=$(id -u) //127.0.0.1/snap /mnt",
+            handle.port
+        );
+        eprintln!(
+            "  macOS  mount_smbfs //guest@127.0.0.1:{}/snap /Volumes/snap",
+            handle.port
+        );
+        std::thread::sleep(std::time::Duration::from_secs(secs));
         handle.stop();
     }
 
