@@ -11,6 +11,7 @@ mod repo;
 mod restic;
 mod s3_backend;
 mod share;
+mod smb;
 mod ui;
 
 use anyhow::Result;
