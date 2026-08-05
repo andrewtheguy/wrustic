@@ -24,7 +24,8 @@ docs/restic-usage.md is the overview of exactly which workflows that means.
   stale locks (live ones are kept) and retries
 - **Prune** (`p` on the snapshot list): reclaim the space deleted snapshots
   left behind — runs `restic prune` (the one feature that needs restic, >=
-  0.19, on PATH), unsticking stale repository locks first
+  0.19, on PATH), unsticking stale repository locks first, with live
+  progress and safe cancellation via Ctrl+C
 - **File sharing**: one-time signed download URLs served from localhost
 - **Keyboard and mouse navigation**: Vim-style keys, arrow keys, PgUp/PgDn,
   mouse click/scroll; `--no-mouse` to disable

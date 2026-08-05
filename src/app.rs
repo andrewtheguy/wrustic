@@ -329,6 +329,13 @@ pub(crate) struct App {
     pub(crate) prune_rx: Option<std::sync::mpsc::Receiver<Result<Vec<u8>, String>>>,
     pub(crate) prune_started: Option<Instant>,
     pub(crate) prune_scroll: u16,
+    // Handle to the running restic child (Ctrl+C on the running screen calls
+    // `interrupt()`), the flag remembering that the user asked to cancel (so
+    // the resulting restic error renders as "cancelled", not a failure), and
+    // the live progress buffer the worker appends restic's stdout lines to.
+    pub(crate) prune_tracker: Option<std::sync::Arc<crate::restic::ChildTracker>>,
+    pub(crate) prune_cancel_requested: bool,
+    pub(crate) prune_progress: Option<std::sync::Arc<std::sync::Mutex<String>>>,
 
     // Outer rect of the currently-rendered list/paragraph (bordered area).
     // Used by PageUp/PageDown to size the jump and by the mouse handler
@@ -436,6 +443,9 @@ impl App {
             prune_rx: None,
             prune_started: None,
             prune_scroll: 0,
+            prune_tracker: None,
+            prune_cancel_requested: false,
+            prune_progress: None,
             list_area: None,
             list_header_rows: 0,
             last_snapshot_click: None,
@@ -1532,9 +1542,11 @@ impl App {
                 _ => {}
             },
 
-            // Prune cannot be cancelled from here: restic holds an exclusive
-            // repository lock and interrupting it mid-repack just leaves work
-            // for the next run. Keys are swallowed until the worker reports.
+            // Keys on the running screen are handled by the main loop's event
+            // drain, not here: Ctrl+C interrupts the restic child (safe —
+            // restic never removes data still in use, and an interrupted
+            // prune leaves the remaining work for the next run); everything
+            // else is swallowed until the worker reports.
             Screen::PruneRunning => {}
 
             Screen::PruneDone(report) => match key.code {

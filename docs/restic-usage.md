@@ -26,7 +26,13 @@ user passed `--restic-cache`). Before spawning, the harness evaluates the
 repo's lock files natively and runs `restic unlock` if a stale lock would
 block the exclusive acquisition. restic ≥ 0.19 must be on PATH for this
 one action; every other feature works without it. restic 0.19 has no JSON
-output for prune, so the report is shown verbatim, never parsed.
+output for prune, so the report is shown verbatim, never parsed; restic's
+stdout is streamed into the running screen live (on a pipe restic reports
+progress roughly every 10 s). Ctrl+C interrupts the run safely — restic
+never removes data still in use, so a cancelled prune just leaves the
+remaining work for the next one (SIGINT on Unix, which restic catches and
+removes its lock; process termination on Windows, whose leftover lock is
+stale and removed by the next run's unstick pre-check).
 
 ## Expected to use restic from the app (planned, not wired yet)
 
