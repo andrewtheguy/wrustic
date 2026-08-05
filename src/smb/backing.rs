@@ -247,15 +247,26 @@ impl SnapshotBacking {
     }
 
     /// The children of the directory a path names.
-    fn entries(&self, path: &SmbPath) -> Result<Vec<Node>, String> {
+    ///
+    /// The status rides along with the reason because the two failures are
+    /// different answers: a path that is not there, and a path that is there
+    /// and is a file. `MemBacking` has always drawn that line, and a real
+    /// backing that blurred it would make the in-memory one a poor stand-in.
+    fn entries(&self, path: &SmbPath) -> Result<Vec<Node>, (u32, String)> {
         let tree = if path.is_root() {
             self.root
         } else {
-            let node = self.lookup(path)?;
-            node.subtree
-                .ok_or_else(|| format!("{:?} is not a directory", node.name))?
+            let node = self
+                .lookup(path)
+                .map_err(|e| (status::OBJECT_PATH_NOT_FOUND, e))?;
+            node.subtree.ok_or_else(|| {
+                (
+                    status::NOT_A_DIRECTORY,
+                    format!("{:?} is not a directory", node.name),
+                )
+            })?
         };
-        nodes_in(&self.repo, &tree)
+        nodes_in(&self.repo, &tree).map_err(|e| (status::OBJECT_PATH_NOT_FOUND, e))
     }
 }
 
@@ -292,9 +303,9 @@ impl Backing for SnapshotBacking {
     }
 
     fn list(&self, path: &SmbPath) -> Result<Vec<NodeInfo>, u32> {
-        let entries = self.entries(path).map_err(|e| {
+        let entries = self.entries(path).map_err(|(status, e)| {
             smb_log!("list {:?} failed: {e}", path.to_smb_absolute());
-            status::OBJECT_PATH_NOT_FOUND
+            status
         })?;
         Ok(entries.iter().map(|n| node_info(n, self.now)).collect())
     }

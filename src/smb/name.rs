@@ -8,7 +8,7 @@
 //
 // `rustic_core::repofile::Node::name()` reverses that — on Unix. Its Windows
 // build defines `unescape_filename` as the identity function (see
-// `rustic_core`'s `src/backend/node.rs`), so on Windows the quoted form leaks
+// `rustic_core`'s `src/backend/node.rs`), so there the quoted form leaks
 // through to the caller. That is not a cosmetic problem for an SMB share: the
 // quoted form of a very ordinary macOS filename contains a backslash, SMB2
 // filenames cannot, and the Windows redirector answers a directory listing
@@ -16,13 +16,12 @@
 // disappears behind "the specified server cannot perform the requested
 // operation". One quoted name makes one directory unbrowsable.
 //
-// So this module does on Windows what `rustic_core` does everywhere else, and
-// keeps the inverse as well, because a name that has been decoded still has to
-// be looked up under the name the repository actually stores.
-//
-// The pair is used through `from_repo`/`to_repo`, which are the identity on
-// Unix — decoding a second time would corrupt a name that legitimately
-// contains a backslash.
+// So the share does not use that accessor at all. It reads `Node.name`, the
+// raw stored spelling, and converts it here — `from_repo` on the way out to a
+// client, `to_repo` on the way back in for a lookup, unconditionally on every
+// platform. Working from the stored string is what makes that safe: there is
+// nothing to double-decode, and a share behaves the same wherever it runs
+// rather than inheriting a dependency's platform split.
 
 use std::fmt::Write;
 
@@ -36,9 +35,6 @@ use std::fmt::Write;
 /// reaches a client intact anyway — `backing::wire_safe` replaces the character
 /// SMB cannot carry, and the file is listed but not openable.
 pub(crate) fn from_repo(stored: &str) -> String {
-    if !cfg!(windows) {
-        return stored.to_string();
-    }
     match decode(stored) {
         // The round-trip is the whole safety argument, so it is checked rather
         // than reasoned about: `encode` mirrors Go's `strconv.Quote` only for
@@ -52,9 +48,6 @@ pub(crate) fn from_repo(stored: &str) -> String {
 
 /// Re-encode a decoded name into the form the repository stores.
 pub(crate) fn to_repo(name: &str) -> String {
-    if !cfg!(windows) {
-        return name.to_string();
-    }
     encode(name)
 }
 
@@ -211,6 +204,30 @@ mod tests {
             let decoded = decode(stored).unwrap_or_else(|| panic!("{stored:?} decodes"));
             assert_eq!(encode(&decoded), stored, "round trip for {stored:?}");
         }
+    }
+
+    /// Both directions convert on every platform.
+    ///
+    /// This module once gated them behind `cfg!(windows)`, which left a share
+    /// hosted on Linux or macOS serving the quoted name: listed with its
+    /// backslash replaced, and impossible to open. The round-trip tests cannot
+    /// catch that — with the gate in place both directions are the identity, so
+    /// the round trip holds trivially — and no Windows run can catch it either.
+    /// `.github/workflows/unix-ci.yml` exists to run this one.
+    #[test]
+    fn conversion_is_not_platform_conditional() {
+        let stored = quoted("No.", "03-1532.pdf");
+        let shown = "No.\u{2002}03-1532.pdf";
+        assert_eq!(
+            from_repo(&stored),
+            shown,
+            "from_repo must decode the stored spelling on every platform"
+        );
+        assert_eq!(
+            to_repo(shown),
+            stored,
+            "to_repo must produce the stored spelling on every platform"
+        );
     }
 
     /// The invariant every lookup depends on: whatever name a client is shown,

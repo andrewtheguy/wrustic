@@ -1,8 +1,8 @@
 // SMB path parsing.
 //
 // This is the trust boundary. Everything a client sends as a filename arrives
-// here, and the only thing standing between `..\..\..\etc\shadow` and a
-// `Vfs::node_from_path` call is this module. Paths are validated into a
+// here, and the only thing standing between `..\..\..\etc\shadow` and a walk
+// over the repository's trees is this module. Paths are validated into a
 // component list rather than string-manipulated, so there is no normalisation
 // step whose ordering could be got wrong.
 
@@ -62,8 +62,8 @@ impl SmbPath {
     }
 
     /// Render back to SMB form, for keying and comparison. Only the in-memory
-    /// test backing keys on paths this way — the real one goes through
-    /// `to_vfs_path` — so it is not compiled into the server.
+    /// test backing keys on paths this way — the real one walks `components`
+    /// — so it is not compiled into the server.
     #[cfg(test)]
     pub(crate) fn to_smb_string(&self) -> String {
         self.components.join("\\")
@@ -149,10 +149,13 @@ mod tests {
         assert_eq!(p.to_smb_string(), r"dir\sub\file.txt");
     }
 
-    /// A name whose stored spelling contains a backslash stays one component —
-    /// the reason paths are not rendered back into a `Path`.
+    /// A backslash from a client is a separator and nothing else, so the
+    /// quoted spelling of a name arrives as two components rather than as the
+    /// name. This is why a client cannot address a quoted name directly, and
+    /// why `SnapshotBacking` re-encodes each component instead of asking the
+    /// client for the stored form.
     #[test]
-    fn a_component_is_never_split_again() {
+    fn a_client_backslash_is_always_a_separator() {
         let quoted = format!("a{}b.txt", "\\u2002");
         let p = SmbPath::parse(&quoted).unwrap();
         assert_eq!(

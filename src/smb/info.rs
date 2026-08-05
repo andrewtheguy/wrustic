@@ -544,6 +544,9 @@ mod tests {
         assert_eq!(allocation_size(1), 4096);
         assert_eq!(allocation_size(4096), 4096);
         assert_eq!(allocation_size(4097), 8192);
+        // Rounding up has nowhere to go: it saturates rather than panicking in
+        // a debug build, which would take the connection down mid-listing.
+        assert_eq!(allocation_size(u64::MAX), u64::MAX);
     }
 
     #[test]
