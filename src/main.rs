@@ -493,9 +493,11 @@ fn run(
                     Event::Mouse(m) => app.handle_mouse(m),
                     _ => {}
                 }
-            } else {
-                app.poll_smb_lock();
             }
+            // After every wakeup, not just the timeout: a steady stream of
+            // events (scrolling, focus/resize churn) would otherwise starve
+            // the poison check for as long as it kept arriving.
+            app.poll_smb_lock();
             continue;
         }
 
