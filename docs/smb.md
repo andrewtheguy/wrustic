@@ -49,11 +49,11 @@ password shown on the share screen when asked.
 
 ```sh
 # Linux — mount.cifs prompts for the password
-sudo mount -t cifs -o port=4456,vers=2.1,username=wrustic,ro,uid=$(id -u),gid=$(id -g) \
+sudo mount -t cifs -o port=4456,vers=2.1,username=wrustic,ro,uid=$(id -u),gid=$(id -g),file_mode=0444,dir_mode=0555 \
     //127.0.0.1/snap /mnt/snap
 
 # macOS
-mount_smbfs //wrustic@127.0.0.1:4456/snap /Volumes/snap
+mount_smbfs -f 0444 -d 0555 //wrustic@127.0.0.1:4456/snap /Volumes/snap
 ```
 
 ```bat
@@ -64,6 +64,28 @@ net use Z: \\127.0.0.1\snap * /user:wrustic /TCPPORT:4456
 Windows needs **no client-side policy changes**. Sessions are authenticated and
 signed, so `EnableInsecureGuestLogons` and `RequireSecuritySignature` stay at
 their secure defaults.
+
+### Permissions: readable by everyone, executable by no one
+
+Every file mounts as `0444` and every directory as `0555` — readable and
+listable by any local user, writable and runnable by none. A share is a way to
+*browse* a snapshot, not to restore one from: symlinks, devices and modes are
+already lost on the way through SMB 2.1 (see [Known
+limitations](#known-limitations)), so a tree copied out of a mount is not a
+faithful restore however it is executed. Use `restic restore` for that.
+
+The mode itself is a client-side setting, because SMB 2.1 carries no POSIX
+mode: `file_mode=`/`dir_mode=` on Linux and `-f`/`-d` on macOS, which is why
+the commands above pass them. Dropping those options does not open the share up
+to writes — every write is refused by the server regardless — it only makes the
+client display a mode the server never claimed, typically `0555` from the
+kernel's own default with the read-only attribute applied.
+
+The execute bit is enforced server-side, though, since Windows checks it there:
+a CREATE naming a file and asking for `FILE_EXECUTE` (which is how Windows
+activates an image) is answered `ACCESS_DENIED`, so a binary in a snapshot
+cannot be launched from a mapped drive. The same bit on a *directory* means
+`FILE_TRAVERSE` and is granted — without it a client cannot descend.
 
 ### Older Windows
 

@@ -518,8 +518,10 @@ pub(crate) fn tree_connect(
     w.u32(0); // Capabilities
     w.u32(match kind {
         // Advertising the read-only mask here is what makes a client show the
-        // mount as read-only before it ever attempts a write.
-        TreeKind::Disk => access::READ_ONLY,
+        // mount as read-only before it ever attempts a write. The share root is
+        // a directory, so this is the directory mask — per-file opens still get
+        // the file mask, which carries no execute bit.
+        TreeKind::Disk => access::READ_ONLY_DIR,
         TreeKind::Ipc => 0,
     });
     Ok((w.into_vec(), kind, tree_id))
@@ -1003,7 +1005,7 @@ mod tests {
         assert_eq!(u16::from_le_bytes(resp[0..2].try_into().unwrap()), 16);
         assert_eq!(resp[2], SHARE_TYPE_DISK);
         let maximal = u32::from_le_bytes(resp[12..16].try_into().unwrap());
-        assert_eq!(maximal, access::READ_ONLY);
+        assert_eq!(maximal, access::READ_ONLY_DIR);
         assert_eq!(maximal & access::WRITE_BITS, 0);
     }
 

@@ -148,7 +148,12 @@ pub(crate) mod access {
     pub(crate) const FILE_APPEND_DATA: u32 = 0x0000_0004;
     pub(crate) const FILE_READ_EA: u32 = 0x0000_0008;
     pub(crate) const FILE_WRITE_EA: u32 = 0x0000_0010;
+    /// The same bit means "run this file as an image" on a file and "traverse"
+    /// on a directory. Directories need it — without it a Windows client cannot
+    /// walk into a subdirectory — and files must not have it: this share is for
+    /// browsing a backup, not for launching one out of it.
     pub(crate) const FILE_EXECUTE: u32 = 0x0000_0020;
+    pub(crate) const FILE_TRAVERSE: u32 = FILE_EXECUTE;
     pub(crate) const FILE_DELETE_CHILD: u32 = 0x0000_0040;
     pub(crate) const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
     pub(crate) const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
@@ -158,14 +163,36 @@ pub(crate) mod access {
     pub(crate) const WRITE_OWNER: u32 = 0x0008_0000;
     pub(crate) const SYNCHRONIZE: u32 = 0x0010_0000;
 
-    /// Everything a caller may hold on this share. Reported as MaximalAccess on
-    /// TREE_CONNECT and as the granted access on every CREATE.
-    pub(crate) const READ_ONLY: u32 = FILE_READ_DATA
-        | FILE_READ_EA
-        | FILE_EXECUTE
-        | FILE_READ_ATTRIBUTES
-        | READ_CONTROL
-        | SYNCHRONIZE;
+    /// Everything a caller may hold on a file here: read, and nothing else.
+    /// FILE_EXECUTE is deliberately absent — see `read_only`.
+    pub(crate) const READ_ONLY_FILE: u32 =
+        FILE_READ_DATA | FILE_READ_EA | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE;
+
+    /// The same for a directory, plus FILE_TRAVERSE, which is what a client
+    /// needs to descend into it. Also what TREE_CONNECT reports as
+    /// MaximalAccess, the share root being a directory.
+    pub(crate) const READ_ONLY_DIR: u32 = READ_ONLY_FILE | FILE_TRAVERSE;
+
+    /// Access granted on an open, and reported by FileAccessInformation.
+    ///
+    /// Files get no execute bit. On Windows that is the whole mechanism: image
+    /// activation opens with FILE_EXECUTE, so refusing it means an executable
+    /// on the share cannot be launched from it, only copied off and run
+    /// locally. Linux clients decide that from the mode instead, which comes
+    /// from the mount's `file_mode=`/`dir_mode=` (0444/0555 in the mount
+    /// commands wrustic prints), because SMB 2.1 carries no POSIX mode.
+    pub(crate) const fn read_only(is_dir: bool) -> u32 {
+        if is_dir { READ_ONLY_DIR } else { READ_ONLY_FILE }
+    }
+
+    /// Generic access bits (MS-DTYP 2.4.3). Only execute matters here: a client
+    /// that means to run an image may ask for the generic form rather than
+    /// FILE_EXECUTE, and the server, not the client, is what maps it.
+    pub(crate) const GENERIC_EXECUTE: u32 = 0x2000_0000;
+
+    /// Either spelling of "I intend to run this". Refused on a file; on a
+    /// directory the specific bit is FILE_TRAVERSE and is granted instead.
+    pub(crate) const EXECUTE_BITS: u32 = FILE_EXECUTE | GENERIC_EXECUTE;
 
     /// Any of these in a CREATE request means the caller intends to modify
     /// something, and the open is refused outright rather than silently
@@ -431,7 +458,22 @@ mod tests {
 
     #[test]
     fn read_only_access_mask_excludes_every_write_bit() {
-        assert_eq!(access::READ_ONLY & access::WRITE_BITS, 0);
+        assert_eq!(access::READ_ONLY_FILE & access::WRITE_BITS, 0);
+        assert_eq!(access::READ_ONLY_DIR & access::WRITE_BITS, 0);
+    }
+
+    #[test]
+    fn only_directories_get_the_execute_traverse_bit() {
+        assert_eq!(access::read_only(false) & access::FILE_EXECUTE, 0);
+        assert_eq!(
+            access::read_only(true) & access::FILE_TRAVERSE,
+            access::FILE_TRAVERSE
+        );
+        // Traverse is the only difference between the two.
+        assert_eq!(
+            access::read_only(true) & !access::FILE_TRAVERSE,
+            access::read_only(false)
+        );
     }
 
     #[test]

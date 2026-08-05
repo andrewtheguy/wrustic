@@ -232,6 +232,15 @@ pub(crate) fn create(
 
     let info = backing.stat(&path)?;
 
+    // Nothing here is executable. On a file the bit means "run this as an
+    // image", and refusing it is what stops a Windows client launching a
+    // binary straight off the share — this is a way to browse a backup, not a
+    // way to restore or run one. On a directory the identical bit means
+    // traverse, which every client needs to descend, so it is granted there.
+    if !info.kind.is_dir() && desired_access & access::EXECUTE_BITS != 0 {
+        return Err(status::ACCESS_DENIED);
+    }
+
     // Honour the caller's stated expectation about what it is opening.
     if create_options & options::DIRECTORY_FILE != 0 && !info.kind.is_dir() {
         return Err(status::NOT_A_DIRECTORY);
@@ -547,19 +556,18 @@ pub(crate) fn query_info(
             // with a backslash, and the root's name must not be empty.
             let path = handle.path.to_smb_absolute();
             let id = handle.path.file_id();
+            let granted = access::read_only(handle.info.kind.is_dir());
             match class {
                 file_class::BASIC => info::file_basic(&handle.info),
                 file_class::STANDARD => info::file_standard(&handle.info),
                 file_class::INTERNAL => info::file_internal(id),
                 file_class::EA => info::file_ea(),
-                file_class::ACCESS => info::file_access(access::READ_ONLY),
+                file_class::ACCESS => info::file_access(granted),
                 file_class::NAME => info::file_name(&path),
                 file_class::POSITION => info::file_position(),
                 file_class::MODE => info::file_mode(),
                 file_class::ALIGNMENT => info::file_alignment(),
-                file_class::ALL => {
-                    info::file_all(&handle.info, id, access::READ_ONLY, &path)
-                }
+                file_class::ALL => info::file_all(&handle.info, id, granted, &path),
                 file_class::STREAM => info::file_stream(&handle.info),
                 file_class::NETWORK_OPEN => info::file_network_open(&handle.info),
                 file_class::ATTRIBUTE_TAG => info::file_attribute_tag(&handle.info),
@@ -670,7 +678,7 @@ mod tests {
         name: &str,
         tree_id: u32,
     ) -> Result<u64, u32> {
-        let body = create_body(name, access::READ_ONLY, disposition::OPEN, 0);
+        let body = create_body(name, access::READ_ONLY_FILE, disposition::OPEN, 0);
         let msg = message(&body);
         let resp = create(&body, &msg, b, h, tree_id)?;
         Ok(u64::from_le_bytes(resp[72..80].try_into().unwrap()))
@@ -688,7 +696,7 @@ mod tests {
     fn create_opens_a_file_and_reports_its_size() {
         let b = backing();
         let mut h = Handles::default();
-        let body = create_body("top.bin", access::READ_ONLY, disposition::OPEN, 0);
+        let body = create_body("top.bin", access::READ_ONLY_FILE, disposition::OPEN, 0);
         let resp = create(&body, &message(&body), &b, &mut h, TREE).unwrap();
 
         assert_eq!(u16::from_le_bytes(resp[0..2].try_into().unwrap()), 89);
@@ -729,7 +737,7 @@ mod tests {
             disposition::OVERWRITE,
             disposition::OVERWRITE_IF,
         ] {
-            let body = create_body("top.bin", access::READ_ONLY, disp, 0);
+            let body = create_body("top.bin", access::READ_ONLY_FILE, disp, 0);
             assert_eq!(
                 create(&body, &message(&body), &b, &mut h, TREE).unwrap_err(),
                 status::MEDIA_WRITE_PROTECTED,
@@ -740,7 +748,7 @@ mod tests {
         // Delete-on-close.
         let body = create_body(
             "top.bin",
-            access::READ_ONLY,
+            access::READ_ONLY_FILE,
             disposition::OPEN,
             options::DELETE_ON_CLOSE,
         );
@@ -753,10 +761,76 @@ mod tests {
     }
 
     #[test]
+    fn create_refuses_execute_on_a_file_but_allows_traverse_on_a_directory() {
+        let b = backing();
+        let mut h = Handles::default();
+
+        // Image activation on Windows asks for FILE_EXECUTE, in either its
+        // specific or its generic spelling. Nothing on this share may be
+        // launched out of it.
+        for name in ["top.bin", "dir\\a.txt"] {
+            for bit in [access::FILE_EXECUTE, access::GENERIC_EXECUTE] {
+                let body = create_body(
+                    name,
+                    access::READ_ONLY_FILE | bit,
+                    disposition::OPEN,
+                    0,
+                );
+                assert_eq!(
+                    create(&body, &message(&body), &b, &mut h, TREE).unwrap_err(),
+                    status::ACCESS_DENIED,
+                    "{name} must not open for execute ({bit:#x})"
+                );
+            }
+        }
+        assert_eq!(h.len(), 0, "no handle may leak from a refused create");
+
+        // The same bit on a directory is FILE_TRAVERSE, which a client needs to
+        // descend into it.
+        let body = create_body(
+            "dir",
+            access::READ_ONLY_DIR,
+            disposition::OPEN,
+            options::DIRECTORY_FILE,
+        );
+        assert!(create(&body, &message(&body), &b, &mut h, TREE).is_ok());
+    }
+
+    #[test]
+    fn query_info_grants_traverse_only_to_directories() {
+        let b = backing();
+        let mut h = Handles::default();
+
+        for (name, want) in [
+            ("dir\\a.txt", access::READ_ONLY_FILE),
+            ("dir", access::READ_ONLY_DIR),
+        ] {
+            let id = open_path(&b, &mut h, name).unwrap();
+            let body = query_info_body(info_type::FILE, file_class::ACCESS, id, 4096);
+            let resp = query_info(&body, &b, &h, UNIX_EPOCH, 1).unwrap();
+            assert_eq!(
+                u32::from_le_bytes(resp[8..12].try_into().unwrap()),
+                want,
+                "{name} granted access"
+            );
+
+            // FileAllInformation carries the same mask, at offset 76 of the
+            // structure (Basic 40 + Standard 24 + Internal 8 + EA 4).
+            let body = query_info_body(info_type::FILE, file_class::ALL, id, 4096);
+            let resp = query_info(&body, &b, &h, UNIX_EPOCH, 1).unwrap();
+            assert_eq!(
+                u32::from_le_bytes(resp[8 + 76..8 + 80].try_into().unwrap()),
+                want,
+                "{name} granted access in FileAllInformation"
+            );
+        }
+    }
+
+    #[test]
     fn create_refuses_a_path_that_escapes_the_share() {
         let b = backing();
         let mut h = Handles::default();
-        let body = create_body(r"..\..\etc\shadow", access::READ_ONLY, disposition::OPEN, 0);
+        let body = create_body(r"..\..\etc\shadow", access::READ_ONLY_FILE, disposition::OPEN, 0);
         assert_eq!(
             create(&body, &message(&body), &b, &mut h, TREE).unwrap_err(),
             status::OBJECT_PATH_SYNTAX_BAD
@@ -770,7 +844,7 @@ mod tests {
 
         let body = create_body(
             "top.bin",
-            access::READ_ONLY,
+            access::READ_ONLY_FILE,
             disposition::OPEN,
             options::DIRECTORY_FILE,
         );
@@ -781,7 +855,7 @@ mod tests {
 
         let body = create_body(
             "dir",
-            access::READ_ONLY,
+            access::READ_ONLY_FILE,
             disposition::OPEN,
             options::NON_DIRECTORY_FILE,
         );
@@ -795,7 +869,7 @@ mod tests {
     fn create_reports_a_missing_file() {
         let b = backing();
         let mut h = Handles::default();
-        let body = create_body("nope.txt", access::READ_ONLY, disposition::OPEN, 0);
+        let body = create_body("nope.txt", access::READ_ONLY_FILE, disposition::OPEN, 0);
         assert_eq!(
             create(&body, &message(&body), &b, &mut h, TREE).unwrap_err(),
             status::OBJECT_NAME_NOT_FOUND
