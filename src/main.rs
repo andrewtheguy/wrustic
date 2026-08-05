@@ -386,8 +386,8 @@ fn run(
                     app.prune_scroll = 0;
                     app.screen = match outcome {
                         Ok(stdout) => {
-                            let report = String::from_utf8_lossy(&stdout).trim().to_string();
-                            Screen::PruneDone(if report.is_empty() {
+                            let report = String::from_utf8_lossy(&stdout).into_owned();
+                            Screen::PruneDone(if report.trim().is_empty() {
                                 "prune finished (restic produced no output)".into()
                             } else {
                                 report

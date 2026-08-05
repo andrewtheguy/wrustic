@@ -205,7 +205,7 @@ You *will* want `restic` (>= 0.19.0 — the release whose locking protocol and
 JSON output wrustic is built against) on your `$PATH` for development. Use it
 for:
 
-- **Write operations wrustic doesn't expose** (init, backup, prune, copy, key
+- **Write operations wrustic doesn't expose** (init, backup, copy, key
   management, …).
 - Any read operation not yet wired up in the TUI.
 
