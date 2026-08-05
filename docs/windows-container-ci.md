@@ -147,6 +147,55 @@ rather than the mounted `target/`, so a container run and a host `cargo build`
 never fight over the same directory — and running this does not blow away your
 host build cache.
 
+## Watching a run
+
+`docker stats` and `docker logs -f` cover most of it, and the CI output streams
+to whichever terminal launched the run. For something more visual, the thing to
+know first is what *not* to reach for.
+
+**Docker Desktop is not an option that keeps this setup intact.** It has no
+Windows-containers-only mode. Switching engines — the tray menu, `DockerCli.exe
+-SwitchDaemon`, or `docker desktop engine use windows` on newer builds — changes
+which engine is active, but Desktop's backend and the `docker-desktop` WSL2
+distro come with the package regardless; that distro was observed running here
+while Desktop was in Windows-container mode. Installing it puts back everything
+the engine-only setup above exists to avoid.
+
+**Portainer CE runs as a Windows container** on the engine already installed, so
+it needs no Linux VM and no Desktop. It talks to the daemon over the named pipe:
+
+```powershell
+docker run -d --name portainer --restart=always `
+  --isolation=hyperv --memory=2g `
+  -p 127.0.0.1:9443:9443 `
+  -v \\.\pipe\docker_engine:\\.\pipe\docker_engine `
+  -v portainer_data:C:\data `
+  portainer/portainer-ce@sha256:ebdd4ad94fd870df825ccc27f1be3f30c81c6727c5a57b6df4eb51414960a89b
+```
+
+Then `https://localhost:9443`, self-signed, first visit sets the admin password.
+
+The digest is not fussiness. `portainer/portainer-ce:lts` is a multi-platform
+manifest carrying three Windows variants — `10.0.17763.*` (WS2019),
+`10.0.20348.*` (WS2022) and `10.0.26100.*` (WS2025) — and on a 25H2 host the
+WS2025 one is the plausible match and the one that cannot start, for the same
+reason the Dockerfile pins `ltsc2022`. There is no `:lts-windows-ltsc2022` tag
+to name instead, so the WS2022 variant has to be pinned by digest. Re-resolve it
+after an upgrade with:
+
+```powershell
+(docker manifest inspect portainer/portainer-ce:lts | ConvertFrom-Json).manifests |
+  Where-Object { $_.platform.'os.version' -like '10.0.20348.*' } | Select-Object digest
+```
+
+Two things to weigh: it is a persistent service on 9443 (bound to loopback
+above — dropping the `127.0.0.1:` publishes it to the LAN), and mounting
+`\\.\pipe\docker_engine` into it is root-equivalent access to the host.
+
+**The VS Code Container Tools extension** is the smaller option: it attaches to
+the same named pipe and gives a container tree with live logs, without running
+anything persistent.
+
 ## Image version pinning
 
 The base image is `servercore:ltsc2022`, not `ltsc2025`, and that is not
