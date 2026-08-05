@@ -544,7 +544,7 @@ pub(crate) fn query_info(
     r.skip(2).map_err(|_| status::INVALID_PARAMETER)?; // InputBufferOffset
     r.skip(2).map_err(|_| status::INVALID_PARAMETER)?; // Reserved
     r.skip(4).map_err(|_| status::INVALID_PARAMETER)?; // InputBufferLength
-    r.skip(4).map_err(|_| status::INVALID_PARAMETER)?; // AdditionalInformation
+    let additional = r.u32().map_err(|_| status::INVALID_PARAMETER)?; // AdditionalInformation
     r.skip(4).map_err(|_| status::INVALID_PARAMETER)?; // Flags
     let file_id = read_file_id(&mut r)?;
 
@@ -594,10 +594,16 @@ pub(crate) fn query_info(
             fs_class::SECTOR_SIZE => info::fs_sector_size(),
             _ => return Err(status::NOT_SUPPORTED),
         },
-        // No security descriptors and no quotas. Clients treat both as
-        // optional; refusing is cleaner than inventing an ACL that does not
-        // describe anything real.
-        info_type::SECURITY | info_type::QUOTA => return Err(status::NOT_SUPPORTED),
+        // One fixed descriptor for every node, rather than the snapshot's own
+        // uid/gid/mode, which describe a machine that is not this one. See
+        // `info::security_descriptor`.
+        info_type::SECURITY => {
+            let is_dir = handle.info.kind.is_dir();
+            info::security_descriptor(is_dir, additional, access::read_only(is_dir))
+        }
+        // Quotas stay unsupported: a snapshot has no free space to account for,
+        // and clients treat the class as optional.
+        info_type::QUOTA => return Err(status::NOT_SUPPORTED),
         _ => return Err(status::INVALID_PARAMETER),
     };
 
@@ -611,7 +617,17 @@ pub(crate) fn query_info(
         // implied promise, and matches what `encode_dir_entries` already returns
         // for the identical case. Unreachable in practice: clients ask with
         // 4 KiB or more, and the largest class here is a few hundred bytes.
-        return Err(status::INFO_LENGTH_MISMATCH);
+        //
+        // A security query is the one case a client may deliberately undersize,
+        // to be told the length it needs, so it gets the status that means that
+        // — BUFFER_TOO_SMALL. The required length still cannot ride along for
+        // want of ErrorData; the descriptor here is under a hundred bytes, so a
+        // client that retries at any sane size succeeds.
+        return Err(if ty == info_type::SECURITY {
+            status::BUFFER_TOO_SMALL
+        } else {
+            status::INFO_LENGTH_MISMATCH
+        });
     }
 
     let mut w = Writer::with_capacity(8 + buf.len());
@@ -1224,6 +1240,16 @@ mod tests {
     }
 
     fn query_info_body(ty: u8, class: u8, file_id: u64, output_len: u32) -> Vec<u8> {
+        query_info_body_with(ty, class, file_id, output_len, 0)
+    }
+
+    fn query_info_body_with(
+        ty: u8,
+        class: u8,
+        file_id: u64,
+        output_len: u32,
+        additional: u32,
+    ) -> Vec<u8> {
         let mut w = Writer::new();
         w.u16(41);
         w.u8(ty);
@@ -1232,7 +1258,7 @@ mod tests {
         w.u16(0); // InputBufferOffset
         w.u16(0); // Reserved
         w.u32(0); // InputBufferLength
-        w.u32(0); // AdditionalInformation
+        w.u32(additional); // AdditionalInformation
         w.u32(0); // Flags
         write_file_id(&mut w, file_id);
         w.into_vec()
@@ -1293,12 +1319,55 @@ mod tests {
     }
 
     #[test]
-    fn query_info_refuses_security_and_unknown_classes() {
+    fn query_info_answers_a_security_query_for_every_node() {
+        use crate::smb::info::sec_info;
+        const PARTS: u32 = sec_info::OWNER | sec_info::GROUP | sec_info::DACL;
+
+        let b = backing();
+        let mut h = Handles::default();
+
+        // A file and a directory both answer, with the mask each would be
+        // granted on CREATE — no node can be less accessible than another.
+        for (name, want_mask) in [
+            ("dir\\a.txt", access::READ_ONLY_FILE),
+            ("dir", access::READ_ONLY_DIR),
+        ] {
+            let id = open_path(&b, &mut h, name).unwrap();
+            let body = query_info_body_with(info_type::SECURITY, 0, id, 4096, PARTS);
+            let resp = query_info(&body, &b, &h, UNIX_EPOCH, 1).unwrap();
+            let len = u32::from_le_bytes(resp[4..8].try_into().unwrap()) as usize;
+            let sd = &resp[8..8 + len];
+            assert_eq!(
+                sd,
+                info::security_descriptor(name == "dir", PARTS, want_mask),
+                "{name} security descriptor"
+            );
+        }
+    }
+
+    #[test]
+    fn query_info_reports_a_security_buffer_that_is_too_small() {
+        use crate::smb::info::sec_info;
         let b = backing();
         let mut h = Handles::default();
         let id = open_path(&b, &mut h, "dir\\a.txt").unwrap();
 
-        let body = query_info_body(info_type::SECURITY, 0, id, 4096);
+        // BUFFER_TOO_SMALL, not INFO_LENGTH_MISMATCH: a client is allowed to
+        // undersize this query on purpose to learn the length it needs.
+        let body = query_info_body_with(info_type::SECURITY, 0, id, 8, sec_info::DACL);
+        assert_eq!(
+            query_info(&body, &b, &h, UNIX_EPOCH, 1).unwrap_err(),
+            status::BUFFER_TOO_SMALL
+        );
+    }
+
+    #[test]
+    fn query_info_refuses_quotas_and_unknown_classes() {
+        let b = backing();
+        let mut h = Handles::default();
+        let id = open_path(&b, &mut h, "dir\\a.txt").unwrap();
+
+        let body = query_info_body(info_type::QUOTA, 0, id, 4096);
         assert_eq!(
             query_info(&body, &b, &h, UNIX_EPOCH, 1).unwrap_err(),
             status::NOT_SUPPORTED

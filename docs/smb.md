@@ -89,6 +89,25 @@ activates an image) is answered `ACCESS_DENIED`, so a binary in a snapshot
 cannot be launched from a mapped drive. The same bit on a *directory* means
 `FILE_TRAVERSE` and is granted — without it a client cannot descend.
 
+### Ownership is standardised, not restored
+
+A snapshot records the uid, gid and mode of the machine it came from, and none
+of those mean anything on the client. Honouring them is what makes `restic
+mount` unpleasant to browse a system backup with: a directory backed up as
+`0700 root:root` is one you cannot open. The share does not honour them —
+`node_info()` in `src/smb/backing.rs` reads name, kind, size and timestamps and
+nothing else, so no folder can be less accessible than any other because of who
+owned it.
+
+Windows needs that said in its own vocabulary, or it fills the gap with a guess.
+Every node answers a security query with the *same* descriptor: owner
+`BUILTIN\Administrators`, group `BUILTIN\Users`, and a one-ACE DACL granting
+`Everyone` exactly the rights the share grants anyway — read on a file, read and
+traverse on a directory, never write. Without it, Explorer reports folders as
+ones you have no permission for and offers to take ownership to "fix" them.
+`FILE_PERSISTENT_ACLS` is advertised alongside, since a client told the volume
+has no ACLs never asks. Setting security is refused like every other write.
+
 ### Older Windows
 
 Windows builds before 11 24H2 can only reach port 445, which wrustic will not

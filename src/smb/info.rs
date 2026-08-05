@@ -231,6 +231,141 @@ pub(crate) fn file_stream(info: &NodeInfo) -> Vec<u8> {
     w.into_vec()
 }
 
+/// `AdditionalInformation` in a QUERY_INFO request for security (MS-SMB2
+/// 2.2.37). Which parts of the descriptor the client is asking for.
+pub(crate) mod sec_info {
+    pub(crate) const OWNER: u32 = 0x0000_0001;
+    pub(crate) const GROUP: u32 = 0x0000_0002;
+    pub(crate) const DACL: u32 = 0x0000_0004;
+    pub(crate) const SACL: u32 = 0x0000_0008;
+}
+
+/// A well-known SID in its wire form (MS-DTYP 2.4.2.2): revision, sub-authority
+/// count, a 6-byte big-endian identifier authority, then the sub-authorities
+/// little-endian.
+fn sid(authority: u8, sub: &[u32]) -> Vec<u8> {
+    let mut w = Writer::with_capacity(8 + 4 * sub.len());
+    w.u8(1); // Revision
+    w.u8(sub.len() as u8); // SubAuthorityCount
+    w.bytes(&[0, 0, 0, 0, 0, authority]); // IdentifierAuthority, big-endian
+    for s in sub {
+        w.u32(*s);
+    }
+    w.into_vec()
+}
+
+/// S-1-1-0. Every caller is a member, which is the point: the share hands the
+/// same rights to whoever mounted it.
+fn sid_everyone() -> Vec<u8> {
+    sid(1, &[0])
+}
+
+/// S-1-5-32-544, BUILTIN\Administrators.
+fn sid_administrators() -> Vec<u8> {
+    sid(5, &[32, 544])
+}
+
+/// S-1-5-32-545, BUILTIN\Users.
+fn sid_users() -> Vec<u8> {
+    sid(5, &[32, 545])
+}
+
+/// A security descriptor for a node — MS-DTYP 2.4.6, self-relative form.
+///
+/// Every node gets the same one, deliberately. A snapshot records the uid, gid
+/// and mode of the machine it came from, and none of those mean anything on the
+/// client: a directory backed up as `0700 root:root` would be a directory
+/// Windows refuses to open, on a share whose whole purpose is browsing. That is
+/// the behaviour `restic mount` has, and the reason it is unpleasant to browse a
+/// system backup with. So ownership is standardised here instead — a fixed
+/// owner and group, and one ACE granting Everyone exactly the rights the share
+/// grants anyway (read on a file, read and traverse on a directory, never
+/// write). It is the same statement the 0444/0555 mount modes make on Linux and
+/// macOS, in the only vocabulary Windows reads.
+///
+/// Returning nothing at all is what this replaced, and it is worse than it
+/// sounds: a client that cannot read an owner or a DACL reports the folder as
+/// one it has no permission for, and offers to "fix" it by taking ownership.
+///
+/// `wanted` is the request's `AdditionalInformation`; only the parts asked for
+/// are included, since a client that asked for the owner alone must not be told
+/// the DACL is absent. SACL is never returned — auditing is a thing this share
+/// does not have, and claiming an empty one invites a client to believe it.
+pub(crate) fn security_descriptor(is_dir: bool, wanted: u32, granted: u32) -> Vec<u8> {
+    const SE_DACL_PRESENT: u16 = 0x0004;
+    const SE_SELF_RELATIVE: u16 = 0x8000;
+    const ACL_REVISION: u8 = 2;
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0x00;
+    const OBJECT_INHERIT_ACE: u8 = 0x01;
+    const CONTAINER_INHERIT_ACE: u8 = 0x02;
+    const HEADER_LEN: usize = 20;
+
+    // Dropped rather than refused: a client that asks for the audit ACL
+    // alongside the parts it actually needs should get those parts, not an
+    // error for the one thing this share has nothing to say about.
+    let wanted = wanted & !sec_info::SACL;
+
+    let owner = (wanted & sec_info::OWNER != 0).then(sid_administrators);
+    let group = (wanted & sec_info::GROUP != 0).then(sid_users);
+    let dacl = (wanted & sec_info::DACL != 0).then(|| {
+        let who = sid_everyone();
+        let ace_len = 8 + who.len();
+        let acl_len = 8 + ace_len;
+        let mut w = Writer::with_capacity(acl_len);
+        w.u8(ACL_REVISION); // 0 AclRevision
+        w.u8(0); // 1 Sbz1
+        w.u16(acl_len as u16); // 2 AclSize — the whole ACL, header included
+        w.u16(1); // 4 AceCount
+        w.u16(0); // 6 Sbz2
+        w.u8(ACCESS_ALLOWED_ACE_TYPE); // 8 AceType
+        // Inheritance flags on a directory only, so a client's permission
+        // dialog shows what a child would get rather than an empty inheritance
+        // column. Nothing is ever created here for them to apply to.
+        w.u8(if is_dir {
+            OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+        } else {
+            0
+        }); // 9 AceFlags
+        w.u16(ace_len as u16); // 10 AceSize
+        w.u32(granted); // 12 Mask — exactly what CREATE would grant
+        w.bytes(&who); // 16 Sid
+        w.into_vec()
+    });
+
+    // Offsets are from the start of the descriptor, and are zero for a part
+    // that is absent.
+    let mut offset = HEADER_LEN;
+    let mut body = Vec::new();
+    let mut place = |part: &Option<Vec<u8>>| -> u32 {
+        match part {
+            Some(bytes) => {
+                let at = offset;
+                offset += bytes.len();
+                body.extend_from_slice(bytes);
+                at as u32
+            }
+            None => 0,
+        }
+    };
+    let owner_off = place(&owner);
+    let group_off = place(&group);
+    let dacl_off = place(&dacl);
+
+    let mut w = Writer::with_capacity(HEADER_LEN + body.len());
+    w.u8(1); // 0 Revision
+    w.u8(0); // 1 Sbz1
+    // DACL_PRESENT is a claim about the descriptor, not about the request: it
+    // may only be set when a DACL actually rides along, or a client reads the
+    // absent one as "deny everything".
+    w.u16(SE_SELF_RELATIVE | if dacl.is_some() { SE_DACL_PRESENT } else { 0 }); // 2 Control
+    w.u32(owner_off); // 4 OffsetOwner
+    w.u32(group_off); // 8 OffsetGroup
+    w.u32(0); // 12 OffsetSacl — never present
+    w.u32(dacl_off); // 16 OffsetDacl
+    w.bytes(&body);
+    w.into_vec()
+}
+
 /// FileFsVolumeInformation — MS-FSCC 2.5.9.
 pub(crate) fn fs_volume(label: &str, created: SystemTime, serial: u32) -> Vec<u8> {
     let encoded = utf16le(label);
@@ -287,6 +422,11 @@ pub(crate) fn fs_attribute() -> Vec<u8> {
     const FILE_CASE_SENSITIVE_SEARCH: u32 = 0x0000_0001;
     const FILE_CASE_PRESERVED_NAMES: u32 = 0x0000_0002;
     const FILE_UNICODE_ON_DISK: u32 = 0x0000_0004;
+    /// Set because `security_descriptor` answers for every node. A client that
+    /// is told the volume has no ACLs skips the query and falls back to its own
+    /// idea of who may read the share, which on Windows is the guess this
+    /// server exists to remove.
+    const FILE_PERSISTENT_ACLS: u32 = 0x0000_0008;
     const FILE_READ_ONLY_VOLUME: u32 = 0x0008_0000;
 
     let name = utf16le("wrustic");
@@ -295,6 +435,7 @@ pub(crate) fn fs_attribute() -> Vec<u8> {
         FILE_CASE_SENSITIVE_SEARCH
             | FILE_CASE_PRESERVED_NAMES
             | FILE_UNICODE_ON_DISK
+            | FILE_PERSISTENT_ACLS
             | FILE_READ_ONLY_VOLUME,
     ); // 0 FileSystemAttributes
     w.u32(255); // 4 MaximumComponentNameLength
@@ -515,6 +656,97 @@ mod tests {
         assert_eq!(&all[40..64], file_standard(&info).as_slice());
         assert_eq!(&all[64..72], file_internal(42).as_slice());
         assert_eq!(&all[96..], file_name("dir\\x.txt").as_slice());
+    }
+
+    /// The parts a client normally asks for, and the mask a file gets.
+    const ALL_PARTS: u32 = sec_info::OWNER | sec_info::GROUP | sec_info::DACL;
+    const READ_MASK: u32 = 0x0012_0089;
+
+    fn u16_at(b: &[u8], at: usize) -> u16 {
+        u16::from_le_bytes(b[at..at + 2].try_into().unwrap())
+    }
+
+    fn u32_at(b: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn security_descriptor_is_self_relative_with_offsets_that_land_on_its_parts() {
+        let sd = security_descriptor(false, ALL_PARTS, READ_MASK);
+
+        assert_eq!(sd[0], 1, "Revision");
+        // SE_SELF_RELATIVE | SE_DACL_PRESENT.
+        assert_eq!(u16_at(&sd, 2), 0x8000 | 0x0004);
+        assert_eq!(u32_at(&sd, 12), 0, "no SACL is ever present");
+
+        // Every offset must land inside the buffer, on the SID or ACL it names.
+        let owner = u32_at(&sd, 4) as usize;
+        let group = u32_at(&sd, 8) as usize;
+        let dacl = u32_at(&sd, 16) as usize;
+        assert_eq!(&sd[owner..owner + 16], sid_administrators().as_slice());
+        assert_eq!(&sd[group..group + 16], sid_users().as_slice());
+
+        // ACL: revision 2, one ACE, AclSize covering header plus that ACE.
+        assert_eq!(sd[dacl], 2, "AclRevision");
+        assert_eq!(u16_at(&sd, dacl + 4), 1, "AceCount");
+        let acl_size = u16_at(&sd, dacl + 2) as usize;
+        assert_eq!(dacl + acl_size, sd.len(), "AclSize must reach the end");
+
+        // The one ACE allows Everyone exactly the rights CREATE would grant.
+        assert_eq!(sd[dacl + 8], 0, "ACCESS_ALLOWED_ACE_TYPE");
+        assert_eq!(sd[dacl + 9], 0, "no inheritance flags on a file");
+        assert_eq!(u16_at(&sd, dacl + 10) as usize, acl_size - 8, "AceSize");
+        assert_eq!(u32_at(&sd, dacl + 12), READ_MASK);
+        assert_eq!(&sd[dacl + 16..], sid_everyone().as_slice());
+    }
+
+    #[test]
+    fn security_descriptor_grants_traverse_and_inheritance_on_a_directory() {
+        let dir_mask = READ_MASK | 0x20;
+        let sd = security_descriptor(true, ALL_PARTS, dir_mask);
+        let dacl = u32_at(&sd, 16) as usize;
+        // OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE.
+        assert_eq!(sd[dacl + 9], 0x01 | 0x02);
+        assert_eq!(u32_at(&sd, dacl + 12), dir_mask);
+
+        // The descriptor says nothing about the node beyond its kind: two
+        // directories cannot differ, whatever uid or mode the snapshot recorded.
+        assert_eq!(sd, security_descriptor(true, ALL_PARTS, dir_mask));
+    }
+
+    #[test]
+    fn security_descriptor_returns_only_the_parts_asked_for() {
+        let owner_only = security_descriptor(false, sec_info::OWNER, READ_MASK);
+        assert_ne!(u32_at(&owner_only, 4), 0, "owner requested");
+        assert_eq!(u32_at(&owner_only, 8), 0, "group not requested");
+        assert_eq!(u32_at(&owner_only, 16), 0, "DACL not requested");
+        // DACL_PRESENT must stay clear, or the absent DACL reads as "deny all".
+        assert_eq!(u16_at(&owner_only, 2) & 0x0004, 0);
+
+        // A SACL is dropped rather than refused: the rest still comes back.
+        let with_sacl = security_descriptor(false, ALL_PARTS | sec_info::SACL, READ_MASK);
+        assert_eq!(with_sacl, security_descriptor(false, ALL_PARTS, READ_MASK));
+        assert_eq!(u32_at(&with_sacl, 12), 0);
+
+        // Nothing asked for is a legal, empty descriptor, not a panic.
+        assert_eq!(security_descriptor(false, 0, READ_MASK).len(), 20);
+    }
+
+    #[test]
+    fn well_known_sids_match_their_string_forms() {
+        // S-1-1-0, S-1-5-32-544, S-1-5-32-545.
+        assert_eq!(sid_everyone(), vec![1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0]);
+        assert_eq!(&sid_administrators()[..8], &[1, 2, 0, 0, 0, 0, 0, 5]);
+        assert_eq!(u32_at(&sid_administrators(), 8), 32);
+        assert_eq!(u32_at(&sid_administrators(), 12), 544);
+        assert_eq!(u32_at(&sid_users(), 12), 545);
+    }
+
+    #[test]
+    fn fs_attribute_advertises_acl_support() {
+        // A client told the volume has no ACLs never asks for one.
+        const FILE_PERSISTENT_ACLS: u32 = 0x0000_0008;
+        assert_ne!(u32_at(&fs_attribute(), 0) & FILE_PERSISTENT_ACLS, 0);
     }
 
     #[test]

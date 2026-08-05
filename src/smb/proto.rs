@@ -71,6 +71,7 @@ pub(crate) mod cmd {
 pub(crate) mod status {
     pub(crate) const SUCCESS: u32 = 0x0000_0000;
     pub(crate) const BUFFER_OVERFLOW: u32 = 0x8000_0005;
+    pub(crate) const BUFFER_TOO_SMALL: u32 = 0xC000_0023;
     pub(crate) const NO_MORE_FILES: u32 = 0x8000_0006;
     pub(crate) const INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
     pub(crate) const INVALID_PARAMETER: u32 = 0xC000_000D;
