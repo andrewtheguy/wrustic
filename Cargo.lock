@@ -2017,6 +2017,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "md4"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd76fb0fd6b2e4be62a73f8e0858ca97f81babcb1af322dcaca196f735f17f80"
+dependencies = [
+ "digest 0.11.3",
+]
+
+[[package]]
 name = "mea"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2933,6 +2942,15 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
+]
+
+[[package]]
+name = "rc4"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "840038b674daa9f7a7957440d937951d15c0143c056e631e529141fd780e0c92"
+dependencies = [
+ "cipher 0.5.2",
 ]
 
 [[package]]
@@ -4926,7 +4944,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "wrustic"
-version = "0.0.38"
+version = "0.0.39"
 dependencies = [
  "aes-gcm",
  "aes256ctr_poly1305aes",
@@ -4944,9 +4962,12 @@ dependencies = [
  "jiff",
  "keyring-core",
  "libc",
+ "md-5",
+ "md4",
  "opendal",
  "rand 0.10.1",
  "ratatui",
+ "rc4",
  "reqwest",
  "rustic_backend",
  "rustic_core",
@@ -4954,6 +4975,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "subtle",
  "tokio",
  "toml",
  "tui-input",

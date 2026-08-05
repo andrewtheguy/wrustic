@@ -11,6 +11,7 @@ mod repo;
 mod restic;
 mod s3_backend;
 mod share;
+mod smb;
 mod ui;
 
 use anyhow::Result;
@@ -80,7 +81,7 @@ fn main() -> Result<()> {
     // selection; users can hold Shift to bypass and select text.
     let mouse_enabled = !cli.no_mouse
         && crossterm::execute!(std::io::stdout(), EnableMouseCapture).is_ok();
-    let result = run(&mut terminal, paths, config_lock, cli.port, no_keychain);
+    let result = run(&mut terminal, paths, config_lock, cli.port, cli.smb_port, no_keychain);
     if mouse_enabled {
         let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     }
@@ -93,9 +94,10 @@ fn run(
     paths: Paths,
     config_lock: ConfigLock,
     server_port: u16,
+    smb_port: u16,
     no_keychain: bool,
 ) -> Result<()> {
-    let mut app = App::boot(paths, config_lock, server_port, no_keychain)?;
+    let mut app = App::boot(paths, config_lock, server_port, smb_port, no_keychain)?;
 
     while !app.quit {
         terminal.draw(|f| render(f, &mut app))?;
@@ -126,6 +128,14 @@ fn run(
                     app.screen = Screen::Error(format!("{e:#}"));
                 }
             }
+            continue;
+        }
+
+        // Drawn as "starting…" on the pass above; opening the repository reads
+        // the full index, which is slow enough on a large remote repository to
+        // look like a hang if the frame were not already on screen.
+        if matches!(app.screen, Screen::SnapshotSmbStarting) {
+            app.start_smb_share();
             continue;
         }
 

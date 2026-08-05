@@ -1,6 +1,6 @@
 [package]
 name = "wrustic"
-version = "0.0.38"
+version = "0.0.39"
 edition = "2024"
 
 [dependencies]
@@ -34,12 +34,19 @@ scrypt = { version = "0.12", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros"] }
+# Constant-time byte comparison for the NTLMv2 proof check. A hand-written
+# `diff |= a ^ b` loop is one the optimiser is free to turn into an early exit;
+# `ct_eq` carries the barriers that stop it.
+subtle = "2"
+tokio ={ version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros"] }
 toml = "1"
 tui-input = { version = "0.15", default-features = false, features = ["crossterm"] }
 url = "2"
 zstd = "0.13"
 keyring-core = { version = "1", optional = true }
+md-5 = "0.11"
+md4 = "0.11"
+rc4 = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 # uid/gid for restic-compatible lock files, kill(pid, 0) staleness probes, and

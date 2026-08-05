@@ -27,6 +27,10 @@ docs/restic-usage.md is the overview of exactly which workflows that means.
   0.19, on PATH), unsticking stale repository locks first, with live
   progress and safe cancellation via Ctrl+C
 - **File sharing**: one-time signed download URLs served from localhost
+- **Snapshot sharing over SMB** (`s` on the snapshot list): mount a whole
+  snapshot read-only from Linux, macOS, or Windows 11 24H2+, served by a
+  hand-rolled SMB 2.1 server bound to localhost, with NTLMv2 authentication
+  and signing; see [`docs/smb.md`](docs/smb.md)
 - **Keyboard and mouse navigation**: Vim-style keys, arrow keys, PgUp/PgDn,
   mouse click/scroll; `--no-mouse` to disable
 - **Passphrase entry**: masked TUI input, with optional keychain auto-unlock
@@ -107,7 +111,7 @@ cargo run
 ### CLI flags
 
 ```text
-wrustic [-c|--config-dir <PATH>] [-p|--port <N>] [--no-restic-cache] [--no-keychain] [-h|--help]
+wrustic [-c|--config-dir <PATH>] [-p|--port <N>] [--smb-port <N>] [--no-restic-cache] [--no-keychain] [-h|--help]
 ```
 
 `--config-dir <PATH>` overrides the default config location —
@@ -148,6 +152,14 @@ give each its own `--config-dir`.
 
 `--port <N>` selects the localhost port for the file-share dialog
 (default: 7834).
+
+`--smb-port <N>` selects the localhost port for the snapshot SMB share
+(default: 4456). It is fixed rather than picked per run so a mount command,
+an `/etc/fstab` line, or a saved Windows drive mapping keeps working across
+restarts. Mounting needs a client that can be pointed at a non-standard port:
+Linux, macOS, and Windows 11 24H2 or newer all can — earlier Windows builds
+cannot, and should use the per-file HTTP share instead. See
+[`docs/smb.md`](docs/smb.md).
 
 The restic CLI commands wrustic shells out for (prune-class operations) keep
 an on-disk cache by default, in a `wrustic` directory under your platform's

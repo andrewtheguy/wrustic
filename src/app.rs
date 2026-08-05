@@ -16,6 +16,7 @@ use crate::crypto::Cipher;
 use crate::passphrase::{self, PassphrasePhase};
 use crate::repo::{ContentKind, ContentRow, ContentsPreview, DeleteSnapshotInfo, DiffChange, DiffSummary, FileDetails, SnapshotRow};
 use crate::share::{self, SHARE_TTL, ShareHandle, ShareTarget};
+use crate::smb;
 
 pub(crate) const BACKEND_ORDER: [BackendKind; 3] =
     [BackendKind::Local, BackendKind::Rest, BackendKind::S3];
@@ -41,6 +42,8 @@ pub(crate) enum Screen {
     LoadingFileDetails,
     FileDetails,
     ShareUrl,
+    SnapshotSmbStarting,
+    SnapshotSmb,
     SnapshotCompareSecond,
     SnapshotCompareLoading,
     SnapshotCompareResults,
@@ -238,6 +241,8 @@ pub(crate) struct App {
     /// expects it to be).
     pub(crate) cipher: Option<Cipher>,
     pub(crate) server_port: u16,
+    /// Localhost port the snapshot SMB share listens on (`--smb-port`).
+    pub(crate) smb_port: u16,
     pub(crate) passphrase_instance_input: Input,
     pub(crate) passphrase_input: Input,
     pub(crate) passphrase_confirm: Input,
@@ -300,6 +305,20 @@ pub(crate) struct App {
     // Inline error for the Share screen (e.g. EADDRINUSE on start) — keeps
     // the user on the Share screen instead of jumping to the global Error.
     pub(crate) share_error: Option<String>,
+
+    // SMB share of a whole snapshot, started with `s` on the Snapshots screen.
+    // The handle owns the listener thread; dropping it stops the server, which
+    // is what makes "leaving the screen stops it" hold even on an early return
+    // or a panic unwind. `smb_snapshot_id` is set before the server starts (the
+    // starting screen reads it), so it can be Some while the handle is None.
+    pub(crate) smb_handle: Option<smb::SmbHandle>,
+    pub(crate) smb_snapshot_id: Option<String>,
+    pub(crate) smb_password: Option<String>,
+    pub(crate) smb_error: Option<String>,
+
+    // Whether the `?` key overlay is showing. Screen-relative: it renders the
+    // key list for whatever screen is underneath.
+    pub(crate) help_overlay: bool,
     pub(crate) error_is_fatal: bool,
     pub(crate) quit: bool,
 
@@ -356,11 +375,31 @@ pub(crate) struct App {
 // Two clicks on the same row within this window count as a double-click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
+/// Render an SMB start failure for the share screen.
+///
+/// The port is fixed, so a clash is the one failure a user will hit routinely:
+/// a second wrustic, or a manual test harness, is already on it. The bare bind
+/// error says which address is taken but not what to do about it, and the flag
+/// that fixes it is only settable at startup, which is worth spelling out.
+fn smb_start_error(e: anyhow::Error, port: u16) -> String {
+    let msg = format!("{e:#}");
+    // `local_server::bind_one` produces this wording, and its tests pin it.
+    if msg.contains("already in use") {
+        format!(
+            "{msg}\n\nSomething else is on port {port}. Quit wrustic and start it with \
+             --smb-port <N> to use a different one."
+        )
+    } else {
+        msg
+    }
+}
+
 impl App {
     pub(crate) fn boot(
         paths: Paths,
         config_lock: ConfigLock,
         server_port: u16,
+        smb_port: u16,
         no_keychain: bool,
     ) -> Result<Self> {
         let mut auth_method_list = ListState::default();
@@ -375,6 +414,7 @@ impl App {
             config: Config::default(),
             cipher: None,
             server_port,
+            smb_port,
             passphrase_instance_input: Input::default(),
             passphrase_input: Input::default(),
             passphrase_confirm: Input::default(),
@@ -424,6 +464,11 @@ impl App {
             share_short_url: None,
             share_exp_unix: None,
             share_error: None,
+            smb_handle: None,
+            smb_snapshot_id: None,
+            smb_password: None,
+            smb_error: None,
+            help_overlay: false,
             error_is_fatal: false,
             quit: false,
             delete_target: None,
@@ -1201,6 +1246,72 @@ impl App {
         }
     }
 
+    // Stop the SMB server and clear everything the share screen displays.
+    // Called on every exit from that screen: the share is scoped to viewing it,
+    // exactly like the HTTP file share, so there is never a server running that
+    // the UI is not showing.
+    pub(crate) fn stop_smb_share(&mut self) {
+        if let Some(h) = self.smb_handle.take() {
+            h.stop();
+        }
+        self.smb_snapshot_id = None;
+        self.smb_password = None;
+        self.smb_error = None;
+    }
+
+    // Start the SMB server for `smb_snapshot_id`. Called from the main loop
+    // once the "starting" screen has been drawn, because opening the repository
+    // reads the full index — seconds on a large remote repository — and doing
+    // that inside the key handler would freeze the TUI with no explanation.
+    //
+    // Errors land inline on the share screen rather than the global Error
+    // screen, so a port clash or a bad passphrase leaves the user somewhere
+    // they can retry from.
+    pub(crate) fn start_smb_share(&mut self) {
+        self.screen = Screen::SnapshotSmb;
+        if self.smb_handle.is_some() {
+            return;
+        }
+        let Some(snap_id) = self.smb_snapshot_id.clone() else {
+            self.smb_error = Some("No snapshot selected to share.".into());
+            return;
+        };
+        let Some((_, profile)) = self.config.profile_at(self.loading_index) else {
+            self.smb_error = Some("Selected profile no longer exists.".into());
+            return;
+        };
+        let profile = profile.clone();
+        let password = smb::random_password();
+        let credentials = smb::Credentials {
+            user: smb::DEFAULT_SHARE_USER.to_string(),
+            password: password.clone(),
+        };
+        // A fixed port (--smb-port), not an ephemeral one: the mount outlives
+        // any single run of this screen, so an fstab line or a saved Windows
+        // drive mapping has to keep pointing somewhere. The cost is that a
+        // second wrustic, or a manual test harness, collides here — which
+        // surfaces as an inline "address already in use".
+        let port = self.smb_port;
+        match smb::start_snapshot_share(port, &profile, &snap_id, smb::Bind::Loopback, credentials)
+        {
+            Ok(h) => {
+                self.smb_password = Some(password);
+                self.smb_error = None;
+                self.smb_handle = Some(h);
+            }
+            Err(e) => {
+                self.smb_error = Some(smb_start_error(e, port));
+            }
+        }
+    }
+
+    // The snapshot currently selected in the (possibly filtered) list.
+    fn selected_snapshot_id(&self) -> Option<String> {
+        let visible = self.visible_snapshot_indices();
+        let pos = self.list_state.selected()?;
+        let abs = *visible.get(pos)?;
+        Some(self.snapshots.get(abs)?.id.clone())
+    }
 
     fn activate_backend(&mut self) {
         let idx = self
@@ -1220,6 +1331,19 @@ impl App {
     pub(crate) fn handle_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.quit = true;
+            return;
+        }
+
+        // The `?` overlay is modal: while it is up the next key only dismisses
+        // it. Otherwise a key pressed to close the help would also act on the
+        // screen behind it — `d` would open a delete confirmation the user
+        // never asked for.
+        if self.help_overlay {
+            self.help_overlay = false;
+            return;
+        }
+        if key.code == KeyCode::Char('?') && crate::ui::help_rows(&self.screen).is_some() {
+            self.help_overlay = true;
             return;
         }
 
@@ -1431,6 +1555,14 @@ impl App {
                 }
                 KeyCode::Char('p') => {
                     self.screen = Screen::PruneConfirm;
+                }
+                KeyCode::Char('s') => {
+                    if let Some(id) = self.selected_snapshot_id() {
+                        self.smb_snapshot_id = Some(id);
+                        self.smb_password = None;
+                        self.smb_error = None;
+                        self.screen = Screen::SnapshotSmbStarting;
+                    }
                 }
                 KeyCode::Char('c') => {
                     let visible = self.visible_snapshot_indices();
@@ -1812,6 +1944,19 @@ impl App {
                 _ => {}
             },
 
+            // Drawn once, then the main loop calls `start_smb_share`. No keys:
+            // opening the repository is a blocking call we are about to make,
+            // so there is nothing an input could affect.
+            Screen::SnapshotSmbStarting => {}
+
+            Screen::SnapshotSmb => match key.code {
+                KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('q') => {
+                    self.stop_smb_share();
+                    self.screen = Screen::Snapshots;
+                }
+                _ => {}
+            },
+
             Screen::CreateProfileName => match key.code {
                 KeyCode::Enter => {
                     let name = self.new_profile_name.value().trim().to_string();
@@ -2040,6 +2185,13 @@ impl App {
     }
 
     pub(crate) fn handle_mouse(&mut self, m: MouseEvent) {
+        // The `?` overlay is modal for the mouse too, for the same reason it is
+        // for the keyboard: the overlay covers the list, so a click would select
+        // a row the user cannot see. Dismiss and swallow the event.
+        if self.help_overlay {
+            self.help_overlay = false;
+            return;
+        }
         // Only left-click and the vertical scroll wheel are wired up;
         // right/middle/drag/motion are ignored.
         match m.kind {
@@ -2370,7 +2522,7 @@ mod tests {
         ));
         let paths = config::paths(Some(tmp)).expect("paths");
         let lock = config::acquire_lock(&paths).expect("lock fresh test config dir");
-        let mut app = App::boot(paths, lock, 7834, false).expect("boot");
+        let mut app = App::boot(paths, lock, 7834, 4456, false).expect("boot");
         app.snapshots = snaps;
         app
     }
@@ -2434,6 +2586,137 @@ mod tests {
 
     fn press(app: &mut App, code: KeyCode) {
         app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn row_with_id(id: &str) -> SnapshotRow {
+        let mut r = row("laptop", &[], &["/home"]);
+        r.id = id.into();
+        r
+    }
+
+    #[test]
+    fn s_on_the_snapshot_list_targets_the_selected_snapshot() {
+        let mut app = boot_app_with_snapshots(vec![row_with_id("aaa"), row_with_id("bbb")]);
+        app.screen = Screen::Snapshots;
+        app.list_state.select(Some(1));
+
+        press(&mut app, KeyCode::Char('s'));
+
+        // The key handler only captures the target; the main loop does the
+        // opening, so the repository is never touched here.
+        assert!(matches!(app.screen, Screen::SnapshotSmbStarting));
+        assert_eq!(app.smb_snapshot_id.as_deref(), Some("bbb"));
+        assert!(app.smb_handle.is_none());
+    }
+
+    #[test]
+    fn s_picks_from_the_filtered_view_not_the_raw_list() {
+        let mut app = boot_app_with_snapshots(vec![
+            row_with_id("aaa"),
+            {
+                let mut r = row_with_id("bbb");
+                r.host = "server".into();
+                r
+            },
+            row_with_id("ccc"),
+        ]);
+        app.screen = Screen::Snapshots;
+        // Hides row 1, so visible index 1 is the *third* snapshot.
+        app.snapshot_filter = Some(SnapshotFilter::Host("laptop".into()));
+        app.list_state.select(Some(1));
+
+        press(&mut app, KeyCode::Char('s'));
+
+        assert_eq!(app.smb_snapshot_id.as_deref(), Some("ccc"));
+    }
+
+    #[test]
+    fn s_with_nothing_selected_does_nothing() {
+        let mut app = boot_app_with_snapshots(vec![]);
+        app.screen = Screen::Snapshots;
+        app.list_state.select(None);
+
+        press(&mut app, KeyCode::Char('s'));
+
+        assert!(matches!(app.screen, Screen::Snapshots));
+        assert!(app.smb_snapshot_id.is_none());
+    }
+
+    #[test]
+    fn leaving_the_smb_screen_clears_the_share() {
+        let mut app = boot_app_with_snapshots(vec![row_with_id("aaa")]);
+        app.screen = Screen::SnapshotSmb;
+        app.smb_snapshot_id = Some("aaa".into());
+        app.smb_password = Some("hunter2".into());
+        app.smb_error = Some("boom".into());
+
+        press(&mut app, KeyCode::Esc);
+
+        assert!(matches!(app.screen, Screen::Snapshots));
+        assert!(app.smb_snapshot_id.is_none());
+        assert!(app.smb_password.is_none(), "the password must not outlive the server");
+        assert!(app.smb_error.is_none());
+    }
+
+    #[test]
+    fn the_starting_screen_ignores_keys() {
+        let mut app = boot_app_with_snapshots(vec![row_with_id("aaa")]);
+        app.screen = Screen::SnapshotSmbStarting;
+        app.smb_snapshot_id = Some("aaa".into());
+
+        for code in [KeyCode::Esc, KeyCode::Char('q'), KeyCode::Enter] {
+            press(&mut app, code);
+            assert!(matches!(app.screen, Screen::SnapshotSmbStarting));
+        }
+        assert_eq!(app.smb_snapshot_id.as_deref(), Some("aaa"));
+    }
+
+    #[test]
+    fn help_overlay_opens_and_the_next_key_only_closes_it() {
+        let mut app = boot_app_with_snapshots(vec![row_with_id("aaa")]);
+        app.screen = Screen::Snapshots;
+        app.list_state.select(Some(0));
+
+        press(&mut app, KeyCode::Char('?'));
+        assert!(app.help_overlay);
+        assert!(matches!(app.screen, Screen::Snapshots), "? must not navigate");
+
+        // `d` would normally open the delete flow. Dismissing the help must not
+        // also act on the screen behind it.
+        press(&mut app, KeyCode::Char('d'));
+        assert!(!app.help_overlay);
+        assert!(
+            matches!(app.screen, Screen::Snapshots),
+            "the key that closes the help must not also be handled",
+        );
+        assert!(app.delete_target.is_none());
+    }
+
+    #[test]
+    fn question_mark_is_inert_where_there_is_no_help() {
+        let mut app = boot_app_with_snapshots(vec![]);
+        app.screen = Screen::PruneConfirm;
+
+        press(&mut app, KeyCode::Char('?'));
+
+        assert!(!app.help_overlay);
+        assert!(matches!(app.screen, Screen::PruneConfirm));
+    }
+
+    #[test]
+    fn a_port_clash_explains_how_to_change_the_port() {
+        let busy = smb_start_error(
+            anyhow::anyhow!("localhost port 4456 is already in use on IPv4 (127.0.0.1:4456)"),
+            4456,
+        );
+        assert!(busy.contains("--smb-port"), "{busy}");
+        assert!(busy.contains("4456"), "{busy}");
+
+        // Anything else is passed through untouched — a passphrase failure has
+        // nothing to do with the port, and saying so would send the user off
+        // chasing the wrong thing.
+        let other = smb_start_error(anyhow::anyhow!("wrong password"), 4456);
+        assert_eq!(other, "wrong password");
     }
 
     #[test]
