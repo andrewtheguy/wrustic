@@ -73,12 +73,29 @@ service. It installs `docker.exe` and `dockerd.exe` into `C:\Windows\System32`,
 which is why docker ends up on PATH — for the whole machine and, through
 interop, for WSL — without anything editing PATH:
 
+The URL names a commit rather than `Main`, and the hash is checked before the
+script runs. This thing executes as administrator and installs a service; a
+branch ref means whatever is at the tip on the day you run it, which is not
+something to find out about afterwards.
+
 ```powershell
+$commit = 'cb93591d829b8cd15e38fe5debff90f63f3ec30c'
+$sha256 = '16E1E920ECA45EAD4DCB41B55BB6721B87D590452372BFEBD2AAD6ACA9D2FCA1'
+
 Invoke-WebRequest -UseBasicParsing `
-  https://raw.githubusercontent.com/microsoft/Windows-Containers/Main/helpful_tools/Install-DockerCE/install-docker-ce.ps1 `
+  "https://raw.githubusercontent.com/microsoft/Windows-Containers/$commit/helpful_tools/Install-DockerCE/install-docker-ce.ps1" `
   -OutFile install-docker-ce.ps1
+
+if ((Get-FileHash install-docker-ce.ps1 -Algorithm SHA256).Hash -ne $sha256) {
+    throw 'install-docker-ce.ps1 does not match the expected hash'
+}
 .\install-docker-ce.ps1 -NoRestart
 ```
+
+That commit is the one this machine was set up from, and was the tip of `Main`
+at the time. To move to a newer one, take the commit that last touched
+`helpful_tools/Install-DockerCE/install-docker-ce.ps1`, read the diff, and
+recompute the hash with `Get-FileHash` — do not just widen it back to `Main`.
 
 **3. Reboot.** The Containers feature needs one.
 
@@ -282,14 +299,21 @@ group, and ignores the per-user one:
 
 ```powershell
 $akf = 'C:\ProgramData\ssh\administrators_authorized_keys'
-Add-Content -Path $akf -Value 'ssh-ed25519 AAAA... you@yourmac' -Encoding utf8
+Add-Content -Path $akf -Value 'ssh-ed25519 AAAA... you@yourmac' -Encoding ascii
 icacls $akf /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F'
 ```
 
 The ACL matters: sshd refuses the file if anyone else can write it, and refuses
-it if the owner is not SYSTEM or Administrators. It must also be UTF-8 **without
-a BOM** — `Set-Content -Encoding utf8` does the right thing in PowerShell 7 but
-writes a BOM in Windows PowerShell 5.1, which sshd will reject.
+it if the owner is not SYSTEM or Administrators.
+
+`-Encoding ascii` matters for a duller reason: the file must have **no BOM**, and
+`-Encoding utf8` only avoids one in PowerShell 7 — Windows PowerShell 5.1 writes
+UTF-8 *with* a BOM, and sshd then rejects the file. An SSH public key is ASCII,
+so asking for ASCII is both accurate and safe in either edition. Check with:
+
+```powershell
+[System.IO.File]::ReadAllBytes($akf)[0..2]   # want 115 115 104, i.e. "ssh"
+```
 
 ### Three things that will waste an afternoon
 
@@ -310,10 +334,22 @@ writes a BOM in Windows PowerShell 5.1, which sshd will reject.
 The tree is copied rather than fetched from git deliberately: the reason to run
 this instead of pushing a branch is to test what you have in front of you,
 uncommitted changes included. To test a *pushed* branch there is no need for
-`remote.sh` at all:
+`remote.sh` at all — but it needs two things first, neither of which
+`remote.sh` provides:
+
+- **git on the Windows host**, which the container image deliberately does not
+  have. This runs on the host, not in the container.
+- **A real checkout, in its own directory.** Not `C:\ci-workspaces\wrustic`:
+  `remote.sh` excludes `.git` from the archive, so there is no repository there
+  to fetch into, and it now replaces that directory outright on every run — a
+  clone you put there would be deleted. Use a separate one:
+
+```powershell
+git clone https://github.com/andrewtheguy/wrustic C:\ci-workspaces\wrustic-git
+```
 
 ```sh
-ssh $WRUSTIC_WINCI_HOST "cd C:\ci-workspaces\wrustic && git fetch origin && ^
+ssh $WRUSTIC_WINCI_HOST "cd C:\ci-workspaces\wrustic-git && git fetch origin && ^
     git checkout -q <branch> && powershell -File ci\windows\run.ps1"
 ```
 

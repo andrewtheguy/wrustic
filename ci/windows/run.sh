@@ -58,17 +58,28 @@ if [[ "$project_root" != /mnt/[a-z]/* ]]; then
     stage_root="$(cd "$interop_cwd" && wslpath -u "$(cmd.exe /c 'echo %LOCALAPPDATA%' 2>/dev/null | tr -d '\r')")" ||
         fail "could not locate the Windows LOCALAPPDATA directory"
     stage="${stage_root}/Temp/wrustic-winci-src"
+    # The staging path is derived from an interop call, and the tar branch below
+    # deletes it outright. Check it still looks like the path this script builds
+    # before handing it to rm -rf.
+    [[ "$stage" == */Temp/wrustic-winci-src ]] ||
+        fail "refusing to clear an unexpected staging path: ${stage}"
 
     info "checkout is on the WSL filesystem, which a Windows container cannot bind-mount"
     info "staging a copy at ${stage}"
-    mkdir -p "$stage"
     if command -v rsync >/dev/null 2>&1; then
         # --no-perms/--no-owner/--no-group: the destination is a DrvFs mount of
         # an NTFS volume and carries no Unix metadata; without these rsync
         # fails setting modes it cannot set.
+        mkdir -p "$stage"
         rsync -rlt --delete --no-perms --no-owner --no-group \
             --exclude '/target/' --exclude '/tmp/' "${project_root}/" "${stage}/"
     else
+        # rsync's --delete has no tar equivalent, so extracting over a previous
+        # staging would keep files that have since been deleted from the
+        # checkout — and they would be compiled. Start empty instead; this
+        # branch copies the whole tree either way, so nothing is lost by it.
+        rm -rf "$stage"
+        mkdir -p "$stage"
         tar -C "$project_root" --exclude=./target --exclude=./tmp -cf - . | tar -C "$stage" -xf -
     fi
     source_dir="$stage"

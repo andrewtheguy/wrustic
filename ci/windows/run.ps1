@@ -112,6 +112,10 @@ switch ($Command) {
     'clean' {
         Assert-Docker
         & docker volume rm $RegistryVolume $TargetVolume
+        # A volume still attached to a container refuses to go, and saying it
+        # was removed when it was not sends you looking for a stale cache in
+        # the wrong place next time the build behaves oddly.
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         Write-Info "cache volumes removed; the image is still there (docker rmi $Image)"
     }
 

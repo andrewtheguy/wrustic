@@ -14,9 +14,11 @@
 # The tree is copied rather than fetched from git on purpose — the reason to
 # run this instead of pushing a branch is to test what you have in front of
 # you, uncommitted changes included. To test a *pushed* branch, skip this
-# script:
+# script and drive a real checkout on the host instead. It needs its own
+# directory: REMOTE_DIR has no .git (excluded below) and is replaced outright
+# on every run, so a clone left there would be deleted.
 #
-#   ssh $WRUSTIC_WINCI_HOST "cd C:\ci-workspaces\wrustic && git fetch origin && ^
+#   ssh $WRUSTIC_WINCI_HOST "cd C:\ci-workspaces\wrustic-git && git fetch origin && ^
 #       git checkout -q <branch> && powershell -File ci\windows\run.ps1"
 
 set -euo pipefail
@@ -63,13 +65,40 @@ remote_ssh() {
     ssh ${ssh_opts[@]+"${ssh_opts[@]}"} "$HOST" "$@"
 }
 
+# Extract into a staging directory and swap it in only once tar has finished.
+# Unpacking straight onto the workspace has two failure modes: a transfer that
+# dies half way leaves a tree that is neither the old one nor the new one and
+# still builds, and tar has no --delete, so a file removed here would linger
+# there and keep getting compiled. Staging makes the workspace change in one
+# rename instead of over the length of the transfer.
+#
+# Nothing under REMOTE_DIR has to survive the swap. The cargo registry and the
+# target directory are docker named volumes, not subdirectories of the
+# workspace, so the caches are untouched by replacing it.
+stage_dir="${REMOTE_DIR}.staging-$$"
+stage_win="${stage_dir//\//\\}"
+remote_win="${REMOTE_DIR//\//\\}"
+
+drop_stage() {
+    remote_ssh "if exist \"${stage_win}\" rmdir /s /q \"${stage_win}\"" >/dev/null 2>&1 || true
+}
+
 info "copying $(basename "$project_root") to ${HOST}:${REMOTE_DIR}"
-remote_ssh "if not exist \"${REMOTE_DIR//\//\\}\" mkdir \"${REMOTE_DIR//\//\\}\""
+
+# Until the swap lands, any exit — including the tar pipeline failing under
+# `set -e` — leaves a staging directory behind on the remote unless this does
+# something about it.
+trap drop_stage EXIT
+remote_ssh "mkdir \"${stage_win}\""
 
 tar -C "$project_root" \
     --exclude=./target --exclude=./tmp --exclude=./.git \
     -czf - . |
-    remote_ssh "tar -xzf - -C \"${REMOTE_DIR}\""
+    remote_ssh "tar -xzf - -C \"${stage_dir}\""
+
+remote_ssh "if exist \"${remote_win}\" rmdir /s /q \"${remote_win}\""
+remote_ssh "move \"${stage_win}\" \"${remote_win}\" >nul"
+trap - EXIT
 
 info "running 'run.ps1 ${command}' on ${HOST}"
 
