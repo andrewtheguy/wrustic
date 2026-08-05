@@ -185,14 +185,24 @@ pub(crate) mod access {
         if is_dir { READ_ONLY_DIR } else { READ_ONLY_FILE }
     }
 
-    /// Generic access bits (MS-DTYP 2.4.3). Only execute matters here: a client
-    /// that means to run an image may ask for the generic form rather than
-    /// FILE_EXECUTE, and the server, not the client, is what maps it.
+    /// Generic access bits (MS-DTYP 2.4.3). Mapping these to the object-specific
+    /// rights they stand for is the *server's* job, so every check below has to
+    /// name them: a mask of specific bits alone would let `GENERIC_WRITE` — the
+    /// same request, differently spelled — walk past a check that `FILE_WRITE_DATA`
+    /// fails.
+    ///
+    /// `GENERIC_READ` (0x8000_0000) is deliberately absent: it maps to
+    /// FILE_GENERIC_READ, which is exactly what this share grants, and it is how
+    /// cifs.ko opens every file.
+    pub(crate) const GENERIC_ALL: u32 = 0x1000_0000;
     pub(crate) const GENERIC_EXECUTE: u32 = 0x2000_0000;
+    pub(crate) const GENERIC_WRITE: u32 = 0x4000_0000;
 
-    /// Either spelling of "I intend to run this". Refused on a file; on a
+    /// Every spelling of "I intend to run this". Refused on a file; on a
     /// directory the specific bit is FILE_TRAVERSE and is granted instead.
-    pub(crate) const EXECUTE_BITS: u32 = FILE_EXECUTE | GENERIC_EXECUTE;
+    /// GENERIC_ALL subsumes execute as well as write, so it appears here too
+    /// rather than being treated as a write-only request.
+    pub(crate) const EXECUTE_BITS: u32 = FILE_EXECUTE | GENERIC_EXECUTE | GENERIC_ALL;
 
     /// Any of these in a CREATE request means the caller intends to modify
     /// something, and the open is refused outright rather than silently
@@ -205,7 +215,9 @@ pub(crate) mod access {
         | FILE_WRITE_ATTRIBUTES
         | DELETE
         | WRITE_DAC
-        | WRITE_OWNER;
+        | WRITE_OWNER
+        | GENERIC_WRITE
+        | GENERIC_ALL;
 }
 
 /// Parsed SMB2 sync header.
@@ -460,6 +472,21 @@ mod tests {
     fn read_only_access_mask_excludes_every_write_bit() {
         assert_eq!(access::READ_ONLY_FILE & access::WRITE_BITS, 0);
         assert_eq!(access::READ_ONLY_DIR & access::WRITE_BITS, 0);
+    }
+
+    #[test]
+    fn generic_rights_are_covered_by_the_masks_they_map_to() {
+        // A generic bit stands for the specific rights the server maps it to,
+        // so each must be caught by the check its specific form would fail.
+        assert_ne!(access::GENERIC_WRITE & access::WRITE_BITS, 0);
+        assert_ne!(access::GENERIC_ALL & access::WRITE_BITS, 0);
+        assert_ne!(access::GENERIC_EXECUTE & access::EXECUTE_BITS, 0);
+        // GENERIC_ALL means write *and* execute, not write alone.
+        assert_ne!(access::GENERIC_ALL & access::EXECUTE_BITS, 0);
+        // GENERIC_READ maps to FILE_GENERIC_READ, which this share grants:
+        // catching it would break every cifs.ko open.
+        const GENERIC_READ: u32 = 0x8000_0000;
+        assert_eq!(GENERIC_READ & (access::WRITE_BITS | access::EXECUTE_BITS), 0);
     }
 
     #[test]

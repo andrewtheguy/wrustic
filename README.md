@@ -30,9 +30,10 @@ docs/restic-usage.md is the overview of exactly which workflows that means.
 - **Snapshot sharing over SMB** (`s` on the snapshot list): mount a whole
   snapshot read-only from Linux, macOS, or Windows 11 24H2+, served by a
   hand-rolled SMB 2.1 server bound to localhost, with NTLMv2 authentication
-  and signing. Files mount `0444` and directories `0555`, and opening a file
-  for execute is refused — a share is for browsing a snapshot, not restoring
-  from one; see [`docs/smb.md`](docs/smb.md)
+  and signing. Files mount `0444` and directories `0555` on Linux and macOS,
+  and on every client opening a file for execute is refused — a share is for
+  browsing a snapshot, not restoring from one; see
+  [`docs/smb.md`](docs/smb.md)
 - **Keyboard and mouse navigation**: Vim-style keys, arrow keys, PgUp/PgDn,
   mouse click/scroll; `--no-mouse` to disable
 - **Passphrase entry**: masked TUI input, with optional keychain auto-unlock

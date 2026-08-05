@@ -715,12 +715,16 @@ mod tests {
         let b = backing();
         let mut h = Handles::default();
 
-        // Any write bit in the access mask.
+        // Any write bit in the access mask, in either its specific or its
+        // generic spelling — mapping a generic right onto the specific ones it
+        // stands for is the server's job, so both have to be refused here.
         for bit in [
             access::FILE_WRITE_DATA,
             access::FILE_APPEND_DATA,
             access::DELETE,
             access::FILE_WRITE_ATTRIBUTES,
+            access::GENERIC_WRITE,
+            access::GENERIC_ALL,
         ] {
             let body = create_body("top.bin", access::FILE_READ_DATA | bit, disposition::OPEN, 0);
             assert_eq!(
@@ -793,6 +797,17 @@ mod tests {
             disposition::OPEN,
             options::DIRECTORY_FILE,
         );
+        assert!(create(&body, &message(&body), &b, &mut h, TREE).is_ok());
+    }
+
+    #[test]
+    fn create_accepts_generic_read() {
+        // How cifs.ko opens every file. FILE_GENERIC_READ is exactly what the
+        // share grants, so it must not be caught by the write or execute masks.
+        const GENERIC_READ: u32 = 0x8000_0000;
+        let b = backing();
+        let mut h = Handles::default();
+        let body = create_body("top.bin", GENERIC_READ, disposition::OPEN, 0);
         assert!(create(&body, &message(&body), &b, &mut h, TREE).is_ok());
     }
 

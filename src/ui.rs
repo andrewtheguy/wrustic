@@ -1364,9 +1364,9 @@ fn render_snapshot_smb(frame: &mut Frame, app: &mut App, area: Rect) {
     lines.push_str(
         "\nEvery client authenticates and authenticated session messages are signed. \
          Writes are refused at the protocol level, and so is opening a file for execute — \
-         the mount commands above give files mode 0444 and directories 0555, since this is \
-         a way to browse a snapshot rather than to restore one. Leaving this screen stops \
-         the server, and any mount still using it.",
+         the Linux and macOS commands above mount files 0444 and directories 0555, since \
+         this is a way to browse a snapshot rather than to restore one. Leaving this screen \
+         stops the server, and any mount still using it.",
     );
 
     let para = Paragraph::new(lines)
