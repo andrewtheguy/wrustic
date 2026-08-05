@@ -203,13 +203,19 @@ sudo setcap cap_net_bind_service=+ep <path-to-wrustic>\n\
 /// Which interfaces to accept connections on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum Bind {
-    /// 127.0.0.1 and ::1 only. The default, and the only safe one: this server
-    /// authenticates nobody.
+    /// 127.0.0.1 and ::1 only. The default, and the only one the shipped binary
+    /// ever asks for.
     #[default]
     Loopback,
-    /// Every interface. There is no authentication and no encryption, so anyone
-    /// who can reach the port can read the entire snapshot. Only for testing on
-    /// a trusted network, and callers must say so explicitly.
+    /// Every interface. Clients still have to authenticate, but nothing is
+    /// encrypted, so anyone on the network can read file contents in transit.
+    ///
+    /// Constructed only by the manual cross-platform test harness
+    /// (`smb_manual_snapshot`) — validating against macOS and Windows needs a
+    /// server those machines can reach. The TUI has no path to it, deliberately:
+    /// an unencrypted share on a real interface is a testing affordance, not a
+    /// feature to offer.
+    #[cfg_attr(not(test), allow(dead_code))]
     AllInterfaces,
 }
 
@@ -1228,10 +1234,23 @@ mod tests {
     }
 
     /// Serve a real restic snapshot, for validating the `SnapshotBacking` path
-    /// against a live client. Driven by environment variables so it needs no
-    /// wrustic config:
+    /// against a live client. This is the cross-platform test harness: the TUI
+    /// share dies when you leave the screen, and mounting from macOS or Windows
+    /// needs a server that stays up while you walk over to another machine.
     ///
-    ///   WRUSTIC_SMB_REPO=<path> WRUSTIC_SMB_PASSWORD=<pw> WRUSTIC_SMB_SNAPSHOT=<id> \
+    /// Driven by environment variables so it needs no wrustic config, and so no
+    /// password ever reaches argv:
+    ///
+    ///   WRUSTIC_SMB_REPO=<path>       repository to open          (required)
+    ///   WRUSTIC_SMB_PASSWORD=<pw>     its password                (required)
+    ///   WRUSTIC_SMB_SNAPSHOT=<id>     snapshot, or 'latest'       (required)
+    ///   WRUSTIC_SMB_PORT=<n>          listen port                 (default 4456)
+    ///   WRUSTIC_SMB_SHARE_PASSWORD    share password              (default hunter2)
+    ///   WRUSTIC_SMB_SECONDS=<n>       how long to stay up         (default 1200)
+    ///   WRUSTIC_SMB_BIND_ALL=1        every interface, not just loopback
+    ///   WRUSTIC_SMB_LOG=1             trace every command to stderr
+    ///
+    ///   WRUSTIC_SMB_REPO=<path> WRUSTIC_SMB_PASSWORD=<pw> WRUSTIC_SMB_SNAPSHOT=latest \
     ///     cargo test --all-features smb_manual_snapshot -- --ignored --nocapture
     #[test]
     #[ignore]
@@ -1273,18 +1292,33 @@ mod tests {
             },
         )
         .expect("snapshot share starts");
-        eprintln!("  username {TEST_USER}  password {password}");
+        let host = if matches!(bind, Bind::AllInterfaces) {
+            "<this-host>"
+        } else {
+            "127.0.0.1"
+        };
+        let port = handle.port;
+        eprintln!("serving snapshot {snapshot} on {host}:{port} for {secs}s");
+        eprintln!();
+        eprintln!("  username  {TEST_USER}");
+        eprintln!("  password  {password}");
+        if matches!(bind, Bind::AllInterfaces) {
+            eprintln!();
+            eprintln!(
+                "NOTE: listening on every interface. Traffic is signed but not encrypted, \
+                 so anyone on the network can read file contents in transit."
+            );
+        }
+        eprintln!();
+        eprintln!("Mount it with:");
         eprintln!(
-            "serving snapshot {snapshot} on 127.0.0.1:{} for {secs}s",
-            handle.port
+            "  Linux    sudo mount -t cifs -o port={port},vers=2.1,username={TEST_USER},password={password},ro,uid=$(id -u),gid=$(id -g) //{host}/{DEFAULT_SHARE_NAME} /mnt/snap"
         );
         eprintln!(
-            "  Linux  sudo mount -t cifs -o port={},vers=2.1,sec=none,guest,ro,uid=$(id -u) //127.0.0.1/snap /mnt",
-            handle.port
+            "  macOS    mount_smbfs //{TEST_USER}@{host}:{port}/{DEFAULT_SHARE_NAME} /Volumes/snap"
         );
         eprintln!(
-            "  macOS  mount_smbfs //guest@127.0.0.1:{}/snap /Volumes/snap",
-            handle.port
+            "  Windows  net use Z: \\\\{host}\\{DEFAULT_SHARE_NAME} /user:{TEST_USER} {password} /TCPPORT:{port}"
         );
         std::thread::sleep(std::time::Duration::from_secs(secs));
         handle.stop();

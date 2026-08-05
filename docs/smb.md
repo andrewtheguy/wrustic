@@ -10,27 +10,17 @@ locking, no cache invalidation, no oplocks worth honouring.
 
 ## Using it
 
-**From the TUI.** `s` on the snapshot list starts a server on
-`127.0.0.1:4456` and shows the username, the generated password, and a ready
-mount command for each platform. Leaving the screen stops the server and breaks
-any mount using it. `--smb-port <N>` picks a different port.
+`s` on the snapshot list starts a server on `127.0.0.1:4456` and shows the
+username, the generated password, and a ready mount command for each platform.
+Leaving the screen stops the server and breaks any mount using it.
+`--smb-port <N>` picks a different port.
 
-**From the command line.** `wrustic smb-serve` runs the same server in the
-foreground, which is what you want when the mount needs to outlive a TUI
-session:
-
-```sh
-WRUSTIC_SMB_PASSWORD=<repo-password> \
-WRUSTIC_SMB_SHARE_PASSWORD=<share-password> \
-  wrustic smb-serve --repo /path/to/repo --snapshot latest
-```
-
-Neither password is accepted on argv, where it would be readable by every
-process on the machine — the same rule `src/restic.rs` follows for the restic
-CLI. Omit `WRUSTIC_SMB_SHARE_PASSWORD` and one is generated and printed.
-
-`smb-serve` also has `--bind-all`, which the TUI deliberately does not: see
-[Security](#security).
+That is the entire user-facing surface. There is deliberately no `serve`
+subcommand: a share is scoped to the screen that created it and is always
+loopback, so the share cannot outlive the UI that is telling you it exists.
+Everything a manual cross-platform test needs — a long-lived server, a
+non-loopback bind — lives in the test harness instead, see
+[Testing against a real client](#testing-against-a-real-client).
 
 ## Mounting
 
@@ -77,9 +67,10 @@ make signing trivially bypassable. `SIGNING_REQUIRED` is advertised alongside
 stop.
 
 **Nothing is encrypted.** SMB 3.x encryption is not implemented. Signing stops
-tampering, not reading. This is why the TUI binds loopback only and has no
-equivalent of `--bind-all`: on a real interface, anyone on the network can read
-file contents in transit.
+tampering, not reading. This is why the shipped binary only ever binds loopback:
+on a real interface, anyone on the network can read file contents in transit.
+Reaching another machine is possible only from the test harness, deliberately —
+see [Testing against a real client](#testing-against-a-real-client).
 
 **Writes are impossible, and also refused.** There is no code that could write
 to a repository from this module. On top of that, the protocol layer refuses
@@ -131,16 +122,48 @@ implementation, over a `Repository<IndexedFullStatus>` opened once at startup �
 a snapshot is immutable, so concurrent readers need no coordination beyond an
 `Arc`.
 
+## Testing against a real client
+
+The TUI share dies when you leave the screen, which is right for a feature and
+useless for validating against macOS or Windows — you need the server up while
+you walk over to another machine. `scripts/smb-sample.sh` is that harness, and
+it builds its own fixture, so this works on a fresh clone:
+
+```sh
+./scripts/smb-sample.sh seed            # build a sample tree, back it up
+./scripts/smb-sample.sh serve           # serve it (add SMB_BIND_ALL=1 for other machines)
+./scripts/smb-sample.sh verify          # in another terminal: mount, diff, check writes fail
+```
+
+`seed` builds a tree chosen for the parts of the protocol that broke during
+development: a zero-length file, names with spaces and non-ASCII, a 5 MB file
+spanning several blobs and READs, a 120-entry directory that forces
+QUERY_DIRECTORY to page, and a symlink for the known limitation below. `verify`
+compares every file by sha256 against the source, then checks that `touch`,
+`mkdir` and `rm` are all refused.
+
+`serve` runs `smb_manual_snapshot`, an `#[ignore]`d test in `src/smb/mod.rs`
+that starts the same server and holds it open for `SMB_SECONDS` (default 1200)
+— bounded rather than infinite so a forgotten server does not hold the port for
+ever. Knobs: `SMB_PORT`, `SMB_SECONDS`, `WRUSTIC_SMB_SHARE_PASSWORD`,
+`SMB_BIND_ALL`, `SMB_LOG`. Everything reaches the server through the
+environment, never argv, where a password would be readable by every process on
+the machine — the same rule `src/restic.rs` follows for the restic CLI.
+
+`SMB_BIND_ALL` is the only way to reach a non-loopback interface, and it exists
+only here. Nothing is encrypted, so an all-interfaces share exposes file
+contents to anyone on the network: a testing affordance on a trusted network,
+not something the shipped binary offers.
+
+`smb_manual_server` is the same idea over an in-memory tree, for protocol work
+that needs no repository at all.
+
 ## When a mount fails
 
 Client-side errors are close to useless: Linux reports a bare `-EIO` or
 `-EINVAL`, macOS times out with no message, Windows gives a generic system
 error. The server is the only place that can see which command was rejected and
-why, so it can trace:
-
-```sh
-WRUSTIC_SMB_LOG=1 wrustic smb-serve --repo … --snapshot …
-```
+why, so set `WRUSTIC_SMB_LOG=1` and it traces every command to stderr:
 
 ```
 [smb] SMB1 multi-protocol NEGOTIATE -> SMB2 wildcard 0x02ff

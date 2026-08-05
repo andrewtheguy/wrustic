@@ -377,8 +377,8 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 /// Render an SMB start failure for the share screen.
 ///
-/// The port is fixed, so a clash is the one failure a user will hit routinely —
-/// a second wrustic, or their own `smb-serve`, is already on it. The bare bind
+/// The port is fixed, so a clash is the one failure a user will hit routinely:
+/// a second wrustic, or a manual test harness, is already on it. The bare bind
 /// error says which address is taken but not what to do about it, and the flag
 /// that fixes it is only settable at startup, which is worth spelling out.
 fn smb_start_error(e: anyhow::Error, port: u16) -> String {
@@ -1289,7 +1289,7 @@ impl App {
         // A fixed port (--smb-port), not an ephemeral one: the mount outlives
         // any single run of this screen, so an fstab line or a saved Windows
         // drive mapping has to keep pointing somewhere. The cost is that a
-        // second wrustic — or the user's own `smb-serve` — collides here, which
+        // second wrustic, or a manual test harness, collides here — which
         // surfaces as an inline "address already in use".
         let port = self.smb_port;
         match smb::start_snapshot_share(port, &profile, &snap_id, smb::Bind::Loopback, credentials)

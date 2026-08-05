@@ -4,9 +4,9 @@ use anyhow::{Result, bail};
 
 pub(crate) const DEFAULT_SERVER_PORT: u16 = 7834;
 
-/// Localhost port for the snapshot SMB share, and the default for `smb-serve`.
-/// Fixed rather than ephemeral so a mount command, an `/etc/fstab` line or a
-/// saved Windows drive mapping keeps working across restarts of wrustic.
+/// Localhost port for the snapshot SMB share. Fixed rather than ephemeral so a
+/// mount command, an `/etc/fstab` line or a saved Windows drive mapping keeps
+/// working across restarts of wrustic.
 pub(crate) const DEFAULT_SMB_PORT: u16 = 4456;
 
 pub(crate) const USAGE: &str = "\
@@ -51,93 +51,6 @@ Options:
   -V, --version               Print version and exit.
   -h, --help                  Print this help text.
 ";
-
-/// `wrustic smb-serve` — export one snapshot over SMB and block until Ctrl-C.
-///
-/// A separate entry point rather than a TUI action because it is a foreground
-/// server: the useful thing to do with it is leave it running in one terminal
-/// and mount from another.
-pub(crate) struct SmbServe {
-    pub(crate) repo: String,
-    pub(crate) snapshot: String,
-    pub(crate) port: u16,
-    pub(crate) bind_all: bool,
-    pub(crate) user: String,
-}
-
-pub(crate) const SMB_SERVE_USAGE: &str = "\
-Usage: wrustic smb-serve --repo <PATH> --snapshot <ID> [OPTIONS]
-
-Serve one snapshot as a read-only SMB 2.1 share and block until Ctrl-C.
-
-Every client must authenticate with NTLMv2, and every message is signed.
-The share password comes from WRUSTIC_SMB_SHARE_PASSWORD, or is generated
-and printed on startup if that is unset. The *repository* password comes
-from WRUSTIC_SMB_PASSWORD (or RESTIC_PASSWORD). Neither is ever taken from
-the command line, where it would be visible to every process on the
-machine.
-
-Options:
-      --repo <PATH>       Local restic repository to open.
-      --snapshot <ID>     Snapshot to serve. 'latest' picks the newest.
-      --port <N>          Port to listen on. Default: 4456.
-      --bind-all          Listen on every interface instead of loopback only.
-      --user <NAME>       Account name clients log in with. Default: wrustic.
-  -h, --help              Print this help text.
-
-Mount it with:
-  Linux    sudo mount -t cifs -o port=<N>,vers=2.1,username=wrustic,password=<pw>,ro \\
-               //<host>/snap /mnt
-  macOS    mount_smbfs //wrustic@<host>:<N>/snap /Volumes/snap
-  Windows  net use Z: \\\\<host>\\snap /user:wrustic <password>
-
-Set WRUSTIC_SMB_LOG=1 to trace every SMB command and its status to stderr.
-";
-
-pub(crate) fn parse_smb_serve(args: &[String]) -> Result<SmbServe> {
-    let mut repo = None;
-    let mut snapshot = None;
-    let mut port = DEFAULT_SMB_PORT;
-    let mut bind_all = false;
-    let mut user = crate::smb::DEFAULT_SHARE_USER.to_string();
-
-    let mut it = args.iter();
-    while let Some(arg) = it.next() {
-        match arg.as_str() {
-            "--repo" => repo = Some(it.next().ok_or_else(|| anyhow::anyhow!("--repo requires a path"))?.clone()),
-            "--snapshot" => {
-                snapshot = Some(it.next().ok_or_else(|| anyhow::anyhow!("--snapshot requires an id"))?.clone())
-            }
-            "--port" => {
-                let v = it.next().ok_or_else(|| anyhow::anyhow!("--port requires a number"))?;
-                port = parse_port(v, "--port")?;
-            }
-            "--bind-all" => bind_all = true,
-            "--user" => {
-                user = it
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("--user requires a name"))?
-                    .clone();
-                if user.is_empty() {
-                    bail!("--user requires a non-empty name");
-                }
-            }
-            "-h" | "--help" => {
-                println!("{SMB_SERVE_USAGE}");
-                std::process::exit(0);
-            }
-            other => bail!("unknown argument: {other}"),
-        }
-    }
-
-    Ok(SmbServe {
-        repo: repo.ok_or_else(|| anyhow::anyhow!("--repo is required"))?,
-        snapshot: snapshot.ok_or_else(|| anyhow::anyhow!("--snapshot is required"))?,
-        port,
-        bind_all,
-        user,
-    })
-}
 
 pub(crate) struct Cli {
     pub(crate) config_dir: Option<PathBuf>,

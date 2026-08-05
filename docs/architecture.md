@@ -57,9 +57,6 @@ loop. The two servers are the only true async machinery, each isolated on its
 own OS thread + tokio runtime: `share.rs` on a current-thread runtime, `smb/`
 on a multi-thread one (it needs `block_in_place`, see below).
 
-`main()` dispatches `smb-serve` before any terminal setup — it is a foreground
-server, not a TUI screen.
-
 ## State: `App` and `Screen`
 
 `Screen` (in `app.rs`) is the discriminator for what's on screen. It's
@@ -148,9 +145,9 @@ synchronously on `Screen::PassphraseDerivingKey`.
 ## SMB server (`src/smb/`)
 
 A hand-rolled read-only SMB 2.1 server exporting one snapshot, started with `s`
-on the snapshot list or by `wrustic smb-serve`. Full treatment — protocol scope,
-security model, module map, tracing — in [smb.md](smb.md). The architectural
-points:
+on the snapshot list — the only entry point there is. Full treatment — protocol
+scope, security model, module map, tracing — in [smb.md](smb.md). The
+architectural points:
 
 - One OS thread and a `new_multi_thread` runtime with 2 workers, unlike
   `share.rs`. Protocol handling is synchronous code calling into `rustic_core`,
@@ -159,8 +156,10 @@ points:
 - `SmbHandle` mirrors `ShareHandle`: `oneshot::Sender<()>` plus a `JoinHandle`,
   drop = stop, explicit `.stop()` joins.
 - Binds `127.0.0.1` and `[::1]` via `local_server::bind_localhost`, the same
-  helper the HTTP share uses. `--bind-all` exists on `smb-serve` only; the TUI
-  has no path to it, because nothing here is encrypted.
+  helper the HTTP share uses. `Bind::AllInterfaces` exists but is constructed
+  only by the `smb_manual_snapshot` ignored test — validating against macOS and
+  Windows needs a reachable server. Nothing here is encrypted, so that stays a
+  test affordance rather than a shipped option.
 - The port is fixed (`--smb-port`, default 4456), not ephemeral: a mount
   outlives the screen that created it, so an fstab line has to keep resolving.
   A clash therefore surfaces inline on the share screen, with the flag that
@@ -252,6 +251,11 @@ Run from `CLAUDE.md`:
   — it churns the diff.
 - For local testing, use `cargo run -- --config-dir ./tmp/wrustic-sandbox`
   so the production `~/.config/wrustic` is never touched.
-- Test fixtures live under `./tmp/` (gitignored).
+- Test fixtures live under `./tmp/` (gitignored). The scripts that build them
+  live in `scripts/` and are tracked, so a fresh clone can recreate every
+  fixture from nothing:
+  - `scripts/garage-test-server.sh` / `garage-e2e.sh` — Garage S3 backend
+  - `scripts/smb-sample.sh` — `seed` / `serve` / `verify` for the SMB server
+    ([smb.md](smb.md))
 - For write operations not exposed by the TUI, use the `restic` CLI
   directly against the tmp repos.
