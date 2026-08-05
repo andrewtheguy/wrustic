@@ -84,10 +84,18 @@ pub(crate) fn cache_enabled() -> bool {
 ///
 /// The cached path also carries `--cleanup-cache`, so restic itself garbage
 /// collects the per-repository subdirectories it keeps under that directory
-/// once they go unused (restic's own 30-day threshold) — a profile the user
-/// deleted stops costing disk space without anyone remembering to run
-/// `restic cache --cleanup`. It never touches the cache of the repository the
-/// current command is working on.
+/// once they go unused — a profile the user deleted stops costing disk space
+/// without anyone remembering to run `restic cache --cleanup`. The global
+/// flag always uses restic's hardcoded 30-day `MaxCacheAge`; only the
+/// standalone `restic cache --cleanup` honours a `--max-age`.
+///
+/// It cannot evict the cache of the repository the current command is working
+/// on, and the guarantee is ordering rather than an exemption: restic's
+/// `setupCache` stamps this repository's subdirectory with the current time
+/// (`cache.New`, the one place restic touches that timestamp — it is not
+/// refreshed again while the command runs) and only then lists candidates by
+/// modification time. Sweeping happens once, at repository open, not in the
+/// background.
 fn apply_cache_flag(cmd: &mut Command) {
     match cache_dir().filter(|_| CACHE_ENABLED.load(Ordering::Relaxed)) {
         Some(dir) => {
