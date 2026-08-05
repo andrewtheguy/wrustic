@@ -6,27 +6,32 @@ safety rationale behind the native/CLI split (lock tiers, why prune stays
 out) lives in [locking.md](locking.md) under "What writes wrustic can
 safely support".
 
-## Inside the app: nothing
+## Inside the app
 
-No TUI flow shells out to restic. Everything wrustic does at runtime is
-native:
+One TUI flow shells out to restic: **prune** (`p` on the Snapshots
+screen). Everything else wrustic does at runtime is native:
 
 | Workflow | Implementation |
 |---|---|
 | All reads (snapshot list, tree browsing, diff, file view/share, filters) | `rustic_core` |
 | Snapshot delete | native, under the restic-compatible repo lock (`repo::delete_snapshot`) |
 | Unlock / stale-lock removal (`u` shortcut) | native (`repo::unlock`) |
+| Prune | **restic CLI**, via the spawn harness in `src/restic.rs` |
+
+Prune-class operations stay on the restic CLI indefinitely (locking.md
+Tier 3), and the prune flow runs `restic prune` through the secure spawn
+harness (`restic::run_unsticking_locks`: password piped over stdin,
+credentials over env vars, secrets never on argv, `--no-cache` unless the
+user passed `--restic-cache`). Before spawning, the harness evaluates the
+repo's lock files natively and runs `restic unlock` if a stale lock would
+block the exclusive acquisition. restic ≥ 0.19 must be on PATH for this
+one action; every other feature works without it. restic 0.19 has no JSON
+output for prune, so the report is shown verbatim, never parsed.
 
 ## Expected to use restic from the app (planned, not wired yet)
 
-Prune-class operations stay on the restic CLI indefinitely (locking.md
-Tier 3): **prune, repair index, migrate**. If the TUI grows an action to
-trigger one of these, it will go through the secure spawn harness in
-`src/restic.rs` (`restic::run`: password piped over stdin, credentials
-over env vars, secrets never on argv, `--no-cache` unless the user passed
-`--restic-cache`). The harness exists and is tested, but no TUI flow
-calls it yet — which also means `--restic-cache` currently changes the
-behavior of nothing that actually runs.
+**repair index** and **migrate** (also locking.md Tier 3) would go
+through the same harness if the TUI grows actions for them.
 
 Not expected to use restic: **backup**, **copy into repo**, and **key
 add** are planned as *native* operations under a non-exclusive repo lock
@@ -38,8 +43,7 @@ These stay on a user-run `restic` (>= 0.19), outside wrustic:
 
 - `restic init` — creating a new repository
 - `restic backup` — creating snapshots, until native backup ships
-- maintenance: `restic prune` / `forget --prune`, `repair`, `migrate`,
-  key management
+- maintenance beyond prune: `repair`, `migrate`, key management
 
 ## Development and tests only
 

@@ -353,6 +353,68 @@ fn run(
             continue;
         }
 
+        if matches!(app.screen, Screen::PruneRunning) {
+            if app.prune_rx.is_none() {
+                let idx = app.loading_index;
+                let Some((_, profile)) = app.config.profile_at(idx) else {
+                    app.screen = Screen::PruneError("Selected profile no longer exists.".into());
+                    continue;
+                };
+                let profile = profile.clone();
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let result = (|| -> Result<Vec<u8>> {
+                        if let Err(e) = restic::detect() {
+                            return Err(anyhow::anyhow!(e.user_message()));
+                        }
+                        // No `--json`: restic 0.19 has no JSON output for
+                        // prune (the flag is accepted and ignored). The
+                        // report is displayed verbatim, never parsed.
+                        restic::run_unsticking_locks(&profile, &["prune"])
+                    })();
+                    // The receiver is gone only if the app quit; nothing to do.
+                    let _ = tx.send(result.map_err(|e| format!("{e:#}")));
+                });
+                app.prune_rx = Some(rx);
+                app.prune_started = Some(std::time::Instant::now());
+            }
+            let rx = app.prune_rx.as_ref().expect("receiver set above");
+            match rx.try_recv() {
+                Ok(outcome) => {
+                    app.prune_rx = None;
+                    app.prune_started = None;
+                    app.prune_scroll = 0;
+                    app.screen = match outcome {
+                        Ok(stdout) => {
+                            let report = String::from_utf8_lossy(&stdout).trim().to_string();
+                            Screen::PruneDone(if report.is_empty() {
+                                "prune finished (restic produced no output)".into()
+                            } else {
+                                report
+                            })
+                        }
+                        Err(msg) => Screen::PruneError(msg),
+                    };
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // Wait briefly so the loop redraws the elapsed clock
+                    // without spinning; swallow input (prune is uncancellable
+                    // — see the PruneRunning key handler), but let the drain
+                    // pick up resize events for the redraw.
+                    if event::poll(std::time::Duration::from_millis(150))? {
+                        let _ = event::read()?;
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    app.prune_rx = None;
+                    app.prune_started = None;
+                    app.screen =
+                        Screen::PruneError("prune worker exited without reporting".into());
+                }
+            }
+            continue;
+        }
+
         // Idle: block on events and only break out (to redraw) for ones
         // that can change what's on screen. Ignoring focus/mouse/key-release
         // events keeps the terminal quiet when the app has nothing to do.

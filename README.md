@@ -22,6 +22,9 @@ docs/restic-usage.md is the overview of exactly which workflows that means.
 - **Snapshot deletion**, native and guarded by a restic-compatible exclusive
   repository lock; when the repo is locked, `u` on the error screen removes
   stale locks (live ones are kept) and retries
+- **Prune** (`p` on the snapshot list): reclaim the space deleted snapshots
+  left behind — runs `restic prune` (the one feature that needs restic, >=
+  0.19, on PATH), unsticking stale repository locks first
 - **File sharing**: one-time signed download URLs served from localhost
 - **Keyboard and mouse navigation**: Vim-style keys, arrow keys, PgUp/PgDn,
   mouse click/scroll; `--no-mouse` to disable
@@ -188,11 +191,13 @@ Then in the TUI:
 
 ## Relationship to the `restic` binary
 
-`wrustic` does **not** call out to the `restic` executable for anything it
-supports — `rustic_core` reads the on-disk repository format natively, and
-the write operations wrustic exposes (snapshot delete, stale-lock removal)
-are native too, protected by restic-compatible repository locks
-(docs/locking.md). You do not need `restic` installed to run `wrustic`.
+`wrustic` calls out to the `restic` executable for exactly one feature —
+the prune action — because mixing prune implementations on one repo is the
+riskiest place to go native (docs/locking.md). Everything else is native:
+`rustic_core` reads the on-disk repository format, and the other write
+operations wrustic exposes (snapshot delete, stale-lock removal) hold
+restic-compatible repository locks (docs/locking.md). You do not need
+`restic` installed to run `wrustic` — only to prune from it.
 [`docs/restic-usage.md`](docs/restic-usage.md) is the per-workflow overview
 of what still uses (or is expected to use) the restic CLI.
 

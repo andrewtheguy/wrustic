@@ -79,7 +79,7 @@ fn bottom_bar_text(app: &App) -> &'static str {
     match &app.screen {
         Screen::Home => "Up/Dn move  PgUp/PgDn page  Enter open  n new  e edit  d delete  q quit",
         Screen::Snapshots => {
-            "Up/Dn move  PgUp/PgDn page  g/G top/bottom  Enter browse  c compare  f filter  d delete  r refresh  q/Esc back"
+            "Up/Dn move  PgUp/PgDn page  g/G top/bottom  Enter browse  c compare  f filter  d delete  p prune  r refresh  q/Esc back"
         }
         Screen::SnapshotFilterDim => "Up/Dn move  PgUp/PgDn page  Enter pick  Esc back",
         Screen::SnapshotFilterValue => {
@@ -128,6 +128,10 @@ fn bottom_bar_text(app: &App) -> &'static str {
         | Screen::SnapshotDeleteLoading
         | Screen::Unlocking
         | Screen::SnapshotCompareLoading => "working…",
+        Screen::PruneConfirm => "y start prune  n/Esc cancel",
+        Screen::PruneRunning => "running restic prune — keys disabled until it finishes",
+        Screen::PruneDone(_) => "Up/Dn scroll  PgUp/PgDn page  g/G top/bottom  q/Esc back",
+        Screen::PruneError(_) => "any key to continue",
         Screen::CreateProfileName => "type  Enter submit  Esc cancel",
         Screen::BackendChoice => "Up/Dn move  PgUp/PgDn page  Enter pick  Esc back",
         Screen::LocalPath => "type  Enter submit  Esc back",
@@ -291,6 +295,19 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
         Screen::SnapshotCompareSecond => render_compare_second(frame, app, area),
         Screen::SnapshotCompareLoading => render_compare_loading(frame, app, area),
         Screen::SnapshotCompareResults => render_compare_results(frame, app, area),
+        Screen::PruneConfirm => render_prune_confirm(frame, app, area),
+        Screen::PruneRunning => render_prune_running(frame, app, area),
+        Screen::PruneDone(report) => {
+            let report = report.clone();
+            render_prune_done(frame, app, area, &report);
+        }
+        Screen::PruneError(msg) => {
+            let para = Paragraph::new(msg.as_str())
+                .style(Style::new().fg(Color::Red))
+                .wrap(Wrap { trim: false })
+                .block(Block::bordered().title("Prune failed"));
+            frame.render_widget(para, area);
+        }
         Screen::Error(msg) => {
             let title = if app.error_is_fatal {
                 "Error — fatal"
@@ -718,6 +735,61 @@ fn render_compare_results(frame: &mut Frame, app: &mut App, area: Rect) {
 
     record_list_area(app, body);
     frame.render_stateful_widget(table, body, &mut app.compare_results_state);
+}
+
+fn render_prune_confirm(frame: &mut Frame, app: &App, area: Rect) {
+    let profile = app.active_profile_name.as_deref().unwrap_or("?");
+    let cache = if crate::restic::cache_enabled() {
+        "wrustic's private cache directory (--restic-cache)"
+    } else {
+        "no cache (--no-cache; start wrustic with --restic-cache to speed up repeat runs)"
+    };
+    let body = format!(
+        "Prune repository of profile `{profile}`?\n\n\
+         This runs `restic prune`, which rewrites and deletes pack files to\n\
+         reclaim the space left behind by deleted snapshots. It takes an\n\
+         exclusive repository lock — concurrent backups are blocked while it\n\
+         runs — and can take a long time on a large or remote repository.\n\n\
+         Requires restic >= 0.19 on PATH. Cache: {cache}.\n\n\
+         y/Enter start   n/Esc cancel"
+    );
+    let para = Paragraph::new(body)
+        .wrap(Wrap { trim: false })
+        .block(Block::bordered().title("Prune repository"));
+    frame.render_widget(para, area);
+}
+
+fn render_prune_running(frame: &mut Frame, app: &App, area: Rect) {
+    const FRAMES: [char; 4] = ['|', '/', '-', '\\'];
+    let elapsed = app
+        .prune_started
+        .map(|t| t.elapsed())
+        .unwrap_or_default();
+    let spinner = FRAMES[(elapsed.as_millis() / 150) as usize % FRAMES.len()];
+    let secs = elapsed.as_secs();
+    let body = format!(
+        "{spinner} Running `restic prune`…  elapsed {}m{:02}s\n\n\
+         restic holds an exclusive repository lock and reports progress only\n\
+         when finished. Keys are disabled until then.",
+        secs / 60,
+        secs % 60
+    );
+    let para = Paragraph::new(body)
+        .wrap(Wrap { trim: false })
+        .block(Block::bordered().title("Pruning"));
+    frame.render_widget(para, area);
+}
+
+fn render_prune_done(frame: &mut Frame, app: &mut App, area: Rect, report: &str) {
+    // restic's own report, shown verbatim: prune has no JSON output in
+    // restic 0.19 and wrustic does not parse human-readable output.
+    let max_scroll = (report.lines().count() as u16).saturating_sub(1);
+    app.prune_scroll = app.prune_scroll.min(max_scroll);
+    let para = Paragraph::new(report)
+        .scroll((app.prune_scroll, 0))
+        .block(Block::bordered().title("Prune finished — restic report"));
+    record_list_area(app, area);
+    frame.render_widget(para, area);
 }
 
 fn render_filter_dim(frame: &mut Frame, app: &mut App, area: Rect) {

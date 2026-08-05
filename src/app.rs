@@ -44,6 +44,10 @@ pub(crate) enum Screen {
     SnapshotCompareSecond,
     SnapshotCompareLoading,
     SnapshotCompareResults,
+    PruneConfirm,
+    PruneRunning,
+    PruneDone(String),
+    PruneError(String),
     CreateProfileName,
     BackendChoice,
     LocalPath,
@@ -315,6 +319,17 @@ pub(crate) struct App {
     pub(crate) compare_results: Option<(DiffSummary, Vec<DiffChange>)>,
     pub(crate) compare_results_state: TableState,
 
+    // Prune runs `restic prune` on a worker thread so the TUI stays alive
+    // (redraws, elapsed clock) during an operation that can take minutes.
+    // `prune_rx` is the completion channel: Some while a prune is in flight
+    // (restic's stdout on success, rendered error text on failure), and the
+    // main loop spawns the worker exactly when it sees `PruneRunning` with
+    // no receiver yet. `prune_started` feeds the elapsed display;
+    // `prune_scroll` is the PruneDone report scroll offset.
+    pub(crate) prune_rx: Option<std::sync::mpsc::Receiver<Result<Vec<u8>, String>>>,
+    pub(crate) prune_started: Option<Instant>,
+    pub(crate) prune_scroll: u16,
+
     // Outer rect of the currently-rendered list/paragraph (bordered area).
     // Used by PageUp/PageDown to size the jump and by the mouse handler
     // to translate click coordinates into a row index. Set by the renderer
@@ -418,6 +433,9 @@ impl App {
             compare_picker_state: TableState::default(),
             compare_results: None,
             compare_results_state: TableState::default(),
+            prune_rx: None,
+            prune_started: None,
+            prune_scroll: 0,
             list_area: None,
             list_header_rows: 0,
             last_snapshot_click: None,
@@ -1401,6 +1419,9 @@ impl App {
                         self.begin_delete_flow(id);
                     }
                 }
+                KeyCode::Char('p') => {
+                    self.screen = Screen::PruneConfirm;
+                }
                 KeyCode::Char('c') => {
                     let visible = self.visible_snapshot_indices();
                     if visible.len() < 2 {
@@ -1500,6 +1521,51 @@ impl App {
                 }
                 _ => {}
             },
+
+            Screen::PruneConfirm => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.screen = Screen::PruneRunning;
+                }
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.screen = Screen::Snapshots;
+                }
+                _ => {}
+            },
+
+            // Prune cannot be cancelled from here: restic holds an exclusive
+            // repository lock and interrupting it mid-repack just leaves work
+            // for the next run. Keys are swallowed until the worker reports.
+            Screen::PruneRunning => {}
+
+            Screen::PruneDone(report) => match key.code {
+                KeyCode::Down => self.prune_scroll = self.prune_scroll.saturating_add(1),
+                KeyCode::Up => self.prune_scroll = self.prune_scroll.saturating_sub(1),
+                KeyCode::PageDown => {
+                    let step = self.page_step() as u16;
+                    self.prune_scroll = self.prune_scroll.saturating_add(step.max(1));
+                }
+                KeyCode::PageUp => {
+                    let step = self.page_step() as u16;
+                    self.prune_scroll = self.prune_scroll.saturating_sub(step.max(1));
+                }
+                KeyCode::Home | KeyCode::Char('g') => self.prune_scroll = 0,
+                KeyCode::End | KeyCode::Char('G') => {
+                    self.prune_scroll = (report.lines().count() as u16).saturating_sub(1);
+                }
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
+                    self.prune_scroll = 0;
+                    self.screen = Screen::Snapshots;
+                }
+                _ => {}
+            },
+
+            // Unlike SnapshotDeleteError there is no `u` offer here: the
+            // prune flow already ran restic's own stale-lock removal before
+            // spawning (restic::run_unsticking_locks), so a surviving lock
+            // error means a *live* holder that unlocking must not touch.
+            Screen::PruneError(_) => {
+                self.screen = Screen::Snapshots;
+            }
 
             Screen::SnapshotFilterDim => match key.code {
                 KeyCode::Down => self.filter_picker_state.select_next(),
@@ -2352,6 +2418,52 @@ mod tests {
         app.compare_only_related = false;
         // Even with related=off, the host filter narrows to laptop rows only.
         assert_eq!(app.compare_second_visible_indices(), vec![1]);
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn prune_flow_state_machine() {
+        let mut app = boot_app_with_snapshots(vec![row("laptop", &[], &["/home"])]);
+        app.screen = Screen::Snapshots;
+
+        // p opens the confirmation, n backs out.
+        press(&mut app, KeyCode::Char('p'));
+        assert!(matches!(app.screen, Screen::PruneConfirm));
+        press(&mut app, KeyCode::Char('n'));
+        assert!(matches!(app.screen, Screen::Snapshots));
+
+        // y hands off to the running screen (the worker is spawned by the
+        // main loop, not the key handler), where keys are swallowed.
+        press(&mut app, KeyCode::Char('p'));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(matches!(app.screen, Screen::PruneRunning));
+        press(&mut app, KeyCode::Char('q'));
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.screen, Screen::PruneRunning));
+
+        // The report screen scrolls and dismisses back to Snapshots with the
+        // scroll offset reset for the next run.
+        app.screen = Screen::PruneDone("line1\nline2\nline3".into());
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.prune_scroll, 2);
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.prune_scroll, 1);
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(app.prune_scroll, 2);
+        press(&mut app, KeyCode::Char('g'));
+        assert_eq!(app.prune_scroll, 0);
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.screen, Screen::Snapshots));
+        assert_eq!(app.prune_scroll, 0);
+
+        // A prune error dismisses on any key, back to the snapshot list.
+        app.screen = Screen::PruneError("boom".into());
+        press(&mut app, KeyCode::Char('x'));
+        assert!(matches!(app.screen, Screen::Snapshots));
     }
 
     #[test]

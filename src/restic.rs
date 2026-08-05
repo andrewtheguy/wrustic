@@ -1,10 +1,11 @@
 //! Secure harness for running restic CLI commands.
 //!
 //! Snapshot delete and unlock in the TUI are native (src/repo.rs +
-//! src/lock.rs), so no TUI flow shells out to restic anymore — this module is
-//! kept as the one sanctioned way to trigger the restic commands wrustic
-//! deliberately does not reimplement (prune, repair, migrate, dev-flow repo
-//! setup). Launch semantics mirror resterm's: secrets never touch argv — the
+//! src/lock.rs); this module is the one sanctioned way to trigger the restic
+//! commands wrustic deliberately does not reimplement (prune, repair,
+//! migrate, dev-flow repo setup). The TUI's prune flow (`p` on the Snapshots
+//! screen) is its first caller, via [`run_unsticking_locks`].
+//! Launch semantics mirror resterm's: secrets never touch argv — the
 //! master password is piped through the child's stdin (`--password-file
 //! /dev/stdin` on Unix; on Windows restic reads its non-terminal stdin
 //! directly), the repo URL and any cloud credentials go through env vars —
@@ -63,6 +64,12 @@ pub(crate) fn set_cache_enabled(enabled: bool) {
     CACHE_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
+/// Whether `--restic-cache` is on — the prune confirmation screen tells the
+/// user which cache mode the run will carry.
+pub(crate) fn cache_enabled() -> bool {
+    CACHE_ENABLED.load(Ordering::Relaxed)
+}
+
 /// Add the cache flag every restic invocation carries.
 ///
 /// Default is `--no-cache`. With `--restic-cache`, restic is pointed at
@@ -80,11 +87,9 @@ fn apply_cache_flag(cmd: &mut Command) {
     }
 }
 
-#[allow(dead_code)] // harness for future flows (prune etc.); not TUI-wired yet
 pub(crate) struct ResticInfo;
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) enum ResticError {
     NotFound,
     TooOld { found: String },
@@ -92,7 +97,6 @@ pub(crate) enum ResticError {
 }
 
 impl ResticError {
-    #[allow(dead_code)]
     pub(crate) fn user_message(&self) -> String {
         let min = format!("{MIN_MAJOR}.{MIN_MINOR}.{MIN_PATCH}");
         match self {
@@ -114,7 +118,6 @@ struct VersionDocument {
     version: String,
 }
 
-#[allow(dead_code)]
 pub(crate) fn detect() -> Result<ResticInfo, ResticError> {
     let mut cmd = Command::new("restic");
     apply_cache_flag(&mut cmd);
@@ -163,7 +166,6 @@ fn parse_version(v: &str) -> Option<(u32, u32, u32)> {
 /// process are left in place, which is why restic's own lock error message
 /// points at this command. `--json` is passed so any message restic prints is
 /// structured rather than prose; the exit status is what we act on.
-#[allow(dead_code)]
 pub(crate) fn unlock(profile: &Profile) -> Result<()> {
     run(profile, &["unlock", "--json"])?;
     Ok(())
@@ -225,7 +227,6 @@ fn lock_requirement(args: &[&str]) -> LockRequirement {
 /// details, returned for the caller to surface. restic re-runs the same
 /// check in-process at startup, so a lock appearing in the window between
 /// our re-check and the spawn still fails safely inside restic.
-#[allow(dead_code)]
 pub(crate) fn run_unsticking_locks(profile: &Profile, args: &[&str]) -> Result<Vec<u8>> {
     let exclusive = match lock_requirement(args) {
         LockRequirement::None => return run(profile, args),
@@ -307,7 +308,6 @@ fn write_password(child: &mut std::process::Child, profile: &Profile) -> Result<
 
 /// Run `restic <args>` for a profile and return restic's stdout. See
 /// [`command`] for how credentials travel.
-#[allow(dead_code)]
 pub(crate) fn run(profile: &Profile, args: &[&str]) -> Result<Vec<u8>> {
     let mut cmd = command(profile, args)?;
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
