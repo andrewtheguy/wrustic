@@ -1,13 +1,15 @@
 use std::io::{self, Write};
 use std::mem;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use rustic_backend::BackendOptions;
 use rustic_core::repofile::{Node, NodeType};
 use rustic_core::{
-    Credentials, IndexedFull, IndexedFullStatus, IndexedIdsStatus, Repository, RepositoryOptions,
-    RepositoryBackends, TreeId,
+    Credentials, IndexedFull, IndexedFullStatus, IndexedIdsStatus, LimitOption, Progress,
+    ProgressBars, ProgressType, PruneOptions, PruneStats, Repository, RepositoryOptions,
+    RepositoryBackends, RusticProgress, TreeId,
 };
 use tokio::sync::mpsc;
 
@@ -306,6 +308,292 @@ pub(crate) fn delete_snapshot(profile: &Profile, snapshot_id: &str) -> Result<()
     let snap = repo.get_snapshot_from_str(snapshot_id, |_| true)?;
     repo.delete_snapshots(&[snap.id])?;
     Ok(())
+}
+
+/// Prunes the repository natively, under an exclusive restic-compatible lock —
+/// the same lock `restic prune` takes (docs/locking.md). The lock covers
+/// planning *and* execution: rustic_core's executor never re-validates the
+/// plan, so the snapshot set enumerated during planning must stay frozen
+/// until the last pack is deleted.
+///
+/// `instant_delete` is always on. rustic's default two-phase delete records
+/// removed packs under `packs_to_delete` in the index — a rustic-only
+/// extension restic cannot see (restic 0.19 decodes only `packs` and drops
+/// unknown keys on rewrite), so a restic prune would void that bookkeeping
+/// and delete the marked packs immediately anyway. Instant delete is also
+/// restic's own semantic, and it needs no time-based grace period for the
+/// same reason restic needs none: the exclusive lock excludes every
+/// concurrent writer. The resulting repo state — new index files covering
+/// exactly the surviving packs, old indexes and unused packs gone — is
+/// indistinguishable from a restic prune.
+///
+/// `max_repack` is lifted to unlimited to match `restic prune` (rustic's
+/// 10%-per-run default merely spreads repacking over several runs).
+///
+/// The deletion order is crash-safe like restic's: repacked data and the new
+/// index are written before old indexes are removed, and packs are removed
+/// last — an interruption at any point leaves a valid repository plus some
+/// garbage the next prune collects.
+///
+/// Progress lines are written into `progress` for the TUI to render; the
+/// returned report summarizes the executed plan.
+pub(crate) fn prune(
+    profile: &Profile,
+    progress: std::sync::Arc<std::sync::Mutex<String>>,
+) -> Result<String> {
+    let backends = build_backends(profile)?;
+    let repo = Repository::new_with_progress(
+        &RepositoryOptions::default(),
+        &backends,
+        TuiProgressBars { buf: progress },
+    )?
+    .open(&Credentials::password(profile.password()))?;
+    let crypto = lock::RepoCrypto::from_repo(&repo)?;
+    let repo_lock =
+        lock::RepoLock::acquire_exclusive(lock::backend_for_profile(profile)?, crypto)?;
+
+    let opts = PruneOptions::default()
+        .instant_delete(true)
+        .max_repack(LimitOption::Unlimited);
+    let plan = repo.prune_plan(&opts)?;
+    let report = prune_report(&plan.stats);
+    // Planning walks every snapshot tree and can take a long time on a big
+    // repo. Apply restic's refreshability-abort rule at the last gate before
+    // anything destructive: a lock that went unrefreshed for 22.5 minutes may
+    // already have been judged stale and removed by another process.
+    if repo_lock.poisoned() {
+        bail!(
+            "the repository lock could not be refreshed while the prune was being planned; \
+             aborting before deleting anything (the repository is unchanged)"
+        );
+    }
+    repo.prune(&opts, plan)?;
+    Ok(report)
+}
+
+/// Plain-text summary of a prune plan, in the spirit of `restic prune`'s
+/// report. Rendered from the plan (before execution) and shown only after
+/// the execution succeeded, so past tense is accurate.
+fn prune_report(stats: &PruneStats) -> String {
+    use std::fmt::Write;
+
+    let packs = &stats.packs;
+    let blobs = stats.blobs_sum();
+    let size = stats.size_sum();
+    let mut out = String::new();
+
+    let _ = writeln!(
+        out,
+        "used:       {:>9} blobs, {:>10}",
+        blobs.used,
+        human_bytes(size.used)
+    );
+    let _ = writeln!(
+        out,
+        "unused:     {:>9} blobs, {:>10}",
+        blobs.unused,
+        human_bytes(size.unused)
+    );
+    let _ = writeln!(
+        out,
+        "repacked:   {:>9} packs, {:>10} ({} blobs, {} thereof dropped)",
+        packs.repack,
+        human_bytes(size.repack),
+        blobs.repack,
+        blobs.repackrm,
+    );
+    let _ = writeln!(
+        out,
+        "deleted:    {:>9} packs, {:>10} ({} blobs)",
+        packs.unused,
+        human_bytes(size.remove),
+        blobs.remove,
+    );
+    if stats.packs_unref > 0 {
+        let _ = writeln!(
+            out,
+            "unindexed:  {:>9} packs, {:>10} (leftovers of interrupted runs, deleted)",
+            stats.packs_unref,
+            human_bytes(stats.size_unref)
+        );
+    }
+    // Packs an earlier `rustic prune` marked for deletion (wrustic never
+    // marks — instant delete): recovered ones move back into the index,
+    // everything else is deleted now.
+    let marked = &stats.packs_to_delete;
+    if marked.total() > 0 {
+        let _ = writeln!(
+            out,
+            "marked:     {:>9} packs, {:>10} ({} deleted now, {} recovered)",
+            marked.total(),
+            human_bytes(stats.size_to_delete.total()),
+            marked.remove + marked.keep,
+            marked.recover,
+        );
+    }
+    let reclaimed = size.repackrm + size.remove + stats.size_unref;
+    let _ = writeln!(out, "\ntotal space reclaimed: {}", human_bytes(reclaimed));
+    let remaining_size = size.total_after_prune();
+    let _ = writeln!(
+        out,
+        "remaining:  {:>9} blobs, {:>10}",
+        blobs.total_after_prune(),
+        human_bytes(remaining_size)
+    );
+    if remaining_size > 0 {
+        let _ = writeln!(
+            out,
+            "unused size after prune: {} ({:.2}% of remaining size)",
+            human_bytes(size.unused_after_prune()),
+            size.unused_after_prune() as f64 / remaining_size as f64 * 100.0
+        );
+    }
+    let _ = write!(
+        out,
+        "index files rebuilt: {} of {}",
+        stats.index_files_rebuild, stats.index_files
+    );
+    out
+}
+
+pub(crate) fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    let mut value = n as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{n} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// Adapter feeding rustic_core's per-phase progress into the shared text
+/// buffer the prune screen renders. Each phase gets one line in the buffer,
+/// updated in place as the phase advances, so the screen shows the newest
+/// state of every phase rather than a scrolling log.
+#[derive(Debug)]
+struct TuiProgressBars {
+    buf: std::sync::Arc<std::sync::Mutex<String>>,
+}
+
+impl ProgressBars for TuiProgressBars {
+    fn progress(&self, progress_type: ProgressType, prefix: &str) -> Progress {
+        let line = {
+            let mut buf = self.buf.lock().unwrap_or_else(|p| p.into_inner());
+            let line = buf.lines().count();
+            if !buf.is_empty() {
+                buf.push('\n');
+            }
+            buf.push_str(prefix);
+            line
+        };
+        Progress::new(TuiProgress {
+            buf: std::sync::Arc::clone(&self.buf),
+            line,
+            title: std::sync::Mutex::new(prefix.to_string()),
+            kind: progress_type,
+            len: AtomicU64::new(0),
+            pos: AtomicU64::new(0),
+            started: std::time::Instant::now(),
+            last_render_ms: AtomicU64::new(0),
+        })
+    }
+}
+
+/// One phase's progress line. `inc` can fire per blob during a repack, so
+/// re-rendering is throttled to ~10 Hz — the TUI polls the buffer at a
+/// similar rate anyway.
+#[derive(Debug)]
+struct TuiProgress {
+    buf: std::sync::Arc<std::sync::Mutex<String>>,
+    line: usize,
+    title: std::sync::Mutex<String>,
+    kind: ProgressType,
+    len: AtomicU64,
+    pos: AtomicU64,
+    started: std::time::Instant,
+    last_render_ms: AtomicU64,
+}
+
+impl TuiProgress {
+    fn render(&self, finished: bool) {
+        use std::sync::PoisonError;
+        let title = self
+            .title
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let pos = self.pos.load(Ordering::Relaxed);
+        let len = self.len.load(Ordering::Relaxed);
+        let text = match self.kind {
+            ProgressType::Spinner => {
+                if finished {
+                    format!("{title} done")
+                } else {
+                    format!("{title}…")
+                }
+            }
+            ProgressType::Counter => {
+                if len > 0 {
+                    format!("{title} {pos}/{len}")
+                } else {
+                    format!("{title} {pos}")
+                }
+            }
+            ProgressType::Bytes => {
+                if len > 0 {
+                    format!("{title} {} / {}", human_bytes(pos), human_bytes(len))
+                } else {
+                    format!("{title} {}", human_bytes(pos))
+                }
+            }
+        };
+        let mut buf = self.buf.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut lines: Vec<String> = buf.lines().map(str::to_string).collect();
+        if let Some(slot) = lines.get_mut(self.line) {
+            *slot = text;
+            *buf = lines.join("\n");
+        }
+    }
+}
+
+impl RusticProgress for TuiProgress {
+    fn is_hidden(&self) -> bool {
+        false
+    }
+
+    fn set_length(&self, len: u64) {
+        self.len.store(len, Ordering::Relaxed);
+        self.render(false);
+    }
+
+    fn set_title(&self, title: &str) {
+        use std::sync::PoisonError;
+        *self.title.lock().unwrap_or_else(PoisonError::into_inner) = title.to_string();
+        self.render(false);
+    }
+
+    fn inc(&self, inc: u64) {
+        self.pos.fetch_add(inc, Ordering::Relaxed);
+        let now = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let last = self.last_render_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= 100
+            && self
+                .last_render_ms
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            self.render(false);
+        }
+    }
+
+    fn finish(&self) {
+        self.render(true);
+    }
 }
 
 /// Backend + crypto pair for talking to the repo's `locks/` natively —
@@ -832,6 +1120,149 @@ mod tests {
         assert_eq!(listed, serde_json::json!([]));
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    // End-to-end interop for the native prune. restic sets up the repo
+    // (dev-flow writes through the harness), wrustic deletes a snapshot and
+    // prunes natively, and restic must afterwards consider the repository
+    // pristine: `restic check --read-data` passes with no errors and no
+    // orphaned packs (instant delete leaves neither garbage packs nor
+    // rustic's `packs_to_delete` bookkeeping behind), the surviving
+    // snapshot restores intact, and a follow-up `restic prune` runs clean.
+    // Marked #[ignore]; run with `cargo test -- --ignored` (needs restic on
+    // PATH).
+    #[test]
+    #[ignore]
+    fn live_native_prune_interop_with_restic() {
+        // Acquires RepoLocks — serialize with other acquiring tests (SIGHUP
+        // disposition is process-global).
+        let _guard = lock::test_acquire_guard();
+
+        let root = std::path::PathBuf::from("tmp")
+            .join(format!("prune-it-{}", std::process::id()));
+        let repo_path = root.join("repo");
+        let source = root.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        // Two files that land in the same data pack: after the first
+        // snapshot is deleted, that pack is partly used, so the prune must
+        // *repack* (rewrite keep.txt's blob, drop drop.txt's) rather than
+        // just delete whole packs — exercising the riskiest prune path.
+        let keep_content = vec![b'k'; 300_000];
+        std::fs::write(source.join("keep.txt"), &keep_content).unwrap();
+        std::fs::write(source.join("drop.txt"), vec![b'd'; 300_000]).unwrap();
+
+        let profile = Profile::Local {
+            password: "pw".into(),
+            local_path: repo_path.to_string_lossy().into_owned(),
+        };
+        crate::restic::run(&profile, &["init", "--json"]).expect("restic init");
+        crate::restic::run(&profile, &["backup", source.to_str().unwrap(), "--json"])
+            .expect("restic backup 1");
+        std::fs::remove_file(source.join("drop.txt")).unwrap();
+        crate::restic::run(&profile, &["backup", source.to_str().unwrap(), "--json"])
+            .expect("restic backup 2");
+
+        let snapshots = load_snapshots(&profile).expect("list snapshots");
+        assert_eq!(snapshots.len(), 2);
+        // Newest first — delete the older snapshot, the only holder of
+        // drop.txt.
+        let victim = snapshots[1].id.clone();
+        delete_snapshot(&profile, &victim).expect("native delete");
+
+        // A concurrent holder (here a shared lock, as a running backup would
+        // take) must block the exclusive prune with a lock error.
+        {
+            let backends = build_backends(&profile).unwrap();
+            let repo = Repository::new(&RepositoryOptions::default(), &backends)
+                .unwrap()
+                .open(&Credentials::password(profile.password()))
+                .unwrap();
+            let crypto = lock::RepoCrypto::from_repo(&repo).unwrap();
+            let live = lock::RepoLock::acquire_shared(
+                lock::backend_for_profile(&profile).unwrap(),
+                crypto,
+            )
+            .expect("shared lock");
+            let progress = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+            let err = prune(&profile, progress).expect_err("prune must be blocked");
+            assert!(
+                lock::is_lock_error(&format!("{err:#}")),
+                "expected a lock error, got: {err:#}"
+            );
+            drop(live);
+        }
+
+        // The native prune under the exclusive lock.
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let report = prune(&profile, progress.clone()).expect("native prune");
+        assert!(report.contains("total space reclaimed"), "{report}");
+        assert!(
+            !progress.lock().unwrap().is_empty(),
+            "the prune must have reported progress"
+        );
+
+        // The lock must be gone the moment the prune returns.
+        let locks = std::fs::read_dir(repo_path.join("locks"))
+            .map(|d| d.count())
+            .unwrap_or(0);
+        assert_eq!(locks, 0, "the prune must not leave a lock behind");
+
+        // restic's verdict. `check --read-data` re-reads every pack and
+        // validates it against the index; instant delete must leave no
+        // orphaned ("additional") files either.
+        let check = crate::restic::run(&profile, &["check", "--read-data"])
+            .expect("restic check after native prune");
+        let check_text = String::from_utf8_lossy(&check);
+        assert!(
+            check_text.contains("no errors were found"),
+            "restic check must pass: {check_text}"
+        );
+        assert!(
+            !check_text.contains("additional files were found"),
+            "instant delete must leave no orphaned packs: {check_text}"
+        );
+
+        // The surviving snapshot must restore intact through restic.
+        let restore_dir = root.join("restore");
+        crate::restic::run(
+            &profile,
+            &["restore", "latest", "--target", restore_dir.to_str().unwrap(), "--json"],
+        )
+        .expect("restic restore after native prune");
+        let mut restored = Vec::new();
+        collect_files(&restore_dir, &mut restored);
+        let keep = restored
+            .iter()
+            .find(|p| p.file_name().is_some_and(|n| n == "keep.txt"))
+            .expect("keep.txt restored");
+        assert_eq!(std::fs::read(keep).expect("read keep.txt"), keep_content);
+        assert!(
+            !restored.iter().any(|p| p.file_name().is_some_and(|n| n == "drop.txt")),
+            "drop.txt only existed in the deleted snapshot"
+        );
+
+        // And restic's own prune must run clean on the repository state the
+        // native prune left.
+        crate::restic::run(&profile, &["prune", "--json"])
+            .expect("restic prune after native prune");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // Recursive file listing for the restore assertion — restic recreates
+    // the snapshot's absolute directory structure under the target.
+    fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_files(&path, out);
+            } else {
+                out.push(path);
+            }
+        }
     }
 
     #[test]

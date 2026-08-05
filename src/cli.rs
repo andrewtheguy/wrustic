@@ -34,8 +34,9 @@ Options:
                               determined, --no-cache is passed anyway rather
                               than falling back to restic's shared default
                               cache. Only affects the restic CLI commands
-                              wrustic shells out for (prune-class); native
-                              reads/writes never use a restic cache. The cache
+                              wrustic can shell out for (maintenance-class);
+                              native reads/writes never use a restic cache.
+                              The cache
                               speeds up repeated restic work against a remote
                               repository at the cost of disk space — it can
                               reach hundreds of megabytes for a large

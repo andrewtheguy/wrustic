@@ -21,11 +21,12 @@ flat `App` struct.
 
 It is intentionally **not** a restic replacement:
 - Reads go through `rustic_core` directly (no subprocess).
-- The write operations wrustic exposes (snapshot delete + stale-lock
-  removal today) are native too, guarded by restic-compatible repository
-  locks (docs/locking.md) so they coexist safely with concurrent restic
-  processes. Anything without a native + locked implementation (backup,
-  prune, init, key add) is out of scope — use the `restic` CLI for those.
+- The write operations wrustic exposes (snapshot delete, prune, and
+  stale-lock removal today) are native too, guarded by restic-compatible
+  repository locks (docs/locking.md) so they coexist safely with
+  concurrent restic processes. Anything without a native + locked
+  implementation (backup, init, key add) is out of scope — use the
+  `restic` CLI for those.
 
 ## Runtime shape
 
@@ -197,12 +198,12 @@ docs/locking.md for the full design. rustic_core itself is lock-oblivious,
 so every native write MUST hold a `lock::RepoLock` — that discipline lives
 in `repo.rs`, not in rustic_core.
 
-Exactly one TUI flow shells out to restic: prune (`p` on the Snapshots
-screen), which runs `restic prune` on a worker thread so the TUI stays
-responsive; restic ≥ 0.19 on PATH is needed for that action alone, and
-the binary is otherwise not required to run wrustic
-(docs/restic-usage.md is the per-workflow overview). Write operations
-without a native + locked implementation (init, backup, prune, key
+No TUI flow shells out to restic — prune (`p` on the Snapshots screen)
+is native too: `repo::prune` runs rustic_core's prune with instant
+delete under the exclusive lock, on a worker thread so the TUI stays
+responsive (docs/restic-usage.md is the per-workflow overview, and
+docs/locking.md "Native prune" has the safety argument). Write
+operations without a native + locked implementation (init, backup, key
 management) stay on the restic CLI — when code needs to trigger one of
 those, it goes through the secure spawn harness kept in `src/restic.rs`,
 whose launch semantics mirror resterm's:
