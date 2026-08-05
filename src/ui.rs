@@ -129,7 +129,7 @@ fn bottom_bar_text(app: &App) -> &'static str {
         | Screen::Unlocking
         | Screen::SnapshotCompareLoading => "working…",
         Screen::PruneConfirm => "y start prune  n/Esc cancel",
-        Screen::PruneRunning => "running restic prune — keys disabled until it finishes",
+        Screen::PruneRunning => "running restic prune — Ctrl+C cancel (safe), other keys disabled",
         Screen::PruneDone(_) => "Up/Dn scroll  PgUp/PgDn page  g/G top/bottom  q/Esc back",
         Screen::PruneError(_) => "any key to continue",
         Screen::CreateProfileName => "type  Enter submit  Esc cancel",
@@ -749,7 +749,8 @@ fn render_prune_confirm(frame: &mut Frame, app: &App, area: Rect) {
          This runs `restic prune`, which rewrites and deletes pack files to\n\
          reclaim the space left behind by deleted snapshots. It takes an\n\
          exclusive repository lock — concurrent backups are blocked while it\n\
-         runs — and can take a long time on a large or remote repository.\n\n\
+         runs — and can take a long time on a large or remote repository.\n\
+         Progress is shown live, and Ctrl+C cancels safely at any point.\n\n\
          Requires restic >= 0.19 on PATH. Cache: {cache}.\n\n\
          y/Enter start   n/Esc cancel"
     );
@@ -767,13 +768,34 @@ fn render_prune_running(frame: &mut Frame, app: &App, area: Rect) {
         .unwrap_or_default();
     let spinner = FRAMES[(elapsed.as_millis() / 150) as usize % FRAMES.len()];
     let secs = elapsed.as_secs();
-    let body = format!(
-        "{spinner} Running `restic prune`…  elapsed {}m{:02}s\n\n\
-         restic holds an exclusive repository lock and reports progress only\n\
-         when finished. Keys are disabled until then.",
+    let mut body = format!(
+        "{spinner} Running `restic prune`…  elapsed {}m{:02}s\n\n",
         secs / 60,
         secs % 60
     );
+    if app.prune_cancel_requested {
+        body.push_str("Cancelling — waiting for restic to stop…\n\n");
+    } else {
+        body.push_str(
+            "Ctrl+C cancels safely: restic never removes data still in use; an\n\
+             interrupted prune leaves the remaining work for the next run.\n\n",
+        );
+    }
+    // Tail of restic's streamed stdout — on a pipe restic reports progress
+    // roughly every 10 s, so long repacks show movement here.
+    if let Some(progress) = &app.prune_progress {
+        let progress = progress.lock().unwrap_or_else(|p| p.into_inner());
+        // 2 border rows + the 4 header lines above the tail.
+        let avail = area.height.saturating_sub(6) as usize;
+        if avail > 0 && !progress.is_empty() {
+            let lines: Vec<&str> = progress.lines().collect();
+            let start = lines.len().saturating_sub(avail);
+            for line in &lines[start..] {
+                body.push_str(line);
+                body.push('\n');
+            }
+        }
+    }
     let para = Paragraph::new(body)
         .wrap(Wrap { trim: false })
         .block(Block::bordered().title("Pruning"));

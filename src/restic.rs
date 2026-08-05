@@ -227,9 +227,78 @@ fn lock_requirement(args: &[&str]) -> LockRequirement {
 /// details, returned for the caller to surface. restic re-runs the same
 /// check in-process at startup, so a lock appearing in the window between
 /// our re-check and the spawn still fails safely inside restic.
+#[allow(dead_code)] // the TUI's prune uses the streaming variant; kept for future non-interactive flows (repair, migrate) and exercised by the live test
 pub(crate) fn run_unsticking_locks(profile: &Profile, args: &[&str]) -> Result<Vec<u8>> {
+    unstick_if_blocked(profile, args)?;
+    run(profile, args)
+}
+
+/// Tracks the PID of the restic child currently running through this harness
+/// so another thread can interrupt it (the TUI's Ctrl+C on the prune screen).
+/// 0 means no child is running.
+#[derive(Debug, Default)]
+pub(crate) struct ChildTracker {
+    pid: std::sync::atomic::AtomicU32,
+}
+
+impl ChildTracker {
+    /// Ask the tracked restic (if any) to stop. Interrupting restic is safe
+    /// by design: it never removes data still in use — new packs and indexes
+    /// are written before old ones are deleted — so a killed prune only
+    /// leaves the remaining work for the next run.
+    ///
+    /// Unix sends SIGINT, the same signal a terminal Ctrl+C delivers, which
+    /// restic catches to clean up and remove its repository lock. Windows has
+    /// no cross-process Ctrl+C for a piped child, so the process is
+    /// terminated; the lock it leaves behind names a dead PID, which the next
+    /// spawn's unstick pre-check removes as stale.
+    ///
+    /// PID-reuse race: the child can exit between the load and the signal
+    /// below. The window is a main-loop tick against the OS not recycling
+    /// the PID in that instant — the same exposure every kill-by-PID has.
+    pub(crate) fn interrupt(&self) {
+        let pid = self.pid.load(Ordering::Relaxed);
+        if pid == 0 {
+            return;
+        }
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(pid as i32, libc::SIGINT);
+        }
+        #[cfg(windows)]
+        unsafe {
+            use windows_sys::Win32::Foundation::CloseHandle;
+            use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+            let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if !handle.is_null() {
+                TerminateProcess(handle, 1);
+                CloseHandle(handle);
+            }
+        }
+    }
+}
+
+/// [`run_unsticking_locks`] with live output: each stdout line restic prints
+/// is appended to `progress` as it arrives (restic reports progress on a
+/// pipe too, roughly every 10 s when stdout is not a terminal), the child's
+/// PID is registered on `tracker` so it can be interrupted, and the full
+/// stdout is still returned at the end.
+pub(crate) fn run_unsticking_locks_streaming(
+    profile: &Profile,
+    args: &[&str],
+    tracker: &ChildTracker,
+    progress: &std::sync::Mutex<String>,
+) -> Result<Vec<u8>> {
+    unstick_if_blocked(profile, args)?;
+    run_streaming(profile, args, tracker, progress)
+}
+
+/// The native pre-spawn lock check shared by both unsticking runners: apply
+/// restic's acquisition conflict rules for this subcommand's lock, and when
+/// blocked run restic's own `unlock` (stale locks only) and re-check.
+fn unstick_if_blocked(profile: &Profile, args: &[&str]) -> Result<()> {
     let exclusive = match lock_requirement(args) {
-        LockRequirement::None => return run(profile, args),
+        LockRequirement::None => return Ok(()),
         LockRequirement::NonExclusive => false,
         LockRequirement::Exclusive => true,
     };
@@ -238,7 +307,65 @@ pub(crate) fn run_unsticking_locks(profile: &Profile, args: &[&str]) -> Result<V
         unlock(profile)?;
         crate::lock::check_blocking_locks(backend.as_ref(), &crypto, exclusive)?;
     }
-    run(profile, args)
+    Ok(())
+}
+
+/// [`run`], but streaming stdout line-by-line into `progress` and exposing
+/// the child on `tracker` for interruption. stderr is drained on a helper
+/// thread (so neither pipe can fill up and deadlock the child) and reported
+/// on failure exactly like [`run`].
+fn run_streaming(
+    profile: &Profile,
+    args: &[&str],
+    tracker: &ChildTracker,
+    progress: &std::sync::Mutex<String>,
+) -> Result<Vec<u8>> {
+    use std::io::{BufRead, BufReader, Read};
+
+    let mut cmd = command(profile, args)?;
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow!("failed to spawn `restic`: {e}"))?;
+    tracker.pid.store(child.id(), Ordering::Relaxed);
+    let result = (|| {
+        if let Err(e) = write_password(&mut child, profile) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+        let stderr = child.stderr.take().ok_or_else(|| anyhow!("restic stderr not piped"))?;
+        let stderr_thread = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let mut stderr = stderr;
+            let _ = stderr.read_to_end(&mut buf);
+            buf
+        });
+        let stdout = child.stdout.take().ok_or_else(|| anyhow!("restic stdout not piped"))?;
+        let mut collected = Vec::new();
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            collected.extend_from_slice(line.as_bytes());
+            collected.push(b'\n');
+            if let Ok(mut p) = progress.lock() {
+                p.push_str(&line);
+                p.push('\n');
+            }
+        }
+        let status = child.wait().map_err(|e| anyhow!("waiting on restic: {e}"))?;
+        let stderr_buf = stderr_thread.join().unwrap_or_default();
+        if !status.success() {
+            let stderr = String::from_utf8_lossy(&stderr_buf).trim().to_string();
+            return Err(anyhow!(
+                "restic exited with status {}: {}",
+                status,
+                if stderr.is_empty() { "(no stderr)" } else { &stderr }
+            ));
+        }
+        Ok(collected)
+    })();
+    tracker.pid.store(0, Ordering::Relaxed);
+    result
 }
 
 /// Build a `restic <args>` command for a profile with credentials passed by
@@ -443,6 +570,29 @@ mod tests {
         assert_eq!(lock_requirement(&["frobnicate"]), NonExclusive);
         // Flags only (degenerate) → no subcommand, no lock to check.
         assert_eq!(lock_requirement(&["--json"]), None);
+    }
+
+    // Unix-only: the assertion needs a child that dies to SIGINT the way
+    // restic does; on Windows interrupt() terminates instead, which a live
+    // prune would be needed to observe.
+    #[cfg(unix)]
+    #[test]
+    fn child_tracker_interrupt_stops_a_running_child() {
+        use std::sync::atomic::Ordering;
+
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let tracker = ChildTracker::default();
+        tracker.pid.store(child.id(), Ordering::Relaxed);
+        tracker.interrupt();
+        let status = child.wait().expect("wait for interrupted child");
+        assert!(!status.success(), "SIGINT should have stopped the child");
+
+        // With no tracked PID, interrupt must be a no-op (not signal PID 0 —
+        // which would hit our own process group).
+        ChildTracker::default().interrupt();
     }
 
     fn test_profile() -> Profile {
@@ -678,7 +828,19 @@ mod tests {
         }
 
         // Prune through the harness — the command this module is kept for.
-        run_unsticking_locks(&profile, &["prune", "--json"]).expect("prune");
+        // The streaming variant is what the TUI uses: restic's stdout must
+        // land in the progress buffer line-by-line and still come back whole.
+        let tracker = ChildTracker::default();
+        let progress = std::sync::Mutex::new(String::new());
+        let out = run_unsticking_locks_streaming(&profile, &["prune"], &tracker, &progress)
+            .expect("prune");
+        let streamed = progress.into_inner().expect("progress mutex");
+        assert!(!streamed.is_empty(), "prune should have streamed progress lines");
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            streamed,
+            "collected stdout and streamed progress must match"
+        );
 
         let after = run(&profile, &["snapshots", "--json"]).expect("after-list");
         let arr_after: serde_json::Value = serde_json::from_slice(&after).expect("parse after");

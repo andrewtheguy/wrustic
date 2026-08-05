@@ -18,7 +18,10 @@ use ratatui::{
     DefaultTerminal,
     crossterm::{
         self,
-        event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
+        event::{
+            self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
+            KeyModifiers,
+        },
     },
 };
 
@@ -362,6 +365,10 @@ fn run(
                 };
                 let profile = profile.clone();
                 let (tx, rx) = std::sync::mpsc::channel();
+                let tracker = std::sync::Arc::new(restic::ChildTracker::default());
+                let progress = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+                let worker_tracker = tracker.clone();
+                let worker_progress = progress.clone();
                 std::thread::spawn(move || {
                     let result = (|| -> Result<Vec<u8>> {
                         if let Err(e) = restic::detect() {
@@ -370,21 +377,35 @@ fn run(
                         // No `--json`: restic 0.19 has no JSON output for
                         // prune (the flag is accepted and ignored). The
                         // report is displayed verbatim, never parsed.
-                        restic::run_unsticking_locks(&profile, &["prune"])
+                        restic::run_unsticking_locks_streaming(
+                            &profile,
+                            &["prune"],
+                            &worker_tracker,
+                            &worker_progress,
+                        )
                     })();
                     // The receiver is gone only if the app quit; nothing to do.
                     let _ = tx.send(result.map_err(|e| format!("{e:#}")));
                 });
                 app.prune_rx = Some(rx);
+                app.prune_tracker = Some(tracker);
+                app.prune_progress = Some(progress);
+                app.prune_cancel_requested = false;
                 app.prune_started = Some(std::time::Instant::now());
             }
             let rx = app.prune_rx.as_ref().expect("receiver set above");
             match rx.try_recv() {
                 Ok(outcome) => {
+                    let cancelled = app.prune_cancel_requested;
                     app.prune_rx = None;
+                    app.prune_tracker = None;
+                    app.prune_progress = None;
+                    app.prune_cancel_requested = false;
                     app.prune_started = None;
                     app.prune_scroll = 0;
                     app.screen = match outcome {
+                        // A cancel that raced restic's own finish is still a
+                        // finish — the report is real either way.
                         Ok(stdout) => {
                             let report = String::from_utf8_lossy(&stdout).into_owned();
                             Screen::PruneDone(if report.trim().is_empty() {
@@ -393,20 +414,37 @@ fn run(
                                 report
                             })
                         }
+                        Err(msg) if cancelled => Screen::PruneError(format!(
+                            "Prune cancelled — restic was interrupted before finishing.\n\n\
+                             The repository stays valid: restic never removes data still \
+                             in use, and the next prune redoes the remaining work.\n\n\
+                             restic said: {msg}"
+                        )),
                         Err(msg) => Screen::PruneError(msg),
                     };
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    // Wait briefly so the loop redraws the elapsed clock
-                    // without spinning; swallow input (prune is uncancellable
-                    // — see the PruneRunning key handler), but let the drain
-                    // pick up resize events for the redraw.
-                    if event::poll(std::time::Duration::from_millis(150))? {
-                        let _ = event::read()?;
+                    // Wait briefly so the loop redraws the elapsed clock and
+                    // streamed progress without spinning. Ctrl+C interrupts
+                    // the restic child (safe: restic never removes data still
+                    // in use); every other event is swallowed, with resize
+                    // picked up by the redraw.
+                    if event::poll(std::time::Duration::from_millis(150))?
+                        && let Event::Key(key) = event::read()?
+                        && key.kind == KeyEventKind::Press
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+                        && !app.prune_cancel_requested
+                        && let Some(tracker) = &app.prune_tracker
+                    {
+                        tracker.interrupt();
+                        app.prune_cancel_requested = true;
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     app.prune_rx = None;
+                    app.prune_tracker = None;
+                    app.prune_progress = None;
                     app.prune_started = None;
                     app.screen =
                         Screen::PruneError("prune worker exited without reporting".into());
