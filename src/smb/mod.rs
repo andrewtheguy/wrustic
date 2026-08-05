@@ -338,14 +338,22 @@ pub(crate) fn start_snapshot_share(
         .get_snapshot_from_str(snapshot_id, |_| true)
         .map_err(|e| anyhow!("looking up snapshot `{snapshot_id}`: {e}"))?;
 
-    // Label the volume with the short snapshot id, so a client that has several
-    // of these mounted can tell them apart.
+    // restic's standard short id (8 hex chars, `internal/restic/id.go`
+    // shortStr) — the same form `restic snapshots` prints, so the name pastes
+    // straight into other restic commands.
     let hex = snap.id.to_hex();
-    let label = format!("snap-{}", &hex.as_str()[..8.min(hex.as_str().len())]);
+    let short_id = &hex.as_str()[..8.min(hex.as_str().len())];
+    // Label the volume with it too, so a client that has several of these
+    // mounted can tell them apart.
+    let label = format!("snap-{short_id}");
     // restic records the snapshot's byte count at backup time; using it avoids
     // a recursive walk and is exact.
     let total_size = snap.summary.as_ref().map(|s| s.total_bytes_processed);
     let backing = SnapshotBacking::new(repo, snap.tree, label, total_size)?;
+    // The share root shows a single directory named by the short id: the share
+    // name and mount commands stay fixed, while the mount's contents say which
+    // snapshot they came from.
+    let backing = backing::NestedBacking::new(backing, short_id);
 
     let mut handle = start(port, DEFAULT_SHARE_NAME, Arc::new(backing), bind, credentials)?;
     handle.lock = Some(repo_lock);
@@ -1413,6 +1421,50 @@ mod tests {
         );
         std::thread::sleep(std::time::Duration::from_secs(secs));
         handle.stop();
+    }
+
+    /// A snapshot share's layout as a real client sees it: the share root
+    /// lists exactly one directory named by the snapshot's 8-char short id,
+    /// and the tree lives inside it.
+    #[test]
+    fn smbclient_walks_the_nested_snapshot_directory() {
+        use std::process::Command;
+
+        if Command::new("smbclient").arg("--version").output().is_err() {
+            eprintln!("skipping: smbclient is not installed");
+            return;
+        }
+
+        let backing = Arc::new(backing::NestedBacking::new(
+            MemBacking::new()
+                .with_dir("docs")
+                .with_file("docs\\readme.txt", b"nested hello\n"),
+            "1a2b3c4d",
+        ));
+        let handle = start(0, DEFAULT_SHARE_NAME, backing, Bind::Loopback, test_credentials())
+            .expect("server starts");
+        let target = format!("//127.0.0.1/{}", handle.share_name);
+
+        let out = Command::new("smbclient")
+            .arg(&target)
+            .args(["-p", &handle.port.to_string()])
+            .args(["-U", &format!("{TEST_USER}%{TEST_PASSWORD}")])
+            .arg("--option=client min protocol=SMB2_10")
+            .arg("--option=client max protocol=SMB2_10")
+            .args(["-c", "ls; cd 1a2b3c4d; ls; cd docs; ls"])
+            .output()
+            .expect("smbclient runs");
+        handle.stop();
+
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(
+            out.status.success(),
+            "smbclient failed\nstdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert!(stdout.contains("1a2b3c4d"), "root must list the snapshot dir:\n{stdout}");
+        assert!(stdout.contains("docs"), "snapshot dir must list the tree:\n{stdout}");
+        assert!(stdout.contains("readme.txt"), "tree must be walkable:\n{stdout}");
     }
 
     /// The snapshot share holds restic's non-exclusive lock for its lifetime:

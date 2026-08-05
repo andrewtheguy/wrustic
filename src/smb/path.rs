@@ -91,6 +91,14 @@ impl SmbPath {
         Self { components }
     }
 
+    /// Split off the first component: `(first, rest)`, `None` for the root.
+    /// Lets a backing that nests another one route a client path into the
+    /// inner tree without re-parsing anything.
+    pub(crate) fn split_first(&self) -> Option<(&str, Self)> {
+        let (first, rest) = self.components.split_first()?;
+        Some((first.as_str(), Self { components: rest.to_vec() }))
+    }
+
     /// A stable 64-bit id for this path, used as both the SMB FileId and the
     /// inode number reported in directory listings.
     ///
@@ -224,6 +232,21 @@ mod tests {
         let child = dir.join("c");
         assert_eq!(child.to_vfs_path(), PathBuf::from("/a/b/c"));
         assert_eq!(dir.to_vfs_path(), PathBuf::from("/a/b"), "parent unchanged");
+    }
+
+    #[test]
+    fn split_first_peels_one_component() {
+        assert!(SmbPath::parse("").unwrap().split_first().is_none(), "root has no head");
+
+        let single = SmbPath::parse("a").unwrap();
+        let (first, rest) = single.split_first().unwrap();
+        assert_eq!(first, "a");
+        assert!(rest.is_root());
+
+        let nested = SmbPath::parse(r"a\b\c").unwrap();
+        let (first, rest) = nested.split_first().unwrap();
+        assert_eq!(first, "a");
+        assert_eq!(rest.to_smb_string(), r"b\c");
     }
 
     #[test]

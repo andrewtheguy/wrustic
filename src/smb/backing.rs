@@ -247,6 +247,95 @@ impl Backing for SnapshotBacking {
     }
 }
 
+/// Wraps a backing so its whole tree appears one level down, inside a single
+/// synthetic top-level directory.
+///
+/// A snapshot share nests under the snapshot's short id (restic's standard
+/// 8-hex-char form, so the name pastes straight into restic commands): the
+/// share name and mount commands stay fixed (`\\127.0.0.1\snap`, fstab-safe),
+/// while the mount's contents — and anything copied out of it, or several
+/// snapshots mounted side by side — say which snapshot they came from.
+pub(crate) struct NestedBacking<B> {
+    inner: B,
+    /// Name of the single top-level directory.
+    dir: String,
+    /// Timestamp reported for the two synthetic directories (the root and
+    /// `dir`), mirroring what `SnapshotBacking` does for its own root.
+    now: SystemTime,
+}
+
+/// Where a client path lands relative to the synthetic directory.
+enum Route {
+    Root,
+    Dir,
+    Inner(SmbPath),
+    Missing,
+}
+
+impl<B: Backing> NestedBacking<B> {
+    pub(crate) fn new(inner: B, dir: impl Into<String>) -> Self {
+        Self {
+            inner,
+            dir: dir.into(),
+            now: SystemTime::now(),
+        }
+    }
+
+    // The directory name is matched case-insensitively: SMB names are
+    // case-preserving but not case-sensitive, and a Windows client may upcase
+    // a typed path. The inner tree keeps the repository's own (case-sensitive)
+    // semantics — only the synthetic level is ours to define.
+    fn route(&self, path: &SmbPath) -> Route {
+        match path.split_first() {
+            None => Route::Root,
+            Some((first, rest)) if first.eq_ignore_ascii_case(&self.dir) => {
+                if rest.is_root() {
+                    Route::Dir
+                } else {
+                    Route::Inner(rest)
+                }
+            }
+            Some(_) => Route::Missing,
+        }
+    }
+}
+
+impl<B: Backing> Backing for NestedBacking<B> {
+    fn stat(&self, path: &SmbPath) -> Result<NodeInfo, u32> {
+        match self.route(path) {
+            Route::Root => Ok(NodeInfo::synthetic_dir("", self.now)),
+            Route::Dir => Ok(NodeInfo::synthetic_dir(&self.dir, self.now)),
+            Route::Inner(rest) => self.inner.stat(&rest),
+            Route::Missing => Err(status::OBJECT_NAME_NOT_FOUND),
+        }
+    }
+
+    fn list(&self, path: &SmbPath) -> Result<Vec<NodeInfo>, u32> {
+        match self.route(path) {
+            Route::Root => Ok(vec![NodeInfo::synthetic_dir(&self.dir, self.now)]),
+            Route::Dir => self.inner.list(&SmbPath::default()),
+            Route::Inner(rest) => self.inner.list(&rest),
+            Route::Missing => Err(status::OBJECT_PATH_NOT_FOUND),
+        }
+    }
+
+    fn open(&self, path: &SmbPath) -> Result<Arc<dyn FileReader>, u32> {
+        match self.route(path) {
+            Route::Root | Route::Dir => Err(status::FILE_IS_A_DIRECTORY),
+            Route::Inner(rest) => self.inner.open(&rest),
+            Route::Missing => Err(status::OBJECT_NAME_NOT_FOUND),
+        }
+    }
+
+    fn label(&self) -> &str {
+        self.inner.label()
+    }
+
+    fn total_size(&self) -> u64 {
+        self.inner.total_size()
+    }
+}
+
 struct SnapshotFile {
     repo: Arc<Repository<IndexedFullStatus>>,
     open_file: OpenFile,
@@ -484,6 +573,67 @@ mod tests {
     fn listing_a_file_is_refused() {
         let b = MemBacking::new().with_file("f", b"x");
         assert_eq!(b.list(&p("f")).unwrap_err(), status::NOT_A_DIRECTORY);
+    }
+
+    #[test]
+    fn nested_backing_puts_the_tree_one_level_down() {
+        let b = NestedBacking::new(
+            MemBacking::new()
+                .with_dir("docs")
+                .with_file("docs\\a.txt", b"aaa")
+                .with_file("top.txt", b"t"),
+            "1a2b3c4d",
+        );
+
+        // The share root holds exactly the one synthetic directory.
+        let root = b.list(&p("")).unwrap();
+        assert_eq!(root.len(), 1);
+        assert_eq!(root[0].name, "1a2b3c4d");
+        assert!(root[0].kind.is_dir());
+        assert!(b.stat(&p("")).unwrap().kind.is_dir());
+        assert!(b.stat(&p("1a2b3c4d")).unwrap().kind.is_dir());
+
+        // Inside it: the inner backing's root, at its usual paths.
+        let mut names: Vec<_> = b
+            .list(&p("1a2b3c4d"))
+            .unwrap()
+            .into_iter()
+            .map(|n| n.name)
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["docs", "top.txt"]);
+        assert_eq!(b.stat(&p("1a2b3c4d\\top.txt")).unwrap().size, 1);
+        let f = b.open(&p("1a2b3c4d\\docs\\a.txt")).unwrap();
+        assert_eq!(&f.read_at(0, 10).unwrap()[..], b"aaa");
+    }
+
+    #[test]
+    fn nested_backing_matches_its_directory_case_insensitively() {
+        // SMB names are case-preserving, not case-sensitive; Windows may
+        // upcase a typed path, and the synthetic level must still resolve.
+        let b = NestedBacking::new(MemBacking::new().with_file("f", b"x"), "1a2b3c4d");
+        assert!(b.stat(&p("1A2B3C4D")).unwrap().kind.is_dir());
+        assert_eq!(b.stat(&p("1A2B3C4D\\f")).unwrap().size, 1);
+    }
+
+    #[test]
+    fn nested_backing_refuses_paths_outside_its_directory() {
+        let b = NestedBacking::new(MemBacking::new().with_file("f", b"x"), "1a2b3c4d");
+        assert_eq!(b.stat(&p("other")).unwrap_err(), status::OBJECT_NAME_NOT_FOUND);
+        assert_eq!(b.list(&p("other")).unwrap_err(), status::OBJECT_PATH_NOT_FOUND);
+        assert_eq!(b.open(&p("other")).err(), Some(status::OBJECT_NAME_NOT_FOUND));
+        // The inner tree's names do not leak through to the root.
+        assert_eq!(b.stat(&p("f")).unwrap_err(), status::OBJECT_NAME_NOT_FOUND);
+        // Both synthetic directories refuse open like any directory.
+        assert_eq!(b.open(&p("")).err(), Some(status::FILE_IS_A_DIRECTORY));
+        assert_eq!(b.open(&p("1a2b3c4d")).err(), Some(status::FILE_IS_A_DIRECTORY));
+    }
+
+    #[test]
+    fn nested_backing_delegates_label_and_size() {
+        let b = NestedBacking::new(MemBacking::new().with_file("f", b"xyz"), "d");
+        assert_eq!(b.label(), "test");
+        assert_eq!(b.total_size(), 3);
     }
 
     #[test]

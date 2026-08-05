@@ -1395,6 +1395,11 @@ fn short_path(p: &str) -> String {
     format!("…{}", &p[byte_offset..])
 }
 
+// restic's standard short id: 8 hex chars (`internal/restic/id.go` shortStr),
+// the same form `restic snapshots` prints. Every short id the program renders
+// — here, the SMB share's top-level directory, the volume label, lock storage
+// ids — uses this length, so any of them pastes straight into a restic
+// command.
 fn short_snap_id(id: &str) -> &str {
     let end = id.char_indices().nth(8).map(|(i, _)| i).unwrap_or(id.len());
     &id[..end]
