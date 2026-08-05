@@ -36,13 +36,18 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
-      # `--all-features` turns on `keychain`, whose Linux backend is the D-Bus
-      # secret service and needs libdbus to build. The shipped Linux binary is
-      # built without the feature (see release.yml, and docs/keychain.md for
+      # libdbus: `--all-features` turns on `keychain`, whose Linux backend is
+      # the D-Bus secret service and needs it to build. The shipped Linux binary
+      # is built without the feature (see release.yml, and docs/keychain.md for
       # why), but compiling it here is what keeps it from rotting.
-      - name: Install libdbus (Linux, for the keychain feature)
+      #
+      # smbclient: six tests drive a real client through the handshake, a
+      # directory walk and a read, and *skip themselves* where it is not
+      # installed. Without this line they would report as passing while doing
+      # nothing, which is worse than not having them.
+      - name: Install libdbus and smbclient (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config smbclient
 
       - name: Clippy
         run: cargo clippy --all-features --all-targets -- -D warnings
