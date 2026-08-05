@@ -26,9 +26,11 @@
 mod backing;
 mod files;
 mod info;
+mod ntlm;
 mod path;
 mod proto;
 mod session;
+mod sign;
 mod wire;
 
 use std::net::TcpListener as StdTcpListener;
@@ -47,6 +49,7 @@ use crate::repo::open_indexed_full;
 use backing::{Backing, SnapshotBacking};
 use files::Handles;
 use proto::{HEADER_LEN, Header, NEXT_COMMAND_OFFSET, cmd, status, write_error_body};
+pub(crate) use session::Credentials;
 use session::{SessionState, TreeKind};
 use wire::{MAX_INBOUND_MESSAGE, NBSS_HEADER_LEN, Reader, Writer, nbss_header, nbss_len};
 
@@ -117,6 +120,10 @@ struct Ctx {
     /// What the share serves. Shared across connections; a snapshot is
     /// immutable, so concurrent readers need no coordination beyond this Arc.
     backing: Arc<dyn Backing>,
+    /// The account every client must authenticate as. There is no guest path:
+    /// all three client platforms support NTLMv2, and Windows accepts nothing
+    /// less.
+    credentials: Credentials,
     /// Reported as the volume serial number. Clients key their metadata caches
     /// on it, so it must be stable for the server's lifetime and differ between
     /// servers.
@@ -159,6 +166,21 @@ impl Drop for SmbHandle {
     }
 }
 
+/// Turn a bind failure on a privileged port into an actionable message. Ports
+/// below 1024 need CAP_NET_BIND_SERVICE, and the bare "Permission denied" that
+/// the OS returns says nothing about how to fix it.
+fn privileged_hint(e: anyhow::Error, port: u16) -> anyhow::Error {
+    if port >= 1024 {
+        return e;
+    }
+    anyhow!(
+        "{e}\n\nPort {port} is privileged. Either run the whole command under \
+sudo -E, or grant the binary the capability once:\n  \
+sudo setcap cap_net_bind_service=+ep <path-to-wrustic>\n\
+(setcap must be re-applied after every rebuild.)"
+    )
+}
+
 /// Which interfaces to accept connections on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum Bind {
@@ -179,22 +201,16 @@ pub(crate) fn start(
     port: u16,
     share_name: impl Into<String>,
     backing: Arc<dyn Backing>,
-) -> Result<SmbHandle> {
-    start_on(port, share_name, backing, Bind::Loopback)
-}
-
-pub(crate) fn start_on(
-    port: u16,
-    share_name: impl Into<String>,
-    backing: Arc<dyn Backing>,
     bind: Bind,
+    credentials: Credentials,
 ) -> Result<SmbHandle> {
     let listeners_std = match bind {
-        Bind::Loopback => local_server::bind_localhost(port)?,
+        Bind::Loopback => local_server::bind_localhost(port).map_err(|e| privileged_hint(e, port))?,
         Bind::AllInterfaces => {
             let listener = StdTcpListener::bind((std::net::Ipv6Addr::UNSPECIFIED, port))
                 .or_else(|_| StdTcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)))
-                .map_err(|e| anyhow!("binding all interfaces on port {port}: {e}"))?;
+                .map_err(|e| anyhow!("binding all interfaces on port {port}: {e}"));
+            let listener = listener.map_err(|e| privileged_hint(e, port))?;
             listener
                 .set_nonblocking(true)
                 .map_err(|e| anyhow!("set_nonblocking: {e}"))?;
@@ -212,6 +228,7 @@ pub(crate) fn start_on(
     let ctx = Arc::new(Ctx {
         share_name: share_name.clone(),
         backing,
+        credentials,
         volume_serial: rand::random::<u32>(),
         server_guid: rand::random::<[u8; 16]>(),
         boot_time: SystemTime::now(),
@@ -259,6 +276,7 @@ pub(crate) fn start_snapshot_share(
     profile: &Profile,
     snapshot_id: &str,
     bind: Bind,
+    credentials: Credentials,
 ) -> Result<SmbHandle> {
     let repo = Arc::new(open_indexed_full(profile)?);
     let snap = repo
@@ -274,7 +292,7 @@ pub(crate) fn start_snapshot_share(
     let total_size = snap.summary.as_ref().map(|s| s.total_bytes_processed);
     let backing = SnapshotBacking::new(repo, snap.tree, label, total_size)?;
 
-    start_on(port, DEFAULT_SHARE_NAME, Arc::new(backing), bind)
+    start(port, DEFAULT_SHARE_NAME, Arc::new(backing), bind, credentials)
 }
 
 async fn accept_loop(
@@ -333,7 +351,18 @@ async fn serve_connection(mut stream: tokio::net::TcpStream, ctx: Arc<Ctx>) {
         // connection on this one. It is applied here, at the single call site,
         // rather than inside the handlers, so the protocol code stays sync and
         // directly unit-testable without a runtime.
-        let Some(resp) = tokio::task::block_in_place(|| conn.handle_message(&msg)) else {
+        // Verify with the key held *before* this message is processed: the
+        // SESSION_SETUP that establishes the key is itself unsigned, and its
+        // response is the first thing signed.
+        if let Some(key) = conn.state.signing_key {
+            let verdict = sign::verify(&key, &msg);
+            if !verdict.is_valid() {
+                smb_log!("dropping connection: {}", verdict.describe());
+                return;
+            }
+        }
+
+        let Some(mut resp) = tokio::task::block_in_place(|| conn.handle_message(&msg)) else {
             smb_log!(
                 "dropping connection: unparseable message, first bytes {:02x?}",
                 &msg[..msg.len().min(8)]
@@ -345,6 +374,12 @@ async fn serve_connection(mut stream: tokio::net::TcpStream, ctx: Arc<Ctx>) {
         if resp.is_empty() {
             // CANCEL is answered with silence.
             continue;
+        }
+        // Sign with the key as it stands *after* processing, so the
+        // SESSION_SETUP response that completes authentication carries a
+        // signature — Windows verifies that one.
+        if let Some(key) = conn.state.signing_key {
+            sign::sign(&key, &mut resp);
         }
         if stream.write_all(&nbss_header(resp.len())).await.is_err() {
             return;
@@ -537,7 +572,8 @@ impl Conn {
             .map(Reply::ok),
 
             cmd::SESSION_SETUP => {
-                session::session_setup(body, message, &mut self.state).map(|(st, b)| {
+                session::session_setup(body, message, &mut self.state, &self.ctx.credentials)
+                    .map(|(st, b)| {
                     // Both legs must carry the server-assigned session id: the
                     // client reads it off the first response and uses it from
                     // then on.
@@ -548,6 +584,7 @@ impl Conn {
             cmd::LOGOFF => {
                 self.state.authenticated = false;
                 self.state.session_id = 0;
+                self.state.signing_key = None;
                 Ok(Reply::ok(session::simple_ack()))
             }
 
@@ -675,10 +712,21 @@ mod tests {
         )
     }
 
+    const TEST_USER: &str = "wrustic";
+    const TEST_PASSWORD: &str = "hunter2";
+
+    fn test_credentials() -> Credentials {
+        Credentials {
+            user: TEST_USER.to_string(),
+            password: TEST_PASSWORD.to_string(),
+        }
+    }
+
     fn ctx() -> Arc<Ctx> {
         Arc::new(Ctx {
             share_name: DEFAULT_SHARE_NAME.to_string(),
             backing: test_backing(),
+            credentials: test_credentials(),
             volume_serial: 0x1234_5678,
             server_guid: [7u8; 16],
             boot_time: SystemTime::UNIX_EPOCH,
@@ -736,7 +784,10 @@ mod tests {
         token.extend_from_slice(b"NTLMSSP\0");
         token.extend_from_slice(&msg_type.to_le_bytes());
         token.extend_from_slice(&[0u8; 32]);
+        session_setup_body_with(&token)
+    }
 
+    fn session_setup_body_with(token: &[u8]) -> Vec<u8> {
         let mut w = Writer::new();
         w.u16(25);
         w.u8(0);
@@ -746,7 +797,7 @@ mod tests {
         w.u16((HEADER_LEN + 24) as u16);
         w.u16(token.len() as u16);
         w.u64(0);
-        w.bytes(&token);
+        w.bytes(token);
         w.into_vec()
     }
 
@@ -782,15 +833,21 @@ mod tests {
         assert_eq!(h.status, status::MORE_PROCESSING_REQUIRED);
         let session_id = h.session_id;
 
+        // A real NTLMv2 response against the challenge just issued. There is no
+        // guest path any more, so tests authenticate exactly as a client does.
+        let auth = crate::smb::ntlm::tests_support::build_authenticate(
+            TEST_USER,
+            "",
+            TEST_PASSWORD,
+            &conn.state.server_challenge,
+            None,
+        );
+        let body = session_setup_body_with(&auth);
         let resp = conn
-            .handle_message(&request(
-                cmd::SESSION_SETUP,
-                session_id,
-                0,
-                &session_setup_body(3),
-            ))
+            .handle_message(&request(cmd::SESSION_SETUP, session_id, 0, &body))
             .expect("session setup leg two answered");
         assert_eq!(parse_response(&resp).status, status::SUCCESS);
+        assert!(conn.state.signing_key.is_some(), "session must be signed");
 
         (conn, session_id)
     }
@@ -1030,7 +1087,14 @@ mod tests {
 
     #[test]
     fn server_starts_on_an_ephemeral_port_and_stops() {
-        let handle = start(0, DEFAULT_SHARE_NAME, test_backing()).expect("server starts");
+        let handle = start(
+            0,
+            DEFAULT_SHARE_NAME,
+            test_backing(),
+            Bind::Loopback,
+            test_credentials(),
+        )
+        .expect("server starts");
         assert_ne!(handle.port, 0);
         assert_eq!(handle.unc(), r"\\127.0.0.1\snap");
         handle.stop();
@@ -1051,13 +1115,20 @@ mod tests {
             return;
         }
 
-        let handle = start(0, DEFAULT_SHARE_NAME, test_backing()).expect("server starts");
+        let handle = start(
+            0,
+            DEFAULT_SHARE_NAME,
+            test_backing(),
+            Bind::Loopback,
+            test_credentials(),
+        )
+        .expect("server starts");
         let target = format!("//127.0.0.1/{}", handle.share_name);
 
         let out = Command::new("smbclient")
             .arg(&target)
             .args(["-p", &handle.port.to_string()])
-            .arg("-N") // no password: guest
+            .args(["-U", &format!("{TEST_USER}%{TEST_PASSWORD}")])
             // Pin the client to 2.1 so a dialect mismatch shows up here as a
             // clear failure rather than as a confusing later error.
             .arg("--option=client min protocol=SMB2_10")
@@ -1086,12 +1157,19 @@ mod tests {
             return None;
         }
 
-        let handle = start(0, DEFAULT_SHARE_NAME, test_backing()).expect("server starts");
+        let handle = start(
+            0,
+            DEFAULT_SHARE_NAME,
+            test_backing(),
+            Bind::Loopback,
+            test_credentials(),
+        )
+        .expect("server starts");
         let target = format!("//127.0.0.1/{}", handle.share_name);
         let out = Command::new("smbclient")
             .arg(&target)
             .args(["-p", &handle.port.to_string()])
-            .arg("-N")
+            .args(["-U", &format!("{TEST_USER}%{TEST_PASSWORD}")])
             .arg("--option=client min protocol=SMB2_10")
             .arg("--option=client max protocol=SMB2_10")
             .args(["-c", command])
@@ -1117,7 +1195,14 @@ mod tests {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(4455);
-        let handle = start(port, DEFAULT_SHARE_NAME, test_backing()).expect("server starts");
+        let handle = start(
+            port,
+            DEFAULT_SHARE_NAME,
+            test_backing(),
+            Bind::Loopback,
+            test_credentials(),
+        )
+        .expect("server starts");
         eprintln!("serving \\\\127.0.0.1\\snap on port {}", handle.port);
         std::thread::sleep(std::time::Duration::from_secs(120));
         handle.stop();
@@ -1156,8 +1241,20 @@ mod tests {
         } else {
             Bind::Loopback
         };
-        let handle = start_snapshot_share(port, &profile, &snapshot, bind)
-            .expect("snapshot share starts");
+        let password = std::env::var("WRUSTIC_SMB_SHARE_PASSWORD")
+            .unwrap_or_else(|_| TEST_PASSWORD.to_string());
+        let handle = start_snapshot_share(
+            port,
+            &profile,
+            &snapshot,
+            bind,
+            Credentials {
+                user: TEST_USER.to_string(),
+                password: password.clone(),
+            },
+        )
+        .expect("snapshot share starts");
+        eprintln!("  username {TEST_USER}  password {password}");
         eprintln!(
             "serving snapshot {snapshot} on 127.0.0.1:{} for {secs}s",
             handle.port
@@ -1218,7 +1315,14 @@ mod tests {
         if Command::new("smbclient").arg("--version").output().is_err() {
             return;
         }
-        let handle = start(0, DEFAULT_SHARE_NAME, test_backing()).expect("server starts");
+        let handle = start(
+            0,
+            DEFAULT_SHARE_NAME,
+            test_backing(),
+            Bind::Loopback,
+            test_credentials(),
+        )
+        .expect("server starts");
         let target = format!("//127.0.0.1/{}", handle.share_name);
 
         let src = tempdir_path("smb-write");
@@ -1229,7 +1333,7 @@ mod tests {
         let out = Command::new("smbclient")
             .arg(&target)
             .args(["-p", &handle.port.to_string()])
-            .arg("-N")
+            .args(["-U", &format!("{TEST_USER}%{TEST_PASSWORD}")])
             .arg("--option=client min protocol=SMB2_10")
             .arg("--option=client max protocol=SMB2_10")
             .args(["-c", &format!("put {} payload.txt", file.display())])

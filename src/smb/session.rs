@@ -14,8 +14,8 @@
 use anyhow::Result;
 
 use super::proto::{
-    CAP_LARGE_MTU, DIALECT_SMB_2_1, DIALECT_WILDCARD, HEADER_LEN, SESSION_FLAG_IS_GUEST,
-    SHARE_TYPE_DISK, SHARE_TYPE_PIPE, SIGNING_ENABLED, access, status, to_filetime,
+    CAP_LARGE_MTU, DIALECT_SMB_2_1, DIALECT_WILDCARD, HEADER_LEN, SHARE_TYPE_DISK, SHARE_TYPE_PIPE,
+    SIGNING_ENABLED, SIGNING_REQUIRED, access, status, to_filetime,
 };
 use super::wire::{Reader, Writer, der_tlv, from_utf16le, utf16le};
 
@@ -94,7 +94,7 @@ enum Framing {
 /// magic that cannot appear in the surrounding ASN.1 at this nesting depth, so
 /// scanning for it is unambiguous in practice — and its *position* is exactly
 /// the signal needed to tell the two framings apart.
-fn find_ntlmssp(blob: &[u8]) -> Option<(u32, Framing)> {
+fn find_ntlmssp(blob: &[u8]) -> Option<(u32, Framing, &[u8])> {
     let start = blob
         .windows(NTLMSSP_SIGNATURE.len())
         .position(|w| w == NTLMSSP_SIGNATURE)?;
@@ -108,7 +108,14 @@ fn find_ntlmssp(blob: &[u8]) -> Option<(u32, Framing)> {
     } else {
         Framing::Spnego
     };
-    Some((msg_type, framing))
+    Some((msg_type, framing, msg))
+}
+
+/// The account a client must present to get an authenticated, signed session.
+#[derive(Debug, Clone)]
+pub(crate) struct Credentials {
+    pub(crate) user: String,
+    pub(crate) password: String,
 }
 
 /// Build an NTLMSSP CHALLENGE (type 2) message.
@@ -117,27 +124,25 @@ fn find_ntlmssp(blob: &[u8]) -> Option<(u32, Framing)> {
 /// it. A fixed nonce would be a gratuitous oddity in a packet capture, and
 /// costs nothing to avoid.
 fn ntlmssp_challenge(nonce: [u8; 8]) -> Vec<u8> {
-    // Flags we assert. EXTENDED_SESSIONSECURITY and TARGET_INFO are what modern
-    // clients expect to see; without them macOS falls back to a legacy path.
-    const NEGOTIATE_UNICODE: u32 = 0x0000_0001;
-    const REQUEST_TARGET: u32 = 0x0000_0004;
-    const NEGOTIATE_NTLM: u32 = 0x0000_0200;
-    const NEGOTIATE_ALWAYS_SIGN: u32 = 0x0000_8000;
-    const TARGET_TYPE_SERVER: u32 = 0x0002_0000;
-    const EXTENDED_SESSIONSECURITY: u32 = 0x0008_0000;
-    const NEGOTIATE_TARGET_INFO: u32 = 0x0080_0000;
-    const NEGOTIATE_128: u32 = 0x2000_0000;
-    const NEGOTIATE_56: u32 = 0x8000_0000;
+    use super::ntlm::flags as nf;
 
-    let flags = NEGOTIATE_UNICODE
-        | REQUEST_TARGET
-        | NEGOTIATE_NTLM
-        | NEGOTIATE_ALWAYS_SIGN
-        | TARGET_TYPE_SERVER
-        | EXTENDED_SESSIONSECURITY
-        | NEGOTIATE_TARGET_INFO
-        | NEGOTIATE_128
-        | NEGOTIATE_56;
+    // EXTENDED_SESSIONSECURITY and TARGET_INFO are what modern clients expect;
+    // without them macOS drops to a legacy path.
+    let flags = nf::NEGOTIATE_UNICODE
+        | nf::REQUEST_TARGET
+        | nf::NEGOTIATE_NTLM
+        | nf::NEGOTIATE_ALWAYS_SIGN
+        | nf::TARGET_TYPE_SERVER
+        | nf::EXTENDED_SESSIONSECURITY
+        | nf::NEGOTIATE_TARGET_INFO
+        | nf::NEGOTIATE_128
+        | nf::NEGOTIATE_56
+        // KEY_EXCH makes the client generate the session key and send it RC4-
+        // wrapped, which is what Windows expects; without it cifs.ko warns that
+        // "authentication has been weakened as server does not support key
+        // exchange".
+        | nf::NEGOTIATE_KEY_EXCH
+        | nf::NEGOTIATE_SIGN;
 
     let target_name = utf16le(SERVER_NAME);
 
@@ -182,6 +187,11 @@ pub(crate) struct SessionState {
     pub(crate) negotiated: bool,
     pub(crate) session_id: u64,
     pub(crate) authenticated: bool,
+    /// The nonce sent in the NTLMSSP CHALLENGE, needed to check the response.
+    pub(crate) server_challenge: [u8; 8],
+    /// Set once a client authenticates with NTLMv2. Its presence is what makes
+    /// the connection sign responses and require signatures on requests.
+    pub(crate) signing_key: Option<[u8; 16]>,
     /// Tree ids handed out by TREE_CONNECT, mapped to what they point at.
     pub(crate) disk_tree_id: Option<u32>,
     pub(crate) ipc_tree_id: Option<u32>,
@@ -209,7 +219,7 @@ fn negotiate_response_body(
 
     let mut w = Writer::with_capacity(64 + security_buffer.len());
     w.u16(65); // StructureSize
-    w.u16(SIGNING_ENABLED); // SecurityMode: enabled, never required
+    w.u16(SIGNING_ENABLED | SIGNING_REQUIRED); // SecurityMode
     w.u16(dialect);
     w.u16(0); // NegotiateContextCount (3.1.1 only)
     w.bytes(server_guid);
@@ -349,6 +359,7 @@ pub(crate) fn session_setup(
     body: &[u8],
     message: &[u8],
     state: &mut SessionState,
+    credentials: &Credentials,
 ) -> Result<(u32, Vec<u8>), u32> {
     let mut r = Reader::new(body);
     let structure_size = r.u16().map_err(|_| status::INVALID_PARAMETER)?;
@@ -369,7 +380,8 @@ pub(crate) fn session_setup(
         .slice_at(sec_off, sec_len)
         .map_err(|_| status::INVALID_PARAMETER)?;
 
-    let (msg_type, framing) = find_ntlmssp(blob).ok_or(status::INVALID_PARAMETER)?;
+    let (msg_type, framing, ntlmssp) =
+        find_ntlmssp(blob).ok_or(status::INVALID_PARAMETER)?;
 
     let (resp_status, session_flags, token) = match msg_type {
         NTLMSSP_NEGOTIATE => {
@@ -379,7 +391,8 @@ pub(crate) fn session_setup(
                 // hand out the same id.
                 state.session_id = u64::from_le_bytes(rand::random::<[u8; 8]>()) | 1;
             }
-            let challenge = ntlmssp_challenge(rand::random::<[u8; 8]>());
+            state.server_challenge = rand::random::<[u8; 8]>();
+            let challenge = ntlmssp_challenge(state.server_challenge);
             let token = match framing {
                 Framing::Raw => challenge,
                 Framing::Spnego => spnego_challenge(&challenge),
@@ -387,6 +400,25 @@ pub(crate) fn session_setup(
             (status::MORE_PROCESSING_REQUIRED, 0u16, token)
         }
         NTLMSSP_AUTHENTICATE => {
+            // Every session authenticates. There is no guest path: all three
+            // client platforms do NTLMv2, Windows *only* accepts an
+            // authenticated signed session, and keeping a second unauthenticated
+            // path alongside it would mean the password protected nothing —
+            // anyone could simply ask to be a guest instead.
+            let auth =
+                super::ntlm::Authenticate::parse(ntlmssp).ok_or(status::LOGON_FAILURE)?;
+            if auth.is_anonymous() {
+                return Err(status::LOGON_FAILURE);
+            }
+            if !auth.user.eq_ignore_ascii_case(&credentials.user) {
+                return Err(status::LOGON_FAILURE);
+            }
+            let key = super::ntlm::verify(&auth, &credentials.password, &state.server_challenge)
+                .ok_or(status::LOGON_FAILURE)?;
+            state.signing_key = Some(key);
+            // SessionFlags stays 0: not a guest, not a null session.
+            let session_flags = 0u16;
+
             state.authenticated = true;
             let token = match framing {
                 // Raw NTLMSSP has no "accept" message: the exchange ends with
@@ -394,7 +426,7 @@ pub(crate) fn session_setup(
                 Framing::Raw => Vec::new(),
                 Framing::Spnego => spnego_accept(),
             };
-            (status::SUCCESS, SESSION_FLAG_IS_GUEST, token)
+            (status::SUCCESS, session_flags, token)
         }
         _ => return Err(status::INVALID_PARAMETER),
     };
@@ -522,7 +554,7 @@ mod tests {
 
         let mut r = Reader::new(&resp);
         assert_eq!(r.u16().unwrap(), 65, "StructureSize");
-        assert_eq!(r.u16().unwrap(), SIGNING_ENABLED);
+        assert_eq!(r.u16().unwrap(), SIGNING_ENABLED | SIGNING_REQUIRED);
         assert_eq!(r.u16().unwrap(), DIALECT_SMB_2_1);
         assert!(state.negotiated);
     }
@@ -596,29 +628,63 @@ mod tests {
         v
     }
 
+    fn creds() -> Credentials {
+        Credentials {
+            user: "wrustic".to_string(),
+            password: "hunter2".to_string(),
+        }
+    }
+
+    /// Drive both legs of a successful login and return the response to each.
+    fn login(state: &mut SessionState, creds: &Credentials) -> (Vec<u8>, Vec<u8>) {
+        let (body, message) = session_setup_request(&ntlmssp_message(NTLMSSP_NEGOTIATE));
+        let (st, first) = session_setup(&body, &message, state, creds).unwrap();
+        assert_eq!(st, status::MORE_PROCESSING_REQUIRED);
+
+        let auth = super::super::ntlm::tests_support::build_authenticate(
+            &creds.user,
+            "",
+            &creds.password,
+            &state.server_challenge,
+            None,
+        );
+        let (body, message) = session_setup_request(&auth);
+        let (st, second) = session_setup(&body, &message, state, creds).unwrap();
+        assert_eq!(st, status::SUCCESS);
+        (first, second)
+    }
+
     #[test]
-    fn session_setup_challenges_then_accepts_as_guest() {
+    fn session_setup_challenges_then_authenticates() {
+        let creds = creds();
         let mut state = SessionState::default();
 
         let (body, message) = session_setup_request(&ntlmssp_message(NTLMSSP_NEGOTIATE));
-        let (st, resp) = session_setup(&body, &message, &mut state).unwrap();
+        let (st, resp) = session_setup(&body, &message, &mut state, &creds).unwrap();
         assert_eq!(st, status::MORE_PROCESSING_REQUIRED);
         assert_ne!(state.session_id, 0, "a session id is assigned on leg one");
         assert!(!state.authenticated);
-        let flags = u16::from_le_bytes(resp[2..4].try_into().unwrap());
-        assert_eq!(flags, 0, "not a guest until the exchange completes");
+        assert_eq!(u16::from_le_bytes(resp[2..4].try_into().unwrap()), 0);
 
         let first_session = state.session_id;
-        let (body, message) = session_setup_request(&ntlmssp_message(NTLMSSP_AUTHENTICATE));
-        let (st, resp) = session_setup(&body, &message, &mut state).unwrap();
+        let auth = super::super::ntlm::tests_support::build_authenticate(
+            "wrustic",
+            "",
+            "hunter2",
+            &state.server_challenge,
+            None,
+        );
+        let (body, message) = session_setup_request(&auth);
+        let (st, resp) = session_setup(&body, &message, &mut state, &creds).unwrap();
         assert_eq!(st, status::SUCCESS);
         assert!(state.authenticated);
         assert_eq!(state.session_id, first_session, "id is stable across legs");
-        let flags = u16::from_le_bytes(resp[2..4].try_into().unwrap());
         assert_eq!(
-            flags, SESSION_FLAG_IS_GUEST,
-            "guest is what waives signing on the client"
+            u16::from_le_bytes(resp[2..4].try_into().unwrap()),
+            0,
+            "an authenticated session is never flagged guest"
         );
+        assert!(state.signing_key.is_some());
     }
 
     #[test]
@@ -626,7 +692,7 @@ mod tests {
         let mut state = SessionState::default();
         let (body, message) = session_setup_request(b"not a token at all");
         assert_eq!(
-            session_setup(&body, &message, &mut state).unwrap_err(),
+            session_setup(&body, &message, &mut state, &creds()).unwrap_err(),
             status::INVALID_PARAMETER
         );
     }
@@ -636,8 +702,24 @@ mod tests {
         let mut state = SessionState::default();
         let (body, message) = session_setup_request(&ntlmssp_message(2));
         assert_eq!(
-            session_setup(&body, &message, &mut state).unwrap_err(),
+            session_setup(&body, &message, &mut state, &creds()).unwrap_err(),
             status::INVALID_PARAMETER
+        );
+    }
+
+    /// A malformed AUTHENTICATE must be a logon failure, not a parse error that
+    /// leaks how far the message got.
+    #[test]
+    fn session_setup_rejects_a_malformed_authenticate() {
+        let mut state = SessionState::default();
+        let creds = creds();
+        let (body, message) = session_setup_request(&ntlmssp_message(NTLMSSP_NEGOTIATE));
+        let _ = session_setup(&body, &message, &mut state, &creds).unwrap();
+
+        let (body, message) = session_setup_request(&ntlmssp_message(NTLMSSP_AUTHENTICATE));
+        assert_eq!(
+            session_setup(&body, &message, &mut state, &creds).unwrap_err(),
+            status::LOGON_FAILURE
         );
     }
 
@@ -645,29 +727,27 @@ mod tests {
     fn find_ntlmssp_distinguishes_raw_from_spnego_framing() {
         let inner = ntlmssp_message(NTLMSSP_NEGOTIATE);
 
-        let (ty, framing) = find_ntlmssp(&inner).unwrap();
+        let (ty, framing, _) = find_ntlmssp(&inner).unwrap();
         assert_eq!(ty, NTLMSSP_NEGOTIATE);
         assert_eq!(framing, Framing::Raw, "signature at offset zero is raw");
 
         let wrapped = spnego_challenge(&inner);
-        let (ty, framing) = find_ntlmssp(&wrapped).unwrap();
+        let (ty, framing, _) = find_ntlmssp(&wrapped).unwrap();
         assert_eq!(ty, NTLMSSP_NEGOTIATE);
         assert_eq!(framing, Framing::Spnego);
     }
 
-    /// The Linux kernel client with `sec=none` sends raw NTLMSSP and rejects an
-    /// SPNEGO-wrapped reply with "blob signature incorrect". The reply framing
-    /// must mirror the request's.
+    /// The Linux kernel client sends raw NTLMSSP and rejects an SPNEGO-wrapped
+    /// reply with "blob signature incorrect". The reply framing must mirror the
+    /// request's.
     #[test]
     fn session_setup_mirrors_raw_ntlmssp_framing() {
+        let creds = creds();
         let mut state = SessionState::default();
+        let (first, second) = login(&mut state, &creds);
 
-        let (body, message) = session_setup_request(&ntlmssp_message(NTLMSSP_NEGOTIATE));
-        let (st, resp) = session_setup(&body, &message, &mut state).unwrap();
-        assert_eq!(st, status::MORE_PROCESSING_REQUIRED);
-
-        let len = u16::from_le_bytes(resp[6..8].try_into().unwrap()) as usize;
-        let token = &resp[8..8 + len];
+        let len = u16::from_le_bytes(first[6..8].try_into().unwrap()) as usize;
+        let token = &first[8..8 + len];
         assert_eq!(
             &token[..NTLMSSP_SIGNATURE.len()],
             NTLMSSP_SIGNATURE,
@@ -675,14 +755,125 @@ mod tests {
         );
 
         // The final leg carries no token at all under raw framing.
-        let (body, message) = session_setup_request(&ntlmssp_message(NTLMSSP_AUTHENTICATE));
-        let (st, resp) = session_setup(&body, &message, &mut state).unwrap();
-        assert_eq!(st, status::SUCCESS);
-        assert_eq!(u16::from_le_bytes(resp[6..8].try_into().unwrap()), 0);
-        assert_eq!(
-            u16::from_le_bytes(resp[2..4].try_into().unwrap()),
-            SESSION_FLAG_IS_GUEST
+        assert_eq!(u16::from_le_bytes(second[6..8].try_into().unwrap()), 0);
+        assert_eq!(u16::from_le_bytes(second[2..4].try_into().unwrap()), 0);
+    }
+
+    /// The full authenticated handshake: challenge, then a real NTLMv2
+    /// response, yielding a signing key and a session that is *not* guest.
+    #[test]
+    fn a_valid_ntlmv2_login_produces_a_signing_key() {
+        let creds = creds();
+        let mut state = SessionState::default();
+
+        let (body, message) = session_setup_request(&ntlmssp_message(NTLMSSP_NEGOTIATE));
+        let (st, _) = session_setup(&body, &message, &mut state, &creds).unwrap();
+        assert_eq!(st, status::MORE_PROCESSING_REQUIRED);
+        assert_ne!(state.server_challenge, [0u8; 8], "a nonce was issued");
+        assert!(state.signing_key.is_none(), "not yet authenticated");
+
+        let auth = super::super::ntlm::tests_support::build_authenticate(
+            "wrustic",
+            "",
+            "hunter2",
+            &state.server_challenge,
+            None,
         );
+        let (body, message) = session_setup_request(&auth);
+        let (st, resp) = session_setup(&body, &message, &mut state, &creds).unwrap();
+
+        assert_eq!(st, status::SUCCESS);
+        assert!(state.authenticated);
+        assert!(state.signing_key.is_some(), "signing key must be derived");
+        let flags = u16::from_le_bytes(resp[2..4].try_into().unwrap());
+        assert_eq!(
+            flags, 0,
+            "an authenticated session must not be flagged guest — Windows blocks guest"
+        );
+    }
+
+    #[test]
+    fn a_wrong_password_is_refused_with_logon_failure() {
+        let creds = creds();
+        let mut state = SessionState::default();
+        let (body, message) = session_setup_request(&ntlmssp_message(NTLMSSP_NEGOTIATE));
+        let _ = session_setup(&body, &message, &mut state, &creds).unwrap();
+
+        let auth = super::super::ntlm::tests_support::build_authenticate(
+            "wrustic",
+            "",
+            "wrong-password",
+            &state.server_challenge,
+            None,
+        );
+        let (body, message) = session_setup_request(&auth);
+        assert_eq!(
+            session_setup(&body, &message, &mut state, &creds).unwrap_err(),
+            status::LOGON_FAILURE
+        );
+        assert!(state.signing_key.is_none());
+        assert!(!state.authenticated);
+    }
+
+    #[test]
+    fn an_unknown_user_is_refused() {
+        let creds = creds();
+        let mut state = SessionState::default();
+        let (body, message) = session_setup_request(&ntlmssp_message(NTLMSSP_NEGOTIATE));
+        let _ = session_setup(&body, &message, &mut state, &creds).unwrap();
+
+        let auth = super::super::ntlm::tests_support::build_authenticate(
+            "someone-else",
+            "",
+            "hunter2",
+            &state.server_challenge,
+            None,
+        );
+        let (body, message) = session_setup_request(&auth);
+        assert_eq!(
+            session_setup(&body, &message, &mut state, &creds).unwrap_err(),
+            status::LOGON_FAILURE
+        );
+    }
+
+    /// With a password configured, an anonymous request must not fall back to
+    /// guest — otherwise the password protects nothing.
+    #[test]
+    fn anonymous_is_refused_when_a_password_is_configured() {
+        let creds = creds();
+        let mut state = SessionState::default();
+        let (body, message) = session_setup_request(&ntlmssp_message(NTLMSSP_NEGOTIATE));
+        let _ = session_setup(&body, &message, &mut state, &creds).unwrap();
+
+        let mut auth = super::super::ntlm::tests_support::build_authenticate(
+            "",
+            "",
+            "",
+            &state.server_challenge,
+            None,
+        );
+        let f = u32::from_le_bytes(auth[60..64].try_into().unwrap());
+        auth[60..64].copy_from_slice(
+            &(f | super::super::ntlm::flags::NEGOTIATE_ANONYMOUS).to_le_bytes(),
+        );
+
+        let (body, message) = session_setup_request(&auth);
+        assert_eq!(
+            session_setup(&body, &message, &mut state, &creds).unwrap_err(),
+            status::LOGON_FAILURE
+        );
+    }
+
+    #[test]
+    fn the_challenge_offers_key_exchange_and_signing() {
+        use super::super::ntlm::flags as nf;
+        let msg = ntlmssp_challenge([0u8; 8]);
+        let flags = u32::from_le_bytes(msg[20..24].try_into().unwrap());
+        // Without KEY_EXCH the client will not send a session key, and cifs.ko
+        // warns that authentication was weakened.
+        assert_ne!(flags & nf::NEGOTIATE_KEY_EXCH, 0);
+        assert_ne!(flags & nf::NEGOTIATE_SIGN, 0);
+        assert_ne!(flags & nf::EXTENDED_SESSIONSECURITY, 0);
     }
 
     #[test]
@@ -690,7 +881,7 @@ mod tests {
         let mut state = SessionState::default();
         let wrapped = spnego_challenge(&ntlmssp_message(NTLMSSP_NEGOTIATE));
         let (body, message) = session_setup_request(&wrapped);
-        let (_, resp) = session_setup(&body, &message, &mut state).unwrap();
+        let (_, resp) = session_setup(&body, &message, &mut state, &creds()).unwrap();
 
         let len = u16::from_le_bytes(resp[6..8].try_into().unwrap()) as usize;
         let token = &resp[8..8 + len];

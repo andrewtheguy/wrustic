@@ -38,6 +38,19 @@ use crate::repo::{
 };
 use crate::ui::render;
 
+/// A short random password for the share, when the caller supplied none.
+/// Alphanumeric so it survives being typed into a Windows credential prompt or
+/// pasted into a mount command without quoting.
+fn random_password() -> String {
+    const ALPHABET: &[u8] = b"abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    (0..16)
+        .map(|_| {
+            let idx = usize::from(rand::random::<u8>()) % ALPHABET.len();
+            ALPHABET[idx] as char
+        })
+        .collect()
+}
+
 /// Serve one snapshot over SMB until interrupted.
 fn run_smb_serve(args: &[String]) -> Result<()> {
     let opts = match cli::parse_smb_serve(args) {
@@ -67,26 +80,53 @@ fn run_smb_serve(args: &[String]) -> Result<()> {
         smb::Bind::Loopback
     };
 
-    let handle = smb::start_snapshot_share(opts.port, &profile, &opts.snapshot, bind)?;
+    // A generated password is better than a default one: a fixed default on a
+    // --bind-all share is the same as no password at all.
+    let (share_password, generated) = match std::env::var("WRUSTIC_SMB_SHARE_PASSWORD") {
+        Ok(p) if !p.is_empty() => (p, false),
+        _ => (random_password(), true),
+    };
+
+    let credentials = smb::Credentials {
+        user: opts.user.clone(),
+        password: share_password.clone(),
+    };
+
+    let handle =
+        smb::start_snapshot_share(opts.port, &profile, &opts.snapshot, bind, credentials)?;
     let host = if opts.bind_all { "<this-host>" } else { "127.0.0.1" };
 
     println!("Serving snapshot {} on port {}", opts.snapshot, handle.port);
+    println!();
+    println!("  username  {}", opts.user);
+    println!(
+        "  password  {share_password}{}",
+        if generated {
+            "   (generated; set WRUSTIC_SMB_SHARE_PASSWORD to choose your own)"
+        } else {
+            ""
+        }
+    );
     if opts.bind_all {
+        println!();
         println!(
-            "WARNING: listening on every interface with no authentication — \
-anyone who can reach port {} can read this snapshot.",
-            handle.port
+            "NOTE: listening on every interface. Traffic is signed but not encrypted, \
+so anyone on the network can read file contents in transit."
         );
     }
     println!();
     println!("Mount it with:");
     println!(
-        "  Linux  sudo mount -t cifs -o port={},vers=2.1,sec=none,guest,ro,uid=$(id -u),gid=$(id -g) //{host}/snap /mnt",
-        handle.port
+        "  Linux    sudo mount -t cifs -o port={},vers=2.1,username={},password={share_password},ro,uid=$(id -u),gid=$(id -g) //{host}/snap /mnt",
+        handle.port, opts.user
     );
     println!(
-        "  macOS  mount_smbfs //guest@{host}:{}/snap /Volumes/snap",
-        handle.port
+        "  macOS    mount_smbfs //{}@{host}:{}/snap /Volumes/snap",
+        opts.user, handle.port
+    );
+    println!(
+        "  Windows  net use Z: \\\\{host}\\snap /user:{} {share_password}",
+        opts.user
     );
     println!();
     println!("Press Ctrl-C to stop.");

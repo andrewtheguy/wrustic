@@ -71,6 +71,7 @@ pub(crate) mod status {
     pub(crate) const END_OF_FILE: u32 = 0xC000_0011;
     pub(crate) const MORE_PROCESSING_REQUIRED: u32 = 0xC000_0016;
     pub(crate) const ACCESS_DENIED: u32 = 0xC000_0022;
+    pub(crate) const LOGON_FAILURE: u32 = 0xC000_006D;
     pub(crate) const EAS_NOT_SUPPORTED: u32 = 0xC000_004F;
     pub(crate) const NO_EAS_ON_FILE: u32 = 0xC000_0052;
     pub(crate) const OBJECT_NAME_INVALID: u32 = 0xC000_0033;
@@ -112,17 +113,19 @@ pub(crate) const DIALECT_SMB_2_1: u16 = 0x0210;
 /// real SMB2 NEGOTIATE".
 pub(crate) const DIALECT_WILDCARD: u16 = 0x02FF;
 
-/// Negotiate `SecurityMode` bits. We enable signing but never require it, so a
-/// guest session (which cannot sign) is still allowed to proceed.
+/// Negotiate `SecurityMode` bits.
+///
+/// Both are set. ENABLED alone makes a client sign opportunistically — Samba's
+/// signs the session setup and tree connect and then stops, so the first CREATE
+/// arrives unsigned. REQUIRED is what tells a client every message must be
+/// signed, which is the only correct advertisement now that every session
+/// authenticates.
 pub(crate) const SIGNING_ENABLED: u16 = 0x0001;
+pub(crate) const SIGNING_REQUIRED: u16 = 0x0002;
 
 /// Negotiate `Capabilities`. LARGE_MTU is what lets the client use multi-credit
 /// reads; without it cifs.ko is stuck at 64 KiB per READ.
 pub(crate) const CAP_LARGE_MTU: u32 = 0x0000_0004;
-
-/// Session flags (MS-SMB2 2.2.6). IS_GUEST tells the client this session has no
-/// signing key, which is what lets an unauthenticated mount work.
-pub(crate) const SESSION_FLAG_IS_GUEST: u16 = 0x0001;
 
 /// Share types for TREE_CONNECT responses (MS-SMB2 2.2.10).
 pub(crate) const SHARE_TYPE_DISK: u8 = 0x01;

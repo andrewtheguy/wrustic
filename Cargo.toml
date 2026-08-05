@@ -40,6 +40,9 @@ tui-input = { version = "0.15", default-features = false, features = ["crossterm
 url = "2"
 zstd = "0.13"
 keyring-core = { version = "1", optional = true }
+md-5 = "0.11"
+md4 = "0.11"
+rc4 = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 # uid/gid for restic-compatible lock files, kill(pid, 0) staleness probes, and
