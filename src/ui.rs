@@ -740,9 +740,9 @@ fn render_compare_results(frame: &mut Frame, app: &mut App, area: Rect) {
 fn render_prune_confirm(frame: &mut Frame, app: &App, area: Rect) {
     let profile = app.active_profile_name.as_deref().unwrap_or("?");
     let cache = if crate::restic::cache_enabled() {
-        "wrustic's private cache directory (--restic-cache)"
+        "wrustic's private cache directory (start wrustic with --no-restic-cache to save disk space)"
     } else {
-        "no cache (--no-cache; start wrustic with --restic-cache to speed up repeat runs)"
+        "no cache (--no-cache)"
     };
     let body = format!(
         "Prune repository of profile `{profile}`?\n\n\

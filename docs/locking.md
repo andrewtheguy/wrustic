@@ -231,7 +231,8 @@ A `RepoLock` guard type that mirrors restic exactly:
    restic binary is the TUI's prune action (`p` on the Snapshots screen).
    `src/restic.rs` is the secure spawn harness behind it (stdin-piped
    password, env-var credentials, resterm's launch semantics including
-   the opt-in `--restic-cache` flag) for triggering the restic commands
+   its private cache directory, off with `--no-restic-cache`) for
+   triggering the restic commands
    wrustic deliberately does not reimplement — prune and friends
    (Tier 3). Before spawning one of those,
    `restic::run_unsticking_locks` performs restic's acquisition conflict

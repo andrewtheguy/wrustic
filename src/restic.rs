@@ -9,9 +9,10 @@
 //! master password is piped through the child's stdin (`--password-file
 //! /dev/stdin` on Unix; on Windows restic reads its non-terminal stdin
 //! directly), the repo URL and any cloud credentials go through env vars —
-//! and restic's on-disk cache is off (`--no-cache`) unless the user opts in
-//! with `--restic-cache`, which points restic at a directory private to
-//! wrustic.
+//! and restic's on-disk cache is pointed at a directory private to wrustic
+//! (`--cache-dir`, plus `--cleanup-cache` so restic garbage collects unused
+//! per-repository subdirectories there) unless the user opts out with
+//! `--no-restic-cache`, which turns caching off entirely (`--no-cache`).
 //!
 //! Restic checks the repository lock before any of these commands run, so a
 //! leftover lock blocks them with "repository is already locked". wrustic
@@ -45,41 +46,52 @@ const MIN_PATCH: u32 = 0;
 /// wrustic's own restic cache directory, or `None` when no per-user cache
 /// root can be determined.
 ///
-/// `dirs::cache_dir()` is the per-user, per-platform cache root
-/// (`$XDG_CACHE_HOME` or `~/.cache` on Linux). It already sits inside the
-/// calling user's own home, and the `wrustic` component keeps it apart from
-/// restic's default cache, so wrustic never shares cache state with another
-/// restic CLI instance.
+/// `dirs::cache_dir()` resolves each platform's own per-user cache root
+/// rather than assuming the Unix layout: `$XDG_CACHE_HOME` or `~/.cache` on
+/// Linux, `~/Library/Caches` on macOS, `%LOCALAPPDATA%` (FOLDERID_LocalAppData)
+/// on Windows. It already sits inside the calling user's own profile, and the
+/// `wrustic` component keeps it apart from restic's default cache, so wrustic
+/// never shares cache state with another restic CLI instance.
 fn cache_dir() -> Option<PathBuf> {
     Some(dirs::cache_dir()?.join("wrustic"))
 }
 
-/// Whether `--restic-cache` was passed. Off by default: a restic cache costs real
-/// disk space — hundreds of megabytes for a large repository — which is not
-/// always a trade worth making, so wrustic only keeps one when asked.
-static CACHE_ENABLED: AtomicBool = AtomicBool::new(false);
+/// Whether the restic cache is on. On by default: caching is what makes
+/// repeated restic work against a remote repository fast. `--no-restic-cache`
+/// turns it off for users who would rather not spend the disk space —
+/// hundreds of megabytes for a large repository.
+static CACHE_ENABLED: AtomicBool = AtomicBool::new(true);
 
 /// Set once from the command line, before any restic call is made.
 pub(crate) fn set_cache_enabled(enabled: bool) {
     CACHE_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
-/// Whether `--restic-cache` is on — the prune confirmation screen tells the
-/// user which cache mode the run will carry.
+/// Whether the restic cache is on — the prune confirmation screen tells the
+/// user which cache mode the run will carry, so this reports the mode
+/// [`apply_cache_flag`] will actually pass: a machine with no per-user cache
+/// root gets `--no-cache` even though the flag was never given.
 pub(crate) fn cache_enabled() -> bool {
-    CACHE_ENABLED.load(Ordering::Relaxed)
+    CACHE_ENABLED.load(Ordering::Relaxed) && cache_dir().is_some()
 }
 
-/// Add the cache flag every restic invocation carries.
+/// Add the cache flags every restic invocation carries.
 ///
-/// Default is `--no-cache`. With `--restic-cache`, restic is pointed at
-/// [`cache_dir`] instead — and if no per-user cache root can be named,
-/// caching stays off rather than falling back to restic's own default, which
+/// Default points restic at [`cache_dir`]; `--no-restic-cache` passes
+/// `--no-cache` instead. Caching also stays off when no per-user cache root
+/// can be named, rather than falling back to restic's own default, which
 /// wrustic must not share with other restic CLI instances.
+///
+/// The cached path also carries `--cleanup-cache`, so restic itself garbage
+/// collects the per-repository subdirectories it keeps under that directory
+/// once they go unused (restic's own 30-day threshold) — a profile the user
+/// deleted stops costing disk space without anyone remembering to run
+/// `restic cache --cleanup`. It never touches the cache of the repository the
+/// current command is working on.
 fn apply_cache_flag(cmd: &mut Command) {
     match cache_dir().filter(|_| CACHE_ENABLED.load(Ordering::Relaxed)) {
         Some(dir) => {
-            cmd.arg("--cache-dir").arg(dir);
+            cmd.arg("--cache-dir").arg(dir).arg("--cleanup-cache");
         }
         None => {
             cmd.arg("--no-cache");
@@ -394,10 +406,11 @@ fn run_streaming(
 /// inherited so PATH, HOME, SSL_CERT_FILE, HTTP_PROXY, etc. still flow
 /// through).
 ///
-/// Every command built here also carries the cache flag from
-/// [`apply_cache_flag`]: `--no-cache` by default, or `--cache-dir <per-user
-/// path>` under `--restic-cache`. Either way wrustic never lets restic use its
-/// default on-disk cache, which other restic CLI instances share.
+/// Every command built here also carries the cache flags from
+/// [`apply_cache_flag`]: `--cache-dir <per-user path> --cleanup-cache` by
+/// default, or `--no-cache` under `--no-restic-cache`. Either way wrustic never
+/// lets restic use its default on-disk cache, which other restic CLI instances
+/// share.
 fn command(profile: &Profile, args: &[&str]) -> Result<Command> {
     let mut cmd = Command::new("restic");
     apply_cache_flag(&mut cmd);
@@ -633,53 +646,63 @@ mod tests {
     // and Rust runs tests in the same process on parallel threads — as two
     // tests they would race over it.
     #[test]
-    fn cache_is_off_by_default_and_opts_in_to_a_private_per_user_directory() {
-        let args = command_args(&test_profile());
+    fn cache_defaults_to_a_private_per_user_directory_and_opts_out_to_no_cache() {
+        // The tail of every command, whatever the cache mode prepends.
         #[cfg(unix)]
-        let expected: &[&str] = &[
-            "--no-cache",
-            "--password-file",
-            "/dev/stdin",
-            "snapshots",
-            "--json",
-        ];
+        let tail: &[&str] = &["--password-file", "/dev/stdin", "snapshots", "--json"];
         // No `--password-file` on Windows: the password rides restic's
         // non-terminal stdin fallback instead. See `command`.
         #[cfg(windows)]
-        let expected: &[&str] = &["--no-cache", "snapshots", "--json"];
-        assert_eq!(args, expected);
+        let tail: &[&str] = &["snapshots", "--json"];
+
+        let args = command_args(&test_profile());
         assert!(
             !args.iter().any(|arg| arg.contains("pw")),
             "the password must never reach argv: {args:?}"
         );
+        // What the prune screen reports must be the mode actually passed.
+        assert_eq!(cache_enabled(), cache_dir().is_some());
 
-        // No per-user cache root on this machine means there is nothing to opt
-        // into, and `--no-cache` above is the whole story.
-        let Some(dir) = cache_dir() else { return };
-        set_cache_enabled(true);
-        let opted_in = command_args(&test_profile());
+        match cache_dir() {
+            // The default: restic caches into a directory private to wrustic,
+            // and garbage collects its unused per-repo subdirectories there.
+            Some(dir) => {
+                let mut expected = vec![
+                    "--cache-dir".to_string(),
+                    dir.to_string_lossy().into(),
+                    "--cleanup-cache".to_string(),
+                ];
+                expected.extend(tail.iter().map(|s| s.to_string()));
+                assert_eq!(args, expected);
+                // The per-user cache root sits inside the calling user's own
+                // home, and the `wrustic` leaf keeps this out of restic's own
+                // default cache.
+                assert!(
+                    dir.starts_with(dirs::cache_dir().expect("cache root")),
+                    "{dir:?} must sit under the per-user cache root"
+                );
+                assert!(dir.ends_with("wrustic"), "{dir:?}");
+            }
+            // No per-user cache root on this machine: caching stays off rather
+            // than falling back to restic's own shared default.
+            None => {
+                let mut expected = vec!["--no-cache".to_string()];
+                expected.extend(tail.iter().map(|s| s.to_string()));
+                assert_eq!(args, expected);
+            }
+        }
+
+        // `--no-restic-cache` turns caching off outright.
         set_cache_enabled(false);
-
-        assert!(
-            !opted_in.iter().any(|arg| arg == "--no-cache"),
-            "opting in must not also disable the cache: {opted_in:?}"
-        );
-        let passed = opted_in
-            .iter()
-            .position(|arg| arg == "--cache-dir")
-            .and_then(|i| opted_in.get(i + 1))
-            .expect("--cache-dir and its path");
-        assert_eq!(passed.as_str(), dir.to_string_lossy());
-        // The per-user cache root sits inside the calling user's own home,
-        // and the `wrustic` leaf keeps this out of restic's own default cache.
-        assert!(
-            dir.starts_with(dirs::cache_dir().expect("cache root")),
-            "{dir:?} must sit under the per-user cache root"
-        );
-        assert!(dir.ends_with("wrustic"), "{dir:?}");
-
+        assert!(!cache_enabled());
+        let opted_out = command_args(&test_profile());
         // Restored, so the default-path assertions above still hold for any
         // test that runs after this one.
+        set_cache_enabled(true);
+
+        let mut expected = vec!["--no-cache".to_string()];
+        expected.extend(tail.iter().map(|s| s.to_string()));
+        assert_eq!(opted_out, expected);
         assert_eq!(command_args(&test_profile()), args);
     }
 

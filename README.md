@@ -107,7 +107,7 @@ cargo run
 ### CLI flags
 
 ```text
-wrustic [-c|--config-dir <PATH>] [-p|--port <N>] [--restic-cache] [--no-keychain] [-h|--help]
+wrustic [-c|--config-dir <PATH>] [-p|--port <N>] [--no-restic-cache] [--no-keychain] [-h|--help]
 ```
 
 `--config-dir <PATH>` overrides the default config location —
@@ -149,14 +149,42 @@ give each its own `--config-dir`.
 `--port <N>` selects the localhost port for the file-share dialog
 (default: 7834).
 
-`--restic-cache` lets the restic CLI commands wrustic shells out for
-(prune-class operations) keep an on-disk cache, in a directory private to
-wrustic and to your user account (`$XDG_CACHE_HOME/wrustic`, otherwise
-`~/.cache/wrustic`). Off by default: every restic call runs `--no-cache`,
-because a restic cache can reach hundreds of megabytes for a large
-repository. Native reads/writes never use a restic cache either way. To
-prune an opted-in cache, point restic at the same directory:
-`restic --cache-dir <that path> cache --cleanup`.
+The restic CLI commands wrustic shells out for (prune-class operations) keep
+an on-disk cache by default, in a `wrustic` directory under your platform's
+own per-user cache root — `$XDG_CACHE_HOME` or `~/.cache` on Linux,
+`~/Library/Caches` on macOS, `%LOCALAPPDATA%` on Windows — so it stays
+private to your account, and restic's own default cache is never shared.
+`--no-restic-cache` turns that off, so every restic call runs `--no-cache`
+instead; a restic cache can reach hundreds of megabytes for a large
+repository. `--no-cache` is also passed automatically, flag or not, on a
+machine where no per-user cache root can be determined — wrustic falls back
+to no cache rather than to restic's shared default one. Native reads/writes
+never use a restic cache either way.
+
+The cache location does not depend on `--config-dir`, so wrustic instances
+on different config directories share one cache — restic keys a subdirectory
+off the repository ID, so instances on the same repository reuse its cache
+rather than each paying for a copy.
+
+The cache does not grow without bound: every cached call also passes
+`--cleanup-cache`, so restic drops the per-repository subdirectories under
+that directory once they go unused for 30 days — deleting a profile
+eventually reclaims its cache on its own. This is safe to leave on with
+several instances running: restic stamps a subdirectory's timestamp when it
+*opens* that repository, so at 30 days the sweep would have to collide with
+an operation that had been running for a month.
+
+To clean up by hand, point restic at the same directory:
+`restic --cache-dir <that path> cache --cleanup`. **Stop all restic activity
+first** — quit your wrustic instances and let any prune finish. Deleting a
+cache directory out from under a live restic aborts that command (the
+repository itself is unharmed — no lock is left behind and `restic check`
+stays clean — but the prune has to be rerun). Lowering `--max-age` is what
+makes this reachable, and `--max-age 0` guarantees it by making every
+subdirectory eligible, in-use ones included. A smaller `--max-age` is not a
+safe substitute for stopping first: that timestamp is set once at open and
+is never refreshed while the command runs, so an operation that outlives the
+window — a long prune against a slow remote — is treated as idle and swept.
 
 `--no-keychain` disables keychain integration at runtime, even when the
 binary was built with the `keychain` feature. See
