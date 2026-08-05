@@ -27,11 +27,13 @@
 // 2.1 carries no POSIX mode of its own), and on Windows from the READONLY
 // attribute plus a CREATE that refuses FILE_EXECUTE on files.
 //
-// Mount it with:
-//   Linux    sudo mount -t cifs -o port=<p>,vers=2.1,username=wrustic,password=<pw>,ro,\
+// Mount it with — each prompts for the password, which is never passed as an
+// argument: a command line is readable by every other process while it runs,
+// and lands in shell (or console) history afterwards.
+//   Linux    sudo mount -t cifs -o port=<p>,vers=2.1,username=wrustic,ro,\
 //                       file_mode=0444,dir_mode=0555 //127.0.0.1/snap /mnt
 //   macOS    mount_smbfs -f 0444 -d 0555 //wrustic@127.0.0.1:<p>/snap /Volumes/snap
-//   Windows  net use Z: \\127.0.0.1\snap /user:wrustic <pw>   (add /TCPPORT:<p>)
+//   Windows  net use Z: \\127.0.0.1\snap * /user:wrustic   (add /TCPPORT:<p>)
 
 /// Whether to trace protocol traffic to stderr. Enabled by setting
 /// `WRUSTIC_SMB_LOG` to anything.
@@ -1616,13 +1618,13 @@ mod tests {
         eprintln!();
         eprintln!("Mount it with:");
         eprintln!(
-            "  Linux    sudo mount -t cifs -o port={port},vers=2.1,username={TEST_USER},password={password},ro,uid=$(id -u),gid=$(id -g),file_mode=0444,dir_mode=0555 //{host}/{DEFAULT_SHARE_NAME} /mnt/snap"
+            "  Linux    sudo mount -t cifs -o port={port},vers=2.1,username={TEST_USER},ro,uid=$(id -u),gid=$(id -g),file_mode=0444,dir_mode=0555 //{host}/{DEFAULT_SHARE_NAME} /mnt/snap"
         );
         eprintln!(
             "  macOS    mount_smbfs -f 0444 -d 0555 //{TEST_USER}@{host}:{port}/{DEFAULT_SHARE_NAME} /Volumes/snap"
         );
         eprintln!(
-            "  Windows  net use Z: \\\\{host}\\{DEFAULT_SHARE_NAME} /user:{TEST_USER} {password} /TCPPORT:{port}"
+            "  Windows  net use Z: \\\\{host}\\{DEFAULT_SHARE_NAME} * /user:{TEST_USER} /TCPPORT:{port}"
         );
         std::thread::sleep(std::time::Duration::from_secs(secs));
         handle.stop();
