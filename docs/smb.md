@@ -211,15 +211,15 @@ error. The server is the only place that can see which command was rejected and
 why, so set `WRUSTIC_SMB_LOG=1` and it traces every command to stderr:
 
 ```
-[smb] conn 1: connected from 127.0.0.1:45456
-[smb] conn 1: client offers dialects [0202, 0210, 0300, 0302, 0311]
-[smb] conn 1: NEGOTIATE -> SUCCESS (94 bytes)
-[smb] conn 1: SESSION_SETUP -> MORE_PROCESSING_REQUIRED (147 bytes)
-[smb] conn 1: SESSION_SETUP -> SUCCESS (17 bytes)
-[smb] conn 1: TREE_CONNECT -> SUCCESS (16 bytes)
-[smb] conn 2: connected from 127.0.0.1:60874
-[smb] conn 1: CREATE "docs\readme.txt" access 0x00120089
-[smb] conn 1: CREATE -> SUCCESS (88 bytes)
+[smb 04:35:34.087] conn 1: connected from 127.0.0.1:45456
+[smb 04:35:34.090] conn 1: client offers dialects [0202, 0210, 0300, 0302, 0311]
+[smb 04:35:34.090] conn 1: NEGOTIATE -> SUCCESS (94 bytes)
+[smb 04:35:34.092] conn 1: SESSION_SETUP -> MORE_PROCESSING_REQUIRED (147 bytes)
+[smb 04:35:34.093] conn 1: SESSION_SETUP -> SUCCESS (17 bytes)
+[smb 04:35:34.093] conn 1: TREE_CONNECT -> SUCCESS (16 bytes)
+[smb 04:35:34.094] conn 2: connected from 127.0.0.1:60874
+[smb 04:35:34.094] conn 1: CREATE "docs\readme.txt" access 0x00120089
+[smb 04:35:34.095] conn 1: CREATE -> SUCCESS (88 bytes)
 ```
 
 **Every line names its connection**, because a client opens several per mount
@@ -228,6 +228,8 @@ between two successes on another and reads as a server that intermittently
 refuses things — the trace above is four concurrent connections from one
 `smbclient` run. CREATE also logs the path and the requested access mask, since
 "CREATE -> ACCESS_DENIED" alone does not say which path, or what it asked for.
+The timestamp separates a burst from a slow retry loop: the same number of
+failures means different things at 10 ms apart and at 10 minutes apart.
 
 Rejections name the command and the reason:
 
@@ -241,11 +243,24 @@ Rejections name the command and the reason:
 ```
 
 A logon failure names the identity that was offered, never the response or the
-key. That distinction matters: Windows tries the interactive user against a
-server it has no stored credential for *before* the one you typed, so a burst of
-`LOGON_FAILURE` with someone else's username is the client's credential store,
-not the server. Fix it with `cmdkey /add:<server> /user:wrustic /pass` and mount
-by that same name every time.
+key. That distinction is the whole point: a burst of `LOGON_FAILURE` naming
+*someone else's* username is Windows trying the interactive user against a
+server it has no stored credential for, while a burst naming `wrustic` with the
+wrong password is a **saved credential from an earlier run** — the share
+password is generated fresh each time the server starts, so a client that ticked
+"remember" replays one that will never work again. Clear it and re-map:
+
+```bat
+cmdkey /list | findstr <server>
+cmdkey /delete:<server>
+net use * /delete
+```
+
+A connection is dropped after five consecutive refusals (`MAX_FAILED_LOGONS`).
+One real client sent the same stale password 84 times on a single connection,
+which buries the connection that is actually failing. Dropping locks nothing
+out — the client may reconnect immediately — it just stops one socket being used
+as a retry loop.
 
 The `stat`/`list`/`open` lines exist because a repository error and a genuinely
 missing path return the same NTSTATUS — a client can do nothing different with

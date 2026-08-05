@@ -45,12 +45,27 @@ pub(crate) fn log_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("WRUSTIC_SMB_LOG").is_some())
 }
 
+/// Wall-clock stamp for a trace line, to millisecond resolution.
+///
+/// Not decoration: a burst of failed logons and the same number spread over ten
+/// minutes are different problems — a client hammering a stale credential
+/// versus one retrying on a timer — and without a clock the log cannot tell
+/// them apart. Local time, because the reader is looking at their own screen
+/// and correlating with what they just clicked.
+pub(crate) fn log_stamp() -> String {
+    jiff::Zoned::now().strftime("%H:%M:%S%.3f").to_string()
+}
+
 // Defined above the module declarations on purpose: a `macro_rules!` is in
 // scope only for what follows it, and the modules below need it too.
 macro_rules! smb_log {
     ($($arg:tt)*) => {
         if $crate::smb::log_enabled() {
-            eprintln!("[smb] {}", format!($($arg)*));
+            eprintln!(
+                "[smb {}] {}",
+                $crate::smb::log_stamp(),
+                format!($($arg)*)
+            );
         }
     };
 }
@@ -437,6 +452,18 @@ async fn accept_loop(
 /// it would hold its task and socket for as long as the server ran.
 const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
+/// Consecutive refused logons before a connection is dropped.
+///
+/// A real client tries a small number of identities: the interactive user, then
+/// a saved credential, then whatever it prompts for. Anything past that is a
+/// client replaying a credential the server will never accept — one was
+/// observed sending the same stale password 84 times on a single connection,
+/// which is both pointless work and a trace full of noise hiding the connection
+/// that was actually failing. Dropping it does not lock anything out: the
+/// client is free to reconnect and try again, with the round trip as the only
+/// cost.
+const MAX_FAILED_LOGONS: u32 = 5;
+
 async fn serve_connection(mut stream: tokio::net::TcpStream, ctx: Arc<Ctx>) {
     let mut conn = Conn::new(ctx);
     if log_enabled() {
@@ -523,6 +550,16 @@ async fn serve_connection(mut stream: tokio::net::TcpStream, ctx: Arc<Ctx>) {
             return;
         }
         if stream.write_all(&resp).await.is_err() {
+            return;
+        }
+        // Checked after the reply is on the wire, so the client still learns why
+        // its last attempt was refused rather than seeing a bare disconnect.
+        if conn.state.failed_logons >= MAX_FAILED_LOGONS {
+            conn_log!(
+                conn.id,
+                "dropping: {} refused logons in a row",
+                conn.state.failed_logons
+            );
             return;
         }
     }
@@ -735,8 +772,25 @@ impl Conn {
             .map(Reply::ok),
 
             cmd::SESSION_SETUP => {
-                session::session_setup(body, message, &mut self.state, &self.ctx.credentials)
-                    .map(|(st, b)| {
+                let result =
+                    session::session_setup(body, message, &mut self.state, &self.ctx.credentials);
+                // Count consecutive refusals so a client replaying a credential
+                // that will never work cannot do it indefinitely.
+                //
+                // Only a *successful* logon clears the count. The intermediate
+                // leg must not, tempting as it looks: a client retrying a stale
+                // credential runs the whole two-leg exchange every time, so
+                // clearing on the challenge would put the count back to zero
+                // before each refusal and make the cap unreachable — which is
+                // precisely the client this exists for. A client trying a
+                // second identity after a refused first one is unaffected;
+                // MAX_FAILED_LOGONS leaves room for several.
+                if matches!(&result, Err(st) if *st == status::LOGON_FAILURE) {
+                    self.state.failed_logons += 1;
+                } else if matches!(&result, Ok((st, _)) if *st == status::SUCCESS) {
+                    self.state.failed_logons = 0;
+                }
+                result.map(|(st, b)| {
                     // Both legs must carry the server-assigned session id: the
                     // client reads it off the first response and uses it from
                     // then on.
@@ -1024,6 +1078,99 @@ mod tests {
         assert!(conn.state.signing_key.is_some(), "session must be signed");
 
         (conn, session_id)
+    }
+
+    /// One bad-credential exchange: NEGOTIATE leg, then an AUTHENTICATE built
+    /// with the wrong password. Mirrors a client replaying a stale saved
+    /// credential, which is what ran a real connection up to 84 attempts.
+    fn refused_logon(conn: &mut Conn) {
+        let resp = conn
+            .handle_message(&request(cmd::SESSION_SETUP, 0, 0, &session_setup_body(1)))
+            .expect("challenge leg answered");
+        let session_id = parse_response(&resp).session_id;
+        let auth = crate::smb::ntlm::tests_support::build_authenticate(
+            TEST_USER,
+            "",
+            "not-the-password",
+            &conn.state.server_challenge.expect("a challenge was issued"),
+            None,
+        );
+        let resp = conn
+            .handle_message(&request(
+                cmd::SESSION_SETUP,
+                session_id,
+                0,
+                &session_setup_body_with(&auth),
+            ))
+            .expect("refusal is answered, not dropped");
+        assert_eq!(parse_response(&resp).status, status::LOGON_FAILURE);
+    }
+
+    #[test]
+    fn refused_logons_are_counted_up_to_the_cap() {
+        let mut conn = Conn::new(ctx());
+        let _ = conn.handle_message(&request(cmd::NEGOTIATE, 0, 0, &negotiate_body(&[0x0210])));
+
+        for expected in 1..=MAX_FAILED_LOGONS {
+            refused_logon(&mut conn);
+            assert_eq!(
+                conn.state.failed_logons, expected,
+                "every consecutive refusal counts"
+            );
+        }
+        // `serve_connection` drops the connection at this point, having already
+        // written the refusal so the client learns why.
+        assert!(conn.state.failed_logons >= MAX_FAILED_LOGONS);
+    }
+
+    #[test]
+    fn a_successful_logon_clears_the_refusal_count() {
+        // A client may try an identity or two before the one that works, and
+        // must not be dropped mid-mount for the ones that came first.
+        let mut conn = Conn::new(ctx());
+        let _ = conn.handle_message(&request(cmd::NEGOTIATE, 0, 0, &negotiate_body(&[0x0210])));
+        refused_logon(&mut conn);
+        refused_logon(&mut conn);
+        assert_eq!(conn.state.failed_logons, 2);
+
+        let resp = conn
+            .handle_message(&request(cmd::SESSION_SETUP, 0, 0, &session_setup_body(1)))
+            .expect("challenge leg answered");
+        let session_id = parse_response(&resp).session_id;
+        let auth = crate::smb::ntlm::tests_support::build_authenticate(
+            TEST_USER,
+            "",
+            TEST_PASSWORD,
+            &conn.state.server_challenge.expect("a challenge was issued"),
+            None,
+        );
+        let resp = conn
+            .handle_message(&request(
+                cmd::SESSION_SETUP,
+                session_id,
+                0,
+                &session_setup_body_with(&auth),
+            ))
+            .expect("session setup answered");
+        assert_eq!(parse_response(&resp).status, status::SUCCESS);
+        assert_eq!(conn.state.failed_logons, 0, "success clears the count");
+    }
+
+    #[test]
+    fn connections_get_distinct_ids_for_the_trace() {
+        let a = Conn::new(ctx());
+        let b = Conn::new(ctx());
+        assert_ne!(a.id, b.id);
+        assert_eq!(a.state.conn_id, a.id, "state logs against the same id");
+        assert_ne!(a.id, 0, "id 0 means 'no connection'");
+    }
+
+    #[test]
+    fn log_stamp_is_a_wall_clock_time_to_milliseconds() {
+        let s = log_stamp();
+        assert_eq!(s.len(), 12, "HH:MM:SS.mmm, got {s:?}");
+        assert_eq!(s.as_bytes()[2], b':');
+        assert_eq!(s.as_bytes()[8], b'.');
     }
 
     #[test]

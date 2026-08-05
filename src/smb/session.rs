@@ -188,6 +188,9 @@ pub(crate) struct SessionState {
     /// The connection this state belongs to, for the trace. Zero in unit tests,
     /// which build a state by hand and have no connection.
     pub(crate) conn_id: u64,
+    /// Consecutive refused logons on this connection. Reset by a successful
+    /// one, and capped by `MAX_FAILED_LOGONS`.
+    pub(crate) failed_logons: u32,
     pub(crate) negotiated: bool,
     pub(crate) session_id: u64,
     pub(crate) authenticated: bool,
