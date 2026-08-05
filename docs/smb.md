@@ -27,6 +27,12 @@ username, the generated password, and a ready mount command for each platform.
 Leaving the screen stops the server (releasing the repository lock) and breaks
 any mount using it. `--smb-port <N>` picks a different port.
 
+The share root contains a single directory named with the snapshot's short id
+— restic's standard 8-hex-char form, so the name pastes straight into restic
+commands — and the snapshot's tree lives inside it. The share name and mount
+commands stay fixed (`\\127.0.0.1\snap`, fstab-safe), while the mount's
+contents, and anything copied out of it, say which snapshot they came from.
+
 That is the entire user-facing surface. There is deliberately no `serve`
 subcommand: a share is scoped to the screen that created it and is always
 loopback, so the share cannot outlive the UI that is telling you it exists.

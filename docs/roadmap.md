@@ -1,5 +1,4 @@
 # Roadmap
-- Have the smb snap's first directory to be short hash of the snapshot ID, or make it the name of the share
 - Read passphrase from stdin (for securely passing passwords from external tools like password managers or keychain backends not supported by this program)
 - Directory-level diff: compare arbitrary subdirectories across arbitrary snapshots
   — e.g. compare `/photos` in one snapshot against `/backup/old-photos`
