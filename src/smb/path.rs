@@ -1,12 +1,10 @@
 // SMB path parsing.
 //
 // This is the trust boundary. Everything a client sends as a filename arrives
-// here, and the only thing standing between `..\..\..\etc\shadow` and a
-// `Vfs::node_from_path` call is this module. Paths are validated into a
+// here, and the only thing standing between `..\..\..\etc\shadow` and a walk
+// over the repository's trees is this module. Paths are validated into a
 // component list rather than string-manipulated, so there is no normalisation
 // step whose ordering could be got wrong.
-
-use std::path::PathBuf;
 
 use super::proto::status;
 
@@ -53,19 +51,19 @@ impl SmbPath {
         self.components.is_empty()
     }
 
-    /// Render for `rustic_core::vfs`, which expects an absolute path with the
-    /// platform separator.
-    pub(crate) fn to_vfs_path(&self) -> PathBuf {
-        let mut p = PathBuf::from("/");
-        for c in &self.components {
-            p.push(c);
-        }
-        p
+    /// The components, in order, as the client spelled them.
+    ///
+    /// A path is never rendered back into a `std::path::Path` for the
+    /// repository: a stored name may contain a backslash, which `Path` would
+    /// read as a separator on Windows. `SnapshotBacking` walks these one tree
+    /// at a time instead.
+    pub(crate) fn components(&self) -> impl Iterator<Item = &str> {
+        self.components.iter().map(String::as_str)
     }
 
     /// Render back to SMB form, for keying and comparison. Only the in-memory
-    /// test backing keys on paths this way — the real one goes through
-    /// `to_vfs_path` — so it is not compiled into the server.
+    /// test backing keys on paths this way — the real one walks `components`
+    /// — so it is not compiled into the server.
     #[cfg(test)]
     pub(crate) fn to_smb_string(&self) -> String {
         self.components.join("\\")
@@ -136,16 +134,35 @@ mod tests {
         for raw in ["", "\\", "\\\\"] {
             let p = SmbPath::parse(raw).unwrap_or_else(|_| panic!("{raw:?} parses"));
             assert!(p.is_root(), "{raw:?} should be the root");
-            assert_eq!(p.to_vfs_path(), PathBuf::from("/"));
+            assert_eq!(p.components().count(), 0);
         }
     }
 
     #[test]
-    fn nested_paths_map_to_vfs_paths() {
+    fn nested_paths_split_into_components() {
         let p = SmbPath::parse(r"dir\sub\file.txt").unwrap();
         assert!(!p.is_root());
-        assert_eq!(p.to_vfs_path(), PathBuf::from("/dir/sub/file.txt"));
+        assert_eq!(
+            p.components().collect::<Vec<_>>(),
+            vec!["dir", "sub", "file.txt"]
+        );
         assert_eq!(p.to_smb_string(), r"dir\sub\file.txt");
+    }
+
+    /// A backslash from a client is a separator and nothing else, so the
+    /// quoted spelling of a name arrives as two components rather than as the
+    /// name. This is why a client cannot address a quoted name directly, and
+    /// why `SnapshotBacking` re-encodes each component instead of asking the
+    /// client for the stored form.
+    #[test]
+    fn a_client_backslash_is_always_a_separator() {
+        let quoted = format!("a{}b.txt", "\\u2002");
+        let p = SmbPath::parse(&quoted).unwrap();
+        assert_eq!(
+            p.components().collect::<Vec<_>>(),
+            vec!["a", "u2002b.txt"],
+            "a client cannot send a backslash except as a separator"
+        );
     }
 
     #[test]
@@ -230,8 +247,12 @@ mod tests {
     fn join_extends_a_path() {
         let dir = SmbPath::parse("a\\b").unwrap();
         let child = dir.join("c");
-        assert_eq!(child.to_vfs_path(), PathBuf::from("/a/b/c"));
-        assert_eq!(dir.to_vfs_path(), PathBuf::from("/a/b"), "parent unchanged");
+        assert_eq!(child.components().collect::<Vec<_>>(), vec!["a", "b", "c"]);
+        assert_eq!(
+            dir.components().collect::<Vec<_>>(),
+            vec!["a", "b"],
+            "parent unchanged"
+        );
     }
 
     #[test]

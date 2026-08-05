@@ -11,9 +11,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
-use rustic_core::repofile::{Metadata, Node, NodeType};
-use rustic_core::vfs::{OpenFile, Vfs};
-use rustic_core::{IndexedFullStatus, Repository};
+use rustic_core::repofile::Node;
+use rustic_core::vfs::OpenFile;
+use rustic_core::{IndexedFullStatus, Repository, TreeId};
 
 use super::path::SmbPath;
 use super::proto::status;
@@ -109,6 +109,28 @@ fn to_system_time(ts: Option<rustic_core::jiff::Timestamp>) -> Option<SystemTime
     UNIX_EPOCH.checked_add(Duration::new(secs as u64, nanos))
 }
 
+/// A name that SMB2 can carry.
+///
+/// SMB2 filenames are UTF-16 with no path separators: a directory entry whose
+/// name contains one makes the Windows redirector throw away the entire
+/// response, so a single such file would hide every other file in its
+/// directory. macOS allows a backslash in a filename, so this is reachable with
+/// nothing more exotic than an oddly named download. The character is replaced
+/// rather than the entry dropped — a file that cannot be opened through the
+/// share is still worth knowing about — and the substitution means the name no
+/// longer maps back to the repository, so opening it answers "no such file".
+fn wire_safe(name: String) -> String {
+    if !name.contains(['\\', '/', '\0']) {
+        return name;
+    }
+    let safe: String = name
+        .chars()
+        .map(|c| if matches!(c, '\\' | '/' | '\0') { '\u{fffd}' } else { c })
+        .collect();
+    smb_log!("listing {name:?} as {safe:?}: SMB filenames cannot hold a separator");
+    safe
+}
+
 fn node_info(node: &Node, now: SystemTime) -> NodeInfo {
     let kind = if node.is_dir() {
         NodeKind::Dir
@@ -116,7 +138,10 @@ fn node_info(node: &Node, now: SystemTime) -> NodeInfo {
         NodeKind::File
     };
     NodeInfo {
-        name: node.name().to_string_lossy().to_string(),
+        // `node.name` is the raw stored spelling, which restic writes quoted;
+        // `Node::name()` would decode it on Unix and not on Windows, so the
+        // decoding is done here instead — see `super::name`.
+        name: wire_safe(super::name::from_repo(&node.name)),
         kind,
         // Directories report zero: restic stores the source filesystem's
         // directory size, which is meaningless to a client and makes some of
@@ -129,9 +154,16 @@ fn node_info(node: &Node, now: SystemTime) -> NodeInfo {
 }
 
 /// Serves one snapshot out of a restic repository.
+///
+/// Paths are resolved by walking trees rather than through `rustic_core::vfs`,
+/// whose entry points take a `Path` and split it with `Path::components`. A
+/// repository name is stored quoted (see `super::name`), the quoted form of an
+/// ordinary macOS filename contains a backslash, and on Windows a backslash
+/// *is* a path separator — so a name like that can never be expressed as a
+/// `Path` component, and every file with one would be unreachable.
 pub(crate) struct SnapshotBacking {
     repo: Arc<Repository<IndexedFullStatus>>,
-    vfs: Vfs,
+    root: TreeId,
     label: String,
     total_size: u64,
     /// Captured once, so every node missing a timestamp reports the same one.
@@ -152,17 +184,6 @@ impl SnapshotBacking {
         label: impl Into<String>,
         total_size: Option<u64>,
     ) -> Result<Self> {
-        // `Vfs::from_dir_node` wants a directory node; the snapshot's root tree
-        // id is all that actually matters to it.
-        let root = Node::new(
-            String::new(),
-            NodeType::Dir,
-            Metadata::default(),
-            None,
-            Some(tree_id),
-        );
-        let vfs = Vfs::from_dir_node(&root);
-
         let total_size = match total_size {
             Some(n) => n,
             // No summary recorded (older snapshots have none): fall back to the
@@ -176,23 +197,86 @@ impl SnapshotBacking {
             // `node_info` already reports zero for them, so counting them here
             // would make the volume total disagree with the listing a client can
             // add up itself.
-            None => vfs
-                .dir_entries_from_path(repo.as_ref(), std::path::Path::new("/"))
+            None => nodes_in(&repo, &tree_id)
                 .map_err(|e| anyhow!("reading snapshot root: {e}"))?
                 .iter()
-                .filter(|n| !n.is_dir())
+                .filter(|n: &&Node| !n.is_dir())
                 .map(|n| n.meta.size)
-                .sum(),
+                // Saturating rather than `sum`, which panics on overflow in a
+                // debug build: the sizes come out of the repository.
+                .fold(0u64, u64::saturating_add),
         };
 
         Ok(Self {
             repo,
-            vfs,
+            root: tree_id,
             label: label.into(),
             total_size,
             now: SystemTime::now(),
         })
     }
+
+    /// Resolve a client path to its node, one tree at a time.
+    ///
+    /// Each component is matched against the name the repository stores, which
+    /// is the quoted one — and, failing that, against the component as the
+    /// client sent it. The second comparison is not a guess: a repository
+    /// written by rustic on Windows stores names *un*quoted (its
+    /// `escape_filename` is the identity there), so both spellings occur in the
+    /// wild, and neither can be told from the other without looking.
+    ///
+    /// The root has no node of its own; callers handle it before getting here.
+    fn lookup(&self, path: &SmbPath) -> Result<Node, String> {
+        let mut tree = self.root;
+        let mut found: Option<Node> = None;
+        for component in path.components() {
+            if let Some(parent) = &found {
+                tree = parent
+                    .subtree
+                    .ok_or_else(|| format!("{:?} is not a directory", parent.name))?;
+            }
+            let stored = super::name::to_repo(component);
+            found = Some(
+                nodes_in(&self.repo, &tree)?
+                    .into_iter()
+                    .find(|n| n.name == stored || n.name == *component)
+                    .ok_or_else(|| format!("no entry named {stored:?}"))?,
+            );
+        }
+        found.ok_or_else(|| "the share root has no node".to_string())
+    }
+
+    /// The children of the directory a path names.
+    ///
+    /// The status rides along with the reason because the two failures are
+    /// different answers: a path that is not there, and a path that is there
+    /// and is a file. `MemBacking` has always drawn that line, and a real
+    /// backing that blurred it would make the in-memory one a poor stand-in.
+    fn entries(&self, path: &SmbPath) -> Result<Vec<Node>, (u32, String)> {
+        let tree = if path.is_root() {
+            self.root
+        } else {
+            let node = self
+                .lookup(path)
+                .map_err(|e| (status::OBJECT_PATH_NOT_FOUND, e))?;
+            node.subtree.ok_or_else(|| {
+                (
+                    status::NOT_A_DIRECTORY,
+                    format!("{:?} is not a directory", node.name),
+                )
+            })?
+        };
+        nodes_in(&self.repo, &tree).map_err(|e| (status::OBJECT_PATH_NOT_FOUND, e))
+    }
+}
+
+fn nodes_in(
+    repo: &Repository<IndexedFullStatus>,
+    tree: &TreeId,
+) -> Result<Vec<Node>, String> {
+    repo.get_tree(tree)
+        .map(|t| t.nodes)
+        .map_err(|e| e.to_string())
 }
 
 impl Backing for SnapshotBacking {
@@ -211,40 +295,31 @@ impl Backing for SnapshotBacking {
         // next attempt. The status stays as it is, since nothing a client does
         // differs, but the reason is traced so an intermittent one is
         // recognisable as an intermittent one.
-        let node = self
-            .vfs
-            .node_from_path(self.repo.as_ref(), &path.to_vfs_path())
-            .map_err(|e| {
-                smb_log!("stat {:?} failed: {e}", path.to_vfs_path());
-                status::OBJECT_NAME_NOT_FOUND
-            })?;
+        let node = self.lookup(path).map_err(|e| {
+            smb_log!("stat {:?} failed: {e}", path.to_smb_absolute());
+            status::OBJECT_NAME_NOT_FOUND
+        })?;
         Ok(node_info(&node, self.now))
     }
 
     fn list(&self, path: &SmbPath) -> Result<Vec<NodeInfo>, u32> {
-        let entries = self
-            .vfs
-            .dir_entries_from_path(self.repo.as_ref(), &path.to_vfs_path())
-            .map_err(|e| {
-                smb_log!("list {:?} failed: {e}", path.to_vfs_path());
-                status::OBJECT_PATH_NOT_FOUND
-            })?;
+        let entries = self.entries(path).map_err(|(status, e)| {
+            smb_log!("list {:?} failed: {e}", path.to_smb_absolute());
+            status
+        })?;
         Ok(entries.iter().map(|n| node_info(n, self.now)).collect())
     }
 
     fn open(&self, path: &SmbPath) -> Result<Arc<dyn FileReader>, u32> {
-        let node = self
-            .vfs
-            .node_from_path(self.repo.as_ref(), &path.to_vfs_path())
-            .map_err(|e| {
-                smb_log!("open {:?} failed: {e}", path.to_vfs_path());
-                status::OBJECT_NAME_NOT_FOUND
-            })?;
+        let node = self.lookup(path).map_err(|e| {
+            smb_log!("open {:?} failed: {e}", path.to_smb_absolute());
+            status::OBJECT_NAME_NOT_FOUND
+        })?;
         if node.is_dir() {
             return Err(status::FILE_IS_A_DIRECTORY);
         }
         let open_file = self.repo.open_file(&node).map_err(|e| {
-            smb_log!("open_file {:?} failed: {e}", path.to_vfs_path());
+            smb_log!("open_file {:?} failed: {e}", path.to_smb_absolute());
             status::OBJECT_NAME_NOT_FOUND
         })?;
         Ok(Arc::new(SnapshotFile {
@@ -523,11 +598,55 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use rustic_core::repofile::{Metadata, NodeType};
+
     use super::test_support::MemBacking;
     use super::*;
 
     fn p(s: &str) -> SmbPath {
         SmbPath::parse(s).expect("test path parses")
+    }
+
+    /// A node holding a name exactly as a repository stores it.
+    fn stored_node(name: &str) -> Node {
+        Node::new(
+            name.to_string(),
+            NodeType::File,
+            Metadata::default(),
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn node_info_decodes_the_name_the_repository_stores() {
+        // What restic writes for a file named with an EN SPACE.
+        let node = stored_node(&format!("No.{}03-1532.pdf", "\\u2002"));
+        assert_eq!(
+            node_info(&node, UNIX_EPOCH).name,
+            "No.\u{2002}03-1532.pdf",
+            "the quoted form must never reach a client"
+        );
+        // A name with nothing to decode is untouched.
+        assert_eq!(node_info(&stored_node("plain.pdf"), UNIX_EPOCH).name, "plain.pdf");
+    }
+
+    #[test]
+    fn node_info_replaces_separators_the_wire_cannot_carry() {
+        // A real backslash in a macOS filename: stored doubled, decoded back to
+        // one, and then not sendable — a listing carrying it would be discarded
+        // whole by the client, taking every sibling with it.
+        let node = stored_node(r"od\\d");
+        assert_eq!(node_info(&node, UNIX_EPOCH).name, "od\u{fffd}d");
+    }
+
+    #[test]
+    fn wire_safe_only_touches_separators() {
+        assert_eq!(wire_safe("ordinary name.txt".into()), "ordinary name.txt");
+        assert_eq!(wire_safe("\u{5f71}\u{97f3}.pdf".into()), "\u{5f71}\u{97f3}.pdf");
+        // Characters Windows dislikes in a path are still fine in a listing.
+        assert_eq!(wire_safe("a:b*c?.txt".into()), "a:b*c?.txt");
+        assert_eq!(wire_safe("a\\b/c\0d".into()), "a\u{fffd}b\u{fffd}c\u{fffd}d");
     }
 
     #[test]

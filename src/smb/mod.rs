@@ -88,6 +88,7 @@ macro_rules! conn_log {
 mod backing;
 mod files;
 mod info;
+mod name;
 mod ntlm;
 mod path;
 mod proto;

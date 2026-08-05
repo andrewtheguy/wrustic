@@ -93,7 +93,11 @@ pub(crate) fn file_attributes(kind: NodeKind) -> u32 {
 pub(crate) const CLUSTER_SIZE: u64 = 4096;
 
 pub(crate) fn allocation_size(size: u64) -> u64 {
-    size.div_ceil(CLUSTER_SIZE) * CLUSTER_SIZE
+    // Saturating: rounding up overflows for a size within one cluster of
+    // `u64::MAX`, which a debug build turns into a panic on the connection
+    // thread — a corrupt or hostile size field would drop the mount rather than
+    // report a silly number.
+    size.div_ceil(CLUSTER_SIZE).saturating_mul(CLUSTER_SIZE)
 }
 
 fn write_times(w: &mut Writer, info: &NodeInfo) {
@@ -540,6 +544,9 @@ mod tests {
         assert_eq!(allocation_size(1), 4096);
         assert_eq!(allocation_size(4096), 4096);
         assert_eq!(allocation_size(4097), 8192);
+        // Rounding up has nowhere to go: it saturates rather than panicking in
+        // a debug build, which would take the connection down mid-listing.
+        assert_eq!(allocation_size(u64::MAX), u64::MAX);
     }
 
     #[test]
