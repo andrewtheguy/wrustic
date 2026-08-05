@@ -64,7 +64,10 @@ pub(crate) mod dir_class {
     pub(crate) const ID_FULL_DIRECTORY: u8 = 38;
 }
 
-/// File attribute bits (MS-FSCC 2.6).
+/// File attribute bits (MS-FSCC 2.6). NORMAL is unused because it is defined as
+/// "no other attribute set" and everything here carries READONLY, but leaving it
+/// out invites someone to reach for 0 instead.
+#[allow(dead_code)]
 pub(crate) mod attr {
     pub(crate) const READONLY: u32 = 0x0000_0001;
     pub(crate) const DIRECTORY: u32 = 0x0000_0010;

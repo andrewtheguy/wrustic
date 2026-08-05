@@ -60,7 +60,14 @@ pub(crate) mod cmd {
     }
 }
 
-/// NTSTATUS values (MS-ERREF 2.3.1). Only the ones this server can produce.
+/// NTSTATUS values (MS-ERREF 2.3.1).
+///
+/// Deliberately complete for the errors a file server can return, not trimmed
+/// to the ones currently constructed: a half-populated status list is how you
+/// end up inventing a wrong code under pressure, and a client that gets the
+/// wrong NTSTATUS fails in ways that look like a bug in the file, not the
+/// server. Hence the allow — unused entries here are the point.
+#[allow(dead_code)]
 pub(crate) mod status {
     pub(crate) const SUCCESS: u32 = 0x0000_0000;
     pub(crate) const BUFFER_OVERFLOW: u32 = 0x8000_0005;
@@ -94,7 +101,10 @@ pub(crate) mod status {
     pub(crate) const REQUEST_NOT_ACCEPTED: u32 = 0xC000_00D0;
 }
 
-/// Header `Flags` bits (MS-SMB2 2.2.1.2).
+/// Header `Flags` bits (MS-SMB2 2.2.1.2). Complete rather than trimmed, so that
+/// masking against them reads correctly; ASYNC_COMMAND and DFS_OPERATIONS are
+/// bits this server never sets but must not be confused about.
+#[allow(dead_code)]
 pub(crate) mod flags {
     pub(crate) const SERVER_TO_REDIR: u32 = 0x0000_0001;
     pub(crate) const ASYNC_COMMAND: u32 = 0x0000_0002;
@@ -175,6 +185,11 @@ pub(crate) mod access {
 #[derive(Debug, Clone)]
 pub(crate) struct Header {
     pub(crate) credit_charge: u16,
+    /// Requests carry Status = 0 (the field is `ChannelSequence`/Reserved on the
+    /// way in), so nothing reads this. Parsed anyway so the struct mirrors the
+    /// wire layout field-for-field — a header codec with holes in it is one you
+    /// cannot check against the spec by eye.
+    #[allow(dead_code)]
     pub(crate) status: u32,
     pub(crate) command: u16,
     pub(crate) credits: u16,

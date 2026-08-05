@@ -38,19 +38,6 @@ use crate::repo::{
 };
 use crate::ui::render;
 
-/// A short random password for the share, when the caller supplied none.
-/// Alphanumeric so it survives being typed into a Windows credential prompt or
-/// pasted into a mount command without quoting.
-fn random_password() -> String {
-    const ALPHABET: &[u8] = b"abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    (0..16)
-        .map(|_| {
-            let idx = usize::from(rand::random::<u8>()) % ALPHABET.len();
-            ALPHABET[idx] as char
-        })
-        .collect()
-}
-
 /// Serve one snapshot over SMB until interrupted.
 fn run_smb_serve(args: &[String]) -> Result<()> {
     let opts = match cli::parse_smb_serve(args) {
@@ -84,7 +71,7 @@ fn run_smb_serve(args: &[String]) -> Result<()> {
     // --bind-all share is the same as no password at all.
     let (share_password, generated) = match std::env::var("WRUSTIC_SMB_SHARE_PASSWORD") {
         Ok(p) if !p.is_empty() => (p, false),
-        _ => (random_password(), true),
+        _ => (smb::random_password(), true),
     };
 
     let credentials = smb::Credentials {
@@ -187,7 +174,7 @@ fn main() -> Result<()> {
     // selection; users can hold Shift to bypass and select text.
     let mouse_enabled = !cli.no_mouse
         && crossterm::execute!(std::io::stdout(), EnableMouseCapture).is_ok();
-    let result = run(&mut terminal, paths, config_lock, cli.port, no_keychain);
+    let result = run(&mut terminal, paths, config_lock, cli.port, cli.smb_port, no_keychain);
     if mouse_enabled {
         let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     }
@@ -200,9 +187,10 @@ fn run(
     paths: Paths,
     config_lock: ConfigLock,
     server_port: u16,
+    smb_port: u16,
     no_keychain: bool,
 ) -> Result<()> {
-    let mut app = App::boot(paths, config_lock, server_port, no_keychain)?;
+    let mut app = App::boot(paths, config_lock, server_port, smb_port, no_keychain)?;
 
     while !app.quit {
         terminal.draw(|f| render(f, &mut app))?;
@@ -233,6 +221,14 @@ fn run(
                     app.screen = Screen::Error(format!("{e:#}"));
                 }
             }
+            continue;
+        }
+
+        // Drawn as "starting…" on the pass above; opening the repository reads
+        // the full index, which is slow enough on a large remote repository to
+        // look like a hang if the frame were not already on screen.
+        if matches!(app.screen, Screen::SnapshotSmbStarting) {
+            app.start_smb_share();
             continue;
         }
 

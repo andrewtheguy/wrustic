@@ -21,6 +21,120 @@ pub(crate) fn render(frame: &mut Frame, app: &mut App) {
     render_top_bar(frame, app, top);
     render_body(frame, app, body);
     render_bottom_bar(frame, app, bottom);
+    // Last, and over the body only: the top and bottom bars stay readable so
+    // the user can still see which profile they are in and that a key dismisses
+    // the overlay.
+    if app.help_overlay && let Some(rows) = help_rows(&app.screen) {
+        render_help_overlay(frame, body, rows);
+    }
+}
+
+/// The full key list for a screen, shown by `?`. `None` means the screen has no
+/// keys beyond what its footer already spells out, and `?` does nothing there.
+///
+/// Lives next to `bottom_bar_text` on purpose: the footer is the abbreviation of
+/// this list, and the two drifting apart is the failure mode worth designing
+/// against.
+pub(crate) fn help_rows(screen: &Screen) -> Option<&'static [(&'static str, &'static str)]> {
+    Some(match screen {
+        Screen::Home => &[
+            ("Up/Dn", "move between profiles"),
+            ("PgUp/PgDn", "page"),
+            ("Enter", "open — lists this profile's snapshots"),
+            ("n", "new profile"),
+            ("e", "edit the selected profile"),
+            ("d", "delete the selected profile"),
+            ("q", "quit"),
+        ],
+        Screen::Snapshots => &[
+            ("Up/Dn", "move between snapshots"),
+            ("PgUp/PgDn", "page"),
+            ("g / G", "jump to the first / last snapshot"),
+            ("Enter", "browse this snapshot's files"),
+            ("s", "share this snapshot as a read-only SMB mount"),
+            ("c", "compare this snapshot against another"),
+            ("f", "filter the list by host, tag or path"),
+            ("d", "delete this snapshot (no prune)"),
+            ("p", "prune the repository"),
+            ("r", "reload the snapshot list"),
+            ("q / Esc", "back to the profile list"),
+        ],
+        Screen::SnapshotContents => &[
+            ("Up/Dn", "move between entries"),
+            ("PgUp/PgDn", "page"),
+            ("g / G", "jump to the first / last entry"),
+            ("Enter", "open a directory, or show a file's details"),
+            ("Backspace", "up one directory"),
+            ("r", "reload this directory"),
+            ("q / Esc", "back to the snapshot list"),
+        ],
+        Screen::FileDetails => &[
+            ("Up/Dn", "scroll"),
+            ("PgUp/PgDn", "page"),
+            ("g", "back to the top"),
+            ("s", "share this one file over HTTP (expiring signed URL)"),
+            ("Esc / Backspace / q", "back to the directory listing"),
+        ],
+        _ => return None,
+    })
+}
+
+/// Where the help box goes: centred on `area`, sized to its content, and never
+/// larger than `area`. The clamp is what keeps the box on an 80x24 terminal
+/// where the longest description alone is wider than the screen.
+fn help_popup_rect(area: Rect, rows: &[(&str, &str)]) -> Rect {
+    let key_width = rows.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(0);
+    // Each line renders as " <key padded to key_width>  <description>".
+    let longest_desc = rows.iter().map(|(_, d)| d.chars().count()).max().unwrap_or(0);
+    let content_width = 1 + key_width + 2 + longest_desc;
+
+    // +2 for the border, +1 for a right-hand margin.
+    let want_w = (content_width + 3) as u16;
+    // +2 for the border, +2 for the trailing blank line and the dismiss hint.
+    let want_h = (rows.len() + 4) as u16;
+    let w = want_w.min(area.width);
+    let h = want_h.min(area.height);
+    Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    }
+}
+
+/// A centred box over the body area. Sized to its content and clamped to the
+/// area, so it neither wastes space on a big terminal nor overflows a small one.
+fn render_help_overlay(frame: &mut Frame, area: Rect, rows: &[(&str, &str)]) {
+    let key_width = rows.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(0);
+    let popup = help_popup_rect(area, rows);
+
+    let mut lines: Vec<Line> = rows
+        .iter()
+        .map(|(k, d)| {
+            Line::from(vec![
+                Span::styled(
+                    format!(" {k:key_width$}  "),
+                    Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled((*d).to_string(), Style::new().fg(Color::White)),
+            ])
+        })
+        .collect();
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " any key closes this",
+        Style::new().fg(Color::DarkGray),
+    )));
+
+    // Clear what is underneath first: without it the list behind the box shows
+    // through wherever a help line is shorter than the box is wide.
+    frame.render_widget(ratatui::widgets::Clear, popup);
+    let para = Paragraph::new(lines).block(
+        Block::bordered()
+            .title("Keys")
+            .border_style(Style::new().fg(Color::Cyan)),
+    );
+    frame.render_widget(para, popup);
 }
 
 fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
@@ -76,10 +190,19 @@ fn build_footer_line(segments: &[&str], width: usize) -> Line<'static> {
 }
 
 fn bottom_bar_text(app: &App) -> &'static str {
-    match &app.screen {
-        Screen::Home => "Up/Dn move  PgUp/PgDn page  Enter open  n new  e edit  d delete  q quit",
+    footer_text(&app.screen, app.keychain_enabled())
+}
+
+/// The footer hint for a screen. Split out from `bottom_bar_text` so it can be
+/// checked against `help_rows` without building an `App`.
+fn footer_text(screen: &Screen, keychain_enabled: bool) -> &'static str {
+    match screen {
+        // These footers list only what a first-time user needs to get moving;
+        // `?` opens the full key list, which is what keeps them from growing
+        // past the width of a terminal again.
+        Screen::Home => "Enter open  n new  e edit  d delete  ? keys  q quit",
         Screen::Snapshots => {
-            "Up/Dn move  PgUp/PgDn page  g/G top/bottom  Enter browse  c compare  f filter  d delete  p prune  r refresh  q/Esc back"
+            "Enter browse  s share  c compare  f filter  d delete  ? keys  q/Esc back"
         }
         Screen::SnapshotFilterDim => "Up/Dn move  PgUp/PgDn page  Enter pick  Esc back",
         Screen::SnapshotFilterValue => {
@@ -96,19 +219,21 @@ fn bottom_bar_text(app: &App) -> &'static str {
             }
         }
         Screen::SnapshotContents => {
-            "Up/Dn move  PgUp/PgDn page  g/G top/bottom  Enter open  Backspace up  r reload  q/Esc back"
+            "Enter open  Backspace up  r reload  ? keys  q/Esc back"
         }
         Screen::FileDetails => {
-            "Up/Dn scroll  PgUp/PgDn page  g top  s share  Esc/Backspace/q back"
+            "s share  Up/Dn scroll  ? keys  Esc/Backspace/q back"
         }
         Screen::ShareUrl => "Esc/Backspace/q back (stops the server)",
+        Screen::SnapshotSmbStarting => "starting the SMB server…",
+        Screen::SnapshotSmb => "Esc/Backspace/q back (stops the server)",
         Screen::PassphraseInstancePrompt => "type  Enter submit  Esc quit",
-        Screen::PassphraseSetup => if app.keychain_enabled() {
+        Screen::PassphraseSetup => if keychain_enabled {
             "Tab/Shift+Tab field  Space toggle  Enter submit  Esc back"
         } else {
             "Tab/Shift+Tab field  Enter submit  Esc back"
         },
-        Screen::PassphraseUnlock => if app.keychain_enabled() {
+        Screen::PassphraseUnlock => if keychain_enabled {
             "Tab/Shift+Tab field  Space toggle  Enter submit  Esc quit"
         } else {
             "type  Enter submit  Esc quit"
@@ -265,6 +390,16 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
         Screen::SnapshotContents => render_snapshot_contents(frame, app, area),
         Screen::FileDetails => render_file_details(frame, app, area),
         Screen::ShareUrl => render_share_url(frame, app, area),
+        Screen::SnapshotSmbStarting => {
+            let para = Paragraph::new(
+                "Opening the repository and starting the SMB server…\n\n\
+                 Reading the index, which can take a moment on a large repository.",
+            )
+            .wrap(Wrap { trim: false })
+            .block(Block::bordered().title("Share over SMB"));
+            frame.render_widget(para, area);
+        }
+        Screen::SnapshotSmb => render_snapshot_smb(frame, app, area),
         Screen::PassphraseInstancePrompt => {
             let banner = format!(
                 "No config found at {}. Setting up a new instance.",
@@ -1168,6 +1303,63 @@ fn render_share_url(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(para, area);
 }
 
+fn render_snapshot_smb(frame: &mut Frame, app: &mut App, area: Rect) {
+    let snap = app
+        .smb_snapshot_id
+        .as_deref()
+        .map(short_snap_id)
+        .unwrap_or("(none)");
+    let title = format!("Share over SMB — snapshot {snap}");
+
+    let mut lines = String::new();
+    match (app.smb_handle.as_ref(), app.smb_password.as_deref()) {
+        (Some(h), Some(pw)) => {
+            let port = h.port;
+            let user = crate::smb::DEFAULT_SHARE_USER;
+            let share = &h.share_name;
+            lines.push_str(&format!(
+                "Server: listening on 127.0.0.1:{port}  (read-only, this machine only)\n\n"
+            ));
+            lines.push_str(&format!("Username: {user}\n"));
+            lines.push_str(&format!("Password: {pw}\n"));
+            lines.push_str("\nMount it with:\n\n");
+            lines.push_str(&format!(
+                "  Linux    sudo mount -t cifs -o port={port},vers=2.1,username={user},password={pw},ro,uid=$(id -u),gid=$(id -g) //127.0.0.1/{share} /mnt/snap\n\n"
+            ));
+            lines.push_str(&format!(
+                "  macOS    mount_smbfs //{user}@127.0.0.1:{port}/{share} /Volumes/snap\n\n"
+            ));
+            lines.push_str(&format!(
+                "  Windows  net use Z: {} /user:{user} {pw} /TCPPORT:{port}\n",
+                h.unc()
+            ));
+            lines.push_str(
+                "           Needs Windows 11 24H2 or newer for the custom port. On older \
+                 builds, browse the snapshot and share individual files over HTTP instead.\n",
+            );
+        }
+        _ => {
+            lines.push_str("Server: not running\n");
+        }
+    }
+
+    if let Some(err) = &app.smb_error {
+        lines.push_str(&format!("\nError: {err}\n"));
+    }
+
+    lines.push_str(
+        "\nEvery client authenticates and every message is signed. Writes are refused at \
+         the protocol level. Leaving this screen stops the server, and any mount still \
+         using it.",
+    );
+
+    let para = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .block(Block::bordered().title(title));
+    record_list_area(app, area);
+    frame.render_widget(para, area);
+}
+
 // Truncate a path for a title — keep the tail since the basename is usually
 // the most identifying piece. Returns the full path if it already fits.
 // Operates on character counts (not bytes) so multi-byte filenames don't
@@ -1340,7 +1532,131 @@ fn render_snapshot_delete_confirm(frame: &mut Frame, app: &mut App, area: Rect) 
 
 #[cfg(test)]
 mod tests {
-    use super::{human_size, short_path};
+    use super::{Rect, Screen, footer_text, help_popup_rect, help_rows, human_size, short_path};
+
+    /// The screens these checks cover. `Screen` has no way to enumerate itself,
+    /// so this is by hand: a screen added later is not checked until it is added
+    /// here too.
+    fn every_screen() -> Vec<Screen> {
+        vec![
+            Screen::Home,
+            Screen::Snapshots,
+            Screen::SnapshotContents,
+            Screen::FileDetails,
+            Screen::ShareUrl,
+            Screen::SnapshotSmb,
+            Screen::SnapshotSmbStarting,
+            Screen::SnapshotFilterDim,
+            Screen::SnapshotFilterValue,
+            Screen::SnapshotDeleteConfirm,
+            Screen::SnapshotCompareSecond,
+            Screen::SnapshotCompareResults,
+            Screen::PruneConfirm,
+            Screen::BackendChoice,
+            Screen::Password,
+            Screen::ConfirmDelete,
+            Screen::Error(String::new()),
+        ]
+    }
+
+    /// "q / Esc" in the help and "q/Esc" in the footer are the same binding.
+    fn normalize(key: &str) -> String {
+        key.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    #[test]
+    fn footer_advertises_the_help_key_exactly_where_help_exists() {
+        for screen in every_screen() {
+            let footer = footer_text(&screen, false);
+            let advertises = footer.contains("? keys");
+            let has_help = help_rows(&screen).is_some();
+            assert_eq!(
+                advertises, has_help,
+                "footer {footer:?} and help_rows disagree about whether ? does anything",
+            );
+        }
+    }
+
+    #[test]
+    fn every_footer_key_appears_in_the_help() {
+        for screen in every_screen() {
+            let Some(rows) = help_rows(&screen) else {
+                continue;
+            };
+            let keys: Vec<String> = rows.iter().map(|(k, _)| normalize(k)).collect();
+            for segment in footer_text(&screen, false).split("  ") {
+                let key = normalize(segment.split_whitespace().next().unwrap_or(""));
+                // `?` opens the overlay; listing it inside the overlay would be
+                // circular, so it is the one footer key with no help row.
+                if key.is_empty() || key == "?" {
+                    continue;
+                }
+                assert!(
+                    keys.contains(&key),
+                    "footer key {key:?} is missing from the help for this screen; \
+                     help has {keys:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn help_rows_are_populated_and_have_no_duplicate_keys() {
+        for screen in every_screen() {
+            let Some(rows) = help_rows(&screen) else {
+                continue;
+            };
+            assert!(!rows.is_empty());
+            let mut seen: Vec<String> = Vec::new();
+            for (k, d) in rows {
+                assert!(!k.is_empty() && !d.is_empty(), "empty help row: {k:?} {d:?}");
+                let k = normalize(k);
+                assert!(!seen.contains(&k), "duplicate help key {k:?}");
+                seen.push(k);
+            }
+        }
+    }
+
+    #[test]
+    fn help_popup_is_centred_and_fits_its_content() {
+        let rows: &[(&str, &str)] = &[("Enter", "open"), ("q", "quit")];
+        let area = Rect { x: 4, y: 2, width: 80, height: 24 };
+        let popup = help_popup_rect(area, rows);
+
+        // " Enter  open" = 12 columns, +3 for borders and margin.
+        assert_eq!(popup.width, 15);
+        // 2 rows + blank + hint + 2 border rows.
+        assert_eq!(popup.height, 6);
+        assert!(popup.x >= area.x && popup.x + popup.width <= area.x + area.width);
+        assert!(popup.y >= area.y && popup.y + popup.height <= area.y + area.height);
+        assert_eq!(popup.x - area.x, (area.width - popup.width) / 2);
+    }
+
+    #[test]
+    fn help_popup_never_exceeds_a_small_terminal() {
+        // Every real help list is wider and taller than this.
+        let area = Rect { x: 0, y: 0, width: 20, height: 5 };
+        for screen in every_screen() {
+            let Some(rows) = help_rows(&screen) else {
+                continue;
+            };
+            let popup = help_popup_rect(area, rows);
+            assert!(popup.width <= area.width, "{popup:?} wider than {area:?}");
+            assert!(popup.height <= area.height, "{popup:?} taller than {area:?}");
+            assert!(popup.x + popup.width <= area.x + area.width);
+            assert!(popup.y + popup.height <= area.y + area.height);
+        }
+    }
+
+    #[test]
+    fn snapshot_help_documents_the_smb_share_key() {
+        let rows = help_rows(&Screen::Snapshots).expect("snapshots has help");
+        let (_, desc) = rows
+            .iter()
+            .find(|(k, _)| *k == "s")
+            .expect("`s` is bound on the snapshot list");
+        assert!(desc.contains("SMB"), "{desc:?} should say what `s` shares");
+    }
 
     #[test]
     fn human_size_formats() {

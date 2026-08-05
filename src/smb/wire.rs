@@ -44,6 +44,10 @@ impl<'a> Reader<'a> {
         Self { buf, pos: 0 }
     }
 
+    /// How many bytes have been consumed. Only tests look at this — they use it
+    /// to assert a parser consumed exactly its structure's fixed size, which is
+    /// what catches a field added to a codec but not to its reader.
+    #[cfg(test)]
     pub(crate) fn pos(&self) -> usize {
         self.pos
     }
@@ -165,10 +169,6 @@ impl Writer {
         }
     }
 
-    pub(crate) fn patch_u16(&mut self, at: usize, v: u16) {
-        self.buf[at..at + 2].copy_from_slice(&v.to_le_bytes());
-    }
-
     pub(crate) fn patch_u32(&mut self, at: usize, v: u32) {
         self.buf[at..at + 4].copy_from_slice(&v.to_le_bytes());
     }
@@ -274,15 +274,12 @@ mod tests {
     fn writer_patches_fields_in_place() {
         let mut w = Writer::new();
         let at = w.len();
-        w.u16(0);
         w.u32(0);
         w.bytes(b"payload");
-        w.patch_u16(at, 0xBEEF);
-        w.patch_u32(at + 2, 0xDEAD_BEEF);
+        w.patch_u32(at, 0xDEAD_BEEF);
         let v = w.into_vec();
-        assert_eq!(&v[0..2], &[0xEF, 0xBE]);
-        assert_eq!(&v[2..6], &[0xEF, 0xBE, 0xAD, 0xDE]);
-        assert_eq!(&v[6..], b"payload");
+        assert_eq!(&v[0..4], &[0xEF, 0xBE, 0xAD, 0xDE]);
+        assert_eq!(&v[4..], b"payload");
     }
 
     #[test]

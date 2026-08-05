@@ -34,7 +34,7 @@ main()
  ├── config::paths(override) → Paths { dir, config, lock }
  ├── config::acquire_lock(paths) → ConfigLock   // refuse a second instance
  │                                              // before the TUI starts
- └── App::boot(paths, config_lock, port, no_keychain)  // app.rs
+ └── App::boot(paths, config_lock, port, smb_port, no_keychain)  // app.rs
       ├── start_passphrase_flow()           // app.rs + passphrase.rs
       └── load_config_or_set_fatal()
             └── config::load(paths, cipher) → Config (with profiles decrypted)
@@ -42,8 +42,9 @@ main()
  └── while !app.quit { terminal.draw(render); dispatch }
      ├── async-ish screens (Loading, Verifying, OpeningSnapshot,
      │   LoadingDir, LoadingFileDetails, SnapshotDeleteContentsLoading,
-     │   SnapshotDeleting, SnapshotCompareLoading) — main.rs runs the
-     │   blocking work synchronously and transitions the screen
+     │   SnapshotDeleting, SnapshotCompareLoading, SnapshotSmbStarting) —
+     │   main.rs runs the blocking work synchronously and transitions the
+     │   screen
      ├── Screen::PassphraseDerivingKey — runs scrypt synchronously
      └── otherwise — blocking event::read(), App::handle_key/mouse
 ```
@@ -52,8 +53,12 @@ The event loop lives in `main.rs` rather than `App` because some screens need
 to take long-blocking work out of the rendering tick. Each "async-ish" branch
 matches a `Screen::*Loading` variant, runs the blocking call inline, and
 transitions to the next screen — there is no real async/await in the main
-loop. The share server is the only true async machinery, isolated on its own
-OS thread + tokio current-thread runtime.
+loop. The two servers are the only true async machinery, each isolated on its
+own OS thread + tokio runtime: `share.rs` on a current-thread runtime, `smb/`
+on a multi-thread one (it needs `block_in_place`, see below).
+
+`main()` dispatches `smb-serve` before any terminal setup — it is a foreground
+server, not a TUI screen.
 
 ## State: `App` and `Screen`
 
@@ -68,12 +73,15 @@ This is deliberate — wrustic is small enough that a fat struct + an enum
 discriminator is more legible than a nested per-screen state machine. The
 struct includes:
 - Always-present: `screen`, `paths`, `config_lock`, `config`, `cipher`,
-  `server_port`.
+  `server_port`, `smb_port`.
 - Profile-creation scratch (`new_profile_name`, `local_path`, …) cleared
   whenever `enter_home()` runs.
 - Snapshot browse state: `snapshots`, `repo_session`, `browse_stack`,
   `pending_descend` / `pending_file_lookup` / `pending_refresh_path`.
 - Share dialog: `share_target`, `share_handle`, `share_url`, etc.
+- SMB share: `smb_handle`, `smb_snapshot_id`, `smb_password`, `smb_error`.
+- `help_overlay` — the `?` key list, drawn over the body of whichever screen
+  is underneath.
 - Passphrase dialog: `passphrase_input`, `passphrase_confirm`,
   `passphrase_instance_input`, `passphrase_phase`, `passphrase_error`.
 
@@ -136,6 +144,29 @@ No server is started. `passphrase.rs` exposes
 `derive_config_key`, `verify_instance_sig`, `compute_instance_sig`, and
 `passphrase_policy_error` for direct use by `app.rs`. Key derivation runs
 synchronously on `Screen::PassphraseDerivingKey`.
+
+## SMB server (`src/smb/`)
+
+A hand-rolled read-only SMB 2.1 server exporting one snapshot, started with `s`
+on the snapshot list or by `wrustic smb-serve`. Full treatment — protocol scope,
+security model, module map, tracing — in [smb.md](smb.md). The architectural
+points:
+
+- One OS thread and a `new_multi_thread` runtime with 2 workers, unlike
+  `share.rs`. Protocol handling is synchronous code calling into `rustic_core`,
+  wrapped in `tokio::task::block_in_place`; that requires a runtime that can
+  hand the reactor to another worker while one is parked on a backend fetch.
+- `SmbHandle` mirrors `ShareHandle`: `oneshot::Sender<()>` plus a `JoinHandle`,
+  drop = stop, explicit `.stop()` joins.
+- Binds `127.0.0.1` and `[::1]` via `local_server::bind_localhost`, the same
+  helper the HTTP share uses. `--bind-all` exists on `smb-serve` only; the TUI
+  has no path to it, because nothing here is encrypted.
+- The port is fixed (`--smb-port`, default 4456), not ephemeral: a mount
+  outlives the screen that created it, so an fstab line has to keep resolving.
+  A clash therefore surfaces inline on the share screen, with the flag that
+  fixes it named in the message.
+- `Backing` is a trait over `rustic_core::vfs` so the byte-exact wire encoders
+  are testable against an in-memory tree with no repository.
 
 ## Repository access (`src/repo.rs`, `src/lock.rs`)
 

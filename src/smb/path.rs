@@ -53,11 +53,6 @@ impl SmbPath {
         self.components.is_empty()
     }
 
-    /// The final component, or an empty string at the root.
-    pub(crate) fn file_name(&self) -> &str {
-        self.components.last().map_or("", String::as_str)
-    }
-
     /// Render for `rustic_core::vfs`, which expects an absolute path with the
     /// platform separator.
     pub(crate) fn to_vfs_path(&self) -> PathBuf {
@@ -68,7 +63,10 @@ impl SmbPath {
         p
     }
 
-    /// Render back to SMB form, for keying and comparison.
+    /// Render back to SMB form, for keying and comparison. Only the in-memory
+    /// test backing keys on paths this way — the real one goes through
+    /// `to_vfs_path` — so it is not compiled into the server.
+    #[cfg(test)]
     pub(crate) fn to_smb_string(&self) -> String {
         self.components.join("\\")
     }
@@ -138,7 +136,6 @@ mod tests {
     fn nested_paths_map_to_vfs_paths() {
         let p = SmbPath::parse(r"dir\sub\file.txt").unwrap();
         assert!(!p.is_root());
-        assert_eq!(p.file_name(), "file.txt");
         assert_eq!(p.to_vfs_path(), PathBuf::from("/dir/sub/file.txt"));
         assert_eq!(p.to_smb_string(), r"dir\sub\file.txt");
     }

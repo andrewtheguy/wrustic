@@ -5,23 +5,19 @@
 // makes a read-only server small enough to hand-roll, and a mounted filesystem
 // is far more useful than a download link for browsing a backup.
 //
-// Scope, deliberately: SMB 2.1 only, guest sessions only, no signing, no
-// encryption, loopback only. That combination is what Linux (cifs.ko) and macOS
-// (smbfs) accept without credentials, and what Windows 11 24H2 refuses — see
-// docs for the reasoning. Every write command is refused at the protocol level
-// in addition to there being no code that could perform one.
+// Scope, deliberately: SMB 2.1 only, mandatory NTLMv2 authentication, mandatory
+// signing, no encryption, loopback by default. 2.1 is the newest dialect that
+// avoids pre-auth integrity hashes, negotiate contexts and AES-GCM; NTLMv2 plus
+// signing is the floor Windows 11 24H2 accepts, and all three client platforms
+// support it, so there is no guest path to keep working. Every write command is
+// refused at the protocol level in addition to there being no code that could
+// perform one.
 //
 // Mount it with:
-//   Linux  sudo mount -t cifs -o port=<p>,vers=2.1,sec=none,guest,ro \
-//                     //127.0.0.1/snap /mnt
-//   macOS  mount_smbfs //guest@127.0.0.1:<p>/snap /Volumes/snap
-
-// Nothing calls into this module yet — it is wired to the TUI once the file
-// commands land. The constant tables in `proto` are also deliberately complete
-// rather than trimmed to current use, because a half-populated NTSTATUS list is
-// how you end up inventing a wrong status code under pressure. Drop this allow
-// once the module is reachable, and take seriously whatever it then reports.
-#![allow(dead_code)]
+//   Linux    sudo mount -t cifs -o port=<p>,vers=2.1,username=wrustic,password=<pw>,ro \
+//                       //127.0.0.1/snap /mnt
+//   macOS    mount_smbfs //wrustic@127.0.0.1:<p>/snap /Volumes/snap
+//   Windows  net use Z: \\127.0.0.1\snap /user:wrustic <pw>   (add /TCPPORT:<p>)
 
 mod backing;
 mod files;
@@ -113,6 +109,29 @@ const MAX_CREDITS: u16 = 512;
 
 /// The share name clients connect to: `\\127.0.0.1\snap`.
 pub(crate) const DEFAULT_SHARE_NAME: &str = "snap";
+
+/// The account clients authenticate as. Fixed rather than configurable in the
+/// TUI: the password is what protects the share, and a second thing to type
+/// wrong buys nothing.
+pub(crate) const DEFAULT_SHARE_USER: &str = "wrustic";
+
+/// A short random password for a share.
+///
+/// Generated per server rather than defaulted, because a fixed default password
+/// is the same as no password. Alphanumeric with the visually ambiguous
+/// characters removed, so it survives being read off this screen and typed into
+/// a Windows credential prompt, and needs no shell quoting in a mount command.
+pub(crate) fn random_password() -> String {
+    use rand::RngExt;
+    // 55 characters is not a power of two, so `random::<u8>() % len` would
+    // favour the first 36 of them. `random_range` rejects out-of-range draws
+    // instead, keeping all 16 characters uniform (~92 bits total).
+    const ALPHABET: &[u8] = b"abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let mut rng = rand::rng();
+    (0..16)
+        .map(|_| ALPHABET[rng.random_range(0..ALPHABET.len())] as char)
+        .collect()
+}
 
 /// Immutable per-server state shared by every connection.
 struct Ctx {

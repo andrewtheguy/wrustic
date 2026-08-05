@@ -4,6 +4,11 @@ use anyhow::{Result, bail};
 
 pub(crate) const DEFAULT_SERVER_PORT: u16 = 7834;
 
+/// Localhost port for the snapshot SMB share, and the default for `smb-serve`.
+/// Fixed rather than ephemeral so a mount command, an `/etc/fstab` line or a
+/// saved Windows drive mapping keeps working across restarts of wrustic.
+pub(crate) const DEFAULT_SMB_PORT: u16 = 4456;
+
 pub(crate) const USAGE: &str = "\
 Usage: wrustic [OPTIONS]
 
@@ -13,6 +18,12 @@ Options:
                               The directory will be created on first run.
   -p, --port <N>              Localhost port for the file-share dialog.
                               Default: 7834.
+      --smb-port <N>          Localhost port for the snapshot SMB share ('s' on
+                              the snapshot list). Default: 4456. Mounting needs
+                              a client that can be pointed at a non-standard
+                              port: Linux (-o port=), macOS, and Windows 11 24H2
+                              or newer (/TCPPORT:). Earlier Windows builds only
+                              speak to port 445 and cannot use this share.
       --no-restic-cache       Turn off restic's on-disk cache: every restic call
                               runs --no-cache. On by default, restic keeps its
                               cache in a 'wrustic' directory under your
@@ -86,9 +97,9 @@ Set WRUSTIC_SMB_LOG=1 to trace every SMB command and its status to stderr.
 pub(crate) fn parse_smb_serve(args: &[String]) -> Result<SmbServe> {
     let mut repo = None;
     let mut snapshot = None;
-    let mut port = 4456u16;
+    let mut port = DEFAULT_SMB_PORT;
     let mut bind_all = false;
-    let mut user = "wrustic".to_string();
+    let mut user = crate::smb::DEFAULT_SHARE_USER.to_string();
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -131,6 +142,7 @@ pub(crate) fn parse_smb_serve(args: &[String]) -> Result<SmbServe> {
 pub(crate) struct Cli {
     pub(crate) config_dir: Option<PathBuf>,
     pub(crate) port: u16,
+    pub(crate) smb_port: u16,
     pub(crate) restic_cache: bool,
     pub(crate) no_mouse: bool,
     pub(crate) no_keychain: bool,
@@ -143,6 +155,7 @@ impl Default for Cli {
         Self {
             config_dir: None,
             port: DEFAULT_SERVER_PORT,
+            smb_port: DEFAULT_SMB_PORT,
             restic_cache: true,
             no_mouse: false,
             no_keychain: false,
@@ -187,6 +200,16 @@ pub(crate) fn parse_cli() -> Result<Cli> {
             other if other.starts_with("--port=") => {
                 let value = &other["--port=".len()..];
                 cli.port = parse_port(value, "--port=")?;
+            }
+            "--smb-port" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("{arg} requires a port number"))?;
+                cli.smb_port = parse_port(&value, arg.as_str())?;
+            }
+            other if other.starts_with("--smb-port=") => {
+                let value = &other["--smb-port=".len()..];
+                cli.smb_port = parse_port(value, "--smb-port=")?;
             }
             other => bail!("unknown argument: {other}"),
         }

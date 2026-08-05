@@ -112,6 +112,14 @@ impl Handles {
         self.open.remove(&id)
     }
 
+    /// How many handles are open. Tests assert on this to catch a leak — a
+    /// CREATE that never gets its matching CLOSE would otherwise be invisible
+    /// until a long-lived mount ran the table up.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.open.len()
+    }
+
     /// Map the compound placeholder onto the handle the chain just opened.
     fn resolve(&self, id: u64) -> Option<u64> {
         if id == RELATED_FILE_ID {
@@ -119,10 +127,6 @@ impl Handles {
         } else {
             Some(id)
         }
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.open.len()
     }
 }
 
