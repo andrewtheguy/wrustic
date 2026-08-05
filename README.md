@@ -7,7 +7,8 @@ and [`ratatui`](https://crates.io/crates/ratatui).
 `wrustic` is read-mostly by design: reads are native via `rustic_core`, and
 the few write operations it exposes (snapshot delete, stale-lock removal)
 are native too, guarded by restic-compatible repository locks
-(docs/locking.md). Everything else that writes stays on the `restic` CLI.
+(docs/locking.md). Everything else that writes stays on the `restic` CLI —
+docs/restic-usage.md is the overview of exactly which workflows that means.
 
 ## Features
 
@@ -192,6 +193,8 @@ supports — `rustic_core` reads the on-disk repository format natively, and
 the write operations wrustic exposes (snapshot delete, stale-lock removal)
 are native too, protected by restic-compatible repository locks
 (docs/locking.md). You do not need `restic` installed to run `wrustic`.
+[`docs/restic-usage.md`](docs/restic-usage.md) is the per-workflow overview
+of what still uses (or is expected to use) the restic CLI.
 
 You *will* want `restic` (>= 0.19.0 — the release whose locking protocol and
 JSON output wrustic is built against) on your `$PATH` for development. Use it

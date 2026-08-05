@@ -649,7 +649,7 @@ fn render_compare_second(frame: &mut Frame, app: &mut App, area: Rect) {
 fn render_compare_loading(frame: &mut Frame, app: &App, area: Rect) {
     let first = app.compare_first_id.as_deref().map(short_snap_id).unwrap_or("?");
     let second = app.compare_second_id.as_deref().map(short_snap_id).unwrap_or("?");
-    let body = format!("Running `restic diff {first}..{second} --json`…");
+    let body = format!("Comparing snapshots {first}..{second}…");
     let para = Paragraph::new(body).block(Block::bordered().title("Computing diff"));
     frame.render_widget(para, area);
 }

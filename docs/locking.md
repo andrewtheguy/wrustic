@@ -101,6 +101,10 @@ both map to non-exclusive today.
 
 ## What writes wrustic can safely support
 
+(For the user-facing summary of which workflows use the restic CLI today
+vs. by plan, see [restic-usage.md](restic-usage.md); these tables are the
+safety rationale behind that split.)
+
 Restic's own table above *is* the safety map. Tiered by lock type, with
 each operation's implementation status (see Phases below for the history).
 Implemented today: **forget / delete snapshots** (`repo::delete_snapshot`,

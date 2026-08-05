@@ -168,8 +168,10 @@ so every native write MUST hold a `lock::RepoLock` — that discipline lives
 in `repo.rs`, not in rustic_core.
 
 No TUI flow shells out to restic anymore, and the binary is not required
-to run wrustic. Write operations without a native + locked implementation
-(init, backup, prune, key management) stay on the restic CLI — when code
+to run wrustic (docs/restic-usage.md is the per-workflow overview of what
+still uses the CLI). Write operations without a native + locked
+implementation (init, backup, prune, key management) stay on the restic
+CLI — when code
 needs to trigger one of those (e.g. a future prune action), it goes
 through the secure spawn harness kept in `src/restic.rs`, whose launch
 semantics mirror resterm's:

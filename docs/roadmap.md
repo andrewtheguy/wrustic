@@ -8,7 +8,6 @@
 - Moved-file detection in diffs (identify files that were renamed or
   relocated rather than showing them as a delete + add)
 - Search across snapshot contents (find files by name or path pattern)
-- Windows support (needs build and runtime testing on Windows)
 
 ## Ideas (Currently out of scope but worth considering for the future)
 
