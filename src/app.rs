@@ -1307,13 +1307,11 @@ impl App {
         {
             return;
         }
-        let attempts = self
-            .smb_handle
-            .as_ref()
-            .map_or(0, smb::SmbHandle::failed_logons);
-        if let Some(h) = self.smb_handle.take() {
-            h.stop();
-        }
+        let Some(handle) = self.smb_handle.take() else {
+            return;
+        };
+        let attempts = handle.failed_logons();
+        handle.stop();
         self.smb_password = None;
         self.smb_error = Some(format!(
             "Server stopped: {attempts} logons were refused with no successful one in \

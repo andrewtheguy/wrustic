@@ -234,12 +234,12 @@ failures means different things at 10 ms apart and at 10 minutes apart.
 Rejections name the command and the reason:
 
 ```
-[smb] conn 3: dropping: CREATE arrived unsigned
-[smb] conn 3: dropping: READ signature mismatch
-[smb] conn 4: SESSION_SETUP: user "andrew" (domain "") is not "wrustic"
-[smb] conn 4: SESSION_SETUP: wrong password for user "wrustic"
-[smb] conn 4: SESSION_SETUP: anonymous logon refused
-[smb] conn 5: stat "/Users/andrew/Documents" failed: <the repository error>
+[smb 04:41:02.310] conn 3: dropping: CREATE arrived unsigned
+[smb 04:41:02.311] conn 3: dropping: READ signature mismatch
+[smb 04:41:07.884] conn 4: SESSION_SETUP: user "andrew" (domain "") is not "wrustic"
+[smb 04:41:07.902] conn 4: SESSION_SETUP: wrong password for user "wrustic"
+[smb 04:41:07.915] conn 4: SESSION_SETUP: anonymous logon refused
+[smb 04:41:09.006] conn 5: stat "/Users/andrew/Documents" failed: <the repository error>
 ```
 
 A logon failure names the identity that was offered, never the response or the

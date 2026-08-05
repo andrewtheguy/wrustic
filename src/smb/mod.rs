@@ -245,8 +245,7 @@ impl Ctx {
     }
 
     fn logon_limit_reached(&self) -> bool {
-        self.failed_logons.load(std::sync::atomic::Ordering::Relaxed)
-            >= MAX_SERVER_LOGON_FAILURES
+        logon_limit_reached(&self.failed_logons)
     }
 }
 
@@ -282,8 +281,7 @@ impl SmbHandle {
     /// `MAX_SERVER_LOGON_FAILURES`. The server has already stopped accepting
     /// logons at this point; the owner is expected to stop it outright.
     pub(crate) fn logon_limit_reached(&self) -> bool {
-        self.failed_logons.load(std::sync::atomic::Ordering::Relaxed)
-            >= MAX_SERVER_LOGON_FAILURES
+        logon_limit_reached(&self.failed_logons)
     }
 
     /// Refused logons since the last successful one, for the message the owner
@@ -544,6 +542,14 @@ const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60
 /// limit exists so a server left running cannot be ground against indefinitely,
 /// and so the owner is told.
 const MAX_SERVER_LOGON_FAILURES: u32 = 1000;
+
+/// Whether a refusal counter has reached the server-wide limit. Shared by the
+/// two readers — the server, deciding whether to accept a logon, and the owning
+/// handle, deciding whether to stop — so they cannot drift apart on either the
+/// threshold or the ordering.
+fn logon_limit_reached(failed: &std::sync::atomic::AtomicU32) -> bool {
+    failed.load(std::sync::atomic::Ordering::Relaxed) >= MAX_SERVER_LOGON_FAILURES
+}
 
 /// Consecutive refused logons before a connection is dropped.
 ///
