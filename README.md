@@ -153,17 +153,32 @@ The restic CLI commands wrustic shells out for (prune-class operations) keep
 an on-disk cache by default, in a `wrustic` directory under your platform's
 own per-user cache root — `$XDG_CACHE_HOME` or `~/.cache` on Linux,
 `~/Library/Caches` on macOS, `%LOCALAPPDATA%` on Windows — so it stays
-private to your account, and restic's own default cache is never shared. `--no-restic-cache` turns that
-off, so every restic call runs `--no-cache` instead; a restic cache can reach
-hundreds of megabytes for a large repository. Native reads/writes never use a
-restic cache either way.
+private to your account, and restic's own default cache is never shared.
+`--no-restic-cache` turns that off, so every restic call runs `--no-cache`
+instead; a restic cache can reach hundreds of megabytes for a large
+repository. Native reads/writes never use a restic cache either way.
+
+The cache location does not depend on `--config-dir`, so wrustic instances
+on different config directories share one cache — restic keys a subdirectory
+off the repository ID, so instances on the same repository reuse its cache
+rather than each paying for a copy.
 
 The cache does not grow without bound: every cached call also passes
 `--cleanup-cache`, so restic drops the per-repository subdirectories under
 that directory once they go unused for 30 days — deleting a profile
-eventually reclaims its cache on its own. Only the repository a command is
-actually working on is exempt. To clean it out by hand, point restic at the
-same directory: `restic --cache-dir <that path> cache --cleanup`.
+eventually reclaims its cache on its own. This is safe to leave on with
+several instances running, because restic refreshes a subdirectory's
+timestamp whenever it opens that repository: a cache in use is never 30 days
+old, so the sweep cannot take it out from under a prune in flight.
+
+To clean up by hand, point restic at the same directory:
+`restic --cache-dir <that path> cache --cleanup`. Do **not** add
+`--max-age 0` while any wrustic is running a prune. Age 0 makes every
+subdirectory eligible, in-use ones included, and deleting a cache under a
+live restic aborts that command (the repository itself is unharmed — no
+lock is left behind and `restic check` stays clean — but the prune has to
+be rerun). Quit your wrustic instances first, or use `--max-age 1`, which
+reclaims nearly as much and structurally cannot touch a cache in use.
 
 `--no-keychain` disables keychain integration at runtime, even when the
 binary was built with the `keychain` feature. See

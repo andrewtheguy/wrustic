@@ -183,11 +183,17 @@ whose launch semantics mirror resterm's:
 - Every call carries `--cache-dir` pointed at a `wrustic` directory under
   the platform's own per-user cache root (`dirs::cache_dir()`: `~/.cache`
   on Linux, `~/Library/Caches` on macOS, `%LOCALAPPDATA%` on Windows),
-  together with `--cleanup-cache`, which
-  lets restic garbage collect the per-repository subdirectories it keeps
-  there once they go 30 days unused. `--no-restic-cache` opts out and
-  passes `--no-cache` instead — restic's default shared cache is never
-  used either way.
+  together with `--cleanup-cache`, which lets restic garbage collect the
+  per-repository subdirectories it keeps there once they go 30 days
+  unused. `--no-restic-cache` opts out and passes `--no-cache` instead —
+  restic's default shared cache is never used either way. The cache path
+  is independent of `--config-dir`, so instances on different config
+  directories share it; that is safe, and so is the sweep, because restic
+  refreshes a subdirectory's timestamp when it opens that repository, and
+  a cache in use is therefore never old enough to sweep. `restic cache`
+  itself never opens the repository (no `--repo`, no password, no lock) —
+  the only way to break a running command is a manual
+  `cache --cleanup --max-age 0`, which ignores the in-use exemption.
 - restic checks the repository lock before any of these commands run, so
   a leftover (crashed-holder) lock blocks them with "repository is
   already locked". wrustic speaks the lock protocol natively, so
