@@ -50,6 +50,58 @@ use proto::{HEADER_LEN, Header, NEXT_COMMAND_OFFSET, cmd, status, write_error_bo
 use session::{SessionState, TreeKind};
 use wire::{MAX_INBOUND_MESSAGE, NBSS_HEADER_LEN, Reader, Writer, nbss_header, nbss_len};
 
+/// Whether to trace protocol traffic to stderr. Enabled by setting
+/// `WRUSTIC_SMB_LOG` to anything.
+///
+/// Worth having permanently rather than as scaffolding: when a client refuses a
+/// mount it says nothing useful (Linux reports a bare -EIO or -EINVAL, macOS
+/// just times out), and the server is the only place that can see which command
+/// was rejected and why.
+pub(crate) fn log_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("WRUSTIC_SMB_LOG").is_some())
+}
+
+macro_rules! smb_log {
+    ($($arg:tt)*) => {
+        if $crate::smb::log_enabled() {
+            eprintln!("[smb] {}", format!($($arg)*));
+        }
+    };
+}
+
+/// Render an NTSTATUS for a log line.
+fn status_name(status: u32) -> String {
+    let name = match status {
+        status::SUCCESS => "SUCCESS",
+        status::MORE_PROCESSING_REQUIRED => "MORE_PROCESSING_REQUIRED",
+        status::NO_MORE_FILES => "NO_MORE_FILES",
+        status::END_OF_FILE => "END_OF_FILE",
+        status::NO_EAS_ON_FILE => "NO_EAS_ON_FILE",
+        status::NOT_SUPPORTED => "NOT_SUPPORTED",
+        status::ACCESS_DENIED => "ACCESS_DENIED",
+        status::MEDIA_WRITE_PROTECTED => "MEDIA_WRITE_PROTECTED",
+        status::OBJECT_NAME_NOT_FOUND => "OBJECT_NAME_NOT_FOUND",
+        status::OBJECT_PATH_NOT_FOUND => "OBJECT_PATH_NOT_FOUND",
+        status::OBJECT_PATH_SYNTAX_BAD => "OBJECT_PATH_SYNTAX_BAD",
+        status::OBJECT_NAME_INVALID => "OBJECT_NAME_INVALID",
+        status::INVALID_PARAMETER => "INVALID_PARAMETER",
+        status::INVALID_INFO_CLASS => "INVALID_INFO_CLASS",
+        status::INFO_LENGTH_MISMATCH => "INFO_LENGTH_MISMATCH",
+        status::BUFFER_OVERFLOW => "BUFFER_OVERFLOW",
+        status::FILE_CLOSED => "FILE_CLOSED",
+        status::FILE_IS_A_DIRECTORY => "FILE_IS_A_DIRECTORY",
+        status::NOT_A_DIRECTORY => "NOT_A_DIRECTORY",
+        status::BAD_NETWORK_NAME => "BAD_NETWORK_NAME",
+        status::NETWORK_NAME_DELETED => "NETWORK_NAME_DELETED",
+        status::USER_SESSION_DELETED => "USER_SESSION_DELETED",
+        status::INVALID_DEVICE_REQUEST => "INVALID_DEVICE_REQUEST",
+        status::UNEXPECTED_IO_ERROR => "UNEXPECTED_IO_ERROR",
+        _ => return format!("{status:#010x}"),
+    };
+    name.to_string()
+}
+
 /// Upper bound on credits granted per request. Credits are SMB2's flow control:
 /// each one lets the client keep one more request in flight. Granting too few
 /// stalls the client outright, so we are generous — the ceiling exists only to
@@ -107,15 +159,48 @@ impl Drop for SmbHandle {
     }
 }
 
-/// Start the server on `port` (0 picks an ephemeral one), bound to loopback
-/// only. Binding happens synchronously so that a port conflict is reported to
-/// the caller rather than swallowed by the server thread.
+/// Which interfaces to accept connections on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Bind {
+    /// 127.0.0.1 and ::1 only. The default, and the only safe one: this server
+    /// authenticates nobody.
+    #[default]
+    Loopback,
+    /// Every interface. There is no authentication and no encryption, so anyone
+    /// who can reach the port can read the entire snapshot. Only for testing on
+    /// a trusted network, and callers must say so explicitly.
+    AllInterfaces,
+}
+
+/// Start the server on `port` (0 picks an ephemeral one). Binding happens
+/// synchronously so that a port conflict is reported to the caller rather than
+/// swallowed by the server thread.
 pub(crate) fn start(
     port: u16,
     share_name: impl Into<String>,
     backing: Arc<dyn Backing>,
 ) -> Result<SmbHandle> {
-    let listeners_std = local_server::bind_localhost(port)?;
+    start_on(port, share_name, backing, Bind::Loopback)
+}
+
+pub(crate) fn start_on(
+    port: u16,
+    share_name: impl Into<String>,
+    backing: Arc<dyn Backing>,
+    bind: Bind,
+) -> Result<SmbHandle> {
+    let listeners_std = match bind {
+        Bind::Loopback => local_server::bind_localhost(port)?,
+        Bind::AllInterfaces => {
+            let listener = StdTcpListener::bind((std::net::Ipv6Addr::UNSPECIFIED, port))
+                .or_else(|_| StdTcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)))
+                .map_err(|e| anyhow!("binding all interfaces on port {port}: {e}"))?;
+            listener
+                .set_nonblocking(true)
+                .map_err(|e| anyhow!("set_nonblocking: {e}"))?;
+            vec![listener]
+        }
+    };
     let bound_port = listeners_std
         .first()
         .ok_or_else(|| anyhow!("bind_localhost returned no listeners"))?
@@ -173,6 +258,7 @@ pub(crate) fn start_snapshot_share(
     port: u16,
     profile: &Profile,
     snapshot_id: &str,
+    bind: Bind,
 ) -> Result<SmbHandle> {
     let repo = Arc::new(open_indexed_full(profile)?);
     let snap = repo
@@ -188,7 +274,7 @@ pub(crate) fn start_snapshot_share(
     let total_size = snap.summary.as_ref().map(|s| s.total_bytes_processed);
     let backing = SnapshotBacking::new(repo, snap.tree, label, total_size)?;
 
-    start(port, DEFAULT_SHARE_NAME, Arc::new(backing))
+    start_on(port, DEFAULT_SHARE_NAME, Arc::new(backing), bind)
 }
 
 async fn accept_loop(
@@ -248,6 +334,10 @@ async fn serve_connection(mut stream: tokio::net::TcpStream, ctx: Arc<Ctx>) {
         // rather than inside the handlers, so the protocol code stays sync and
         // directly unit-testable without a runtime.
         let Some(resp) = tokio::task::block_in_place(|| conn.handle_message(&msg)) else {
+            smb_log!(
+                "dropping connection: unparseable message, first bytes {:02x?}",
+                &msg[..msg.len().min(8)]
+            );
             // Unparseable, or an SMB1 negotiate. Dropping the connection is the
             // correct answer: clients retry as SMB2.
             return;
@@ -346,9 +436,19 @@ impl Conn {
             let body = chunk.get(HEADER_LEN..end)?;
             let is_only = first && next == 0;
 
+            if log_enabled() && hdr.command == cmd::NEGOTIATE {
+                smb_log!("client offers dialects {:04x?}", session::peek_dialects(body));
+            }
+
             let start = out.len();
             match self.execute(&hdr, body, chunk, is_only) {
                 Some(Ok(reply)) => {
+                    smb_log!(
+                        "{} -> {} ({} bytes)",
+                        cmd::name(hdr.command),
+                        status_name(reply.status),
+                        reply.body.len()
+                    );
                     hdr.write_response(
                         &mut out,
                         reply.status,
@@ -359,6 +459,7 @@ impl Conn {
                     out.bytes(&reply.body);
                 }
                 Some(Err(st)) => {
+                    smb_log!("{} -> {}", cmd::name(hdr.command), status_name(st));
                     hdr.write_response(
                         &mut out,
                         st,
@@ -999,8 +1100,13 @@ mod tests {
             .and_then(|v| v.parse().ok())
             .unwrap_or(1200);
 
-        let handle =
-            start_snapshot_share(port, &profile, &snapshot).expect("snapshot share starts");
+        let bind = if std::env::var_os("WRUSTIC_SMB_BIND_ALL").is_some() {
+            Bind::AllInterfaces
+        } else {
+            Bind::Loopback
+        };
+        let handle = start_snapshot_share(port, &profile, &snapshot, bind)
+            .expect("snapshot share starts");
         eprintln!(
             "serving snapshot {snapshot} on 127.0.0.1:{} for {secs}s",
             handle.port

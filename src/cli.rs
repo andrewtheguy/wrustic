@@ -41,6 +41,78 @@ Options:
   -h, --help                  Print this help text.
 ";
 
+/// `wrustic smb-serve` — export one snapshot over SMB and block until Ctrl-C.
+///
+/// A separate entry point rather than a TUI action because it is a foreground
+/// server: the useful thing to do with it is leave it running in one terminal
+/// and mount from another.
+pub(crate) struct SmbServe {
+    pub(crate) repo: String,
+    pub(crate) snapshot: String,
+    pub(crate) port: u16,
+    pub(crate) bind_all: bool,
+}
+
+pub(crate) const SMB_SERVE_USAGE: &str = "\
+Usage: wrustic smb-serve --repo <PATH> --snapshot <ID> [OPTIONS]
+
+Serve one snapshot as a read-only SMB 2.1 share and block until Ctrl-C.
+Read the repository password from WRUSTIC_SMB_PASSWORD (or RESTIC_PASSWORD);
+it is never taken from the command line, where it would be visible to every
+process on the machine.
+
+Options:
+      --repo <PATH>       Local restic repository to open.
+      --snapshot <ID>     Snapshot to serve. 'latest' picks the newest.
+      --port <N>          Port to listen on. Default: 4456.
+      --bind-all          Listen on every interface instead of loopback only.
+                          There is NO authentication and NO encryption: anyone
+                          who can reach the port can read the whole snapshot.
+                          Use only on a network you trust.
+  -h, --help              Print this help text.
+
+Mount it with:
+  Linux  sudo mount -t cifs -o port=<N>,vers=2.1,sec=none,guest,ro,uid=$(id -u) \\
+             //<host>/snap /mnt
+  macOS  mount_smbfs //guest@<host>:<N>/snap /Volumes/snap
+
+Set WRUSTIC_SMB_LOG=1 to trace every SMB command and its status to stderr.
+";
+
+pub(crate) fn parse_smb_serve(args: &[String]) -> Result<SmbServe> {
+    let mut repo = None;
+    let mut snapshot = None;
+    let mut port = 4456u16;
+    let mut bind_all = false;
+
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--repo" => repo = Some(it.next().ok_or_else(|| anyhow::anyhow!("--repo requires a path"))?.clone()),
+            "--snapshot" => {
+                snapshot = Some(it.next().ok_or_else(|| anyhow::anyhow!("--snapshot requires an id"))?.clone())
+            }
+            "--port" => {
+                let v = it.next().ok_or_else(|| anyhow::anyhow!("--port requires a number"))?;
+                port = parse_port(v, "--port")?;
+            }
+            "--bind-all" => bind_all = true,
+            "-h" | "--help" => {
+                println!("{SMB_SERVE_USAGE}");
+                std::process::exit(0);
+            }
+            other => bail!("unknown argument: {other}"),
+        }
+    }
+
+    Ok(SmbServe {
+        repo: repo.ok_or_else(|| anyhow::anyhow!("--repo is required"))?,
+        snapshot: snapshot.ok_or_else(|| anyhow::anyhow!("--snapshot is required"))?,
+        port,
+        bind_all,
+    })
+}
+
 pub(crate) struct Cli {
     pub(crate) config_dir: Option<PathBuf>,
     pub(crate) port: u16,

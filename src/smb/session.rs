@@ -196,6 +196,24 @@ impl SessionState {
     }
 }
 
+/// Read just the dialect list out of a NEGOTIATE request, for logging. Returns
+/// an empty list rather than an error: this only ever feeds a diagnostic.
+pub(crate) fn peek_dialects(body: &[u8]) -> Vec<u16> {
+    let mut r = Reader::new(body);
+    // StructureSize, DialectCount, SecurityMode, Reserved, Capabilities,
+    // ClientGuid, ClientStartTime.
+    if r.u16().is_err() {
+        return Vec::new();
+    }
+    let Ok(count) = r.u16() else {
+        return Vec::new();
+    };
+    if r.skip(2 + 2 + 4 + 16 + 8).is_err() {
+        return Vec::new();
+    }
+    (0..count).map_while(|_| r.u16().ok()).collect()
+}
+
 /// NEGOTIATE (MS-SMB2 2.2.3 request, 2.2.4 response).
 ///
 /// The client sends a list of dialects it supports; we insist on 2.1 being in

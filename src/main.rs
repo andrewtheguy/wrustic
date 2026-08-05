@@ -38,7 +38,73 @@ use crate::repo::{
 };
 use crate::ui::render;
 
+/// Serve one snapshot over SMB until interrupted.
+fn run_smb_serve(args: &[String]) -> Result<()> {
+    let opts = match cli::parse_smb_serve(args) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("{e:#}");
+            eprintln!("\n{}", cli::SMB_SERVE_USAGE);
+            std::process::exit(2);
+        }
+    };
+
+    // Never from argv: a password there is readable by every process on the
+    // machine, which is the same rule the restic spawn harness follows.
+    let password = std::env::var("WRUSTIC_SMB_PASSWORD")
+        .or_else(|_| std::env::var("RESTIC_PASSWORD"))
+        .map_err(|_| {
+            anyhow::anyhow!("set WRUSTIC_SMB_PASSWORD (or RESTIC_PASSWORD) to the repository password")
+        })?;
+
+    let profile = config::Profile::Local {
+        password,
+        local_path: opts.repo.clone(),
+    };
+    let bind = if opts.bind_all {
+        smb::Bind::AllInterfaces
+    } else {
+        smb::Bind::Loopback
+    };
+
+    let handle = smb::start_snapshot_share(opts.port, &profile, &opts.snapshot, bind)?;
+    let host = if opts.bind_all { "<this-host>" } else { "127.0.0.1" };
+
+    println!("Serving snapshot {} on port {}", opts.snapshot, handle.port);
+    if opts.bind_all {
+        println!(
+            "WARNING: listening on every interface with no authentication — \
+anyone who can reach port {} can read this snapshot.",
+            handle.port
+        );
+    }
+    println!();
+    println!("Mount it with:");
+    println!(
+        "  Linux  sudo mount -t cifs -o port={},vers=2.1,sec=none,guest,ro,uid=$(id -u),gid=$(id -g) //{host}/snap /mnt",
+        handle.port
+    );
+    println!(
+        "  macOS  mount_smbfs //guest@{host}:{}/snap /Volumes/snap",
+        handle.port
+    );
+    println!();
+    println!("Press Ctrl-C to stop.");
+
+    // Park until interrupted; the server owns its own thread and runtime.
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
 fn main() -> Result<()> {
+    // `smb-serve` is a foreground server, not a TUI screen, so it is dispatched
+    // before any terminal setup happens.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().is_some_and(|a| a == "smb-serve") {
+        return run_smb_serve(&argv[1..]);
+    }
+
     let cli = match parse_cli() {
         Ok(cli) => cli,
         Err(e) => {
