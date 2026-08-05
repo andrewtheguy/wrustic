@@ -15,15 +15,19 @@ Options:
                               Default: 7834.
       --no-restic-cache       Turn off restic's on-disk cache: every restic call
                               runs --no-cache. On by default, restic keeps its
-                              cache in a directory private to wrustic and to
-                              your user account: $XDG_CACHE_HOME/wrustic if that
-                              is set, otherwise ~/.cache/wrustic. Only affects
-                              the restic CLI commands wrustic shells out for
-                              (prune-class); native reads/writes never use a
-                              restic cache. The cache speeds up repeated restic
+                              cache in a 'wrustic' directory under your
+                              platform's per-user cache root, private to your
+                              account: $XDG_CACHE_HOME or ~/.cache on Linux,
+                              ~/Library/Caches on macOS, %LOCALAPPDATA% on
+                              Windows. Only affects the restic CLI commands
+                              wrustic shells out for (prune-class); native
+                              reads/writes never use a restic cache. The cache speeds up repeated restic
                               work against a remote repository at the cost of
                               disk space — it can reach hundreds of megabytes
-                              for a large repository. To prune it, point restic
+                              for a large repository. Cached calls also pass
+                              --cleanup-cache, so restic itself drops the
+                              per-repository subdirectories there that go 30
+                              days unused. To clean it out by hand, point restic
                               at the same directory:
                               'restic --cache-dir <that path> cache --cleanup'.
       --no-mouse              Disable mouse reporting (useful for QA / copy-paste).

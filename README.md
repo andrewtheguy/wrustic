@@ -150,13 +150,20 @@ give each its own `--config-dir`.
 (default: 7834).
 
 The restic CLI commands wrustic shells out for (prune-class operations) keep
-an on-disk cache by default, in a directory private to wrustic and to your
-user account (`$XDG_CACHE_HOME/wrustic`, otherwise `~/.cache/wrustic`) —
-restic's own default cache is never shared. `--no-restic-cache` turns that
+an on-disk cache by default, in a `wrustic` directory under your platform's
+own per-user cache root — `$XDG_CACHE_HOME` or `~/.cache` on Linux,
+`~/Library/Caches` on macOS, `%LOCALAPPDATA%` on Windows — so it stays
+private to your account, and restic's own default cache is never shared. `--no-restic-cache` turns that
 off, so every restic call runs `--no-cache` instead; a restic cache can reach
 hundreds of megabytes for a large repository. Native reads/writes never use a
-restic cache either way. To prune the cache, point restic at the same
-directory: `restic --cache-dir <that path> cache --cleanup`.
+restic cache either way.
+
+The cache does not grow without bound: every cached call also passes
+`--cleanup-cache`, so restic drops the per-repository subdirectories under
+that directory once they go unused for 30 days — deleting a profile
+eventually reclaims its cache on its own. Only the repository a command is
+actually working on is exempt. To clean it out by hand, point restic at the
+same directory: `restic --cache-dir <that path> cache --cleanup`.
 
 `--no-keychain` disables keychain integration at runtime, even when the
 binary was built with the `keychain` feature. See
