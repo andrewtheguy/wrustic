@@ -69,14 +69,32 @@ fn spnego_accept() -> Vec<u8> {
     der_tlv(0xA1, &der_tlv(0x30, &inner))
 }
 
-/// Locate an NTLMSSP message inside a security blob.
+/// How the client framed its NTLMSSP token — and therefore how the reply must
+/// be framed.
 ///
-/// The blob is SPNEGO, i.e. DER, but writing a DER parser to reach a field we
-/// accept unconditionally would be pure ceremony. The NTLMSSP signature is an
-/// 8-byte magic that cannot appear in the surrounding ASN.1 structure at this
-/// nesting depth, so scanning for it is unambiguous in practice. Returns the
-/// message type and the message body.
-fn find_ntlmssp(blob: &[u8]) -> Option<(u32, &[u8])> {
+/// This is not a detail we get to choose. `smbclient` negotiates SPNEGO and
+/// expects a `NegTokenResp` back; the Linux kernel client with `sec=none` uses
+/// **raw** NTLMSSP and rejects an SPNEGO-wrapped reply outright with
+/// "blob signature incorrect", because it parses the response buffer by
+/// checking for the NTLMSSP magic at offset zero. Mirroring whatever the client
+/// sent satisfies both without having to guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Framing {
+    /// The token is the security buffer, starting at offset zero.
+    Raw,
+    /// The token is wrapped in a SPNEGO NegTokenInit/NegTokenResp.
+    Spnego,
+}
+
+/// Locate an NTLMSSP message inside a security blob, and note how it was
+/// framed.
+///
+/// The SPNEGO case is DER, but writing a DER parser to reach a field we accept
+/// unconditionally would be pure ceremony. The NTLMSSP signature is an 8-byte
+/// magic that cannot appear in the surrounding ASN.1 at this nesting depth, so
+/// scanning for it is unambiguous in practice — and its *position* is exactly
+/// the signal needed to tell the two framings apart.
+fn find_ntlmssp(blob: &[u8]) -> Option<(u32, Framing)> {
     let start = blob
         .windows(NTLMSSP_SIGNATURE.len())
         .position(|w| w == NTLMSSP_SIGNATURE)?;
@@ -85,7 +103,12 @@ fn find_ntlmssp(blob: &[u8]) -> Option<(u32, &[u8])> {
         return None;
     }
     let msg_type = u32::from_le_bytes(msg[8..12].try_into().unwrap());
-    Some((msg_type, msg))
+    let framing = if start == 0 {
+        Framing::Raw
+    } else {
+        Framing::Spnego
+    };
+    Some((msg_type, framing))
 }
 
 /// Build an NTLMSSP CHALLENGE (type 2) message.
@@ -265,7 +288,7 @@ pub(crate) fn session_setup(
         .slice_at(sec_off, sec_len)
         .map_err(|_| status::INVALID_PARAMETER)?;
 
-    let (msg_type, _ntlmssp) = find_ntlmssp(blob).ok_or(status::INVALID_PARAMETER)?;
+    let (msg_type, framing) = find_ntlmssp(blob).ok_or(status::INVALID_PARAMETER)?;
 
     let (resp_status, session_flags, token) = match msg_type {
         NTLMSSP_NEGOTIATE => {
@@ -276,15 +299,21 @@ pub(crate) fn session_setup(
                 state.session_id = u64::from_le_bytes(rand::random::<[u8; 8]>()) | 1;
             }
             let challenge = ntlmssp_challenge(rand::random::<[u8; 8]>());
-            (
-                status::MORE_PROCESSING_REQUIRED,
-                0u16,
-                spnego_challenge(&challenge),
-            )
+            let token = match framing {
+                Framing::Raw => challenge,
+                Framing::Spnego => spnego_challenge(&challenge),
+            };
+            (status::MORE_PROCESSING_REQUIRED, 0u16, token)
         }
         NTLMSSP_AUTHENTICATE => {
             state.authenticated = true;
-            (status::SUCCESS, SESSION_FLAG_IS_GUEST, spnego_accept())
+            let token = match framing {
+                // Raw NTLMSSP has no "accept" message: the exchange ends with
+                // the AUTHENTICATE, and the response carries an empty buffer.
+                Framing::Raw => Vec::new(),
+                Framing::Spnego => spnego_accept(),
+            };
+            (status::SUCCESS, SESSION_FLAG_IS_GUEST, token)
         }
         _ => return Err(status::INVALID_PARAMETER),
     };
@@ -532,12 +561,59 @@ mod tests {
     }
 
     #[test]
-    fn find_ntlmssp_locates_a_token_wrapped_in_spnego() {
+    fn find_ntlmssp_distinguishes_raw_from_spnego_framing() {
         let inner = ntlmssp_message(NTLMSSP_NEGOTIATE);
-        let wrapped = spnego_challenge(&inner);
-        let (ty, found) = find_ntlmssp(&wrapped).unwrap();
+
+        let (ty, framing) = find_ntlmssp(&inner).unwrap();
         assert_eq!(ty, NTLMSSP_NEGOTIATE);
-        assert_eq!(&found[..inner.len()], inner.as_slice());
+        assert_eq!(framing, Framing::Raw, "signature at offset zero is raw");
+
+        let wrapped = spnego_challenge(&inner);
+        let (ty, framing) = find_ntlmssp(&wrapped).unwrap();
+        assert_eq!(ty, NTLMSSP_NEGOTIATE);
+        assert_eq!(framing, Framing::Spnego);
+    }
+
+    /// The Linux kernel client with `sec=none` sends raw NTLMSSP and rejects an
+    /// SPNEGO-wrapped reply with "blob signature incorrect". The reply framing
+    /// must mirror the request's.
+    #[test]
+    fn session_setup_mirrors_raw_ntlmssp_framing() {
+        let mut state = SessionState::default();
+
+        let (body, message) = session_setup_request(&ntlmssp_message(NTLMSSP_NEGOTIATE));
+        let (st, resp) = session_setup(&body, &message, &mut state).unwrap();
+        assert_eq!(st, status::MORE_PROCESSING_REQUIRED);
+
+        let len = u16::from_le_bytes(resp[6..8].try_into().unwrap()) as usize;
+        let token = &resp[8..8 + len];
+        assert_eq!(
+            &token[..NTLMSSP_SIGNATURE.len()],
+            NTLMSSP_SIGNATURE,
+            "a raw request must get a raw CHALLENGE back, not a NegTokenResp"
+        );
+
+        // The final leg carries no token at all under raw framing.
+        let (body, message) = session_setup_request(&ntlmssp_message(NTLMSSP_AUTHENTICATE));
+        let (st, resp) = session_setup(&body, &message, &mut state).unwrap();
+        assert_eq!(st, status::SUCCESS);
+        assert_eq!(u16::from_le_bytes(resp[6..8].try_into().unwrap()), 0);
+        assert_eq!(
+            u16::from_le_bytes(resp[2..4].try_into().unwrap()),
+            SESSION_FLAG_IS_GUEST
+        );
+    }
+
+    #[test]
+    fn session_setup_mirrors_spnego_framing() {
+        let mut state = SessionState::default();
+        let wrapped = spnego_challenge(&ntlmssp_message(NTLMSSP_NEGOTIATE));
+        let (body, message) = session_setup_request(&wrapped);
+        let (_, resp) = session_setup(&body, &message, &mut state).unwrap();
+
+        let len = u16::from_le_bytes(resp[6..8].try_into().unwrap()) as usize;
+        let token = &resp[8..8 + len];
+        assert_eq!(token[0], 0xA1, "SPNEGO request must get a NegTokenResp back");
     }
 
     #[test]

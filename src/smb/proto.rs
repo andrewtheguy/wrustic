@@ -71,7 +71,12 @@ pub(crate) mod status {
     pub(crate) const END_OF_FILE: u32 = 0xC000_0011;
     pub(crate) const MORE_PROCESSING_REQUIRED: u32 = 0xC000_0016;
     pub(crate) const ACCESS_DENIED: u32 = 0xC000_0022;
+    pub(crate) const EAS_NOT_SUPPORTED: u32 = 0xC000_004F;
+    pub(crate) const NO_EAS_ON_FILE: u32 = 0xC000_0052;
+    pub(crate) const OBJECT_NAME_INVALID: u32 = 0xC000_0033;
     pub(crate) const OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+    pub(crate) const OBJECT_NAME_COLLISION: u32 = 0xC000_0035;
+    pub(crate) const UNEXPECTED_IO_ERROR: u32 = 0xC000_00E9;
     pub(crate) const OBJECT_PATH_NOT_FOUND: u32 = 0xC000_003A;
     pub(crate) const OBJECT_PATH_SYNTAX_BAD: u32 = 0xC000_003B;
     pub(crate) const MEDIA_WRITE_PROTECTED: u32 = 0xC000_00A2;

@@ -1,0 +1,1111 @@
+// CREATE, CLOSE, READ, QUERY_DIRECTORY, QUERY_INFO and IOCTL.
+//
+// Read-only is enforced here rather than relied upon from the absence of a
+// write path: a CREATE asking for write access, a create disposition that would
+// modify anything, or FILE_DELETE_ON_CLOSE is refused outright. Downgrading
+// such a request to a read handle would "work" right up until the client tried
+// the write it announced, and fail somewhere far less obvious.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::SystemTime;
+
+use super::backing::{Backing, FileReader, NodeInfo};
+use super::info::{self, file_class, fs_class, info_type};
+use super::path::SmbPath;
+use super::proto::{HEADER_LEN, access, status, to_filetime};
+use super::session::MAX_READ_SIZE;
+use super::wire::{Reader, Writer, from_utf16le};
+
+/// Create dispositions (MS-SMB2 2.2.13).
+mod disposition {
+    pub(super) const SUPERSEDE: u32 = 0;
+    pub(super) const OPEN: u32 = 1;
+    pub(super) const CREATE: u32 = 2;
+    pub(super) const OPEN_IF: u32 = 3;
+    pub(super) const OVERWRITE: u32 = 4;
+    pub(super) const OVERWRITE_IF: u32 = 5;
+}
+
+/// Create options (MS-SMB2 2.2.13).
+mod options {
+    pub(super) const DIRECTORY_FILE: u32 = 0x0000_0001;
+    pub(super) const NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+    pub(super) const DELETE_ON_CLOSE: u32 = 0x0000_1000;
+}
+
+/// QUERY_DIRECTORY flags (MS-SMB2 2.2.33).
+mod query_dir_flags {
+    pub(super) const RESTART_SCANS: u8 = 0x01;
+    pub(super) const RETURN_SINGLE_ENTRY: u8 = 0x02;
+    pub(super) const INDEX_SPECIFIED: u8 = 0x04;
+    pub(super) const REOPEN: u8 = 0x10;
+}
+
+/// CreateAction in a CREATE response. Nothing here ever creates or overwrites,
+/// so an open is the only outcome.
+const FILE_OPENED: u32 = 1;
+
+/// The FileId a compounded request uses to mean "whatever the previous CREATE
+/// in this chain opened" (MS-SMB2 3.2.4.1.4).
+const RELATED_FILE_ID: u64 = u64::MAX;
+
+/// One open handle.
+pub(crate) struct OpenHandle {
+    pub(crate) path: SmbPath,
+    pub(crate) info: NodeInfo,
+    /// Lazily opened: a client frequently opens a file only to stat it, and
+    /// building the blob start-point index costs an index walk.
+    reader: Option<Arc<dyn FileReader>>,
+    /// Directory listing, captured on the first QUERY_DIRECTORY.
+    ///
+    /// A snapshot cannot change under us, so this is a cache rather than a
+    /// consistency device — but SMB directory enumeration is explicitly
+    /// stateful (each call resumes where the last stopped), so the position has
+    /// to live with the handle regardless.
+    dir_entries: Option<Vec<(NodeInfo, u64)>>,
+    dir_pos: usize,
+}
+
+/// Per-connection open handles.
+pub(crate) struct Handles {
+    open: BTreeMap<u64, OpenHandle>,
+    next_id: u64,
+    /// The handle opened by the most recent CREATE, for related compounds.
+    last_created: Option<u64>,
+}
+
+impl Default for Handles {
+    fn default() -> Self {
+        Self {
+            open: BTreeMap::new(),
+            // Start above zero; 0 and u64::MAX are both reserved.
+            next_id: 1,
+            last_created: None,
+        }
+    }
+}
+
+impl Handles {
+    fn insert(&mut self, handle: OpenHandle) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.open.insert(id, handle);
+        self.last_created = Some(id);
+        id
+    }
+
+    fn get_mut(&mut self, id: u64) -> Option<&mut OpenHandle> {
+        let id = self.resolve(id)?;
+        self.open.get_mut(&id)
+    }
+
+    fn get(&self, id: u64) -> Option<&OpenHandle> {
+        self.open.get(&self.resolve(id)?)
+    }
+
+    fn remove(&mut self, id: u64) -> Option<OpenHandle> {
+        let id = self.resolve(id)?;
+        if self.last_created == Some(id) {
+            self.last_created = None;
+        }
+        self.open.remove(&id)
+    }
+
+    /// Map the compound placeholder onto the handle the chain just opened.
+    fn resolve(&self, id: u64) -> Option<u64> {
+        if id == RELATED_FILE_ID {
+            self.last_created
+        } else {
+            Some(id)
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.open.len()
+    }
+}
+
+/// Read a 16-byte SMB2 FileId, returning the volatile half — the only part this
+/// server distinguishes, since handles do not survive a reconnect.
+fn read_file_id(r: &mut Reader<'_>) -> Result<u64, u32> {
+    let persistent = r.u64().map_err(|_| status::INVALID_PARAMETER)?;
+    let volatile = r.u64().map_err(|_| status::INVALID_PARAMETER)?;
+    // Both halves are set to the placeholder in a related compound.
+    if persistent == RELATED_FILE_ID && volatile == RELATED_FILE_ID {
+        return Ok(RELATED_FILE_ID);
+    }
+    Ok(volatile)
+}
+
+fn write_file_id(w: &mut Writer, id: u64) {
+    w.u64(id); // Persistent
+    w.u64(id); // Volatile
+}
+
+/// CREATE (MS-SMB2 2.2.13 request, 2.2.14 response).
+pub(crate) fn create(
+    body: &[u8],
+    message: &[u8],
+    backing: &dyn Backing,
+    handles: &mut Handles,
+) -> Result<Vec<u8>, u32> {
+    let mut r = Reader::new(body);
+    if r.u16().map_err(|_| status::INVALID_PARAMETER)? != 57 {
+        return Err(status::INVALID_PARAMETER);
+    }
+    r.skip(1).map_err(|_| status::INVALID_PARAMETER)?; // SecurityFlags
+    r.skip(1).map_err(|_| status::INVALID_PARAMETER)?; // RequestedOplockLevel
+    r.skip(4).map_err(|_| status::INVALID_PARAMETER)?; // ImpersonationLevel
+    r.skip(8).map_err(|_| status::INVALID_PARAMETER)?; // SmbCreateFlags
+    r.skip(8).map_err(|_| status::INVALID_PARAMETER)?; // Reserved
+    let desired_access = r.u32().map_err(|_| status::INVALID_PARAMETER)?;
+    r.skip(4).map_err(|_| status::INVALID_PARAMETER)?; // FileAttributes
+    r.skip(4).map_err(|_| status::INVALID_PARAMETER)?; // ShareAccess
+    let create_disposition = r.u32().map_err(|_| status::INVALID_PARAMETER)?;
+    let create_options = r.u32().map_err(|_| status::INVALID_PARAMETER)?;
+    let name_off = r.u16().map_err(|_| status::INVALID_PARAMETER)? as usize;
+    let name_len = r.u16().map_err(|_| status::INVALID_PARAMETER)? as usize;
+    // CreateContexts are deliberately not parsed. macOS sends an AAPL context
+    // to negotiate its extensions, and Windows clients send durable-handle and
+    // maximal-access requests; ignoring them all is valid — a server signals
+    // "not supported" by returning no context in the response — and it means an
+    // unfamiliar context can never break an open.
+
+    // Refuse anything that intends to modify. Checked before the path is even
+    // resolved so that a write attempt fails identically whether or not the
+    // target exists, which avoids leaking existence.
+    if desired_access & access::WRITE_BITS != 0 {
+        return Err(status::ACCESS_DENIED);
+    }
+    match create_disposition {
+        disposition::OPEN | disposition::OPEN_IF => {}
+        disposition::SUPERSEDE
+        | disposition::CREATE
+        | disposition::OVERWRITE
+        | disposition::OVERWRITE_IF => return Err(status::MEDIA_WRITE_PROTECTED),
+        _ => return Err(status::INVALID_PARAMETER),
+    }
+    if create_options & options::DELETE_ON_CLOSE != 0 {
+        return Err(status::MEDIA_WRITE_PROTECTED);
+    }
+
+    let msg_reader = Reader::new(message);
+    let raw_name = msg_reader
+        .slice_at(name_off, name_len)
+        .map_err(|_| status::INVALID_PARAMETER)?;
+    let name = from_utf16le(raw_name).map_err(|_| status::OBJECT_PATH_SYNTAX_BAD)?;
+    let path = SmbPath::parse(&name)?;
+
+    let info = backing.stat(&path)?;
+
+    // Honour the caller's stated expectation about what it is opening.
+    if create_options & options::DIRECTORY_FILE != 0 && !info.kind.is_dir() {
+        return Err(status::NOT_A_DIRECTORY);
+    }
+    if create_options & options::NON_DIRECTORY_FILE != 0 && info.kind.is_dir() {
+        return Err(status::FILE_IS_A_DIRECTORY);
+    }
+
+    let file_id = handles.insert(OpenHandle {
+        path,
+        info: info.clone(),
+        reader: None,
+        dir_entries: None,
+        dir_pos: 0,
+    });
+
+    let mut w = Writer::with_capacity(88);
+    w.u16(89); // StructureSize
+    w.u8(0); // OplockLevel — SMB2_OPLOCK_LEVEL_NONE. No leases: the data is
+    // immutable, so there is nothing for a lease to protect against.
+    w.u8(0); // Flags
+    w.u32(FILE_OPENED); // CreateAction
+    w.u64(to_filetime(info.ctime)); // CreationTime
+    w.u64(to_filetime(info.atime)); // LastAccessTime
+    w.u64(to_filetime(info.mtime)); // LastWriteTime
+    w.u64(to_filetime(info.ctime)); // ChangeTime
+    w.u64(info::allocation_size(info.size)); // AllocationSize
+    w.u64(info.size); // EndOfFile
+    w.u32(info::file_attributes(info.kind)); // FileAttributes
+    w.u32(0); // Reserved2
+    write_file_id(&mut w, file_id);
+    w.u32(0); // CreateContextsOffset — none returned
+    w.u32(0); // CreateContextsLength
+    Ok(w.into_vec())
+}
+
+/// CLOSE (MS-SMB2 2.2.15 request, 2.2.16 response).
+pub(crate) fn close(body: &[u8], handles: &mut Handles) -> Result<Vec<u8>, u32> {
+    const POSTQUERY_ATTRIB: u16 = 0x0001;
+
+    let mut r = Reader::new(body);
+    if r.u16().map_err(|_| status::INVALID_PARAMETER)? != 24 {
+        return Err(status::INVALID_PARAMETER);
+    }
+    let flags = r.u16().map_err(|_| status::INVALID_PARAMETER)?;
+    r.skip(4).map_err(|_| status::INVALID_PARAMETER)?; // Reserved
+    let file_id = read_file_id(&mut r)?;
+
+    let handle = handles.remove(file_id).ok_or(status::FILE_CLOSED)?;
+
+    let mut w = Writer::with_capacity(60);
+    w.u16(60); // StructureSize
+    if flags & POSTQUERY_ATTRIB != 0 {
+        // The client asked for the final attributes rather than issuing a
+        // separate QUERY_INFO. Cheap to answer and saves it a round trip.
+        w.u16(POSTQUERY_ATTRIB);
+        w.u32(0); // Reserved
+        w.u64(to_filetime(handle.info.ctime));
+        w.u64(to_filetime(handle.info.atime));
+        w.u64(to_filetime(handle.info.mtime));
+        w.u64(to_filetime(handle.info.ctime));
+        w.u64(info::allocation_size(handle.info.size));
+        w.u64(handle.info.size);
+        w.u32(info::file_attributes(handle.info.kind));
+    } else {
+        w.u16(0); // Flags
+        w.u32(0); // Reserved
+        // Four FILETIMEs, AllocationSize, EndOfFile and FileAttributes: 52
+        // bytes, all left unset because the client did not ask for them.
+        w.zeros(52);
+    }
+    Ok(w.into_vec())
+}
+
+/// READ (MS-SMB2 2.2.19 request, 2.2.20 response).
+pub(crate) fn read(
+    body: &[u8],
+    backing: &dyn Backing,
+    handles: &mut Handles,
+) -> Result<Vec<u8>, u32> {
+    let mut r = Reader::new(body);
+    if r.u16().map_err(|_| status::INVALID_PARAMETER)? != 49 {
+        return Err(status::INVALID_PARAMETER);
+    }
+    r.skip(1).map_err(|_| status::INVALID_PARAMETER)?; // Padding
+    r.skip(1).map_err(|_| status::INVALID_PARAMETER)?; // Flags
+    let length = r.u32().map_err(|_| status::INVALID_PARAMETER)?;
+    let offset = r.u64().map_err(|_| status::INVALID_PARAMETER)?;
+    let file_id = read_file_id(&mut r)?;
+    let minimum_count = r.u32().map_err(|_| status::INVALID_PARAMETER)?;
+
+    // Cap before allocating: Length is client-supplied and we advertised a
+    // maximum in NEGOTIATE, but nothing forces a client to honour it.
+    let length = length.min(MAX_READ_SIZE);
+
+    let handle = handles.get_mut(file_id).ok_or(status::FILE_CLOSED)?;
+    if handle.info.kind.is_dir() {
+        return Err(status::INVALID_DEVICE_REQUEST);
+    }
+
+    // Open on first read rather than at CREATE: many opens never read.
+    if handle.reader.is_none() {
+        handle.reader = Some(backing.open(&handle.path)?);
+    }
+    let reader = handle.reader.as_ref().expect("just opened");
+    let data = reader.read_at(offset, length)?;
+
+    if data.is_empty() {
+        // A zero-length read is end-of-file, not a successful empty read; a
+        // client that got SUCCESS with no data would loop forever.
+        return Err(status::END_OF_FILE);
+    }
+    if (data.len() as u32) < minimum_count {
+        return Err(status::END_OF_FILE);
+    }
+
+    let mut w = Writer::with_capacity(16 + data.len());
+    w.u16(17); // StructureSize
+    w.u8((HEADER_LEN + 16) as u8); // DataOffset, from the SMB2 header
+    w.u8(0); // Reserved
+    w.u32(data.len() as u32); // DataLength
+    w.u32(0); // DataRemaining — unused for a non-channelled read
+    w.u32(0); // Reserved2
+    w.bytes(&data);
+    Ok(w.into_vec())
+}
+
+/// Match a QUERY_DIRECTORY search pattern. Clients almost always send `*`, but
+/// a lookup of a single name by pattern is legal and macOS does it.
+fn pattern_matches(pattern: &str, name: &str) -> bool {
+    if pattern.is_empty() || pattern == "*" || pattern == "*.*" {
+        return true;
+    }
+    glob_match(pattern.as_bytes(), name.as_bytes())
+}
+
+/// Wildcard matcher for `*` and `?`, iterative so a pathological pattern cannot
+/// blow the stack.
+fn glob_match(pattern: &[u8], name: &[u8]) -> bool {
+    let (mut p, mut n) = (0usize, 0usize);
+    let (mut star, mut backtrack) = (usize::MAX, 0usize);
+
+    while n < name.len() {
+        if p < pattern.len() && (pattern[p] == b'?' || eq_ignore_case(pattern[p], name[n])) {
+            p += 1;
+            n += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star = p;
+            backtrack = n;
+            p += 1;
+        } else if star != usize::MAX {
+            p = star + 1;
+            backtrack += 1;
+            n = backtrack;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+    p == pattern.len()
+}
+
+fn eq_ignore_case(a: u8, b: u8) -> bool {
+    a.eq_ignore_ascii_case(&b)
+}
+
+/// QUERY_DIRECTORY (MS-SMB2 2.2.33 request, 2.2.34 response).
+pub(crate) fn query_directory(
+    body: &[u8],
+    message: &[u8],
+    backing: &dyn Backing,
+    handles: &mut Handles,
+    now: SystemTime,
+) -> Result<Vec<u8>, u32> {
+    let mut r = Reader::new(body);
+    if r.u16().map_err(|_| status::INVALID_PARAMETER)? != 33 {
+        return Err(status::INVALID_PARAMETER);
+    }
+    let class = r.u8().map_err(|_| status::INVALID_PARAMETER)?;
+    let flags = r.u8().map_err(|_| status::INVALID_PARAMETER)?;
+    let file_index = r.u32().map_err(|_| status::INVALID_PARAMETER)?;
+    let file_id = read_file_id(&mut r)?;
+    let pattern_off = r.u16().map_err(|_| status::INVALID_PARAMETER)? as usize;
+    let pattern_len = r.u16().map_err(|_| status::INVALID_PARAMETER)? as usize;
+    let output_len = r.u32().map_err(|_| status::INVALID_PARAMETER)? as usize;
+
+    let msg_reader = Reader::new(message);
+    let raw_pattern = msg_reader
+        .slice_at(pattern_off, pattern_len)
+        .map_err(|_| status::INVALID_PARAMETER)?;
+    let pattern = from_utf16le(raw_pattern).map_err(|_| status::OBJECT_NAME_INVALID)?;
+
+    // Resolve and populate before taking a mutable borrow for the cursor.
+    let path = {
+        let handle = handles.get(file_id).ok_or(status::FILE_CLOSED)?;
+        if !handle.info.kind.is_dir() {
+            return Err(status::NOT_A_DIRECTORY);
+        }
+        handle.path.clone()
+    };
+
+    let needs_listing = {
+        let handle = handles.get(file_id).ok_or(status::FILE_CLOSED)?;
+        handle.dir_entries.is_none()
+    };
+    let listing = if needs_listing {
+        let mut entries = Vec::new();
+        // `.` and `..` are expected by enough clients that omitting them causes
+        // odd behaviour in file managers, and they cost nothing to synthesise.
+        entries.push((NodeInfo::synthetic_dir(".", now), path.file_id()));
+        entries.push((NodeInfo::synthetic_dir("..", now), path.file_id()));
+        for info in backing.list(&path)? {
+            let id = path.join(&info.name).file_id();
+            entries.push((info, id));
+        }
+        Some(entries)
+    } else {
+        None
+    };
+
+    let handle = handles.get_mut(file_id).ok_or(status::FILE_CLOSED)?;
+    if let Some(listing) = listing {
+        handle.dir_entries = Some(listing);
+    }
+    if flags & (query_dir_flags::RESTART_SCANS | query_dir_flags::REOPEN) != 0 {
+        handle.dir_pos = 0;
+    }
+    if flags & query_dir_flags::INDEX_SPECIFIED != 0 {
+        handle.dir_pos = file_index as usize;
+    }
+
+    let all = handle.dir_entries.as_ref().expect("populated above");
+    let remaining: Vec<(NodeInfo, u64)> = all
+        .iter()
+        .skip(handle.dir_pos)
+        .filter(|(info, _)| pattern_matches(&pattern, &info.name))
+        .cloned()
+        .collect();
+
+    if remaining.is_empty() {
+        // The spec's way of saying "enumeration complete". Returning an empty
+        // successful buffer instead makes clients retry forever.
+        return Err(status::NO_MORE_FILES);
+    }
+
+    let max_len = output_len.min(MAX_READ_SIZE as usize);
+    let single = flags & query_dir_flags::RETURN_SINGLE_ENTRY != 0;
+    let (buf, consumed) = info::encode_dir_entries(
+        class,
+        &remaining,
+        handle.dir_pos as u32,
+        max_len,
+        single,
+    )?;
+    // Advance by what was actually encoded, so the next call resumes exactly
+    // where this one stopped.
+    handle.dir_pos += consumed;
+
+    let mut w = Writer::with_capacity(8 + buf.len());
+    w.u16(9); // StructureSize
+    w.u16((HEADER_LEN + 8) as u16); // OutputBufferOffset
+    w.u32(buf.len() as u32); // OutputBufferLength
+    w.bytes(&buf);
+    Ok(w.into_vec())
+}
+
+/// QUERY_INFO (MS-SMB2 2.2.37 request, 2.2.38 response).
+pub(crate) fn query_info(
+    body: &[u8],
+    backing: &dyn Backing,
+    handles: &Handles,
+    volume_created: SystemTime,
+    volume_serial: u32,
+) -> Result<Vec<u8>, u32> {
+    let mut r = Reader::new(body);
+    if r.u16().map_err(|_| status::INVALID_PARAMETER)? != 41 {
+        return Err(status::INVALID_PARAMETER);
+    }
+    let ty = r.u8().map_err(|_| status::INVALID_PARAMETER)?;
+    let class = r.u8().map_err(|_| status::INVALID_PARAMETER)?;
+    let output_len = r.u32().map_err(|_| status::INVALID_PARAMETER)? as usize;
+    r.skip(2).map_err(|_| status::INVALID_PARAMETER)?; // InputBufferOffset
+    r.skip(2).map_err(|_| status::INVALID_PARAMETER)?; // Reserved
+    r.skip(4).map_err(|_| status::INVALID_PARAMETER)?; // InputBufferLength
+    r.skip(4).map_err(|_| status::INVALID_PARAMETER)?; // AdditionalInformation
+    r.skip(4).map_err(|_| status::INVALID_PARAMETER)?; // Flags
+    let file_id = read_file_id(&mut r)?;
+
+    let handle = handles.get(file_id).ok_or(status::FILE_CLOSED)?;
+
+    let buf = match ty {
+        info_type::FILE => {
+            // Absolute form: FileNameInformation is share-relative but starts
+            // with a backslash, and the root's name must not be empty.
+            let path = handle.path.to_smb_absolute();
+            let id = handle.path.file_id();
+            match class {
+                file_class::BASIC => info::file_basic(&handle.info),
+                file_class::STANDARD => info::file_standard(&handle.info),
+                file_class::INTERNAL => info::file_internal(id),
+                file_class::EA => info::file_ea(),
+                file_class::ACCESS => info::file_access(access::READ_ONLY),
+                file_class::NAME => info::file_name(&path),
+                file_class::POSITION => info::file_position(),
+                file_class::MODE => info::file_mode(),
+                file_class::ALIGNMENT => info::file_alignment(),
+                file_class::ALL => {
+                    info::file_all(&handle.info, id, access::READ_ONLY, &path)
+                }
+                file_class::STREAM => info::file_stream(&handle.info),
+                file_class::NETWORK_OPEN => info::file_network_open(&handle.info),
+                file_class::ATTRIBUTE_TAG => info::file_attribute_tag(&handle.info),
+                // `ls -l` calls listxattr on every entry, which lands here.
+                // The accurate answer is "this file has none"; it maps to
+                // ENODATA, which callers ignore silently.
+                file_class::FULL_EA => return Err(status::NO_EAS_ON_FILE),
+                // NOT_SUPPORTED, not INVALID_INFO_CLASS. cifs.ko maps the
+                // latter to EIO, so an unimplemented class would surface to the
+                // user as a broken filesystem rather than as a missing optional
+                // feature; NOT_SUPPORTED maps to EOPNOTSUPP, which callers
+                // degrade past.
+                _ => return Err(status::NOT_SUPPORTED),
+            }
+        }
+        info_type::FILESYSTEM => match class {
+            fs_class::VOLUME => {
+                info::fs_volume(backing.label(), volume_created, volume_serial)
+            }
+            fs_class::SIZE => info::fs_size(backing.total_size()),
+            fs_class::FULL_SIZE => info::fs_full_size(backing.total_size()),
+            fs_class::DEVICE => info::fs_device(),
+            fs_class::ATTRIBUTE => info::fs_attribute(),
+            fs_class::SECTOR_SIZE => info::fs_sector_size(),
+            _ => return Err(status::NOT_SUPPORTED),
+        },
+        // No security descriptors and no quotas. Clients treat both as
+        // optional; refusing is cleaner than inventing an ACL that does not
+        // describe anything real.
+        info_type::SECURITY | info_type::QUOTA => return Err(status::NOT_SUPPORTED),
+        _ => return Err(status::INVALID_PARAMETER),
+    };
+
+    if buf.len() > output_len {
+        // The client's buffer is too small. BUFFER_OVERFLOW with the needed
+        // length is how it learns to ask again with more room.
+        return Err(status::BUFFER_OVERFLOW);
+    }
+
+    let mut w = Writer::with_capacity(8 + buf.len());
+    w.u16(9); // StructureSize
+    w.u16((HEADER_LEN + 8) as u16); // OutputBufferOffset
+    w.u32(buf.len() as u32); // OutputBufferLength
+    w.bytes(&buf);
+    Ok(w.into_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // Only the tests name directory classes explicitly; the handler passes the
+    // client's class straight through to the encoder.
+    use crate::smb::backing::test_support::MemBacking;
+    use crate::smb::info::dir_class;
+    use crate::smb::wire::utf16le;
+    use std::time::UNIX_EPOCH;
+
+    fn message(body: &[u8]) -> Vec<u8> {
+        let mut m = vec![0u8; HEADER_LEN];
+        m.extend_from_slice(body);
+        m
+    }
+
+    fn create_body(name: &str, desired: u32, disp: u32, opts: u32) -> Vec<u8> {
+        let encoded = utf16le(name);
+        let mut w = Writer::new();
+        w.u16(57);
+        w.u8(0); // SecurityFlags
+        w.u8(0); // RequestedOplockLevel
+        w.u32(2); // ImpersonationLevel
+        w.u64(0); // SmbCreateFlags
+        w.u64(0); // Reserved
+        w.u32(desired);
+        w.u32(0); // FileAttributes
+        w.u32(7); // ShareAccess
+        w.u32(disp);
+        w.u32(opts);
+        w.u16((HEADER_LEN + 56) as u16); // NameOffset
+        w.u16(encoded.len() as u16);
+        w.u32(0); // CreateContextsOffset
+        w.u32(0); // CreateContextsLength
+        w.bytes(&encoded);
+        w.into_vec()
+    }
+
+    fn open_path(
+        b: &dyn Backing,
+        h: &mut Handles,
+        name: &str,
+    ) -> Result<u64, u32> {
+        let body = create_body(name, access::READ_ONLY, disposition::OPEN, 0);
+        let msg = message(&body);
+        let resp = create(&body, &msg, b, h)?;
+        Ok(u64::from_le_bytes(resp[72..80].try_into().unwrap()))
+    }
+
+    fn backing() -> MemBacking {
+        MemBacking::new()
+            .with_dir("dir")
+            .with_file("dir\\a.txt", b"hello world")
+            .with_file("dir\\b.log", b"xy")
+            .with_file("top.bin", &[0u8; 5000])
+    }
+
+    #[test]
+    fn create_opens_a_file_and_reports_its_size() {
+        let b = backing();
+        let mut h = Handles::default();
+        let body = create_body("top.bin", access::READ_ONLY, disposition::OPEN, 0);
+        let resp = create(&body, &message(&body), &b, &mut h).unwrap();
+
+        assert_eq!(u16::from_le_bytes(resp[0..2].try_into().unwrap()), 89);
+        assert_eq!(resp[2], 0, "no oplock is granted");
+        assert_eq!(u32::from_le_bytes(resp[4..8].try_into().unwrap()), FILE_OPENED);
+        assert_eq!(u64::from_le_bytes(resp[48..56].try_into().unwrap()), 5000);
+        assert_eq!(
+            u64::from_le_bytes(resp[40..48].try_into().unwrap()),
+            info::allocation_size(5000)
+        );
+        assert_eq!(h.len(), 1);
+    }
+
+    #[test]
+    fn create_refuses_every_write_intent() {
+        let b = backing();
+        let mut h = Handles::default();
+
+        // Any write bit in the access mask.
+        for bit in [
+            access::FILE_WRITE_DATA,
+            access::FILE_APPEND_DATA,
+            access::DELETE,
+            access::FILE_WRITE_ATTRIBUTES,
+        ] {
+            let body = create_body("top.bin", access::FILE_READ_DATA | bit, disposition::OPEN, 0);
+            assert_eq!(
+                create(&body, &message(&body), &b, &mut h).unwrap_err(),
+                status::ACCESS_DENIED,
+                "access bit {bit:#x} must be refused"
+            );
+        }
+
+        // Any disposition that would create or truncate.
+        for disp in [
+            disposition::SUPERSEDE,
+            disposition::CREATE,
+            disposition::OVERWRITE,
+            disposition::OVERWRITE_IF,
+        ] {
+            let body = create_body("top.bin", access::READ_ONLY, disp, 0);
+            assert_eq!(
+                create(&body, &message(&body), &b, &mut h).unwrap_err(),
+                status::MEDIA_WRITE_PROTECTED,
+                "disposition {disp} must be refused"
+            );
+        }
+
+        // Delete-on-close.
+        let body = create_body(
+            "top.bin",
+            access::READ_ONLY,
+            disposition::OPEN,
+            options::DELETE_ON_CLOSE,
+        );
+        assert_eq!(
+            create(&body, &message(&body), &b, &mut h).unwrap_err(),
+            status::MEDIA_WRITE_PROTECTED
+        );
+
+        assert_eq!(h.len(), 0, "no handle may leak from a refused create");
+    }
+
+    #[test]
+    fn create_refuses_a_path_that_escapes_the_share() {
+        let b = backing();
+        let mut h = Handles::default();
+        let body = create_body(r"..\..\etc\shadow", access::READ_ONLY, disposition::OPEN, 0);
+        assert_eq!(
+            create(&body, &message(&body), &b, &mut h).unwrap_err(),
+            status::OBJECT_PATH_SYNTAX_BAD
+        );
+    }
+
+    #[test]
+    fn create_honours_the_directory_expectation() {
+        let b = backing();
+        let mut h = Handles::default();
+
+        let body = create_body(
+            "top.bin",
+            access::READ_ONLY,
+            disposition::OPEN,
+            options::DIRECTORY_FILE,
+        );
+        assert_eq!(
+            create(&body, &message(&body), &b, &mut h).unwrap_err(),
+            status::NOT_A_DIRECTORY
+        );
+
+        let body = create_body(
+            "dir",
+            access::READ_ONLY,
+            disposition::OPEN,
+            options::NON_DIRECTORY_FILE,
+        );
+        assert_eq!(
+            create(&body, &message(&body), &b, &mut h).unwrap_err(),
+            status::FILE_IS_A_DIRECTORY
+        );
+    }
+
+    #[test]
+    fn create_reports_a_missing_file() {
+        let b = backing();
+        let mut h = Handles::default();
+        let body = create_body("nope.txt", access::READ_ONLY, disposition::OPEN, 0);
+        assert_eq!(
+            create(&body, &message(&body), &b, &mut h).unwrap_err(),
+            status::OBJECT_NAME_NOT_FOUND
+        );
+    }
+
+    fn read_body(file_id: u64, offset: u64, length: u32) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.u16(49);
+        w.u8(0); // Padding
+        w.u8(0); // Flags
+        w.u32(length);
+        w.u64(offset);
+        write_file_id(&mut w, file_id);
+        w.u32(0); // MinimumCount
+        w.u32(0); // Channel
+        w.u32(0); // RemainingBytes
+        w.u16(0); // ReadChannelInfoOffset
+        w.u16(0); // ReadChannelInfoLength
+        w.into_vec()
+    }
+
+    #[test]
+    fn read_returns_content_at_an_offset() {
+        let b = backing();
+        let mut h = Handles::default();
+        let id = open_path(&b, &mut h, "dir\\a.txt").unwrap();
+
+        let body = read_body(id, 0, 5);
+        let resp = read(&body, &b, &mut h).unwrap();
+        assert_eq!(u16::from_le_bytes(resp[0..2].try_into().unwrap()), 17);
+        assert_eq!(resp[2] as usize, HEADER_LEN + 16, "DataOffset");
+        let len = u32::from_le_bytes(resp[4..8].try_into().unwrap()) as usize;
+        assert_eq!(len, 5);
+        assert_eq!(&resp[16..16 + len], b"hello");
+
+        let body = read_body(id, 6, 100);
+        let resp = read(&body, &b, &mut h).unwrap();
+        let len = u32::from_le_bytes(resp[4..8].try_into().unwrap()) as usize;
+        assert_eq!(&resp[16..16 + len], b"world");
+    }
+
+    #[test]
+    fn read_at_end_of_file_reports_end_of_file() {
+        let b = backing();
+        let mut h = Handles::default();
+        let id = open_path(&b, &mut h, "dir\\a.txt").unwrap();
+        let body = read_body(id, 11, 10);
+        assert_eq!(read(&body, &b, &mut h).unwrap_err(), status::END_OF_FILE);
+    }
+
+    #[test]
+    fn read_on_a_directory_or_closed_handle_is_refused() {
+        let b = backing();
+        let mut h = Handles::default();
+        let dir_id = open_path(&b, &mut h, "dir").unwrap();
+        let body = read_body(dir_id, 0, 10);
+        assert_eq!(
+            read(&body, &b, &mut h).unwrap_err(),
+            status::INVALID_DEVICE_REQUEST
+        );
+
+        let body = read_body(9999, 0, 10);
+        assert_eq!(read(&body, &b, &mut h).unwrap_err(), status::FILE_CLOSED);
+    }
+
+    fn close_body(file_id: u64, flags: u16) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.u16(24);
+        w.u16(flags);
+        w.u32(0);
+        write_file_id(&mut w, file_id);
+        w.into_vec()
+    }
+
+    #[test]
+    fn close_releases_the_handle_and_can_report_attributes() {
+        let b = backing();
+        let mut h = Handles::default();
+        let id = open_path(&b, &mut h, "dir\\a.txt").unwrap();
+        assert_eq!(h.len(), 1);
+
+        let resp = close(&close_body(id, 0x0001), &mut h).unwrap();
+        assert_eq!(u16::from_le_bytes(resp[0..2].try_into().unwrap()), 60);
+        assert_eq!(resp.len(), 60);
+        assert_eq!(u64::from_le_bytes(resp[48..56].try_into().unwrap()), 11);
+        assert_eq!(h.len(), 0);
+
+        assert_eq!(
+            close(&close_body(id, 0), &mut h).unwrap_err(),
+            status::FILE_CLOSED,
+            "double close must be refused"
+        );
+    }
+
+    #[test]
+    fn close_without_postquery_zeroes_the_attribute_block() {
+        let b = backing();
+        let mut h = Handles::default();
+        let id = open_path(&b, &mut h, "dir\\a.txt").unwrap();
+        let resp = close(&close_body(id, 0), &mut h).unwrap();
+        assert_eq!(resp.len(), 60);
+        assert!(resp[8..60].iter().all(|b| *b == 0));
+    }
+
+    fn query_dir_body(
+        file_id: u64,
+        class: u8,
+        flags: u8,
+        pattern: &str,
+        output_len: u32,
+    ) -> Vec<u8> {
+        let encoded = utf16le(pattern);
+        let mut w = Writer::new();
+        w.u16(33);
+        w.u8(class);
+        w.u8(flags);
+        w.u32(0); // FileIndex
+        write_file_id(&mut w, file_id);
+        w.u16((HEADER_LEN + 32) as u16); // FileNameOffset
+        w.u16(encoded.len() as u16);
+        w.u32(output_len);
+        w.bytes(&encoded);
+        w.into_vec()
+    }
+
+    fn listed_names(resp: &[u8]) -> Vec<String> {
+        let buf_len = u32::from_le_bytes(resp[4..8].try_into().unwrap()) as usize;
+        let buf = &resp[8..8 + buf_len];
+        let mut names = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let next = u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap()) as usize;
+            let name_len =
+                u32::from_le_bytes(buf[offset + 60..offset + 64].try_into().unwrap()) as usize;
+            let start = offset + 104;
+            let units: Vec<u16> = buf[start..start + name_len]
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            names.push(String::from_utf16_lossy(&units));
+            if next == 0 {
+                break;
+            }
+            offset += next;
+        }
+        names
+    }
+
+    #[test]
+    fn query_directory_lists_entries_with_dot_and_dotdot() {
+        let b = backing();
+        let mut h = Handles::default();
+        let id = open_path(&b, &mut h, "dir").unwrap();
+
+        let body = query_dir_body(id, dir_class::ID_BOTH_DIRECTORY, 0, "*", 65536);
+        let resp = query_directory(&body, &message(&body), &b, &mut h, UNIX_EPOCH).unwrap();
+        assert_eq!(u16::from_le_bytes(resp[0..2].try_into().unwrap()), 9);
+        assert_eq!(
+            u16::from_le_bytes(resp[2..4].try_into().unwrap()) as usize,
+            HEADER_LEN + 8
+        );
+        assert_eq!(listed_names(&resp), vec![".", "..", "a.txt", "b.log"]);
+
+        // A second call must report exhaustion, not repeat the listing.
+        let body = query_dir_body(id, dir_class::ID_BOTH_DIRECTORY, 0, "*", 65536);
+        assert_eq!(
+            query_directory(&body, &message(&body), &b, &mut h, UNIX_EPOCH).unwrap_err(),
+            status::NO_MORE_FILES
+        );
+    }
+
+    #[test]
+    fn query_directory_resumes_where_it_stopped() {
+        let b = backing();
+        let mut h = Handles::default();
+        let id = open_path(&b, &mut h, "dir").unwrap();
+
+        let mut seen = Vec::new();
+        loop {
+            let body = query_dir_body(
+                id,
+                dir_class::ID_BOTH_DIRECTORY,
+                query_dir_flags::RETURN_SINGLE_ENTRY,
+                "*",
+                65536,
+            );
+            match query_directory(&body, &message(&body), &b, &mut h, UNIX_EPOCH) {
+                Ok(resp) => seen.extend(listed_names(&resp)),
+                Err(status::NO_MORE_FILES) => break,
+                Err(e) => panic!("unexpected status {e:#x}"),
+            }
+            assert!(seen.len() <= 8, "enumeration must terminate");
+        }
+        assert_eq!(seen, vec![".", "..", "a.txt", "b.log"]);
+    }
+
+    #[test]
+    fn restart_scans_rewinds_the_cursor() {
+        let b = backing();
+        let mut h = Handles::default();
+        let id = open_path(&b, &mut h, "dir").unwrap();
+
+        let body = query_dir_body(id, dir_class::ID_BOTH_DIRECTORY, 0, "*", 65536);
+        let first = query_directory(&body, &message(&body), &b, &mut h, UNIX_EPOCH).unwrap();
+
+        let body = query_dir_body(
+            id,
+            dir_class::ID_BOTH_DIRECTORY,
+            query_dir_flags::RESTART_SCANS,
+            "*",
+            65536,
+        );
+        let again = query_directory(&body, &message(&body), &b, &mut h, UNIX_EPOCH).unwrap();
+        assert_eq!(listed_names(&first), listed_names(&again));
+    }
+
+    #[test]
+    fn query_directory_applies_a_search_pattern() {
+        let b = backing();
+        let mut h = Handles::default();
+        let id = open_path(&b, &mut h, "dir").unwrap();
+        let body = query_dir_body(id, dir_class::ID_BOTH_DIRECTORY, 0, "*.txt", 65536);
+        let resp = query_directory(&body, &message(&body), &b, &mut h, UNIX_EPOCH).unwrap();
+        assert_eq!(listed_names(&resp), vec!["a.txt"]);
+    }
+
+    #[test]
+    fn query_directory_on_a_file_is_refused() {
+        let b = backing();
+        let mut h = Handles::default();
+        let id = open_path(&b, &mut h, "top.bin").unwrap();
+        let body = query_dir_body(id, dir_class::ID_BOTH_DIRECTORY, 0, "*", 65536);
+        assert_eq!(
+            query_directory(&body, &message(&body), &b, &mut h, UNIX_EPOCH).unwrap_err(),
+            status::NOT_A_DIRECTORY
+        );
+    }
+
+    #[test]
+    fn glob_matching_handles_the_usual_patterns() {
+        assert!(pattern_matches("*", "anything"));
+        assert!(pattern_matches("", "anything"));
+        assert!(pattern_matches("*.*", "a.txt"));
+        assert!(pattern_matches("*.txt", "a.txt"));
+        assert!(!pattern_matches("*.txt", "a.log"));
+        assert!(pattern_matches("a?c", "abc"));
+        assert!(!pattern_matches("a?c", "abbc"));
+        assert!(pattern_matches("A.TXT", "a.txt"), "SMB matching is case-insensitive");
+        assert!(pattern_matches("*a*b*", "xxayybzz"));
+        assert!(!pattern_matches("*a*b*", "xxbyyazz"));
+        assert!(pattern_matches("exact", "exact"));
+        assert!(!pattern_matches("exact", "exactly"));
+    }
+
+    fn query_info_body(ty: u8, class: u8, file_id: u64, output_len: u32) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.u16(41);
+        w.u8(ty);
+        w.u8(class);
+        w.u32(output_len);
+        w.u16(0); // InputBufferOffset
+        w.u16(0); // Reserved
+        w.u32(0); // InputBufferLength
+        w.u32(0); // AdditionalInformation
+        w.u32(0); // Flags
+        write_file_id(&mut w, file_id);
+        w.into_vec()
+    }
+
+    #[test]
+    fn query_info_answers_the_common_file_classes() {
+        let b = backing();
+        let mut h = Handles::default();
+        let id = open_path(&b, &mut h, "dir\\a.txt").unwrap();
+
+        for (class, want_len) in [
+            (file_class::BASIC, 40),
+            (file_class::STANDARD, 24),
+            (file_class::INTERNAL, 8),
+            (file_class::NETWORK_OPEN, 56),
+            (file_class::ATTRIBUTE_TAG, 8),
+        ] {
+            let body = query_info_body(info_type::FILE, class, id, 4096);
+            let resp = query_info(&body, &b, &h, UNIX_EPOCH, 1).unwrap();
+            let len = u32::from_le_bytes(resp[4..8].try_into().unwrap()) as usize;
+            assert_eq!(len, want_len, "class {class}");
+            assert_eq!(resp.len(), 8 + len);
+        }
+    }
+
+    #[test]
+    fn query_info_answers_the_filesystem_classes() {
+        let b = backing();
+        let mut h = Handles::default();
+        let id = open_path(&b, &mut h, "dir").unwrap();
+        for class in [
+            fs_class::VOLUME,
+            fs_class::SIZE,
+            fs_class::FULL_SIZE,
+            fs_class::DEVICE,
+            fs_class::ATTRIBUTE,
+            fs_class::SECTOR_SIZE,
+        ] {
+            let body = query_info_body(info_type::FILESYSTEM, class, id, 4096);
+            assert!(
+                query_info(&body, &b, &h, UNIX_EPOCH, 1).is_ok(),
+                "fs class {class} must be answered"
+            );
+        }
+    }
+
+    #[test]
+    fn query_info_reports_a_buffer_that_is_too_small() {
+        let b = backing();
+        let mut h = Handles::default();
+        let id = open_path(&b, &mut h, "dir\\a.txt").unwrap();
+        let body = query_info_body(info_type::FILE, file_class::BASIC, id, 8);
+        assert_eq!(
+            query_info(&body, &b, &h, UNIX_EPOCH, 1).unwrap_err(),
+            status::BUFFER_OVERFLOW
+        );
+    }
+
+    #[test]
+    fn query_info_refuses_security_and_unknown_classes() {
+        let b = backing();
+        let mut h = Handles::default();
+        let id = open_path(&b, &mut h, "dir\\a.txt").unwrap();
+
+        let body = query_info_body(info_type::SECURITY, 0, id, 4096);
+        assert_eq!(
+            query_info(&body, &b, &h, UNIX_EPOCH, 1).unwrap_err(),
+            status::NOT_SUPPORTED
+        );
+
+        // NOT_SUPPORTED rather than INVALID_INFO_CLASS: the latter is EIO on
+        // the Linux client, which presents an unimplemented optional class as a
+        // broken filesystem.
+        let body = query_info_body(info_type::FILE, 200, id, 4096);
+        assert_eq!(
+            query_info(&body, &b, &h, UNIX_EPOCH, 1).unwrap_err(),
+            status::NOT_SUPPORTED
+        );
+
+        // Extended attributes are probed by `ls -l` on every entry.
+        let body = query_info_body(info_type::FILE, file_class::FULL_EA, id, 4096);
+        assert_eq!(
+            query_info(&body, &b, &h, UNIX_EPOCH, 1).unwrap_err(),
+            status::NO_EAS_ON_FILE
+        );
+    }
+
+    #[test]
+    fn a_related_compound_file_id_resolves_to_the_last_create() {
+        let b = backing();
+        let mut h = Handles::default();
+        let real_id = open_path(&b, &mut h, "dir\\a.txt").unwrap();
+
+        // The placeholder must reach the same handle.
+        let body = read_body(RELATED_FILE_ID, 0, 5);
+        let resp = read(&body, &b, &mut h).unwrap();
+        let len = u32::from_le_bytes(resp[4..8].try_into().unwrap()) as usize;
+        assert_eq!(&resp[16..16 + len], b"hello");
+
+        // And once that handle is closed, it resolves to nothing.
+        close(&close_body(real_id, 0), &mut h).unwrap();
+        let body = read_body(RELATED_FILE_ID, 0, 5);
+        assert_eq!(read(&body, &b, &mut h).unwrap_err(), status::FILE_CLOSED);
+    }
+
+    #[test]
+    fn handles_are_distinct_across_opens_of_one_path() {
+        let b = backing();
+        let mut h = Handles::default();
+        let a = open_path(&b, &mut h, "dir\\a.txt").unwrap();
+        let c = open_path(&b, &mut h, "dir\\a.txt").unwrap();
+        assert_ne!(a, c, "each open gets its own handle");
+        assert_eq!(h.len(), 2);
+        close(&close_body(a, 0), &mut h).unwrap();
+        assert_eq!(h.len(), 1, "closing one must not close the other");
+    }
+}

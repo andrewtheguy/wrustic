@@ -23,6 +23,10 @@
 // once the module is reachable, and take seriously whatever it then reports.
 #![allow(dead_code)]
 
+mod backing;
+mod files;
+mod info;
+mod path;
 mod proto;
 mod session;
 mod wire;
@@ -37,7 +41,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
+use crate::config::Profile;
 use crate::local_server;
+use crate::repo::open_indexed_full;
+use backing::{Backing, SnapshotBacking};
+use files::Handles;
 use proto::{HEADER_LEN, Header, NEXT_COMMAND_OFFSET, cmd, status, write_error_body};
 use session::{SessionState, TreeKind};
 use wire::{MAX_INBOUND_MESSAGE, NBSS_HEADER_LEN, Reader, Writer, nbss_header, nbss_len};
@@ -54,6 +62,13 @@ pub(crate) const DEFAULT_SHARE_NAME: &str = "snap";
 /// Immutable per-server state shared by every connection.
 struct Ctx {
     share_name: String,
+    /// What the share serves. Shared across connections; a snapshot is
+    /// immutable, so concurrent readers need no coordination beyond this Arc.
+    backing: Arc<dyn Backing>,
+    /// Reported as the volume serial number. Clients key their metadata caches
+    /// on it, so it must be stable for the server's lifetime and differ between
+    /// servers.
+    volume_serial: u32,
     /// Identifies this server instance in NEGOTIATE. Random per start, as the
     /// spec requires it be stable for a server's lifetime and distinct between
     /// servers.
@@ -95,7 +110,11 @@ impl Drop for SmbHandle {
 /// Start the server on `port` (0 picks an ephemeral one), bound to loopback
 /// only. Binding happens synchronously so that a port conflict is reported to
 /// the caller rather than swallowed by the server thread.
-pub(crate) fn start(port: u16, share_name: impl Into<String>) -> Result<SmbHandle> {
+pub(crate) fn start(
+    port: u16,
+    share_name: impl Into<String>,
+    backing: Arc<dyn Backing>,
+) -> Result<SmbHandle> {
     let listeners_std = local_server::bind_localhost(port)?;
     let bound_port = listeners_std
         .first()
@@ -107,6 +126,8 @@ pub(crate) fn start(port: u16, share_name: impl Into<String>) -> Result<SmbHandl
     let share_name = share_name.into();
     let ctx = Arc::new(Ctx {
         share_name: share_name.clone(),
+        backing,
+        volume_serial: rand::random::<u32>(),
         server_guid: rand::random::<[u8; 16]>(),
         boot_time: SystemTime::now(),
     });
@@ -116,7 +137,12 @@ pub(crate) fn start(port: u16, share_name: impl Into<String>) -> Result<SmbHandl
     let join = thread::Builder::new()
         .name(format!("wrustic-smb-{bound_port}"))
         .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
+            // Multi-thread rather than current-thread: repository reads are
+            // blocking, and `block_in_place` (below) requires a runtime that can
+            // hand the reactor to another worker while one is stalled on a
+            // backend fetch.
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
                 .enable_io()
                 .enable_time()
                 .build()
@@ -136,6 +162,33 @@ pub(crate) fn start(port: u16, share_name: impl Into<String>) -> Result<SmbHandl
         shutdown_tx: Some(shutdown_tx),
         join_handle: Some(join),
     })
+}
+
+/// Serve one snapshot from `profile`'s repository.
+///
+/// The repository is opened synchronously, before the listener thread starts,
+/// so a bad passphrase or an unreachable backend is reported to the caller
+/// rather than surfacing later as a mount that connects and then fails.
+pub(crate) fn start_snapshot_share(
+    port: u16,
+    profile: &Profile,
+    snapshot_id: &str,
+) -> Result<SmbHandle> {
+    let repo = Arc::new(open_indexed_full(profile)?);
+    let snap = repo
+        .get_snapshot_from_str(snapshot_id, |_| true)
+        .map_err(|e| anyhow!("looking up snapshot `{snapshot_id}`: {e}"))?;
+
+    // Label the volume with the short snapshot id, so a client that has several
+    // of these mounted can tell them apart.
+    let hex = snap.id.to_hex();
+    let label = format!("snap-{}", &hex.as_str()[..8.min(hex.as_str().len())]);
+    // restic records the snapshot's byte count at backup time; using it avoids
+    // a recursive walk and is exact.
+    let total_size = snap.summary.as_ref().map(|s| s.total_bytes_processed);
+    let backing = SnapshotBacking::new(repo, snap.tree, label, total_size)?;
+
+    start(port, DEFAULT_SHARE_NAME, Arc::new(backing))
 }
 
 async fn accept_loop(
@@ -188,7 +241,13 @@ async fn serve_connection(mut stream: tokio::net::TcpStream, ctx: Arc<Ctx>) {
         if stream.read_exact(&mut msg).await.is_err() {
             return;
         }
-        let Some(resp) = conn.handle_message(&msg) else {
+        // The file handlers call into the repository, which blocks — on a cache
+        // miss that is an S3 round trip. `block_in_place` moves the reactor to
+        // another worker for the duration instead of stalling every other
+        // connection on this one. It is applied here, at the single call site,
+        // rather than inside the handlers, so the protocol code stays sync and
+        // directly unit-testable without a runtime.
+        let Some(resp) = tokio::task::block_in_place(|| conn.handle_message(&msg)) else {
             // Unparseable, or an SMB1 negotiate. Dropping the connection is the
             // correct answer: clients retry as SMB2.
             return;
@@ -246,6 +305,9 @@ impl Reply {
 struct Conn {
     ctx: Arc<Ctx>,
     state: SessionState,
+    /// Open handles are per-connection: SMB2 file ids are scoped to the
+    /// connection that created them and do not survive a reconnect.
+    handles: Handles,
 }
 
 impl Conn {
@@ -253,6 +315,7 @@ impl Conn {
         Self {
             ctx,
             state: SessionState::default(),
+            handles: Handles::default(),
         }
     }
 
@@ -401,22 +464,63 @@ impl Conn {
             // than from a confusing failure further along.
             cmd::WRITE | cmd::SET_INFO | cmd::FLUSH => Err(status::MEDIA_WRITE_PROTECTED),
 
-            // Milestone 2 and 3. Until then a mount will get this far and then
-            // fail cleanly on the first CREATE rather than hanging.
+            // File commands. All of them need the disk tree: reaching them
+            // through IPC$, or through a tree id that was never connected, is
+            // refused before any path is resolved.
             cmd::CREATE
             | cmd::CLOSE
             | cmd::READ
             | cmd::QUERY_DIRECTORY
-            | cmd::QUERY_INFO
-            | cmd::IOCTL
-            | cmd::LOCK
-            | cmd::CHANGE_NOTIFY
-            | cmd::OPLOCK_BREAK => Err(status::NOT_SUPPORTED),
+            | cmd::QUERY_INFO => match self.tree_kind(hdr.tree_id) {
+                Some(TreeKind::Disk) => self.file_command(hdr, body, message),
+                Some(TreeKind::Ipc) => Err(status::NOT_SUPPORTED),
+                None => Err(status::NETWORK_NAME_DELETED),
+            },
+
+            // IOCTL is refused wholesale. macOS probes FSCTL_DFS_GET_REFERRALS
+            // and a couple of others during mount; NOT_SUPPORTED is the answer
+            // that makes a client move on, and never implementing one keeps the
+            // FSCTL surface at zero.
+            cmd::IOCTL => Err(status::NOT_SUPPORTED),
+
+            // Byte-range locks on immutable data protect nothing, and there is
+            // nothing to notify about in a snapshot that cannot change.
+            cmd::LOCK | cmd::CHANGE_NOTIFY | cmd::OPLOCK_BREAK => Err(status::NOT_SUPPORTED),
 
             _ => Err(status::NOT_SUPPORTED),
         };
 
         Some(result)
+    }
+
+    /// Dispatch to the file handlers. Split out so the tree check above stays
+    /// legible and so every one of these shares a single entry point.
+    fn file_command(&mut self, hdr: &Header, body: &[u8], message: &[u8]) -> Result<Reply, u32> {
+        let backing = self.ctx.backing.as_ref();
+        match hdr.command {
+            cmd::CREATE => {
+                files::create(body, message, backing, &mut self.handles).map(Reply::ok)
+            }
+            cmd::CLOSE => files::close(body, &mut self.handles).map(Reply::ok),
+            cmd::READ => files::read(body, backing, &mut self.handles).map(Reply::ok),
+            cmd::QUERY_DIRECTORY => files::query_directory(
+                body,
+                message,
+                backing,
+                &mut self.handles,
+                self.ctx.boot_time,
+            )
+            .map(Reply::ok),
+            cmd::QUERY_INFO => files::query_info(
+                body,
+                backing,
+                &self.handles,
+                self.ctx.boot_time,
+                self.ctx.volume_serial,
+            )
+            .map(Reply::ok),
+            _ => Err(status::NOT_SUPPORTED),
+        }
     }
 
     fn tree_kind(&self, tree_id: u32) -> Option<TreeKind> {
@@ -439,11 +543,25 @@ fn grant_credits(hdr: &Header) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use backing::test_support::MemBacking;
     use wire::utf16le;
+
+    /// A small tree the end-to-end tests can list and read.
+    fn test_backing() -> Arc<dyn Backing> {
+        Arc::new(
+            MemBacking::new()
+                .with_dir("docs")
+                .with_file("docs\\readme.txt", b"hello from a snapshot\n")
+                .with_file("docs\\notes.md", b"# notes\n")
+                .with_file("data.bin", &[0xAB; 9000]),
+        )
+    }
 
     fn ctx() -> Arc<Ctx> {
         Arc::new(Ctx {
             share_name: DEFAULT_SHARE_NAME.to_string(),
+            backing: test_backing(),
+            volume_serial: 0x1234_5678,
             server_guid: [7u8; 16],
             boot_time: SystemTime::UNIX_EPOCH,
         })
@@ -760,7 +878,7 @@ mod tests {
 
     #[test]
     fn server_starts_on_an_ephemeral_port_and_stops() {
-        let handle = start(0, DEFAULT_SHARE_NAME).expect("server starts");
+        let handle = start(0, DEFAULT_SHARE_NAME, test_backing()).expect("server starts");
         assert_ne!(handle.port, 0);
         assert_eq!(handle.unc(), r"\\127.0.0.1\snap");
         handle.stop();
@@ -781,7 +899,7 @@ mod tests {
             return;
         }
 
-        let handle = start(0, DEFAULT_SHARE_NAME).expect("server starts");
+        let handle = start(0, DEFAULT_SHARE_NAME, test_backing()).expect("server starts");
         let target = format!("//127.0.0.1/{}", handle.share_name);
 
         let out = Command::new("smbclient")
@@ -804,5 +922,163 @@ mod tests {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr),
         );
+    }
+
+    /// Run one smbclient command against a fresh server, returning its stdout.
+    /// Returns None when smbclient is not installed.
+    fn smbclient(command: &str) -> Option<String> {
+        use std::process::Command;
+
+        if Command::new("smbclient").arg("--version").output().is_err() {
+            eprintln!("skipping: smbclient is not installed");
+            return None;
+        }
+
+        let handle = start(0, DEFAULT_SHARE_NAME, test_backing()).expect("server starts");
+        let target = format!("//127.0.0.1/{}", handle.share_name);
+        let out = Command::new("smbclient")
+            .arg(&target)
+            .args(["-p", &handle.port.to_string()])
+            .arg("-N")
+            .arg("--option=client min protocol=SMB2_10")
+            .arg("--option=client max protocol=SMB2_10")
+            .args(["-c", command])
+            .output()
+            .expect("smbclient runs");
+        handle.stop();
+
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(
+            out.status.success(),
+            "smbclient `{command}` failed\nstdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&out.stderr),
+        );
+        Some(stdout)
+    }
+
+    /// Hold a server open on a fixed port so an external client can be pointed
+    /// at it. Run with: cargo test --all-features smb_manual_server -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn smb_manual_server() {
+        let port: u16 = std::env::var("WRUSTIC_SMB_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4455);
+        let handle = start(port, DEFAULT_SHARE_NAME, test_backing()).expect("server starts");
+        eprintln!("serving \\\\127.0.0.1\\snap on port {}", handle.port);
+        std::thread::sleep(std::time::Duration::from_secs(120));
+        handle.stop();
+    }
+
+    /// Serve a real restic snapshot, for validating the `SnapshotBacking` path
+    /// against a live client. Driven by environment variables so it needs no
+    /// wrustic config:
+    ///
+    ///   WRUSTIC_SMB_REPO=<path> WRUSTIC_SMB_PASSWORD=<pw> WRUSTIC_SMB_SNAPSHOT=<id> \
+    ///     cargo test --all-features smb_manual_snapshot -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn smb_manual_snapshot() {
+        let repo = std::env::var("WRUSTIC_SMB_REPO").expect("WRUSTIC_SMB_REPO");
+        let password = std::env::var("WRUSTIC_SMB_PASSWORD").expect("WRUSTIC_SMB_PASSWORD");
+        let snapshot = std::env::var("WRUSTIC_SMB_SNAPSHOT").expect("WRUSTIC_SMB_SNAPSHOT");
+        let port: u16 = std::env::var("WRUSTIC_SMB_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4456);
+
+        let profile = Profile::Local {
+            password,
+            local_path: repo,
+        };
+        let handle =
+            start_snapshot_share(port, &profile, &snapshot).expect("snapshot share starts");
+        eprintln!("serving snapshot {snapshot} on port {}", handle.port);
+        std::thread::sleep(std::time::Duration::from_secs(120));
+        handle.stop();
+    }
+
+    #[test]
+    fn smbclient_lists_the_share_root() {
+        let Some(out) = smbclient("ls") else { return };
+        assert!(out.contains("docs"), "missing directory in listing:\n{out}");
+        assert!(out.contains("data.bin"), "missing file in listing:\n{out}");
+        // The size column must reflect the real file size.
+        assert!(out.contains("9000"), "wrong size reported:\n{out}");
+    }
+
+    #[test]
+    fn smbclient_lists_a_subdirectory() {
+        let Some(out) = smbclient("cd docs; ls") else {
+            return;
+        };
+        assert!(out.contains("readme.txt"), "missing entry:\n{out}");
+        assert!(out.contains("notes.md"), "missing entry:\n{out}");
+    }
+
+    #[test]
+    fn smbclient_reads_file_content() {
+        let dir = tempdir_path("smb-read");
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let dest = dir.join("readme.txt");
+        let Some(_) = smbclient(&format!(
+            "get docs\\readme.txt {}",
+            dest.display()
+        )) else {
+            return;
+        };
+        let got = std::fs::read(&dest).expect("downloaded file exists");
+        assert_eq!(
+            got, b"hello from a snapshot\n",
+            "content read over SMB must match the source"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn smbclient_refuses_to_write() {
+        use std::process::Command;
+
+        if Command::new("smbclient").arg("--version").output().is_err() {
+            return;
+        }
+        let handle = start(0, DEFAULT_SHARE_NAME, test_backing()).expect("server starts");
+        let target = format!("//127.0.0.1/{}", handle.share_name);
+
+        let src = tempdir_path("smb-write");
+        std::fs::create_dir_all(&src).expect("scratch dir");
+        let file = src.join("payload.txt");
+        std::fs::write(&file, b"should not land").expect("write scratch file");
+
+        let out = Command::new("smbclient")
+            .arg(&target)
+            .args(["-p", &handle.port.to_string()])
+            .arg("-N")
+            .arg("--option=client min protocol=SMB2_10")
+            .arg("--option=client max protocol=SMB2_10")
+            .args(["-c", &format!("put {} payload.txt", file.display())])
+            .output()
+            .expect("smbclient runs");
+        handle.stop();
+        let _ = std::fs::remove_dir_all(&src);
+
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            combined.contains("NT_STATUS_MEDIA_WRITE_PROTECTED")
+                || combined.contains("NT_STATUS_ACCESS_DENIED"),
+            "a write must be refused with a read-only status, got:\n{combined}"
+        );
+    }
+
+    fn tempdir_path(tag: &str) -> std::path::PathBuf {
+        // Per the project convention, scratch data lives under tmp/.
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tmp")
+            .join(format!("{tag}-{}", std::process::id()))
     }
 }
