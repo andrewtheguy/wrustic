@@ -21,8 +21,9 @@ screen). Everything else wrustic does at runtime is native:
 Prune-class operations stay on the restic CLI indefinitely (locking.md
 Tier 3), and the prune flow runs `restic prune` through the secure spawn
 harness (`restic::run_unsticking_locks`: password piped over stdin,
-credentials over env vars, secrets never on argv, `--no-cache` unless the
-user passed `--restic-cache`). Before spawning, the harness evaluates the
+credentials over env vars, secrets never on argv, `--cache-dir <per-user
+path private to wrustic>` unless the user passed `--no-restic-cache`, which
+switches it to `--no-cache`). Before spawning, the harness evaluates the
 repo's lock files natively and runs `restic unlock` if a stale lock would
 block the exclusive acquisition. restic ≥ 0.19 must be on PATH for this
 one action; every other feature works without it. restic 0.19 has no JSON

@@ -180,10 +180,10 @@ whose launch semantics mirror resterm's:
   stdin (`--password-file /dev/stdin`) and passes the repo URL and cloud
   credentials via env vars, so secrets never appear on argv; inherited
   `RESTIC_PASSWORD*` variables are scrubbed from the child environment.
-- Every call carries `--no-cache` unless the user opted in with the
-  `--restic-cache` CLI flag, which points restic at a per-user directory
-  private to wrustic (`~/.cache/wrustic`) — restic's default shared cache
-  is never used.
+- Every call carries `--cache-dir` pointed at a per-user directory private
+  to wrustic (`~/.cache/wrustic`), unless the user opted out with the
+  `--no-restic-cache` CLI flag, which passes `--no-cache` instead —
+  restic's default shared cache is never used.
 - restic checks the repository lock before any of these commands run, so
   a leftover (crashed-holder) lock blocks them with "repository is
   already locked". wrustic speaks the lock protocol natively, so
