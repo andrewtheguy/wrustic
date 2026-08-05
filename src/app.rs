@@ -315,6 +315,11 @@ pub(crate) struct App {
     pub(crate) smb_snapshot_id: Option<String>,
     pub(crate) smb_password: Option<String>,
     pub(crate) smb_error: Option<String>,
+    // The Unlocking screen serves two flows (snapshot delete and the SMB
+    // share). True when it was entered from the SMB screen, so the main loop
+    // routes the outcome back there (retry the share on success, inline error
+    // on failure) instead of into the delete flow. Consumed by the main loop.
+    pub(crate) unlock_from_smb: bool,
 
     // Whether the `?` key overlay is showing. Screen-relative: it renders the
     // key list for whatever screen is underneath.
@@ -468,6 +473,7 @@ impl App {
             smb_snapshot_id: None,
             smb_password: None,
             smb_error: None,
+            unlock_from_smb: false,
             help_overlay: false,
             error_is_fatal: false,
             quit: false,
@@ -1259,6 +1265,33 @@ impl App {
         self.smb_error = None;
     }
 
+    // Enforces restic's refreshability rule while the share screen is up: a
+    // repo lock that went 22.5 minutes without a successful refresh may be
+    // removed as stale by any other process, after which a prune could delete
+    // data a mounted client is reading. Stopping the server is the only safe
+    // answer. Called by the main loop's once-a-second wakeup on the SMB
+    // screen.
+    pub(crate) fn poll_smb_lock(&mut self) {
+        if !self
+            .smb_handle
+            .as_ref()
+            .is_some_and(smb::SmbHandle::lock_poisoned)
+        {
+            return;
+        }
+        if let Some(h) = self.smb_handle.take() {
+            h.stop();
+        }
+        self.smb_password = None;
+        self.smb_error = Some(
+            "Server stopped: the repository lock could not be refreshed for over 22 \
+             minutes (backend unreachable?), so other restic processes may treat it \
+             as stale and remove it. Press Esc and share again once the repository \
+             is reachable."
+                .into(),
+        );
+    }
+
     // Start the SMB server for `smb_snapshot_id`. Called from the main loop
     // once the "starting" screen has been drawn, because opening the repository
     // reads the full index — seconds on a large remote repository — and doing
@@ -1953,6 +1986,21 @@ impl App {
                 KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('q') => {
                     self.stop_smb_share();
                     self.screen = Screen::Snapshots;
+                }
+                // Offered only when starting failed on a lock conflict (the
+                // share's non-exclusive lock is blocked by an exclusive one).
+                // Mirrors the delete flow's `u`: remove stale locks natively,
+                // then retry; a live lock survives and fails the retry with
+                // the holder's details.
+                KeyCode::Char('u') | KeyCode::Char('U')
+                    if self.smb_handle.is_none()
+                        && self
+                            .smb_error
+                            .as_deref()
+                            .is_some_and(crate::lock::is_lock_error) =>
+                {
+                    self.unlock_from_smb = true;
+                    self.screen = Screen::Unlocking;
                 }
                 _ => {}
             },
@@ -2656,6 +2704,44 @@ mod tests {
         assert!(app.smb_snapshot_id.is_none());
         assert!(app.smb_password.is_none(), "the password must not outlive the server");
         assert!(app.smb_error.is_none());
+    }
+
+    #[test]
+    fn u_on_an_smb_lock_error_enters_the_unlock_flow() {
+        let mut app = boot_app_with_snapshots(vec![row_with_id("aaa")]);
+        app.screen = Screen::SnapshotSmb;
+        app.smb_snapshot_id = Some("aaa".into());
+        app.smb_error = Some(
+            "unable to create lock in backend: repository is already locked \
+             exclusively by PID 1 on host by someone"
+                .into(),
+        );
+
+        press(&mut app, KeyCode::Char('u'));
+
+        assert!(matches!(app.screen, Screen::Unlocking));
+        assert!(app.unlock_from_smb, "the main loop must route the outcome back to the SMB flow");
+        assert_eq!(
+            app.smb_snapshot_id.as_deref(),
+            Some("aaa"),
+            "the retry after unlocking needs its target"
+        );
+    }
+
+    #[test]
+    fn u_on_a_non_lock_smb_error_does_nothing() {
+        let mut app = boot_app_with_snapshots(vec![row_with_id("aaa")]);
+        app.screen = Screen::SnapshotSmb;
+        app.smb_snapshot_id = Some("aaa".into());
+        app.smb_error = Some("binding 127.0.0.1:445: address already in use".into());
+
+        press(&mut app, KeyCode::Char('u'));
+
+        assert!(
+            matches!(app.screen, Screen::SnapshotSmb),
+            "unlocking cannot fix a port clash, so `u` must not be wired"
+        );
+        assert!(!app.unlock_from_smb);
     }
 
     #[test]

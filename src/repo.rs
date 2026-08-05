@@ -198,6 +198,26 @@ pub(crate) fn open_indexed_full(profile: &Profile) -> Result<Repository<IndexedF
     Ok(repo)
 }
 
+/// Like [`open_indexed_full`], but holding restic's non-exclusive lock — the
+/// lock `restic mount` takes. Acquired between opening (which yields the
+/// master key the lock file is encrypted with) and loading the index, in that
+/// order so the index can never reference packs a concurrent prune already
+/// deleted: once our lock is on the backend, no exclusive operation can
+/// start, and one that was running would have blocked the acquisition.
+/// The lock refreshes itself every 5 minutes for as long as the caller
+/// holds it.
+pub(crate) fn open_indexed_full_shared_lock(
+    profile: &Profile,
+) -> Result<(Repository<IndexedFullStatus>, lock::RepoLock)> {
+    let backends = build_backends(profile)?;
+    let repo = Repository::new(&RepositoryOptions::default(), &backends)?
+        .open(&Credentials::password(profile.password()))?;
+    let crypto = lock::RepoCrypto::from_repo(&repo)?;
+    let repo_lock = lock::RepoLock::acquire_shared(lock::backend_for_profile(profile)?, crypto)?;
+    let repo = repo.to_indexed()?;
+    Ok((repo, repo_lock))
+}
+
 // Stream one file's content blob-by-blob into `tx`. Looks up the node by name
 // inside the tree at `tree_id`. Each call to `Repository::dump` writes one
 // blob at a time via `write_all`; our writer wraps each call in a single mpsc

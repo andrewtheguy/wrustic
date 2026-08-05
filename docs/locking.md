@@ -108,7 +108,9 @@ safety rationale behind that split.)
 Restic's own table above *is* the safety map. Tiered by lock type, with
 each operation's implementation status (see Phases below for the history).
 Implemented today: **forget / delete snapshots** (`repo::delete_snapshot`,
-the TUI delete flow) and — outside these tables because it takes no lock —
+the TUI delete flow), the **snapshot SMB share** (a long-running *read*
+under the same non-exclusive lock `restic mount` takes — see "Long-running
+reads" below), and — outside these tables because it takes no lock —
 **unlock** (`repo::unlock`, native stale-lock removal behind the TUI's `u`
 shortcut, plus the pre-spawn unstick in `restic::run_unsticking_locks`).
 
@@ -131,6 +133,32 @@ shortcut, plus the pre-spawn unstick in `restic::run_unsticking_locks`).
 These have tiny critical sections (seconds); a concurrent restic command
 gets the ordinary "repository is already locked" error it is designed to
 handle.
+
+**Long-running reads — non-exclusive lock (implemented):** the snapshot
+SMB share (`smb::start_snapshot_share`). Reads take no lock in wrustic's
+other flows because they are short and restic tolerates concurrent
+readers, but a share can stay mounted for hours, and "snapshots are
+immutable" only holds while nothing prunes — so the share does what
+`restic mount` does (`cmd_mount.go` → `openWithReadLock`): it holds a
+non-exclusive lock for its lifetime, refreshed every 5 minutes. The
+acquisition order in `repo::open_indexed_full_shared_lock` is open →
+lock → load index, restic's order, so the served index can never
+reference packs a concurrent prune deleted. Concurrent backups coexist;
+prune/forget get "repository is already locked" until the share screen
+closes. rustic's own webdav/mount is lock-free (rustic_core cannot even
+address `locks/`) and was deliberately not followed here — lock-free
+serving is exactly what breaks coexistence with restic.
+
+Because this is wrustic's first *long-running* lock, it also implements
+restic's refreshability-abort rule (`refreshabilityTimeout`,
+`internal/repository/lock.go`): if the lock has not been successfully
+refreshed for 22.5 min (StaleLockTimeout − 1.5 × refresh interval),
+`RepoLock::poisoned()` latches true — other processes are about to judge
+the lock stale and may remove it — and the TUI (which polls once a second
+while the share screen is up) stops the SMB server rather than serve
+unlocked. Poisoning is a latch: a refresh that succeeds after the timeout
+was observed does not resurrect trust, since an unlock + prune may have
+happened in the gap.
 
 **Tier 3 — stays on the restic CLI indefinitely:** prune, repair index,
 migrate. Technically possible under an exclusive lock, but rustic_core's
@@ -189,8 +217,9 @@ A `RepoLock` guard type that mirrors restic exactly:
    lock and return a typed `AlreadyLocked` error carrying the holder's
    hostname/PID/age
 2. background refresh every 5 min (write new file, delete old); if
-   refresh has not succeeded for 22.5 min, mark the lock poisoned so the
-   owning operation aborts
+   refresh has not succeeded for 22.5 min, `poisoned()` latches true so
+   the owning operation aborts (implemented; the SMB share is its first
+   consumer)
 3. `Drop` deletes the lock file (best effort) and restores SIGHUP
    disposition
 4. staleness evaluation (30 min age, or same-host + dead PID via
@@ -244,12 +273,22 @@ A `RepoLock` guard type that mirrors restic exactly:
    flows — and re-check; a live lock fails the re-check and its holder
    details are surfaced without spawning restic. restic's own in-process
    check at startup remains the authoritative gate against races.
-3. **Native backup** under a non-exclusive lock (the headline win:
+3. **SMB share under a non-exclusive lock** — DONE. The snapshot SMB
+   server holds the lock `restic mount` takes for as long as the share
+   runs (see "Long-running reads" above). This brought the
+   refreshability-abort rule with it: `RepoLock::poisoned()` implements
+   restic's 22.5-minute cutoff, the main loop polls it once a second on
+   the share screen and tears the server down when it trips. Verified
+   live against restic 0.19.1: `restic forget` is blocked by the share's
+   lock with the ordinary "already locked" message naming our PID,
+   `restic snapshots` coexists, and `restic unlock` leaves the fresh lock
+   in place (and its SIGHUP probe doesn't kill the process). On a lock
+   conflict at share start, the share screen offers `u` — native
+   stale-lock removal, then retry.
+4. **Native backup** under a non-exclusive lock (the headline win:
    wrustic backups running concurrently with restic cron backups), then
-   copy / key add as wanted. This phase also needs the
-   refreshability-abort rule (stop the operation when the lock could not
-   be refreshed for 22.5 minutes) — deferred so far because delete's
-   critical section lasts seconds.
+   copy / key add as wanted. The refreshability-abort rule it needs is
+   already in place (phase 3).
 
 Non-goals: native prune/repair/migrate (Tier 3), multi-host clock-skew
 mitigation beyond what restic itself does, and any restic < 0.19
