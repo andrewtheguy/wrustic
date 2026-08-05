@@ -7,7 +7,7 @@
 - Moved-file detection in diffs (identify files that were renamed or
   relocated rather than showing them as a delete + add)
 - Search across snapshot contents (find files by name or path pattern, can workaround with smb and ripgrep for now)
-- max login attempts for smb before server stops
+- max login attempts for smb before server stops (need to be high number)
 
 ## Ideas (Currently out of scope but worth considering for the future)
 
