@@ -61,10 +61,12 @@ the only shipped way to share a snapshot is `s` in the TUI, which is bound to
 that screen and to loopback. A long-lived server and a non-loopback bind are
 testing affordances and live in the test harness.
 
-Mount from another machine (after `serve` with SMB_BIND_ALL=1):
-  Linux    sudo mount -t cifs -o port=4456,vers=2.1,username=wrustic,password=<pw>,ro //<host>/snap /mnt
+Mount from another machine (after `serve` with SMB_BIND_ALL=1). Each prompts for
+the password rather than taking it on the command line, where every process on
+the machine could read it:
+  Linux    sudo mount -t cifs -o port=4456,vers=2.1,username=wrustic,ro //<host>/snap /mnt
   macOS    mount_smbfs //wrustic@<host>:4456/snap /Volumes/snap
-  Windows  net use Z: \\<host>\snap /user:wrustic <pw> /TCPPORT:4456
+  Windows  net use Z: \\<host>\snap * /user:wrustic /TCPPORT:4456
 EOF
 }
 
@@ -189,9 +191,13 @@ verify_mount() {
     # Always leave the mountpoint clean, including when a comparison below fails.
     trap 'sudo umount "$mountpoint" 2>/dev/null || sudo umount -l "$mountpoint" 2>/dev/null || true; rmdir "$mountpoint" 2>/dev/null || true' EXIT
 
-    info "mounting //127.0.0.1/snap on ${mountpoint}"
+    # Deliberately not `ro`. With it the mount is read-only because *we asked*
+    # for that, and the checks below would prove nothing about the share. Without
+    # it the mount comes up rw and everything read-only about it comes from the
+    # server's own advertisement.
+    info "mounting //127.0.0.1/snap on ${mountpoint} (rw, so read-only comes from the server)"
     sudo mount -t cifs \
-        -o "port=${SMB_PORT},vers=2.1,username=${SHARE_USER},password=${SHARE_PASSWORD},ro,uid=$(id -u),gid=$(id -g)" \
+        -o "port=${SMB_PORT},vers=2.1,username=${SHARE_USER},password=${SHARE_PASSWORD},uid=$(id -u),gid=$(id -g)" \
         //127.0.0.1/snap "$mountpoint" ||
         fail "mount failed; is ./scripts/smb-sample.sh serve running? (sudo dmesg | tail says more)"
 
@@ -215,7 +221,36 @@ verify_mount() {
         fail "mkdir succeeded on a read-only share"
     ! rm -f "${mountpoint}${source_tree}/docs/readme.txt" 2>/dev/null ||
         fail "delete succeeded on a read-only share"
-    info "writes are refused"
+    info "writes are refused through the mount"
+
+    # Those three prove the client refuses, not that the server does. cifs.ko
+    # reads FILE_READ_ONLY_VOLUME off FileFsAttributeInformation and stops there
+    # — it never sends a write-intent CREATE, so ACCESS_DENIED and
+    # MEDIA_WRITE_PROTECTED are unreachable through a kernel mount. smbclient
+    # has no such shortcut and asks anyway, which is the only way to see the
+    # server's own refusal from here.
+    if command -v smbclient >/dev/null 2>&1; then
+        info "checking that the server itself refuses a write"
+        local payload="${sample}/payload.txt"
+        printf 'should not land\n' >"$payload"
+        local out
+        out="$(smbclient "//127.0.0.1/snap" -p "$SMB_PORT" \
+            -U "${SHARE_USER}%${SHARE_PASSWORD}" \
+            --option='client min protocol=SMB2_10' \
+            --option='client max protocol=SMB2_10' \
+            -c "put \"${payload}\" payload.txt" 2>&1 || true)"
+        rm -f "$payload"
+        case "$out" in
+            *NT_STATUS_MEDIA_WRITE_PROTECTED* | *NT_STATUS_ACCESS_DENIED*)
+                info "the server refuses writes at the protocol level"
+                ;;
+            *)
+                fail "the server did not refuse a write with a read-only status: ${out}"
+                ;;
+        esac
+    else
+        info "smbclient is not installed; skipping the server-side write check"
+    fi
 
     info "reported size: $(df -h "$mountpoint" | awk 'NR == 2 { print $2 }')"
     info "verify passed"

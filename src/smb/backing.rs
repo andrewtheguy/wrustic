@@ -103,7 +103,10 @@ fn to_system_time(ts: Option<rustic_core::jiff::Timestamp>) -> Option<SystemTime
         return None;
     }
     let nanos = u32::try_from(nanos.max(0)).unwrap_or(0);
-    Some(UNIX_EPOCH + Duration::new(secs as u64, nanos))
+    // `checked_add` rather than `+`: SystemTime's Add panics on overflow, and a
+    // timestamp the platform cannot represent is a reason to fall back to the
+    // server's start time, not to take down a response mid-listing.
+    UNIX_EPOCH.checked_add(Duration::new(secs as u64, nanos))
 }
 
 fn node_info(node: &Node, now: SystemTime) -> NodeInfo {
@@ -165,10 +168,19 @@ impl SnapshotBacking {
             // No summary recorded (older snapshots have none): fall back to the
             // top level, which at least reads the root and confirms the tree is
             // there before a client ever connects.
+            //
+            // Files only, and only at this level. Nested content is not counted,
+            // so this under-reports whenever the snapshot has depth. Directory
+            // entries are skipped because restic records the *source*
+            // filesystem's directory size, typically 4 KiB of nothing — and
+            // `node_info` already reports zero for them, so counting them here
+            // would make the volume total disagree with the listing a client can
+            // add up itself.
             None => vfs
                 .dir_entries_from_path(repo.as_ref(), std::path::Path::new("/"))
                 .map_err(|e| anyhow!("reading snapshot root: {e}"))?
                 .iter()
+                .filter(|n| !n.is_dir())
                 .map(|n| n.meta.size)
                 .sum(),
         };
@@ -387,11 +399,18 @@ pub(crate) mod test_support {
 
     impl FileReader for MemFile {
         fn read_at(&self, offset: u64, len: u32) -> Result<Bytes, u32> {
-            let offset = offset as usize;
+            // An offset that does not fit a usize is past the end of anything
+            // held in memory, so it reads empty — same answer `SnapshotFile`
+            // gives for a read at or past EOF, reached before it casts.
+            let Ok(offset) = usize::try_from(offset) else {
+                return Ok(Bytes::new());
+            };
             if offset >= self.content.len() {
                 return Ok(Bytes::new());
             }
-            let end = (offset + len as usize).min(self.content.len());
+            // Saturating: `offset + len` is two client-supplied numbers and can
+            // exceed usize on a 32-bit target.
+            let end = offset.saturating_add(len as usize).min(self.content.len());
             Ok(Bytes::copy_from_slice(&self.content[offset..end]))
         }
     }

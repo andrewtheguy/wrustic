@@ -391,11 +391,15 @@ fn write_dir_entry(
         }
     }
 
-    debug_assert_eq!(
-        out.len() - start,
-        fixed,
-        "class {class} fixed part must be {fixed} bytes"
-    );
+    // Checked, not debug-asserted. `encode_dir_entries` reserved exactly `fixed`
+    // bytes for this entry and links the next one relative to it, so a mismatch
+    // between the table and what the arms above write does not fail loudly — it
+    // ships a listing whose chain offsets land mid-structure, which a client
+    // renders as garbage names. Better to refuse the class than to emit that,
+    // and in a release build the assertion would not have caught it at all.
+    if out.len() - start != fixed {
+        return Err(status::INVALID_INFO_CLASS);
+    }
     out.bytes(&name);
     Ok(())
 }
@@ -440,12 +444,16 @@ pub(crate) fn encode_dir_entries(
 
         if count > 0 {
             // Link the previous entry to this one, now that its distance is
-            // known.
+            // known. This padding is the same 8-byte boundary `start` was
+            // computed against above, and nothing may be written between the
+            // two — `start` is then reused as the entry's offset rather than
+            // re-derived, so the fit check and the write cannot disagree.
             out.align_to(8);
             let prev_len = (out.len() - last_start) as u32;
             out.patch_u32(last_start, prev_len);
         }
-        last_start = out.len();
+        debug_assert_eq!(out.len(), start, "padding must land where the check assumed");
+        last_start = start;
         write_dir_entry(&mut out, class, start_index + i as u32, info, *file_id)?;
         count += 1;
         if single {

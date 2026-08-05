@@ -123,9 +123,10 @@ pub(crate) const DEFAULT_SHARE_USER: &str = "wrustic";
 /// a Windows credential prompt, and needs no shell quoting in a mount command.
 pub(crate) fn random_password() -> String {
     use rand::RngExt;
-    // 55 characters is not a power of two, so `random::<u8>() % len` would
-    // favour the first 36 of them. `random_range` rejects out-of-range draws
-    // instead, keeping all 16 characters uniform (~92 bits total).
+    // 56 characters does not divide 256, so `random::<u8>() % len` would favour
+    // the first 32 of them (256 % 56 == 32). `random_range` rejects
+    // out-of-range draws instead, keeping all 16 characters uniform (~92 bits
+    // total).
     const ALPHABET: &[u8] = b"abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
     let mut rng = rand::rng();
     (0..16)
@@ -335,7 +336,23 @@ async fn accept_loop(
             loop {
                 let stream = match listener.accept().await {
                     Ok((s, _)) => s,
-                    Err(_) => continue,
+                    // A per-connection failure (the peer went away between the
+                    // SYN and the accept, or a signal interrupted the call) is
+                    // gone by the next iteration, so retry at once. Anything
+                    // else — EMFILE and ENFILE above all — is a condition that
+                    // persists, and retrying immediately spins a core at full
+                    // tilt until a descriptor frees up.
+                    Err(e) => {
+                        use std::io::ErrorKind;
+                        if !matches!(
+                            e.kind(),
+                            ErrorKind::Interrupted | ErrorKind::ConnectionAborted
+                        ) {
+                            smb_log!("accept failed: {e}; backing off");
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                        continue;
+                    }
                 };
                 let ctx = ctx.clone();
                 tokio::spawn(async move {
@@ -351,12 +368,28 @@ async fn accept_loop(
     let _ = shutdown_rx.await;
 }
 
+/// How long a connection may sit without sending anything before it is dropped.
+///
+/// Generous on purpose. Every client that holds a mount open sends keepalives
+/// far more often than this — cifs.ko echoes once a minute by default — so a
+/// connection silent this long is one whose peer is gone, and without a bound
+/// it would hold its task and socket for as long as the server ran.
+const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
 async fn serve_connection(mut stream: tokio::net::TcpStream, ctx: Arc<Ctx>) {
     let mut conn = Conn::new(ctx);
     let mut nb = [0u8; NBSS_HEADER_LEN];
     loop {
-        if stream.read_exact(&mut nb).await.is_err() {
-            return;
+        // Only the wait for a *new* message is bounded. Once a header has
+        // arrived the rest of that message is already in flight, so timing out
+        // partway through it would drop a connection that is working fine.
+        match tokio::time::timeout(IDLE_TIMEOUT, stream.read_exact(&mut nb)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => return,
+            Err(_) => {
+                smb_log!("dropping connection: idle for {}s", IDLE_TIMEOUT.as_secs());
+                return;
+            }
         }
         let len = nbss_len(&nb);
         if len == 0 {
@@ -405,6 +438,14 @@ async fn serve_connection(mut stream: tokio::net::TcpStream, ctx: Arc<Ctx>) {
         // signature — Windows verifies that one.
         if let Some(key) = conn.state.signing_key {
             sign::sign(&key, &mut resp);
+            // LOGOFF keeps its key just long enough to sign its own reply. It
+            // tears the session down, and a client that required signing —
+            // which is every client, since we advertise SIGNING_REQUIRED —
+            // rejects an unsigned response to it. Now that the signature is
+            // written, the key goes.
+            if !conn.state.authenticated {
+                conn.state.signing_key = None;
+            }
         }
         if stream.write_all(&nbss_header(resp.len())).await.is_err() {
             return;
@@ -609,7 +650,11 @@ impl Conn {
             cmd::LOGOFF => {
                 self.state.authenticated = false;
                 self.state.session_id = 0;
-                self.state.signing_key = None;
+                // `signing_key` deliberately survives this: the LOGOFF response
+                // still has to be signed. `serve_connection` drops it once the
+                // signature is on, and `authenticated` being false is what
+                // refuses every later command in the meantime.
+                self.handles.close_all();
                 Ok(Reply::ok(session::simple_ack()))
             }
 
@@ -622,6 +667,12 @@ impl Conn {
                 if self.tree_kind(hdr.tree_id).is_none() {
                     Err(status::NETWORK_NAME_DELETED)
                 } else {
+                    // Handles opened through this tree die with it. A client is
+                    // supposed to CLOSE each one first, but nothing makes it,
+                    // and a handle left behind is unreachable — its tree id is
+                    // gone — while still pinning an open file and its blob
+                    // index for as long as the connection lasts.
+                    self.handles.close_tree(hdr.tree_id);
                     if self.state.disk_tree_id == Some(hdr.tree_id) {
                         self.state.disk_tree_id = None;
                     }
@@ -679,7 +730,8 @@ impl Conn {
         let backing = self.ctx.backing.as_ref();
         match hdr.command {
             cmd::CREATE => {
-                files::create(body, message, backing, &mut self.handles).map(Reply::ok)
+                files::create(body, message, backing, &mut self.handles, hdr.tree_id)
+                    .map(Reply::ok)
             }
             cmd::CLOSE => files::close(body, &mut self.handles).map(Reply::ok),
             cmd::READ => files::read(body, backing, &mut self.handles).map(Reply::ok),
@@ -864,7 +916,7 @@ mod tests {
             TEST_USER,
             "",
             TEST_PASSWORD,
-            &conn.state.server_challenge,
+            &conn.state.server_challenge.expect("a challenge was issued"),
             None,
         );
         let body = session_setup_body_with(&auth);
@@ -939,6 +991,14 @@ mod tests {
             .handle_message(&request(cmd::LOGOFF, session_id, 0, &[4, 0, 0, 0]))
             .expect("answered");
         assert_eq!(parse_response(&resp).status, status::SUCCESS);
+        // The key has to outlive the handler: `serve_connection` signs this very
+        // response with it, and a client that required signing rejects an
+        // unsigned reply. It is dropped there, once the signature is written.
+        assert!(
+            conn.state.signing_key.is_some(),
+            "the LOGOFF response still has to be signed"
+        );
+        assert!(!conn.state.authenticated, "but the session is gone");
 
         let resp = conn
             .handle_message(&request(cmd::ECHO, session_id, 0, &[4, 0, 0, 0]))
@@ -1347,8 +1407,10 @@ mod tests {
         let dir = tempdir_path("smb-read");
         std::fs::create_dir_all(&dir).expect("scratch dir");
         let dest = dir.join("readme.txt");
+        // Quoted: the scratch path runs through CARGO_MANIFEST_DIR, and
+        // smbclient splits its -c command on whitespace.
         let Some(_) = smbclient(&format!(
-            "get docs\\readme.txt {}",
+            "get docs\\readme.txt \"{}\"",
             dest.display()
         )) else {
             return;

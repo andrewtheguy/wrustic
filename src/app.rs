@@ -2185,6 +2185,13 @@ impl App {
     }
 
     pub(crate) fn handle_mouse(&mut self, m: MouseEvent) {
+        // The `?` overlay is modal for the mouse too, for the same reason it is
+        // for the keyboard: the overlay covers the list, so a click would select
+        // a row the user cannot see. Dismiss and swallow the event.
+        if self.help_overlay {
+            self.help_overlay = false;
+            return;
+        }
         // Only left-click and the vertical scroll wheel are wired up;
         // right/middle/drag/motion are ignored.
         match m.kind {

@@ -1348,9 +1348,9 @@ fn render_snapshot_smb(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 
     lines.push_str(
-        "\nEvery client authenticates and every message is signed. Writes are refused at \
-         the protocol level. Leaving this screen stops the server, and any mount still \
-         using it.",
+        "\nEvery client authenticates and authenticated session messages are signed. \
+         Writes are refused at the protocol level. Leaving this screen stops the server, \
+         and any mount still using it.",
     );
 
     let para = Paragraph::new(lines)

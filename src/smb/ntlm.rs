@@ -1,9 +1,8 @@
 // NTLMv2 authentication (MS-NLMP).
 //
-// Exists for one reason: Windows 11 24H2 requires SMB signing and refuses guest
-// sessions, and signing needs a session key that only a real authentication can
-// produce. Linux and macOS are happy with the unauthenticated guest path, so
-// this runs only when a client actually presents a username.
+// Exists for one reason: signing needs a session key, and only a real
+// authentication produces one. There is no guest path to fall back to — every
+// client on every platform runs through here.
 //
 // Everything here is MD4, MD5 and RC4 — all broken primitives. They are not a
 // security choice; they are what NTLMv2 is specified in terms of, and a client
@@ -16,6 +15,7 @@ use md5::Md5;
 // `Rc4::new` is typed to a 32-byte key; NTLM's is 16, so the slice constructor
 // is the one to use — it accepts any length the cipher allows.
 use rc4::{KeyInit as Rc4KeyInit, Rc4, StreamCipher};
+use subtle::ConstantTimeEq;
 
 use super::wire::utf16le;
 
@@ -155,7 +155,7 @@ pub(crate) fn verify(
     let key = ntowf_v2(password, &auth.user, &auth.domain);
     let expected = hmac_md5(&key, &[server_challenge.as_slice(), temp]);
 
-    if !constant_time_eq(proof, &expected) {
+    if proof.ct_eq(&expected[..]).unwrap_u8() == 0 {
         return None;
     }
 
@@ -174,17 +174,6 @@ pub(crate) fn verify(
     } else {
         Some(session_base_key)
     }
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 #[cfg(test)]
@@ -410,13 +399,5 @@ mod tests {
         // Point the NT response offset far past the end.
         msg[24..28].copy_from_slice(&0xFFFF_u32.to_le_bytes());
         assert!(Authenticate::parse(&msg).is_none());
-    }
-
-    #[test]
-    fn constant_time_eq_behaves_like_equality() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"ab"));
-        assert!(constant_time_eq(b"", b""));
     }
 }

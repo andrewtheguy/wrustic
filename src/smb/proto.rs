@@ -223,7 +223,11 @@ impl Header {
         r.skip(4)?; // Reserved (AsyncId low half in async headers)
         let tree_id = r.u32()?;
         let session_id = r.u64()?;
-        r.skip(16)?; // Signature — never verified: guest sessions are unsigned.
+        // Signature. Skipped here on purpose: verification needs the whole PDU,
+        // not a parsed header, so `sign::verify` runs over the raw message
+        // before this ever sees it (see `serve_connection`). Copying the field
+        // into the struct would only invite a second, weaker check.
+        r.skip(16)?;
         Ok(Self {
             credit_charge,
             status,
@@ -259,7 +263,9 @@ impl Header {
         w.u16(self.command);
         w.u16(credits);
         // RELATED_OPERATIONS is echoed back so the client can match a compounded
-        // response chain; SIGNED never is, because we never sign.
+        // response chain. SIGNED is not: `sign::sign` sets it as it signs, and
+        // it has to go on immediately before the hash because the flag is
+        // itself part of the signed bytes.
         w.u32(flags::SERVER_TO_REDIR | (self.flags & flags::RELATED_OPERATIONS));
         w.u32(0); // NextCommand, patched later
         w.u64(self.message_id);
@@ -371,7 +377,11 @@ mod tests {
         assert_eq!(parsed.tree_id, h.tree_id);
         assert_eq!(parsed.session_id, h.session_id);
         assert_eq!(parsed.flags & flags::SERVER_TO_REDIR, flags::SERVER_TO_REDIR);
-        assert_eq!(parsed.flags & flags::SIGNED, 0, "we never claim to sign");
+        assert_eq!(
+            parsed.flags & flags::SIGNED,
+            0,
+            "the header codec leaves SIGNED clear; sign::sign sets it"
+        );
     }
 
     #[test]

@@ -1,15 +1,15 @@
 // Connection setup: NEGOTIATE, SESSION_SETUP, TREE_CONNECT and the trivial
 // session-scoped commands.
 //
-// Authentication here is deliberately a formality. The share is bound to the
-// loopback interface and serves one immutable snapshot read-only, so the server
-// completes the NTLMSSP exchange without checking anything and marks the result
-// as a guest session. SMB2_SESSION_FLAG_IS_GUEST is what makes this work: a
-// guest session has no signing key, so the client stops expecting signatures.
+// Authentication is mandatory. The NTLMSSP exchange runs in full: the client's
+// user name must match the configured account, its NTLMv2 response is checked
+// against the challenge this connection issued (`ntlm::verify`), and the session
+// key that falls out becomes the signing key for every later message. There is
+// no guest path — SessionFlags stays 0, never SMB2_SESSION_FLAG_IS_GUEST.
 //
-// This is exactly the configuration Windows 11 24H2 refuses (it requires
-// signing, and signing is incompatible with guest), which is why this server
-// targets Linux and macOS clients only.
+// That is what Windows 11 24H2 requires: it insists on signing, and a guest
+// session cannot sign. Linux and macOS accept the same configuration, so one
+// authenticated path serves all three.
 
 use anyhow::Result;
 
@@ -120,9 +120,10 @@ pub(crate) struct Credentials {
 
 /// Build an NTLMSSP CHALLENGE (type 2) message.
 ///
-/// The challenge nonce is random even though nothing verifies the response to
-/// it. A fixed nonce would be a gratuitous oddity in a packet capture, and
-/// costs nothing to avoid.
+/// The nonce is what makes the exchange more than a password echo: the client's
+/// response is a MAC over it, so a capture from one connection cannot be
+/// replayed against another. It is generated fresh per connection and discarded
+/// once used.
 fn ntlmssp_challenge(nonce: [u8; 8]) -> Vec<u8> {
     use super::ntlm::flags as nf;
 
@@ -188,7 +189,13 @@ pub(crate) struct SessionState {
     pub(crate) session_id: u64,
     pub(crate) authenticated: bool,
     /// The nonce sent in the NTLMSSP CHALLENGE, needed to check the response.
-    pub(crate) server_challenge: [u8; 8],
+    ///
+    /// `None` until one is issued, and `None` again the moment it is spent.
+    /// Both matter: an AUTHENTICATE arriving as the first leg would otherwise be
+    /// checked against a default nonce the server never sent, and a spent one
+    /// left in place would let the same AUTHENTICATE be replayed on this
+    /// connection for as long as it stayed open.
+    pub(crate) server_challenge: Option<[u8; 8]>,
     /// Set once a client authenticates with NTLMv2. Its presence is what makes
     /// the connection sign responses and require signatures on requests.
     pub(crate) signing_key: Option<[u8; 16]>,
@@ -352,8 +359,9 @@ pub(crate) fn negotiate(
 /// SESSION_SETUP (MS-SMB2 2.2.5 request, 2.2.6 response).
 ///
 /// Two round trips: the client's NTLMSSP NEGOTIATE gets a CHALLENGE back with
-/// STATUS_MORE_PROCESSING_REQUIRED, then its AUTHENTICATE is accepted without
-/// inspection. Returns `(status, body)` because the first leg is deliberately
+/// STATUS_MORE_PROCESSING_REQUIRED, then its AUTHENTICATE is verified against
+/// that challenge and either yields a signing key or is refused with
+/// LOGON_FAILURE. Returns `(status, body)` because the first leg is deliberately
 /// not a success status.
 pub(crate) fn session_setup(
     body: &[u8],
@@ -391,8 +399,9 @@ pub(crate) fn session_setup(
                 // hand out the same id.
                 state.session_id = u64::from_le_bytes(rand::random::<[u8; 8]>()) | 1;
             }
-            state.server_challenge = rand::random::<[u8; 8]>();
-            let challenge = ntlmssp_challenge(state.server_challenge);
+            let nonce = rand::random::<[u8; 8]>();
+            state.server_challenge = Some(nonce);
+            let challenge = ntlmssp_challenge(nonce);
             let token = match framing {
                 Framing::Raw => challenge,
                 Framing::Spnego => spnego_challenge(&challenge),
@@ -405,6 +414,13 @@ pub(crate) fn session_setup(
             // authenticated signed session, and keeping a second unauthenticated
             // path alongside it would mean the password protected nothing —
             // anyone could simply ask to be a guest instead.
+            //
+            // Spend the challenge here, before anything can fail: a response is
+            // only ever valid against the nonce it was computed for, and once
+            // that nonce is gone a replay of the same AUTHENTICATE has nothing
+            // to match. A client that gets it wrong starts a fresh exchange,
+            // which is what every real one does anyway.
+            let challenge = state.server_challenge.take().ok_or(status::LOGON_FAILURE)?;
             let auth =
                 super::ntlm::Authenticate::parse(ntlmssp).ok_or(status::LOGON_FAILURE)?;
             if auth.is_anonymous() {
@@ -413,7 +429,7 @@ pub(crate) fn session_setup(
             if !auth.user.eq_ignore_ascii_case(&credentials.user) {
                 return Err(status::LOGON_FAILURE);
             }
-            let key = super::ntlm::verify(&auth, &credentials.password, &state.server_challenge)
+            let key = super::ntlm::verify(&auth, &credentials.password, &challenge)
                 .ok_or(status::LOGON_FAILURE)?;
             state.signing_key = Some(key);
             // SessionFlags stays 0: not a guest, not a null session.
@@ -645,7 +661,7 @@ mod tests {
             &creds.user,
             "",
             &creds.password,
-            &state.server_challenge,
+            &state.server_challenge.expect("a challenge was issued"),
             None,
         );
         let (body, message) = session_setup_request(&auth);
@@ -671,7 +687,7 @@ mod tests {
             "wrustic",
             "",
             "hunter2",
-            &state.server_challenge,
+            &state.server_challenge.expect("a challenge was issued"),
             None,
         );
         let (body, message) = session_setup_request(&auth);
@@ -769,14 +785,14 @@ mod tests {
         let (body, message) = session_setup_request(&ntlmssp_message(NTLMSSP_NEGOTIATE));
         let (st, _) = session_setup(&body, &message, &mut state, &creds).unwrap();
         assert_eq!(st, status::MORE_PROCESSING_REQUIRED);
-        assert_ne!(state.server_challenge, [0u8; 8], "a nonce was issued");
+        assert!(state.server_challenge.is_some(), "a nonce was issued");
         assert!(state.signing_key.is_none(), "not yet authenticated");
 
         let auth = super::super::ntlm::tests_support::build_authenticate(
             "wrustic",
             "",
             "hunter2",
-            &state.server_challenge,
+            &state.server_challenge.expect("a challenge was issued"),
             None,
         );
         let (body, message) = session_setup_request(&auth);
@@ -792,6 +808,59 @@ mod tests {
         );
     }
 
+    /// An AUTHENTICATE that skips the challenge leg must be refused. Without a
+    /// challenge to check against, the alternative is verifying the response
+    /// against a default nonce the server never sent.
+    #[test]
+    fn an_authenticate_as_the_first_leg_is_refused() {
+        let creds = creds();
+        let mut state = SessionState::default();
+        assert!(state.server_challenge.is_none(), "nothing issued yet");
+
+        let auth = super::super::ntlm::tests_support::build_authenticate(
+            "wrustic",
+            "",
+            "hunter2",
+            &[0u8; 8],
+            None,
+        );
+        let (body, message) = session_setup_request(&auth);
+        assert_eq!(
+            session_setup(&body, &message, &mut state, &creds).unwrap_err(),
+            status::LOGON_FAILURE
+        );
+        assert!(!state.authenticated);
+        assert!(state.signing_key.is_none());
+    }
+
+    /// The challenge is spent by the AUTHENTICATE that uses it, so replaying
+    /// that same message on the connection cannot log in a second time.
+    #[test]
+    fn a_replayed_authenticate_is_refused_because_the_challenge_is_spent() {
+        let creds = creds();
+        let mut state = SessionState::default();
+        let (body, message) = session_setup_request(&ntlmssp_message(NTLMSSP_NEGOTIATE));
+        let _ = session_setup(&body, &message, &mut state, &creds).unwrap();
+
+        let auth = super::super::ntlm::tests_support::build_authenticate(
+            "wrustic",
+            "",
+            "hunter2",
+            &state.server_challenge.expect("a challenge was issued"),
+            None,
+        );
+        let (body, message) = session_setup_request(&auth);
+        let (st, _) = session_setup(&body, &message, &mut state, &creds).unwrap();
+        assert_eq!(st, status::SUCCESS);
+        assert!(state.server_challenge.is_none(), "the nonce is consumed");
+
+        assert_eq!(
+            session_setup(&body, &message, &mut state, &creds).unwrap_err(),
+            status::LOGON_FAILURE,
+            "the same AUTHENTICATE must not verify twice"
+        );
+    }
+
     #[test]
     fn a_wrong_password_is_refused_with_logon_failure() {
         let creds = creds();
@@ -803,7 +872,7 @@ mod tests {
             "wrustic",
             "",
             "wrong-password",
-            &state.server_challenge,
+            &state.server_challenge.expect("a challenge was issued"),
             None,
         );
         let (body, message) = session_setup_request(&auth);
@@ -826,7 +895,7 @@ mod tests {
             "someone-else",
             "",
             "hunter2",
-            &state.server_challenge,
+            &state.server_challenge.expect("a challenge was issued"),
             None,
         );
         let (body, message) = session_setup_request(&auth);
@@ -849,7 +918,7 @@ mod tests {
             "",
             "",
             "",
-            &state.server_challenge,
+            &state.server_challenge.expect("a challenge was issued"),
             None,
         );
         let f = u32::from_le_bytes(auth[60..64].try_into().unwrap());

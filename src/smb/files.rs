@@ -52,6 +52,10 @@ const RELATED_FILE_ID: u64 = u64::MAX;
 
 /// One open handle.
 pub(crate) struct OpenHandle {
+    /// The tree it was opened through. Kept so a TREE_DISCONNECT can release
+    /// everything that tree owns; a handle outliving its tree is unreachable
+    /// but would still hold its reader.
+    tree_id: u32,
     pub(crate) path: SmbPath,
     pub(crate) info: NodeInfo,
     /// Lazily opened: a client frequently opens a file only to stat it, and
@@ -112,6 +116,30 @@ impl Handles {
         self.open.remove(&id)
     }
 
+    /// Release every handle opened through `tree_id`, for TREE_DISCONNECT.
+    pub(crate) fn close_tree(&mut self, tree_id: u32) {
+        self.open.retain(|_, h| h.tree_id != tree_id);
+        self.forget_stale_last_created();
+    }
+
+    /// Release everything, for LOGOFF: the session is gone, so no file id in it
+    /// can ever be named again.
+    pub(crate) fn close_all(&mut self) {
+        self.open.clear();
+        self.last_created = None;
+    }
+
+    /// Drop the compound placeholder if the handle it points at is gone.
+    /// Leaving it dangling would let a later related compound resolve onto a
+    /// handle id that was reused.
+    fn forget_stale_last_created(&mut self) {
+        if let Some(id) = self.last_created
+            && !self.open.contains_key(&id)
+        {
+            self.last_created = None;
+        }
+    }
+
     /// How many handles are open. Tests assert on this to catch a leak — a
     /// CREATE that never gets its matching CLOSE would otherwise be invisible
     /// until a long-lived mount ran the table up.
@@ -153,6 +181,7 @@ pub(crate) fn create(
     message: &[u8],
     backing: &dyn Backing,
     handles: &mut Handles,
+    tree_id: u32,
 ) -> Result<Vec<u8>, u32> {
     let mut r = Reader::new(body);
     if r.u16().map_err(|_| status::INVALID_PARAMETER)? != 57 {
@@ -212,6 +241,7 @@ pub(crate) fn create(
     }
 
     let file_id = handles.insert(OpenHandle {
+        tree_id,
         path,
         info: info.clone(),
         reader: None,
@@ -341,6 +371,12 @@ fn pattern_matches(pattern: &str, name: &str) -> bool {
 
 /// Wildcard matcher for `*` and `?`, iterative so a pathological pattern cannot
 /// blow the stack.
+///
+/// Case-insensitivity is **ASCII-only**: the comparison is over raw UTF-8 bytes,
+/// so `A` matches `a` but `É` does not match `é`. Real Unicode case folding
+/// would mean decoding both sides and carrying a folding table, and the clients
+/// that send a pattern at all send `*` or a literal name they read back from us
+/// moments earlier.
 fn glob_match(pattern: &[u8], name: &[u8]) -> bool {
     let (mut p, mut n) = (0usize, 0usize);
     let (mut star, mut backtrack) = (usize::MAX, 0usize);
@@ -397,19 +433,17 @@ pub(crate) fn query_directory(
         .map_err(|_| status::INVALID_PARAMETER)?;
     let pattern = from_utf16le(raw_pattern).map_err(|_| status::OBJECT_NAME_INVALID)?;
 
-    // Resolve and populate before taking a mutable borrow for the cursor.
-    let path = {
+    // Everything the listing needs, read under one immutable borrow, which then
+    // ends: `backing.list` is a repository call, and the mutable borrow for the
+    // cursor cannot be taken until after it.
+    let (path, needs_listing) = {
         let handle = handles.get(file_id).ok_or(status::FILE_CLOSED)?;
         if !handle.info.kind.is_dir() {
             return Err(status::NOT_A_DIRECTORY);
         }
-        handle.path.clone()
+        (handle.path.clone(), handle.dir_entries.is_none())
     };
 
-    let needs_listing = {
-        let handle = handles.get(file_id).ok_or(status::FILE_CLOSED)?;
-        handle.dir_entries.is_none()
-    };
     let listing = if needs_listing {
         let mut entries = Vec::new();
         // `.` and `..` are expected by enough clients that omitting them causes
@@ -437,19 +471,28 @@ pub(crate) fn query_directory(
     }
 
     let all = handle.dir_entries.as_ref().expect("populated above");
-    let remaining: Vec<(NodeInfo, u64)> = all
+    // Each match carries its position in the *unfiltered* listing, because that
+    // is what `dir_pos` indexes. Advancing the cursor by the number of encoded
+    // matches instead would skip over the entries the pattern rejected: with
+    // `[., .., a.txt, b.log]` and `*.log`, one match would move the cursor to 1
+    // rather than past `b.log`, and the next call would hand out `b.log` again,
+    // for ever.
+    let matched: Vec<(usize, (NodeInfo, u64))> = all
         .iter()
+        .enumerate()
         .skip(handle.dir_pos)
-        .filter(|(info, _)| pattern_matches(&pattern, &info.name))
-        .cloned()
+        .filter(|(_, (info, _))| pattern_matches(&pattern, &info.name))
+        .map(|(i, entry)| (i, entry.clone()))
         .collect();
 
-    if remaining.is_empty() {
+    if matched.is_empty() {
         // The spec's way of saying "enumeration complete". Returning an empty
         // successful buffer instead makes clients retry forever.
         return Err(status::NO_MORE_FILES);
     }
 
+    let remaining: Vec<(NodeInfo, u64)> =
+        matched.iter().map(|(_, entry)| entry.clone()).collect();
     let max_len = output_len.min(MAX_READ_SIZE as usize);
     let single = flags & query_dir_flags::RETURN_SINGLE_ENTRY != 0;
     let (buf, consumed) = info::encode_dir_entries(
@@ -459,9 +502,12 @@ pub(crate) fn query_directory(
         max_len,
         single,
     )?;
-    // Advance by what was actually encoded, so the next call resumes exactly
-    // where this one stopped.
-    handle.dir_pos += consumed;
+    // Resume immediately after the last entry actually encoded. `consumed` is
+    // never zero here — `encode_dir_entries` errors rather than report an empty
+    // page — but the cursor is left alone rather than trusting that.
+    if let Some((last, _)) = consumed.checked_sub(1).and_then(|i| matched.get(i)) {
+        handle.dir_pos = last + 1;
+    }
 
     let mut w = Writer::with_capacity(8 + buf.len());
     w.u16(9); // StructureSize
@@ -548,9 +594,16 @@ pub(crate) fn query_info(
     };
 
     if buf.len() > output_len {
-        // The client's buffer is too small. BUFFER_OVERFLOW with the needed
-        // length is how it learns to ask again with more room.
-        return Err(status::BUFFER_OVERFLOW);
+        // The client's buffer is too small for this class. INFO_LENGTH_MISMATCH
+        // rather than BUFFER_OVERFLOW: the latter is the spec's answer only when
+        // the required length rides along in the error response's ErrorData, and
+        // this server's error path (`write_error_body`) carries none — so a
+        // client would get "too small" with no idea how small, and retry at the
+        // same size. INFO_LENGTH_MISMATCH says the same thing without the
+        // implied promise, and matches what `encode_dir_entries` already returns
+        // for the identical case. Unreachable in practice: clients ask with
+        // 4 KiB or more, and the largest class here is a few hundred bytes.
+        return Err(status::INFO_LENGTH_MISMATCH);
     }
 
     let mut w = Writer::with_capacity(8 + buf.len());
@@ -599,14 +652,27 @@ mod tests {
         w.into_vec()
     }
 
+    /// The tree id the tests open through. Any non-zero value works; handles
+    /// only ever compare it against the tree a TREE_DISCONNECT names.
+    const TREE: u32 = 1;
+
     fn open_path(
         b: &dyn Backing,
         h: &mut Handles,
         name: &str,
     ) -> Result<u64, u32> {
+        open_path_on(b, h, name, TREE)
+    }
+
+    fn open_path_on(
+        b: &dyn Backing,
+        h: &mut Handles,
+        name: &str,
+        tree_id: u32,
+    ) -> Result<u64, u32> {
         let body = create_body(name, access::READ_ONLY, disposition::OPEN, 0);
         let msg = message(&body);
-        let resp = create(&body, &msg, b, h)?;
+        let resp = create(&body, &msg, b, h, tree_id)?;
         Ok(u64::from_le_bytes(resp[72..80].try_into().unwrap()))
     }
 
@@ -623,7 +689,7 @@ mod tests {
         let b = backing();
         let mut h = Handles::default();
         let body = create_body("top.bin", access::READ_ONLY, disposition::OPEN, 0);
-        let resp = create(&body, &message(&body), &b, &mut h).unwrap();
+        let resp = create(&body, &message(&body), &b, &mut h, TREE).unwrap();
 
         assert_eq!(u16::from_le_bytes(resp[0..2].try_into().unwrap()), 89);
         assert_eq!(resp[2], 0, "no oplock is granted");
@@ -650,7 +716,7 @@ mod tests {
         ] {
             let body = create_body("top.bin", access::FILE_READ_DATA | bit, disposition::OPEN, 0);
             assert_eq!(
-                create(&body, &message(&body), &b, &mut h).unwrap_err(),
+                create(&body, &message(&body), &b, &mut h, TREE).unwrap_err(),
                 status::ACCESS_DENIED,
                 "access bit {bit:#x} must be refused"
             );
@@ -665,7 +731,7 @@ mod tests {
         ] {
             let body = create_body("top.bin", access::READ_ONLY, disp, 0);
             assert_eq!(
-                create(&body, &message(&body), &b, &mut h).unwrap_err(),
+                create(&body, &message(&body), &b, &mut h, TREE).unwrap_err(),
                 status::MEDIA_WRITE_PROTECTED,
                 "disposition {disp} must be refused"
             );
@@ -679,7 +745,7 @@ mod tests {
             options::DELETE_ON_CLOSE,
         );
         assert_eq!(
-            create(&body, &message(&body), &b, &mut h).unwrap_err(),
+            create(&body, &message(&body), &b, &mut h, TREE).unwrap_err(),
             status::MEDIA_WRITE_PROTECTED
         );
 
@@ -692,7 +758,7 @@ mod tests {
         let mut h = Handles::default();
         let body = create_body(r"..\..\etc\shadow", access::READ_ONLY, disposition::OPEN, 0);
         assert_eq!(
-            create(&body, &message(&body), &b, &mut h).unwrap_err(),
+            create(&body, &message(&body), &b, &mut h, TREE).unwrap_err(),
             status::OBJECT_PATH_SYNTAX_BAD
         );
     }
@@ -709,7 +775,7 @@ mod tests {
             options::DIRECTORY_FILE,
         );
         assert_eq!(
-            create(&body, &message(&body), &b, &mut h).unwrap_err(),
+            create(&body, &message(&body), &b, &mut h, TREE).unwrap_err(),
             status::NOT_A_DIRECTORY
         );
 
@@ -720,7 +786,7 @@ mod tests {
             options::NON_DIRECTORY_FILE,
         );
         assert_eq!(
-            create(&body, &message(&body), &b, &mut h).unwrap_err(),
+            create(&body, &message(&body), &b, &mut h, TREE).unwrap_err(),
             status::FILE_IS_A_DIRECTORY
         );
     }
@@ -731,7 +797,7 @@ mod tests {
         let mut h = Handles::default();
         let body = create_body("nope.txt", access::READ_ONLY, disposition::OPEN, 0);
         assert_eq!(
-            create(&body, &message(&body), &b, &mut h).unwrap_err(),
+            create(&body, &message(&body), &b, &mut h, TREE).unwrap_err(),
             status::OBJECT_NAME_NOT_FOUND
         );
     }
@@ -957,6 +1023,89 @@ mod tests {
         assert_eq!(listed_names(&resp), vec!["a.txt"]);
     }
 
+    /// The cursor indexes the unfiltered listing, so it has to skip the entries
+    /// the pattern rejected as well as the ones it returned. `dir` enumerates as
+    /// `[., .., a.txt, b.log]`, and `*.log` matches only the last of them:
+    /// advancing by the match count would leave the cursor at 1 and hand back
+    /// `b.log` on every call for ever.
+    #[test]
+    fn a_filtered_enumeration_terminates_instead_of_repeating() {
+        let b = backing();
+        let mut h = Handles::default();
+        let id = open_path(&b, &mut h, "dir").unwrap();
+
+        let body = query_dir_body(id, dir_class::ID_BOTH_DIRECTORY, 0, "*.log", 65536);
+        let resp = query_directory(&body, &message(&body), &b, &mut h, UNIX_EPOCH).unwrap();
+        assert_eq!(listed_names(&resp), vec!["b.log"]);
+
+        let body = query_dir_body(id, dir_class::ID_BOTH_DIRECTORY, 0, "*.log", 65536);
+        assert_eq!(
+            query_directory(&body, &message(&body), &b, &mut h, UNIX_EPOCH).unwrap_err(),
+            status::NO_MORE_FILES,
+            "the match was already returned; a second call must report exhaustion"
+        );
+    }
+
+    /// One entry at a time, with a pattern that skips entries in between: every
+    /// match must come back exactly once.
+    #[test]
+    fn a_filtered_single_entry_enumeration_visits_each_match_once() {
+        let b = MemBacking::new()
+            .with_dir("d")
+            .with_file("d\\keep1.log", b"1")
+            .with_file("d\\skip.txt", b"2")
+            .with_file("d\\keep2.log", b"3");
+        let mut h = Handles::default();
+        let id = open_path(&b, &mut h, "d").unwrap();
+
+        let mut seen = Vec::new();
+        loop {
+            let body = query_dir_body(
+                id,
+                dir_class::ID_BOTH_DIRECTORY,
+                query_dir_flags::RETURN_SINGLE_ENTRY,
+                "*.log",
+                65536,
+            );
+            match query_directory(&body, &message(&body), &b, &mut h, UNIX_EPOCH) {
+                Ok(resp) => seen.extend(listed_names(&resp)),
+                Err(status::NO_MORE_FILES) => break,
+                Err(e) => panic!("unexpected status {e:#x}"),
+            }
+            assert!(seen.len() <= 4, "enumeration must terminate");
+        }
+        assert_eq!(seen, vec!["keep1.log", "keep2.log"]);
+    }
+
+    #[test]
+    fn tree_disconnect_releases_only_that_trees_handles() {
+        let b = backing();
+        let mut h = Handles::default();
+        let kept = open_path_on(&b, &mut h, "dir\\a.txt", 1).unwrap();
+        open_path_on(&b, &mut h, "dir\\b.log", 2).unwrap();
+        open_path_on(&b, &mut h, "top.bin", 2).unwrap();
+        assert_eq!(h.len(), 3);
+
+        h.close_tree(2);
+        assert_eq!(h.len(), 1, "only tree 2's handles go");
+        assert!(close(&close_body(kept, 0), &mut h).is_ok(), "tree 1 survives");
+
+        // The compound placeholder pointed at a handle tree 2 owned; it must not
+        // resolve onto anything now.
+        let body = read_body(RELATED_FILE_ID, 0, 1);
+        assert_eq!(read(&body, &b, &mut h).unwrap_err(), status::FILE_CLOSED);
+    }
+
+    #[test]
+    fn close_all_releases_every_handle() {
+        let b = backing();
+        let mut h = Handles::default();
+        open_path_on(&b, &mut h, "dir\\a.txt", 1).unwrap();
+        open_path_on(&b, &mut h, "top.bin", 2).unwrap();
+        h.close_all();
+        assert_eq!(h.len(), 0);
+    }
+
     #[test]
     fn query_directory_on_a_file_is_refused() {
         let b = backing();
@@ -1050,7 +1199,7 @@ mod tests {
         let body = query_info_body(info_type::FILE, file_class::BASIC, id, 8);
         assert_eq!(
             query_info(&body, &b, &h, UNIX_EPOCH, 1).unwrap_err(),
-            status::BUFFER_OVERFLOW
+            status::INFO_LENGTH_MISMATCH
         );
     }
 

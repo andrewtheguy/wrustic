@@ -24,11 +24,14 @@ non-loopback bind — lives in the test harness instead, see
 
 ## Mounting
 
-Replace `<pw>` with the password shown at startup.
+Every one of these prompts for the password rather than taking it on the command
+line, where it would be readable by any process on the machine for as long as the
+mount command ran — and would sit in shell history afterwards. Type in the
+password shown on the share screen when asked.
 
 ```sh
-# Linux
-sudo mount -t cifs -o port=4456,vers=2.1,username=wrustic,password=<pw>,ro,uid=$(id -u),gid=$(id -g) \
+# Linux — mount.cifs prompts for the password
+sudo mount -t cifs -o port=4456,vers=2.1,username=wrustic,ro,uid=$(id -u),gid=$(id -g) \
     //127.0.0.1/snap /mnt/snap
 
 # macOS
@@ -36,8 +39,8 @@ mount_smbfs //wrustic@127.0.0.1:4456/snap /Volumes/snap
 ```
 
 ```bat
-:: Windows 11 24H2 or newer
-net use Z: \\127.0.0.1\snap /user:wrustic <pw> /TCPPORT:4456
+:: Windows 11 24H2 or newer — * makes net use prompt
+net use Z: \\127.0.0.1\snap * /user:wrustic /TCPPORT:4456
 ```
 
 Windows needs **no client-side policy changes**. Sessions are authenticated and

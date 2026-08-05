@@ -78,8 +78,9 @@ pub(crate) fn sign(key: &[u8; 16], buf: &mut [u8]) {
 
 /// Verify every PDU in `buf`.
 ///
-/// Called only for sessions that authenticated with NTLMv2 and therefore have a
-/// key; the guest path has none and never reaches here.
+/// Called once a session holds a key, which happens only on a successful NTLMv2
+/// authentication. The messages before that — NEGOTIATE and the SESSION_SETUP
+/// legs themselves — have no key to check against and are not routed here.
 ///
 /// An unsigned PDU is **rejected**, not skipped. Skipping it would mean anyone
 /// able to reach the port could clear the SIGNED flag and have their requests
