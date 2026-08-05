@@ -17,4 +17,3 @@
   lock module (docs/locking.md) — snapshot delete and unlock are already
   native; next is backup under a non-exclusive lock, then copy / key add.
   prune/repair/migrate stay on the restic CLI
-- Search text file contents across snapshots (requires indexing and is a much larger project)
