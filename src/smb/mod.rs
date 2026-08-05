@@ -33,6 +33,41 @@
 //   macOS    mount_smbfs -f 0444 -d 0555 //wrustic@127.0.0.1:<p>/snap /Volumes/snap
 //   Windows  net use Z: \\127.0.0.1\snap /user:wrustic <pw>   (add /TCPPORT:<p>)
 
+/// Whether to trace protocol traffic to stderr. Enabled by setting
+/// `WRUSTIC_SMB_LOG` to anything.
+///
+/// Worth having permanently rather than as scaffolding: when a client refuses a
+/// mount it says nothing useful (Linux reports a bare -EIO or -EINVAL, macOS
+/// just times out), and the server is the only place that can see which command
+/// was rejected and why.
+pub(crate) fn log_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("WRUSTIC_SMB_LOG").is_some())
+}
+
+// Defined above the module declarations on purpose: a `macro_rules!` is in
+// scope only for what follows it, and the modules below need it too.
+macro_rules! smb_log {
+    ($($arg:tt)*) => {
+        if $crate::smb::log_enabled() {
+            eprintln!("[smb] {}", format!($($arg)*));
+        }
+    };
+}
+
+/// The same, prefixed with the connection it happened on.
+///
+/// Not cosmetic. A Windows client opens several connections per mount and
+/// spreads work across them, so in a flat trace a failed SESSION_SETUP on one
+/// connection sits between two successful operations on another — which reads
+/// as a server that intermittently refuses folders, rather than as a client
+/// whose extra connections never authenticated.
+macro_rules! conn_log {
+    ($id:expr, $($arg:tt)*) => {
+        smb_log!("conn {}: {}", $id, format_args!($($arg)*))
+    };
+}
+
 mod backing;
 mod files;
 mod info;
@@ -61,26 +96,6 @@ use proto::{HEADER_LEN, Header, NEXT_COMMAND_OFFSET, cmd, status, write_error_bo
 pub(crate) use session::Credentials;
 use session::{SessionState, TreeKind};
 use wire::{MAX_INBOUND_MESSAGE, NBSS_HEADER_LEN, Reader, Writer, nbss_header, nbss_len};
-
-/// Whether to trace protocol traffic to stderr. Enabled by setting
-/// `WRUSTIC_SMB_LOG` to anything.
-///
-/// Worth having permanently rather than as scaffolding: when a client refuses a
-/// mount it says nothing useful (Linux reports a bare -EIO or -EINVAL, macOS
-/// just times out), and the server is the only place that can see which command
-/// was rejected and why.
-pub(crate) fn log_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("WRUSTIC_SMB_LOG").is_some())
-}
-
-macro_rules! smb_log {
-    ($($arg:tt)*) => {
-        if $crate::smb::log_enabled() {
-            eprintln!("[smb] {}", format!($($arg)*));
-        }
-    };
-}
 
 /// Render an NTSTATUS for a log line.
 fn status_name(status: u32) -> String {
@@ -424,6 +439,16 @@ const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60
 
 async fn serve_connection(mut stream: tokio::net::TcpStream, ctx: Arc<Ctx>) {
     let mut conn = Conn::new(ctx);
+    if log_enabled() {
+        // How many connections a mount opens, and when, is half the story when
+        // one of them misbehaves: a client that spreads work across several
+        // shows up here as several ids, not as one busy session.
+        let peer = match stream.peer_addr() {
+            Ok(a) => a.to_string(),
+            Err(_) => "<unknown>".to_string(),
+        };
+        conn_log!(conn.id, "connected from {peer}");
+    }
     let mut nb = [0u8; NBSS_HEADER_LEN];
     loop {
         // Only the wait for a *new* message is bounded. Once a header has
@@ -433,7 +458,7 @@ async fn serve_connection(mut stream: tokio::net::TcpStream, ctx: Arc<Ctx>) {
             Ok(Ok(_)) => {}
             Ok(Err(_)) => return,
             Err(_) => {
-                smb_log!("dropping connection: idle for {}s", IDLE_TIMEOUT.as_secs());
+                conn_log!(conn.id, "dropping: idle for {}s", IDLE_TIMEOUT.as_secs());
                 return;
             }
         }
@@ -461,14 +486,15 @@ async fn serve_connection(mut stream: tokio::net::TcpStream, ctx: Arc<Ctx>) {
         if let Some(key) = conn.state.signing_key {
             let verdict = sign::verify(&key, &msg);
             if !verdict.is_valid() {
-                smb_log!("dropping connection: {}", verdict.describe());
+                conn_log!(conn.id, "dropping: {}", verdict.describe());
                 return;
             }
         }
 
         let Some(mut resp) = tokio::task::block_in_place(|| conn.handle_message(&msg)) else {
-            smb_log!(
-                "dropping connection: unparseable message, first bytes {:02x?}",
+            conn_log!(
+                conn.id,
+                "dropping: unparseable message, first bytes {:02x?}",
                 &msg[..msg.len().min(8)]
             );
             // Unparseable, or an SMB1 negotiate. Dropping the connection is the
@@ -541,17 +567,31 @@ impl Reply {
 /// Per-connection protocol state.
 struct Conn {
     ctx: Arc<Ctx>,
+    /// Identifies this connection in the trace. Process-wide and monotonic
+    /// rather than derived from the socket: a peer address is reused as soon as
+    /// a port is, and two connections from the same client are exactly what has
+    /// to be told apart.
+    id: u64,
     state: SessionState,
     /// Open handles are per-connection: SMB2 file ids are scoped to the
     /// connection that created them and do not survive a reconnect.
     handles: Handles,
 }
 
+/// Hands out `Conn::id`. Starts at 1 so id 0 can mean "no connection" in the
+/// session state a unit test builds by hand.
+fn next_conn_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 impl Conn {
     fn new(ctx: Arc<Ctx>) -> Self {
+        let id = next_conn_id();
         Self {
             ctx,
-            state: SessionState::default(),
+            id,
+            state: SessionState::new(id),
             handles: Handles::default(),
         }
     }
@@ -565,7 +605,7 @@ impl Conn {
         // the SMB2 wildcard dialect is what gets the client to re-negotiate in
         // SMB2; dropping it leaves the client waiting for a timeout.
         if session::is_smb1_negotiate(msg) {
-            smb_log!("SMB1 multi-protocol NEGOTIATE -> SMB2 wildcard 0x02ff");
+            conn_log!(self.id, "SMB1 multi-protocol NEGOTIATE -> SMB2 wildcard 0x02ff");
             return Some(session::smb1_negotiate_response(
                 &self.ctx.server_guid,
                 self.ctx.boot_time,
@@ -574,7 +614,7 @@ impl Conn {
         if session::is_smb1(msg) {
             // Any other SMB1 command. We do not speak SMB1, and there is no
             // SMB2 status that means "wrong protocol", so the connection goes.
-            smb_log!("dropping connection: SMB1 command {:#04x}", msg[4]);
+            conn_log!(self.id, "dropping: SMB1 command {:#04x}", msg[4]);
             return None;
         }
 
@@ -601,13 +641,24 @@ impl Conn {
             let is_only = first && next == 0;
 
             if log_enabled() && hdr.command == cmd::NEGOTIATE {
-                smb_log!("client offers dialects {:04x?}", session::peek_dialects(body));
+                conn_log!(
+                    self.id,
+                    "client offers dialects {:04x?}",
+                    session::peek_dialects(body)
+                );
+            }
+            if log_enabled()
+                && hdr.command == cmd::CREATE
+                && let Some((name, access)) = files::peek_create(body, chunk)
+            {
+                conn_log!(self.id, "CREATE \"{name}\" access {access:#010x}");
             }
 
             let start = out.len();
             match self.execute(&hdr, body, chunk, is_only) {
                 Some(Ok(reply)) => {
-                    smb_log!(
+                    conn_log!(
+                        self.id,
                         "{} -> {} ({} bytes)",
                         cmd::name(hdr.command),
                         status_name(reply.status),
@@ -623,7 +674,7 @@ impl Conn {
                     out.bytes(&reply.body);
                 }
                 Some(Err(st)) => {
-                    smb_log!("{} -> {}", cmd::name(hdr.command), status_name(st));
+                    conn_log!(self.id, "{} -> {}", cmd::name(hdr.command), status_name(st));
                     hdr.write_response(
                         &mut out,
                         st,

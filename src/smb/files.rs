@@ -175,6 +175,35 @@ fn write_file_id(w: &mut Writer, id: u64) {
     w.u64(id); // Volatile
 }
 
+/// Read a CREATE's filename and DesiredAccess back out of the request, for the
+/// trace log. Same idea as `session::peek_dialects`: a client reports a refused
+/// open as a generic system error, so "CREATE -> ACCESS_DENIED" on its own does
+/// not say *which* path was refused or what it asked for — the two things
+/// needed to tell a real bug from a client probing for write access.
+///
+/// Returns None rather than an error: this only ever feeds a log line, and a
+/// request too malformed to peek at is about to be rejected by `create` anyway.
+pub(crate) fn peek_create(body: &[u8], message: &[u8]) -> Option<(String, u32)> {
+    let mut r = Reader::new(body);
+    if r.u16().ok()? != 57 {
+        return None;
+    }
+    r.skip(1).ok()?; // SecurityFlags
+    r.skip(1).ok()?; // RequestedOplockLevel
+    r.skip(4).ok()?; // ImpersonationLevel
+    r.skip(8).ok()?; // SmbCreateFlags
+    r.skip(8).ok()?; // Reserved
+    let desired_access = r.u32().ok()?;
+    r.skip(4).ok()?; // FileAttributes
+    r.skip(4).ok()?; // ShareAccess
+    r.skip(4).ok()?; // CreateDisposition
+    r.skip(4).ok()?; // CreateOptions
+    let name_off = r.u16().ok()? as usize;
+    let name_len = r.u16().ok()? as usize;
+    let raw = Reader::new(message).slice_at(name_off, name_len).ok()?;
+    Some((from_utf16le(raw).ok()?, desired_access))
+}
+
 /// CREATE (MS-SMB2 2.2.13 request, 2.2.14 response).
 pub(crate) fn create(
     body: &[u8],
@@ -798,6 +827,17 @@ mod tests {
             options::DIRECTORY_FILE,
         );
         assert!(create(&body, &message(&body), &b, &mut h, TREE).is_ok());
+    }
+
+    #[test]
+    fn peek_create_recovers_the_name_and_access_for_the_log() {
+        let body = create_body(r"Users\andrew\Documents", 0x0012_00A9, disposition::OPEN, 0);
+        let (name, access) = peek_create(&body, &message(&body)).unwrap();
+        assert_eq!(name, r"Users\andrew\Documents");
+        assert_eq!(access, 0x0012_00A9);
+
+        // A body too short to parse must not panic — it only feeds a log line.
+        assert!(peek_create(&body[..8], &message(&body)).is_none());
     }
 
     #[test]

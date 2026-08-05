@@ -211,21 +211,47 @@ error. The server is the only place that can see which command was rejected and
 why, so set `WRUSTIC_SMB_LOG=1` and it traces every command to stderr:
 
 ```
-[smb] SMB1 multi-protocol NEGOTIATE -> SMB2 wildcard 0x02ff
-[smb] client offers dialects [0202, 0210, 0300, 0302, 0311]
-[smb] NEGOTIATE -> SUCCESS (94 bytes)
-[smb] SESSION_SETUP -> MORE_PROCESSING_REQUIRED (147 bytes)
-[smb] SESSION_SETUP -> SUCCESS (17 bytes)
-[smb] TREE_CONNECT -> SUCCESS (16 bytes)
+[smb] conn 1: connected from 127.0.0.1:45456
+[smb] conn 1: client offers dialects [0202, 0210, 0300, 0302, 0311]
+[smb] conn 1: NEGOTIATE -> SUCCESS (94 bytes)
+[smb] conn 1: SESSION_SETUP -> MORE_PROCESSING_REQUIRED (147 bytes)
+[smb] conn 1: SESSION_SETUP -> SUCCESS (17 bytes)
+[smb] conn 1: TREE_CONNECT -> SUCCESS (16 bytes)
+[smb] conn 2: connected from 127.0.0.1:60874
+[smb] conn 1: CREATE "docs\readme.txt" access 0x00120089
+[smb] conn 1: CREATE -> SUCCESS (88 bytes)
 ```
+
+**Every line names its connection**, because a client opens several per mount
+and spreads work across them. Without the id, a failure on one connection sits
+between two successes on another and reads as a server that intermittently
+refuses things — the trace above is four concurrent connections from one
+`smbclient` run. CREATE also logs the path and the requested access mask, since
+"CREATE -> ACCESS_DENIED" alone does not say which path, or what it asked for.
 
 Rejections name the command and the reason:
 
 ```
-[smb] dropping connection: CREATE arrived unsigned
-[smb] dropping connection: READ signature mismatch
-[smb] SESSION_SETUP -> LOGON_FAILURE          <- wrong username or password
+[smb] conn 3: dropping: CREATE arrived unsigned
+[smb] conn 3: dropping: READ signature mismatch
+[smb] conn 4: SESSION_SETUP: user "andrew" (domain "") is not "wrustic"
+[smb] conn 4: SESSION_SETUP: wrong password for user "wrustic"
+[smb] conn 4: SESSION_SETUP: anonymous logon refused
+[smb] conn 5: stat "/Users/andrew/Documents" failed: <the repository error>
 ```
+
+A logon failure names the identity that was offered, never the response or the
+key. That distinction matters: Windows tries the interactive user against a
+server it has no stored credential for *before* the one you typed, so a burst of
+`LOGON_FAILURE` with someone else's username is the client's credential store,
+not the server. Fix it with `cmdkey /add:<server> /user:wrustic /pass` and mount
+by that same name every time.
+
+The `stat`/`list`/`open` lines exist because a repository error and a genuinely
+missing path return the same NTSTATUS — a client can do nothing different with
+them — so without the trace a cold pack or a backend hiccup is indistinguishable
+from "that folder is not in this snapshot", right down to the wording the client
+shows.
 
 On Linux, `sudo dmesg | tail` adds cifs.ko's own complaint, which is often more
 specific than the mount error.
