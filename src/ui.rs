@@ -1318,8 +1318,13 @@ fn render_snapshot_smb(frame: &mut Frame, app: &mut App, area: Rect) {
             let user = crate::smb::DEFAULT_SHARE_USER;
             let share = &h.share_name;
             lines.push_str(&format!(
-                "Server: listening on 127.0.0.1:{port}  (read-only, this machine only)\n\n"
+                "Server: listening on 127.0.0.1:{port}  (read-only, this machine only)\n"
             ));
+            lines.push_str(
+                "Lock:   holding restic's non-exclusive repository lock — concurrent \
+                 backups keep working; prune/forget are blocked until this screen \
+                 closes.\n\n",
+            );
             lines.push_str(&format!("Username: {user}\n"));
             lines.push_str(&format!("Password: {pw}\n"));
             lines.push_str("\nMount it with:\n\n");
@@ -1345,6 +1350,15 @@ fn render_snapshot_smb(frame: &mut Frame, app: &mut App, area: Rect) {
 
     if let Some(err) = &app.smb_error {
         lines.push_str(&format!("\nError: {err}\n"));
+        // The share needs restic's non-exclusive lock; an exclusive holder
+        // (prune, forget — possibly one that crashed) blocks it. `u` mirrors
+        // the delete flow: stale locks are removed, live ones survive.
+        if app.smb_handle.is_none() && crate::lock::is_lock_error(err) {
+            lines.push_str(
+                "\nPress u to remove stale locks and retry. A lock held by a live \
+                 process is left alone (the retry reports its holder).\n",
+            );
+        }
     }
 
     lines.push_str(

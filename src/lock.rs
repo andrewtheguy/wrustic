@@ -37,6 +37,17 @@ const WAIT_BEFORE_LOCK_CHECK: Duration = Duration::from_millis(200);
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const STALE_TIMEOUT_SECS: i64 = 30 * 60;
 
+// restic's refreshability rule (`internal/repository/lock.go`
+// refreshabilityTimeout): when a lock has not been successfully refreshed for
+// StaleLockTimeout − 1.5 × refreshInterval = 22.5 minutes, the operation must
+// abort — other processes are 7.5 minutes away from judging the lock stale
+// and removing it via `restic unlock`. Expressed as a multiple of the refresh
+// interval (22.5 min / 5 min = 4.5) so tests with a shortened interval get a
+// proportionally shortened timeout.
+fn refreshability_timeout(refresh_interval: Duration) -> Duration {
+    refresh_interval * 9 / 2
+}
+
 type Nonce = aes256ctr_poly1305aes::aead::Nonce<Aes256CtrPoly1305Aes>;
 type AeadKey = aes256ctr_poly1305aes::Key;
 
@@ -473,17 +484,29 @@ pub(crate) fn write_stale_lock_for_tests(backend: &dyn LockBackend, crypto: &Rep
 struct LockShared {
     current_name: String,
     stop: bool,
+    // When the lock file on the backend last got a fresh timestamp — set at
+    // acquisition and after every successful refresh. Feeds `poisoned()`.
+    last_refresh: std::time::Instant,
+    // Latched by `poisoned()`: once the refreshability timeout was observed
+    // exceeded, a later successful refresh must not un-poison the lock — in
+    // the meantime another process may have removed it as stale and started
+    // an exclusive operation.
+    poisoned: bool,
 }
 
 /// A held repository lock. Refreshes itself every 5 minutes on a background
 /// thread and removes its lock file on drop. While any `RepoLock` is alive
 /// the process ignores SIGHUP: restic's staleness probe (`restic unlock` on
 /// the same host) delivers SIGHUP to the lock-holder PID, which would
-/// otherwise kill the TUI.
+/// otherwise kill the TUI. Long-running holders must watch [`Self::poisoned`]
+/// and abort when it turns true.
 pub(crate) struct RepoLock {
     backend: Arc<dyn LockBackend>,
     shared: Arc<(Mutex<LockShared>, Condvar)>,
     refresher: Option<JoinHandle<()>>,
+    // 22.5 minutes at the protocol's real refresh interval; see
+    // `refreshability_timeout`.
+    poison_after: Duration,
 }
 
 impl RepoLock {
@@ -494,7 +517,6 @@ impl RepoLock {
         Self::acquire(backend, crypto, true, REFRESH_INTERVAL)
     }
 
-    #[allow(dead_code)] // for append-only operations (native backup, phase 3)
     pub(crate) fn acquire_shared(
         backend: Arc<dyn LockBackend>,
         crypto: RepoCrypto,
@@ -530,7 +552,12 @@ impl RepoLock {
         };
 
         let shared = Arc::new((
-            Mutex::new(LockShared { current_name: name, stop: false }),
+            Mutex::new(LockShared {
+                current_name: name,
+                stop: false,
+                last_refresh: std::time::Instant::now(),
+                poisoned: false,
+            }),
             Condvar::new(),
         ));
         let refresher = {
@@ -540,7 +567,28 @@ impl RepoLock {
                 refresh_loop(&backend, &crypto, exclusive, refresh_interval, &shared);
             })
         };
-        Ok(Self { backend, shared, refresher: Some(refresher) })
+        Ok(Self {
+            backend,
+            shared,
+            refresher: Some(refresher),
+            poison_after: refreshability_timeout(refresh_interval),
+        })
+    }
+
+    /// restic's abort-if-unrefreshable rule for long-running operations: true
+    /// once the lock went 22.5 minutes without a successful refresh. From that
+    /// point other processes are close to (or past) judging the lock stale and
+    /// removing it, after which an exclusive operation like prune could run —
+    /// so the owning operation must stop. Latched: a refresh that succeeds
+    /// after the timeout was observed does not make the lock trustworthy
+    /// again.
+    pub(crate) fn poisoned(&self) -> bool {
+        use std::sync::PoisonError;
+        let mut state = self.shared.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if !state.poisoned && state.last_refresh.elapsed() > self.poison_after {
+            state.poisoned = true;
+        }
+        state.poisoned
     }
 
     // restic's acquisition protocol: write our lock, wait 200 ms, then check
@@ -610,12 +658,14 @@ fn refresh_loop(
         // never a moment without a valid lock in the repo.
         if let Ok(new) = write_lock(backend.as_ref(), crypto, &LockData::ours(exclusive)) {
             let _ = backend.remove(&old);
-            state.lock().expect("lock state poisoned").current_name = new;
+            let mut s = state.lock().expect("lock state poisoned");
+            s.current_name = new;
+            s.last_refresh = std::time::Instant::now();
         }
         // On refresh failure just try again next tick; the lock only turns
         // stale for others after 30 minutes without a successful refresh.
-        // (An abort-if-unrefreshable signal, restic's 22.5-minute rule, comes
-        // with native backup — today's critical sections last seconds.)
+        // Long-running holders (the SMB share) watch `poisoned()` and abort
+        // per restic's 22.5-minute refreshability rule.
     }
 }
 
@@ -789,6 +839,10 @@ mod tests {
         // Fired once, right after the next write completes — lets a test
         // inject a competing lock inside acquisition's 200 ms grace window.
         on_write: Mutex<Option<WriteHook>>,
+        // Simulates an unreachable backend for the refresh loop: while set,
+        // every write fails (reads and removes keep working, like a backend
+        // that turned read-only or an object store rejecting PUTs).
+        fail_writes: std::sync::atomic::AtomicBool,
     }
 
     impl MemLockBackend {
@@ -796,6 +850,7 @@ mod tests {
             Arc::new(Self {
                 files: Mutex::new(HashMap::new()),
                 on_write: Mutex::new(None),
+                fail_writes: std::sync::atomic::AtomicBool::new(false),
             })
         }
 
@@ -824,6 +879,9 @@ mod tests {
         }
 
         fn write(&self, name: &str, data: &[u8]) -> Result<()> {
+            if self.fail_writes.load(Ordering::SeqCst) {
+                bail!("injected write failure");
+            }
             let _ = self.files.lock().unwrap().insert(name.to_string(), data.to_vec());
             let hook = self.on_write.lock().unwrap().take();
             if let Some(hook) = hook {
@@ -1115,6 +1173,56 @@ mod tests {
 
         drop(lock);
         assert_eq!(backend.count(), 0, "drop must remove the *current* (refreshed) lock");
+    }
+
+    // restic's refreshability rule scaled down: at a 20 ms refresh interval
+    // the poison threshold is 90 ms (4.5×, the same ratio as 22.5 min to
+    // 5 min). Once the backend stops accepting writes for that long, the
+    // lock reports poisoned — and stays poisoned even after the backend
+    // recovers and a refresh succeeds again.
+    #[test]
+    fn unrefreshable_lock_becomes_poisoned_and_stays_poisoned() {
+        let _guard = test_acquire_guard();
+        let backend = MemLockBackend::new();
+        let crypto = test_crypto(true);
+        let lock = RepoLock::acquire_exclusive_with_refresh_interval(
+            Arc::clone(&backend) as Arc<dyn LockBackend>,
+            crypto,
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        assert!(!lock.poisoned(), "a fresh lock is healthy");
+
+        backend.fail_writes.store(true, Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !lock.poisoned() {
+            assert!(std::time::Instant::now() < deadline, "lock never became poisoned");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Backend recovers; wait until a refresh visibly succeeded (the lock
+        // file's storage id changes on every refresh).
+        let before: Vec<String> =
+            backend.list().unwrap().into_iter().map(|(n, _)| n).collect();
+        backend.fail_writes.store(false, Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let now: Vec<String> =
+                backend.list().unwrap().into_iter().map(|(n, _)| n).collect();
+            if now != before {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "refresh never resumed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            lock.poisoned(),
+            "poisoning must latch: during the outage another process may have \
+             removed the lock as stale"
+        );
+
+        drop(lock);
+        assert_eq!(backend.count(), 0);
     }
 
     #[test]

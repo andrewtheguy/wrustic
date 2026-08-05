@@ -1,9 +1,16 @@
 // A read-only SMB 2.1 server for a single restic snapshot.
 //
 // Why this exists: a snapshot is immutable, so exporting one over a real
-// network filesystem needs no invalidation, no locking and no write path. That
-// makes a read-only server small enough to hand-roll, and a mounted filesystem
-// is far more useful than a download link for browsing a backup.
+// network filesystem needs no invalidation, no file-level locking and no write
+// path. That makes a read-only server small enough to hand-roll, and a mounted
+// filesystem is far more useful than a download link for browsing a backup.
+//
+// Repository-level coordination is a separate matter: "immutable" only holds
+// while nothing prunes the repo, so a snapshot share holds restic's
+// non-exclusive lock — the same lock `restic mount` takes — for its lifetime
+// (see `start_snapshot_share` and docs/locking.md). Concurrent restic backups
+// keep working; a concurrent prune/forget is blocked with restic's ordinary
+// "repository is already locked" error until the share stops.
 //
 // Scope, deliberately: SMB 2.1 only, mandatory NTLMv2 authentication, mandatory
 // signing, no encryption, loopback by default. 2.1 is the newest dialect that
@@ -41,7 +48,6 @@ use tokio::sync::oneshot;
 
 use crate::config::Profile;
 use crate::local_server;
-use crate::repo::open_indexed_full;
 use backing::{Backing, SnapshotBacking};
 use files::Handles;
 use proto::{HEADER_LEN, Header, NEXT_COMMAND_OFFSET, cmd, status, write_error_body};
@@ -160,12 +166,25 @@ pub(crate) struct SmbHandle {
     pub(crate) share_name: String,
     shutdown_tx: Option<oneshot::Sender<()>>,
     join_handle: Option<thread::JoinHandle<()>>,
+    /// restic's non-exclusive repository lock, held for snapshot shares (test
+    /// servers over an in-memory backing carry no lock). Declared after the
+    /// shutdown fields so drop order releases the lock only once the shutdown
+    /// signal is on its way — the repo is never served unlocked.
+    lock: Option<crate::lock::RepoLock>,
 }
 
 impl SmbHandle {
     /// UNC path for a Linux `mount -t cifs`.
     pub(crate) fn unc(&self) -> String {
         format!(r"\\127.0.0.1\{}", self.share_name)
+    }
+
+    /// restic's abort-if-unrefreshable rule: true once the held lock went
+    /// 22.5 minutes without a successful refresh, meaning other processes may
+    /// already treat it as stale and remove it — at which point a concurrent
+    /// prune could delete data mid-read. The owner must stop the share.
+    pub(crate) fn lock_poisoned(&self) -> bool {
+        self.lock.as_ref().is_some_and(crate::lock::RepoLock::poisoned)
     }
 
     pub(crate) fn stop(mut self) {
@@ -175,6 +194,8 @@ impl SmbHandle {
         if let Some(jh) = self.join_handle.take() {
             let _ = jh.join();
         }
+        // `self` drops here, releasing the repo lock after the server has
+        // fully stopped.
     }
 }
 
@@ -289,6 +310,7 @@ pub(crate) fn start(
         share_name,
         shutdown_tx: Some(shutdown_tx),
         join_handle: Some(join),
+        lock: None,
     })
 }
 
@@ -297,6 +319,12 @@ pub(crate) fn start(
 /// The repository is opened synchronously, before the listener thread starts,
 /// so a bad passphrase or an unreachable backend is reported to the caller
 /// rather than surfacing later as a mount that connects and then fails.
+///
+/// Holds restic's non-exclusive repository lock (what `restic mount` takes)
+/// for the share's lifetime, acquired before the index loads and before the
+/// snapshot is resolved. A repo locked exclusively (a running prune/forget)
+/// makes this fail with restic's "repository is already locked" error rather
+/// than serve data that operation may delete.
 pub(crate) fn start_snapshot_share(
     port: u16,
     profile: &Profile,
@@ -304,7 +332,8 @@ pub(crate) fn start_snapshot_share(
     bind: Bind,
     credentials: Credentials,
 ) -> Result<SmbHandle> {
-    let repo = Arc::new(open_indexed_full(profile)?);
+    let (repo, repo_lock) = crate::repo::open_indexed_full_shared_lock(profile)?;
+    let repo = Arc::new(repo);
     let snap = repo
         .get_snapshot_from_str(snapshot_id, |_| true)
         .map_err(|e| anyhow!("looking up snapshot `{snapshot_id}`: {e}"))?;
@@ -318,7 +347,9 @@ pub(crate) fn start_snapshot_share(
     let total_size = snap.summary.as_ref().map(|s| s.total_bytes_processed);
     let backing = SnapshotBacking::new(repo, snap.tree, label, total_size)?;
 
-    start(port, DEFAULT_SHARE_NAME, Arc::new(backing), bind, credentials)
+    let mut handle = start(port, DEFAULT_SHARE_NAME, Arc::new(backing), bind, credentials)?;
+    handle.lock = Some(repo_lock);
+    Ok(handle)
 }
 
 async fn accept_loop(
@@ -1382,6 +1413,78 @@ mod tests {
         );
         std::thread::sleep(std::time::Duration::from_secs(secs));
         handle.stop();
+    }
+
+    /// The snapshot share holds restic's non-exclusive lock for its lifetime:
+    /// while it runs, an exclusive acquisition is blocked but a concurrent
+    /// append lock (a backup) is not; stopping releases the lock; and an
+    /// existing exclusive lock stops the share from starting at all. Uses the
+    /// tmp/share-test fixture (seeding: see the share.rs e2e test).
+    #[test]
+    #[ignore]
+    fn snapshot_share_holds_restics_append_lock() {
+        let _guard = crate::lock::test_acquire_guard();
+        let profile = Profile::Local {
+            password: "sandbox".into(),
+            local_path: "tmp/share-test/restic-repo".into(),
+        };
+        let snap_id = {
+            let repo = crate::repo::open_indexed(&profile).expect("open fixture repo");
+            let snaps = repo.get_all_snapshots().expect("list snapshots");
+            let snap = snaps.last().expect("at least one snapshot");
+            snap.id.to_hex().as_str().to_string()
+        };
+        let (lock_backend, crypto) =
+            crate::repo::lock_context(&profile).expect("lock context");
+        assert!(
+            lock_backend.list().expect("list locks").is_empty(),
+            "fixture repo must start unlocked"
+        );
+
+        let handle = start_snapshot_share(
+            0,
+            &profile,
+            &snap_id,
+            Bind::Loopback,
+            test_credentials(),
+        )
+        .expect("share starts");
+        let err = crate::lock::check_blocking_locks(lock_backend.as_ref(), &crypto, true)
+            .unwrap_err();
+        assert!(
+            crate::lock::is_lock_error(&format!("{err:#}")),
+            "a running share must block exclusive operations: {err:#}"
+        );
+        assert!(
+            crate::lock::check_blocking_locks(lock_backend.as_ref(), &crypto, false).is_ok(),
+            "a concurrent backup's append lock must not be blocked"
+        );
+        handle.stop();
+        assert!(
+            lock_backend.list().expect("list locks").is_empty(),
+            "stopping the share must release its lock"
+        );
+
+        // An exclusive holder (a prune in flight) refuses the share.
+        let held = crate::lock::RepoLock::acquire_exclusive(
+            std::sync::Arc::clone(&lock_backend),
+            crypto,
+        )
+        .expect("exclusive lock");
+        let err = start_snapshot_share(
+            0,
+            &profile,
+            &snap_id,
+            Bind::Loopback,
+            test_credentials(),
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert!(
+            crate::lock::is_lock_error(&format!("{err:#}")),
+            "unexpected error: {err:#}"
+        );
+        drop(held);
     }
 
     #[test]

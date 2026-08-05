@@ -253,14 +253,25 @@ fn run(
         }
 
         if matches!(app.screen, Screen::Unlocking) {
+            // Which flow asked for the unlock decides where its outcome goes:
+            // the SMB share retries starting (its lock conflict is why `u` was
+            // offered), the delete flow re-enters its confirmation.
+            let from_smb = std::mem::take(&mut app.unlock_from_smb);
             let idx = app.loading_index;
             let Some((_, profile)) = app.config.profile_at(idx) else {
-                app.screen = Screen::SnapshotDeleteError(
-                    "Selected profile no longer exists.".into(),
-                );
+                let msg = "Selected profile no longer exists.".to_string();
+                app.screen = if from_smb {
+                    app.smb_error = Some(msg);
+                    Screen::SnapshotSmb
+                } else {
+                    Screen::SnapshotDeleteError(msg)
+                };
                 continue;
             };
             match unlock(profile) {
+                Ok(_removed) if from_smb => {
+                    app.screen = Screen::SnapshotSmbStarting;
+                }
                 // Re-enter the delete flow so details/preview are rebuilt and
                 // the confirmation is asked again; without a pending target
                 // there is nothing to retry, so just refresh the list.
@@ -271,6 +282,10 @@ fn run(
                     } else {
                         Screen::Loading
                     };
+                }
+                Err(e) if from_smb => {
+                    app.smb_error = Some(format!("unlock failed: {e:#}"));
+                    app.screen = Screen::SnapshotSmb;
                 }
                 Err(e) => {
                     app.screen = Screen::SnapshotDeleteError(format!("unlock failed: {e:#}"));
@@ -462,6 +477,24 @@ fn run(
                     app.screen =
                         Screen::PruneError("prune worker exited without reporting".into());
                 }
+            }
+            continue;
+        }
+
+        // A running SMB share holds a repo lock that refreshes on a background
+        // thread; instead of blocking on input indefinitely, wake once a
+        // second to enforce restic's refreshability rule — an unrefreshable
+        // lock means the server must stop before other processes remove the
+        // lock as stale and a prune deletes data mid-read.
+        if matches!(app.screen, Screen::SnapshotSmb) && app.smb_handle.is_some() {
+            if event::poll(std::time::Duration::from_secs(1))? {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
+                    Event::Mouse(m) => app.handle_mouse(m),
+                    _ => {}
+                }
+            } else {
+                app.poll_smb_lock();
             }
             continue;
         }

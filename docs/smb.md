@@ -6,14 +6,26 @@ the snapshot list.
 
 The server is hand-rolled — `src/smb/`, no SMB crate — because the read-only
 half of SMB 2.1 against an immutable snapshot is small: no write path, no
-locking, no cache invalidation, no oplocks worth honouring.
+file locking, no cache invalidation, no oplocks worth honouring.
+
+At the repository level the share is not lock-free: "immutable" only holds
+while nothing prunes the repo, so for its whole lifetime the share holds
+restic's non-exclusive lock — the same one `restic mount` takes. Concurrent
+backups keep working; a concurrent `restic prune`/`forget` is refused with
+restic's ordinary "repository is already locked" error until the share screen
+closes, and conversely a running prune stops the share from starting (the
+share screen then offers `u` to remove stale locks and retry). If the lock
+cannot be refreshed for 22.5 minutes (restic's refreshability rule — e.g.
+the backend became unreachable), the server shuts itself down rather than
+keep serving a repo other processes may now treat as unlocked. Details in
+[locking.md](locking.md).
 
 ## Using it
 
 `s` on the snapshot list starts a server on `127.0.0.1:4456` and shows the
 username, the generated password, and a ready mount command for each platform.
-Leaving the screen stops the server and breaks any mount using it.
-`--smb-port <N>` picks a different port.
+Leaving the screen stops the server (releasing the repository lock) and breaks
+any mount using it. `--smb-port <N>` picks a different port.
 
 That is the entire user-facing surface. There is deliberately no `serve`
 subcommand: a share is scoped to the screen that created it and is always
