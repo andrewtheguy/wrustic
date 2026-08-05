@@ -7,6 +7,16 @@
 - Moved-file detection in diffs (identify files that were renamed or
   relocated rather than showing them as a delete + add)
 - Search across snapshot contents (find files by name or path pattern, can workaround with smb and ripgrep for now)
+- Cache tree blobs while an SMB share is up. `SnapshotBacking::lookup` reads
+  one tree per path component on every CREATE, and rustic_core does not cache
+  those: its 32 MB blob cache on `IndexedFullStatus` is only consulted through
+  `get_blob_cached`, which the file-content path uses, while `Tree::from_backend`
+  re-reads and re-deserializes the tree JSON each call. Directory listings are
+  already cached per handle, so what repeats is the ancestor walk — cheap
+  against a local repository, a network round trip per component against S3. A
+  snapshot is immutable, so the cache is trivially correct; the work is picking
+  a bounded policy (a share can stay up for hours, and one tree can hold
+  thousands of nodes), and measuring first to see whether it is worth it
 - Read-only "index of" browser over HTTP: walk a snapshot's tree in a web
   browser and download files, served by the existing local file-share
   server. Where it starts is still to be decided — the snapshot list, or a
