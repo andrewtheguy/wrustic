@@ -227,12 +227,13 @@ A `RepoLock` guard type that mirrors restic exactly:
    exclusive lock (`repo::delete_snapshot`), and the `u` shortcut's
    `restic unlock` became native stale-lock removal (`repo::unlock`).
    The restic/rustic metadata cross-check and `restic snapshots --json`
-   fetch went away with it; no wrustic feature needs the restic binary at
-   runtime anymore. `src/restic.rs` survives only as the secure spawn
-   harness (stdin-piped password, env-var credentials, resterm's launch
-   semantics including the opt-in `--restic-cache` flag) for triggering
-   the restic commands wrustic deliberately does not reimplement — prune
-   and friends (Tier 3). Before spawning one of those,
+   fetch went away with it; since then the only feature that needs the
+   restic binary is the TUI's prune action (`p` on the Snapshots screen).
+   `src/restic.rs` is the secure spawn harness behind it (stdin-piped
+   password, env-var credentials, resterm's launch semantics including
+   the opt-in `--restic-cache` flag) for triggering the restic commands
+   wrustic deliberately does not reimplement — prune and friends
+   (Tier 3). Before spawning one of those,
    `restic::run_unsticking_locks` performs restic's acquisition conflict
    check natively: the subcommand maps to the lock restic takes for it
    (the per-command table above) and `lock::check_blocking_locks`
