@@ -14,8 +14,8 @@
 use anyhow::Result;
 
 use super::proto::{
-    CAP_LARGE_MTU, DIALECT_SMB_2_1, HEADER_LEN, SESSION_FLAG_IS_GUEST, SHARE_TYPE_DISK,
-    SHARE_TYPE_PIPE, SIGNING_ENABLED, access, status, to_filetime,
+    CAP_LARGE_MTU, DIALECT_SMB_2_1, DIALECT_WILDCARD, HEADER_LEN, SESSION_FLAG_IS_GUEST,
+    SHARE_TYPE_DISK, SHARE_TYPE_PIPE, SIGNING_ENABLED, access, status, to_filetime,
 };
 use super::wire::{Reader, Writer, der_tlv, from_utf16le, utf16le};
 
@@ -196,6 +196,86 @@ impl SessionState {
     }
 }
 
+/// Build the fixed part of a NEGOTIATE response for `dialect`.
+///
+/// Shared by the real SMB2 negotiate and by the SMB1 multi-protocol reply
+/// below, which is byte-identical apart from the dialect field.
+fn negotiate_response_body(
+    dialect: u16,
+    server_guid: &[u8; 16],
+    boot_time: std::time::SystemTime,
+) -> Vec<u8> {
+    let security_buffer = spnego_neg_token_init();
+
+    let mut w = Writer::with_capacity(64 + security_buffer.len());
+    w.u16(65); // StructureSize
+    w.u16(SIGNING_ENABLED); // SecurityMode: enabled, never required
+    w.u16(dialect);
+    w.u16(0); // NegotiateContextCount (3.1.1 only)
+    w.bytes(server_guid);
+    w.u32(CAP_LARGE_MTU);
+    w.u32(MAX_READ_SIZE); // MaxTransactSize
+    w.u32(MAX_READ_SIZE); // MaxReadSize
+    w.u32(MAX_READ_SIZE); // MaxWriteSize — advertised, but every WRITE is refused
+    w.u64(to_filetime(std::time::SystemTime::now())); // SystemTime
+    w.u64(to_filetime(boot_time)); // ServerStartTime
+    // Offsets are measured from the start of this response's SMB2 header, and
+    // the fixed part of this structure is 64 bytes.
+    w.u16((HEADER_LEN + 64) as u16); // SecurityBufferOffset
+    w.u16(security_buffer.len() as u16); // SecurityBufferLength
+    w.u32(0); // NegotiateContextOffset (3.1.1 only)
+    w.bytes(&security_buffer);
+    w.into_vec()
+}
+
+/// True if `msg` is an SMB1 message, i.e. begins with the `\xFFSMB` protocol id.
+pub(crate) fn is_smb1(msg: &[u8]) -> bool {
+    msg.len() >= 5 && msg[..4] == [0xFF, b'S', b'M', b'B']
+}
+
+/// SMB1 `SMB_COM_NEGOTIATE`.
+const SMB1_COM_NEGOTIATE: u8 = 0x72;
+
+pub(crate) fn is_smb1_negotiate(msg: &[u8]) -> bool {
+    is_smb1(msg) && msg[4] == SMB1_COM_NEGOTIATE
+}
+
+/// Answer an SMB1 multi-protocol NEGOTIATE with an SMB2 response.
+///
+/// macOS opens every connection this way: a legacy SMB1 negotiate whose dialect
+/// list includes the strings "SMB 2.002" and "SMB 2.???". Dropping it — which is
+/// what a server that only parses SMB2 does — leaves the client waiting until it
+/// times out, with no error on either side.
+///
+/// MS-SMB2 3.3.5.3.1 says to reply with an *SMB2* NEGOTIATE response carrying
+/// the wildcard revision 0x02FF, meaning "I speak SMB2, ask me again properly".
+/// The client then sends a real SMB2 NEGOTIATE and the normal path takes over.
+/// Note this is not SMB1 support: the reply is SMB2, and no other SMB1 command
+/// is answered.
+pub(crate) fn smb1_negotiate_response(
+    server_guid: &[u8; 16],
+    boot_time: std::time::SystemTime,
+) -> Vec<u8> {
+    let body = negotiate_response_body(DIALECT_WILDCARD, server_guid, boot_time);
+
+    let mut w = Writer::with_capacity(HEADER_LEN + body.len());
+    w.bytes(&super::proto::SMB2_MAGIC);
+    w.u16(HEADER_LEN as u16); // StructureSize
+    w.u16(0); // CreditCharge
+    w.u32(status::SUCCESS);
+    w.u16(super::proto::cmd::NEGOTIATE);
+    w.u16(1); // CreditResponse — must be at least one or the client cannot ask again
+    w.u32(super::proto::flags::SERVER_TO_REDIR);
+    w.u32(0); // NextCommand
+    w.u64(0); // MessageId — the SMB1 request had no SMB2 id, and 0 is expected here
+    w.u32(0); // Reserved
+    w.u32(0); // TreeId
+    w.u64(0); // SessionId
+    w.zeros(16); // Signature
+    w.bytes(&body);
+    w.into_vec()
+}
+
 /// Read just the dialect list out of a NEGOTIATE request, for logging. Returns
 /// an empty list rather than an error: this only ever feeds a diagnostic.
 pub(crate) fn peek_dialects(body: &[u8]) -> Vec<u16> {
@@ -251,29 +331,12 @@ pub(crate) fn negotiate(
         return Err(status::NOT_SUPPORTED);
     }
 
-    let security_buffer = spnego_neg_token_init();
-
-    let mut w = Writer::with_capacity(64 + security_buffer.len());
-    w.u16(65); // StructureSize
-    w.u16(SIGNING_ENABLED); // SecurityMode: enabled, never required
-    w.u16(DIALECT_SMB_2_1);
-    w.u16(0); // NegotiateContextCount (3.1.1 only)
-    w.bytes(server_guid);
-    w.u32(CAP_LARGE_MTU);
-    w.u32(MAX_READ_SIZE); // MaxTransactSize
-    w.u32(MAX_READ_SIZE); // MaxReadSize
-    w.u32(MAX_READ_SIZE); // MaxWriteSize — advertised, but every WRITE is refused
-    w.u64(to_filetime(std::time::SystemTime::now())); // SystemTime
-    w.u64(to_filetime(boot_time)); // ServerStartTime
-    // Offsets are measured from the start of this response's SMB2 header, and
-    // the fixed part of this structure is 64 bytes.
-    w.u16((HEADER_LEN + 64) as u16); // SecurityBufferOffset
-    w.u16(security_buffer.len() as u16); // SecurityBufferLength
-    w.u32(0); // NegotiateContextOffset (3.1.1 only)
-    w.bytes(&security_buffer);
-
     state.negotiated = true;
-    Ok(w.into_vec())
+    Ok(negotiate_response_body(
+        DIALECT_SMB_2_1,
+        server_guid,
+        boot_time,
+    ))
 }
 
 /// SESSION_SETUP (MS-SMB2 2.2.5 request, 2.2.6 response).

@@ -107,6 +107,11 @@ pub(crate) mod flags {
 /// AES-GCM encryption, none of which a loopback read-only share needs.
 pub(crate) const DIALECT_SMB_2_1: u16 = 0x0210;
 
+/// SMB2_WILDCARD_REVISION_NUMBER. Not a dialect a session ever runs at — it is
+/// the reply to an SMB1 multi-protocol negotiate, meaning "I speak SMB2, send a
+/// real SMB2 NEGOTIATE".
+pub(crate) const DIALECT_WILDCARD: u16 = 0x02FF;
+
 /// Negotiate `SecurityMode` bits. We enable signing but never require it, so a
 /// guest session (which cannot sign) is still allowed to proceed.
 pub(crate) const SIGNING_ENABLED: u16 = 0x0001;

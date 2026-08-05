@@ -414,6 +414,23 @@ impl Conn {
     /// empty vector if the message warrants no reply, or `None` to drop the
     /// connection.
     fn handle_message(&mut self, msg: &[u8]) -> Option<Vec<u8>> {
+        // macOS opens with an SMB1 multi-protocol negotiate. Answering it with
+        // the SMB2 wildcard dialect is what gets the client to re-negotiate in
+        // SMB2; dropping it leaves the client waiting for a timeout.
+        if session::is_smb1_negotiate(msg) {
+            smb_log!("SMB1 multi-protocol NEGOTIATE -> SMB2 wildcard 0x02ff");
+            return Some(session::smb1_negotiate_response(
+                &self.ctx.server_guid,
+                self.ctx.boot_time,
+            ));
+        }
+        if session::is_smb1(msg) {
+            // Any other SMB1 command. We do not speak SMB1, and there is no
+            // SMB2 status that means "wrong protocol", so the connection goes.
+            smb_log!("dropping connection: SMB1 command {:#04x}", msg[4]);
+            return None;
+        }
+
         let mut out = Writer::with_capacity(msg.len().max(256));
         let mut offset = 0usize;
         let mut first = true;
@@ -856,11 +873,45 @@ mod tests {
         assert!(resp.is_empty(), "CANCEL is answered with silence");
     }
 
+    /// macOS opens every connection with an SMB1 multi-protocol negotiate.
+    /// It must be answered with the SMB2 wildcard dialect, not dropped — a
+    /// dropped connection is an invisible failure that ends in a client-side
+    /// timeout.
     #[test]
-    fn an_smb1_negotiate_drops_the_connection() {
+    fn an_smb1_multi_protocol_negotiate_gets_the_smb2_wildcard() {
+        let mut conn = Conn::new(ctx());
+        // \xFFSMB followed by SMB_COM_NEGOTIATE.
+        let mut msg = vec![0xFF, b'S', b'M', b'B', 0x72];
+        msg.extend_from_slice(&[0u8; 32]);
+
+        let resp = conn.handle_message(&msg).expect("must be answered");
+        let hdr = parse_response(&resp);
+        assert_eq!(hdr.command, cmd::NEGOTIATE);
+        assert_eq!(hdr.status, status::SUCCESS);
+        assert_eq!(hdr.message_id, 0);
+        assert!(hdr.credits >= 1, "zero credits would stall the re-negotiation");
+
+        let dialect = u16::from_le_bytes(
+            resp[HEADER_LEN + 4..HEADER_LEN + 6].try_into().unwrap(),
+        );
+        assert_eq!(dialect, proto::DIALECT_WILDCARD);
+
+        // The client now re-negotiates in SMB2 and the normal path takes over.
+        let resp = conn
+            .handle_message(&request(cmd::NEGOTIATE, 0, 0, &negotiate_body(&[0x0210, 0x0311])))
+            .expect("answered");
+        assert_eq!(parse_response(&resp).status, status::SUCCESS);
+        let dialect = u16::from_le_bytes(
+            resp[HEADER_LEN + 4..HEADER_LEN + 6].try_into().unwrap(),
+        );
+        assert_eq!(dialect, proto::DIALECT_SMB_2_1);
+    }
+
+    #[test]
+    fn other_smb1_commands_drop_the_connection() {
         let mut conn = Conn::new(ctx());
         let mut msg = request(cmd::NEGOTIATE, 0, 0, &negotiate_body(&[0x0210]));
-        msg[0] = 0xFF; // \xFFSMB — the SMB1 magic
+        msg[0] = 0xFF; // \xFFSMB with a command byte that is not NEGOTIATE
         assert!(conn.handle_message(&msg).is_none());
     }
 
