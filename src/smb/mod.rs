@@ -163,20 +163,41 @@ pub(crate) const DEFAULT_SHARE_USER: &str = "wrustic";
 /// A short random password for a share.
 ///
 /// Generated per server rather than defaulted, because a fixed default password
-/// is the same as no password. Alphanumeric with the visually ambiguous
-/// characters removed, so it survives being read off this screen and typed into
-/// a Windows credential prompt, and needs no shell quoting in a mount command.
+/// is the same as no password.
+///
+/// The alphabet is lower case, upper case, digits and the four RFC 3986
+/// *unreserved* symbols. Unreserved is the point: those four need no
+/// percent-encoding in a URL, no quoting in a shell, and no escaping in
+/// mount.cifs's comma-separated option list, so the password stays literal
+/// wherever it is typed. The visually ambiguous characters are left out
+/// (`l`/`1`/`I`, `O`/`0`), because this is read off a screen and typed into a
+/// credential prompt by hand.
+///
+/// One character of each class is placed first and the result shuffled, so a
+/// password is never all one case by chance — a client or policy that demands
+/// mixed case cannot be handed a draw that happens not to have it.
 pub(crate) fn random_password() -> String {
     use rand::RngExt;
-    // 56 characters does not divide 256, so `random::<u8>() % len` would favour
-    // the first 32 of them (256 % 56 == 32). `random_range` rejects
-    // out-of-range draws instead, keeping all 16 characters uniform (~92 bits
-    // total).
-    const ALPHABET: &[u8] = b"abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    use rand::seq::SliceRandom;
+
+    const LOWER: &[u8] = b"abcdefghijkmnpqrstuvwxyz";
+    const UPPER: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ";
+    const DIGITS: &[u8] = b"23456789";
+    /// The unreserved marks of RFC 3986 §2.3, the whole set.
+    const SYMBOLS: &[u8] = b"-._~";
+    const LEN: usize = 16;
+
     let mut rng = rand::rng();
-    (0..16)
-        .map(|_| ALPHABET[rng.random_range(0..ALPHABET.len())] as char)
-        .collect()
+    // `random_range` rejects out-of-range draws rather than taking a modulus,
+    // which would favour the first `256 % len` characters of an alphabet whose
+    // length does not divide 256. 16 characters over 60 is ~94 bits.
+    let mut pick = |set: &[u8]| set[rng.random_range(0..set.len())] as char;
+
+    let all: Vec<u8> = [LOWER, UPPER, DIGITS, SYMBOLS].concat();
+    let mut chars: Vec<char> = vec![pick(LOWER), pick(UPPER), pick(DIGITS), pick(SYMBOLS)];
+    chars.extend((chars.len()..LEN).map(|_| pick(&all)));
+    chars.shuffle(&mut rng);
+    chars.into_iter().collect()
 }
 
 /// Immutable per-server state shared by every connection.
@@ -1156,6 +1177,48 @@ mod tests {
             .expect("session setup answered");
         assert_eq!(parse_response(&resp).status, status::SUCCESS);
         assert_eq!(conn.state.failed_logons, 0, "success clears the count");
+    }
+
+    #[test]
+    fn random_password_covers_every_class_and_stays_url_safe() {
+        // RFC 3986 §2.3 unreserved: safe unencoded in a URL, unquoted in a
+        // shell, and unescaped in mount.cifs's comma-separated option list.
+        const SYMBOLS: [char; 4] = ['-', '.', '_', '~'];
+        let mut symbol_positions = std::collections::HashSet::new();
+
+        for _ in 0..200 {
+            let pw = random_password();
+            assert_eq!(pw.chars().count(), 16);
+            assert!(pw.chars().any(|c| c.is_ascii_lowercase()), "{pw}");
+            assert!(pw.chars().any(|c| c.is_ascii_uppercase()), "{pw}");
+            assert!(pw.chars().any(|c| c.is_ascii_digit()), "{pw}");
+            assert!(pw.chars().any(|c| SYMBOLS.contains(&c)), "{pw}");
+
+            for c in pw.chars() {
+                assert!(
+                    c.is_ascii_alphanumeric() || SYMBOLS.contains(&c),
+                    "{c:?} would need escaping somewhere"
+                );
+                assert!(
+                    !"lIO01".contains(c),
+                    "{c:?} is ambiguous read off a screen"
+                );
+            }
+            symbol_positions.extend(
+                pw.char_indices()
+                    .filter(|(_, c)| SYMBOLS.contains(c))
+                    .map(|(i, _)| i),
+            );
+        }
+
+        // The guaranteed characters are generated in class order, so without the
+        // shuffle the symbol would sit at index 3 every time — which leaks the
+        // shape of every password the server ever issues.
+        assert!(
+            symbol_positions.len() > 1,
+            "guaranteed characters must be shuffled, not left in class order"
+        );
+        assert_ne!(random_password(), random_password());
     }
 
     #[test]
