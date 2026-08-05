@@ -7,6 +7,13 @@
 - Moved-file detection in diffs (identify files that were renamed or
   relocated rather than showing them as a delete + add)
 - Search across snapshot contents (find files by name or path pattern, can workaround with smb and ripgrep for now)
+- Read-only "index of" browser over HTTP: walk a snapshot's tree in a web
+  browser and download files, served by the existing local file-share
+  server. Where it starts is still to be decided — the snapshot list, or a
+  single snapshot picked in the TUI. Filenames keep the TUI browser's
+  representation, which is the name as stored; the SMB share deliberately
+  differs, decoding restic's quoting and replacing what an SMB2 name cannot
+  carry (docs/smb.md)
 
 ## Ideas (Currently out of scope but worth considering for the future)
 
