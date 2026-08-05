@@ -785,8 +785,11 @@ fn render_prune_running(frame: &mut Frame, app: &App, area: Rect) {
     // roughly every 10 s, so long repacks show movement here.
     if let Some(progress) = &app.prune_progress {
         let progress = progress.lock().unwrap_or_else(|p| p.into_inner());
-        // 2 border rows + the 4 header lines above the tail.
-        let avail = area.height.saturating_sub(6) as usize;
+        // Reserve the 2 border rows plus however many rows the header text
+        // built above actually occupies (it differs by cancel state), so the
+        // newest progress line is never pushed past the bottom border.
+        let header_rows = body.lines().count();
+        let avail = (area.height as usize).saturating_sub(2 + header_rows);
         if avail > 0 && !progress.is_empty() {
             let lines: Vec<&str> = progress.lines().collect();
             let start = lines.len().saturating_sub(avail);

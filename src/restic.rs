@@ -334,14 +334,25 @@ fn run_streaming(
             let _ = child.wait();
             return Err(e);
         }
-        let stderr = child.stderr.take().ok_or_else(|| anyhow!("restic stderr not piped"))?;
+        // Every fallible path below must not leave a live (or zombie) child
+        // behind — same kill-and-reap discipline as the password path above.
+        let Some(stderr) = child.stderr.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow!("restic stderr not piped"));
+        };
         let stderr_thread = std::thread::spawn(move || {
             let mut buf = Vec::new();
             let mut stderr = stderr;
             let _ = stderr.read_to_end(&mut buf);
             buf
         });
-        let stdout = child.stdout.take().ok_or_else(|| anyhow!("restic stdout not piped"))?;
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stderr_thread.join();
+            return Err(anyhow!("restic stdout not piped"));
+        };
         let mut collected = Vec::new();
         for line in BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
@@ -352,7 +363,15 @@ fn run_streaming(
                 p.push('\n');
             }
         }
-        let status = child.wait().map_err(|e| anyhow!("waiting on restic: {e}"))?;
+        let status = match child.wait() {
+            Ok(status) => status,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stderr_thread.join();
+                return Err(anyhow!("waiting on restic: {e}"));
+            }
+        };
         let stderr_buf = stderr_thread.join().unwrap_or_default();
         if !status.success() {
             let stderr = String::from_utf8_lossy(&stderr_buf).trim().to_string();
