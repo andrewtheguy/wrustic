@@ -219,11 +219,42 @@ struct Ctx {
     /// servers.
     server_guid: [u8; 16],
     boot_time: SystemTime,
+    /// Refused logons across every connection this server has seen, shared with
+    /// the `SmbHandle` so the owner can stop a server being worked over. See
+    /// `MAX_SERVER_LOGON_FAILURES`.
+    failed_logons: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl Ctx {
+    /// Count one refusal, returning the running total. Saturating: a server
+    /// left running for a very long time must not wrap the counter back under
+    /// the limit and start accepting logons again.
+    fn record_failed_logon(&self) -> u32 {
+        use std::sync::atomic::Ordering;
+        self.failed_logons
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_add(1))
+            })
+            .unwrap_or(0)
+            .saturating_add(1)
+    }
+
+    fn clear_failed_logons(&self) {
+        self.failed_logons
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn logon_limit_reached(&self) -> bool {
+        self.failed_logons.load(std::sync::atomic::Ordering::Relaxed)
+            >= MAX_SERVER_LOGON_FAILURES
+    }
 }
 
 pub(crate) struct SmbHandle {
     pub(crate) port: u16,
     pub(crate) share_name: String,
+    /// Shared with `Ctx`. Read by the owner to decide whether to stop.
+    failed_logons: Arc<std::sync::atomic::AtomicU32>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     join_handle: Option<thread::JoinHandle<()>>,
     /// restic's non-exclusive repository lock, held for snapshot shares (test
@@ -245,6 +276,20 @@ impl SmbHandle {
     /// prune could delete data mid-read. The owner must stop the share.
     pub(crate) fn lock_poisoned(&self) -> bool {
         self.lock.as_ref().is_some_and(crate::lock::RepoLock::poisoned)
+    }
+
+    /// True once refused logons since the last successful one have reached
+    /// `MAX_SERVER_LOGON_FAILURES`. The server has already stopped accepting
+    /// logons at this point; the owner is expected to stop it outright.
+    pub(crate) fn logon_limit_reached(&self) -> bool {
+        self.failed_logons.load(std::sync::atomic::Ordering::Relaxed)
+            >= MAX_SERVER_LOGON_FAILURES
+    }
+
+    /// Refused logons since the last successful one, for the message the owner
+    /// shows when it stops.
+    pub(crate) fn failed_logons(&self) -> u32 {
+        self.failed_logons.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn stop(mut self) {
@@ -332,6 +377,7 @@ pub(crate) fn start(
         .port();
 
     let share_name = share_name.into();
+    let failed_logons = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let ctx = Arc::new(Ctx {
         share_name: share_name.clone(),
         backing,
@@ -339,6 +385,7 @@ pub(crate) fn start(
         volume_serial: rand::random::<u32>(),
         server_guid: rand::random::<[u8; 16]>(),
         boot_time: SystemTime::now(),
+        failed_logons: failed_logons.clone(),
     });
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -368,6 +415,7 @@ pub(crate) fn start(
     Ok(SmbHandle {
         port: bound_port,
         share_name,
+        failed_logons,
         shutdown_tx: Some(shutdown_tx),
         join_handle: Some(join),
         lock: None,
@@ -474,6 +522,28 @@ async fn accept_loop(
 /// connection silent this long is one whose peer is gone, and without a bound
 /// it would hold its task and socket for as long as the server ran.
 const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Refused logons across the whole server, since the last successful one,
+/// before it stops serving.
+///
+/// Deliberately far above anything a working setup produces. A client replaying
+/// a credential that went stale across a restart is *normal* here — the share
+/// password is generated per run — and one was observed sending 85 refused
+/// logons during a single browsing session without anything being wrong. A
+/// limit that a mount could trip by accident would turn a cosmetic annoyance
+/// into a share that stops mid-read, which is worse than the thing it guards
+/// against.
+///
+/// It resets on every successful logon, so a working mount holds it near zero
+/// indefinitely, and only a client that never authenticates can walk it up.
+/// That is what makes a high ceiling safe: 1000 refusals with not one success
+/// in between is not a stale credential, it is something trying passwords.
+///
+/// This is defence in depth rather than the defence. The password is ~94 bits
+/// of entropy over a loopback socket; guessing it is not the threat model. The
+/// limit exists so a server left running cannot be ground against indefinitely,
+/// and so the owner is told.
+const MAX_SERVER_LOGON_FAILURES: u32 = 1000;
 
 /// Consecutive refused logons before a connection is dropped.
 ///
@@ -795,6 +865,17 @@ impl Conn {
             .map(Reply::ok),
 
             cmd::SESSION_SETUP => {
+                // Once the server-wide limit is reached, nothing authenticates
+                // again — not even the right password. The owner stops the
+                // server on its next poll; this closes the window in between,
+                // so the limit is a limit rather than a notification.
+                if self.ctx.logon_limit_reached() {
+                    conn_log!(
+                        self.id,
+                        "SESSION_SETUP refused: server logon limit ({MAX_SERVER_LOGON_FAILURES}) reached"
+                    );
+                    return Some(Err(status::LOGON_FAILURE));
+                }
                 let result =
                     session::session_setup(body, message, &mut self.state, &self.ctx.credentials);
                 // Count consecutive refusals so a client replaying a credential
@@ -810,8 +891,17 @@ impl Conn {
                 // MAX_FAILED_LOGONS leaves room for several.
                 if matches!(&result, Err(st) if *st == status::LOGON_FAILURE) {
                     self.state.failed_logons += 1;
+                    let total = self.ctx.record_failed_logon();
+                    if total >= MAX_SERVER_LOGON_FAILURES {
+                        conn_log!(
+                            self.id,
+                            "server logon limit reached: {total} refused logons with no \
+                             successful one in between — refusing every logon from here"
+                        );
+                    }
                 } else if matches!(&result, Ok((st, _)) if *st == status::SUCCESS) {
                     self.state.failed_logons = 0;
+                    self.ctx.clear_failed_logons();
                 }
                 result.map(|(st, b)| {
                     // Both legs must carry the server-assigned session id: the
@@ -981,6 +1071,7 @@ mod tests {
             volume_serial: 0x1234_5678,
             server_guid: [7u8; 16],
             boot_time: SystemTime::UNIX_EPOCH,
+            failed_logons: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         })
     }
 
@@ -1070,7 +1161,11 @@ mod tests {
     /// Drive a connection through negotiate + both session-setup legs,
     /// returning the connection and its session id.
     fn connected() -> (Conn, u64) {
-        let mut conn = Conn::new(ctx());
+        connected_with(ctx())
+    }
+
+    fn connected_with(ctx: Arc<Ctx>) -> (Conn, u64) {
+        let mut conn = Conn::new(ctx);
 
         let resp = conn
             .handle_message(&request(cmd::NEGOTIATE, 0, 0, &negotiate_body(&[0x0210, 0x0311])))
@@ -1177,6 +1272,62 @@ mod tests {
             .expect("session setup answered");
         assert_eq!(parse_response(&resp).status, status::SUCCESS);
         assert_eq!(conn.state.failed_logons, 0, "success clears the count");
+    }
+
+    #[test]
+    fn the_server_refuses_every_logon_once_its_limit_is_reached() {
+        use std::sync::atomic::Ordering;
+
+        let ctx = ctx();
+        // Fast-forward to one below the limit rather than sending a thousand
+        // messages: the counting itself is covered above, and the behaviour
+        // under test is what happens at the boundary.
+        ctx.failed_logons
+            .store(MAX_SERVER_LOGON_FAILURES - 1, Ordering::Relaxed);
+        assert!(!ctx.logon_limit_reached(), "one short of the limit");
+
+        let mut conn = Conn::new(ctx.clone());
+        let _ = conn.handle_message(&request(cmd::NEGOTIATE, 0, 0, &negotiate_body(&[0x0210])));
+        refused_logon(&mut conn);
+        assert!(ctx.logon_limit_reached(), "the last refusal trips it");
+
+        // From here even the right password is refused, on a fresh connection,
+        // starting with the very first leg of the exchange. Waiting for the
+        // owner to poll would leave a window in which the limit was advice.
+        let mut fresh = Conn::new(ctx.clone());
+        let _ = fresh.handle_message(&request(cmd::NEGOTIATE, 0, 0, &negotiate_body(&[0x0210])));
+        let resp = fresh
+            .handle_message(&request(cmd::SESSION_SETUP, 0, 0, &session_setup_body(1)))
+            .expect("refused, not dropped");
+        assert_eq!(parse_response(&resp).status, status::LOGON_FAILURE);
+        assert!(fresh.state.server_challenge.is_none(), "no challenge issued");
+    }
+
+    #[test]
+    fn a_successful_logon_clears_the_server_counter() {
+        use std::sync::atomic::Ordering;
+
+        // What makes a high limit safe: a working mount holds the count at zero
+        // however much noise a client makes in between, so only a client that
+        // never authenticates can walk it up to the limit.
+        let ctx = ctx();
+        ctx.failed_logons
+            .store(MAX_SERVER_LOGON_FAILURES - 1, Ordering::Relaxed);
+        let (_conn, _session_id) = connected_with(ctx.clone());
+        assert_eq!(ctx.failed_logons.load(Ordering::Relaxed), 0);
+        assert!(!ctx.logon_limit_reached());
+    }
+
+    #[test]
+    fn the_server_logon_counter_saturates_rather_than_wrapping() {
+        use std::sync::atomic::Ordering;
+
+        // Wrapping past u32::MAX would drop the count back under the limit and
+        // quietly start accepting logons again on a long-lived server.
+        let ctx = ctx();
+        ctx.failed_logons.store(u32::MAX, Ordering::Relaxed);
+        assert_eq!(ctx.record_failed_logon(), u32::MAX);
+        assert!(ctx.logon_limit_reached());
     }
 
     #[test]

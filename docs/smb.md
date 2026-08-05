@@ -262,6 +262,20 @@ which buries the connection that is actually failing. Dropping locks nothing
 out — the client may reconnect immediately — it just stops one socket being used
 as a retry loop.
 
+Across the whole server, 1000 refusals with **no successful logon in between**
+(`MAX_SERVER_LOGON_FAILURES`) stop the share: every further logon is refused
+from that moment, including the correct password, and the share screen reports
+it and releases the repository lock on its next poll. The number is deliberately
+far above anything a working setup produces — a client replaying a credential
+that went stale across a restart is normal here, and one was seen producing 85
+refusals in a single browsing session — and any successful logon resets it, so a
+working mount holds it at zero indefinitely. Only a client that never
+authenticates can walk it to the limit.
+
+This is defence in depth, not the defence: the password is ~94 bits over a
+loopback socket, so guessing it is not the threat model. It exists so a server
+left running cannot be ground against indefinitely, and so its owner is told.
+
 The `stat`/`list`/`open` lines exist because a repository error and a genuinely
 missing path return the same NTSTATUS — a client can do nothing different with
 them — so without the trace a cold pack or a backend hiccup is indistinguishable
