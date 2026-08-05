@@ -498,6 +498,7 @@ fn run(
             // events (scrolling, focus/resize churn) would otherwise starve
             // the poison check for as long as it kept arriving.
             app.poll_smb_lock();
+            app.poll_smb_logons();
             continue;
         }
 

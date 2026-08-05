@@ -1327,15 +1327,20 @@ fn render_snapshot_smb(frame: &mut Frame, app: &mut App, area: Rect) {
             );
             lines.push_str(&format!("Username: {user}\n"));
             lines.push_str(&format!("Password: {pw}\n"));
-            lines.push_str("\nMount it with:\n\n");
+            // Every command below prompts for the password rather than taking
+            // it as an argument. A password on a command line is readable by
+            // every process on the machine for as long as the command runs, and
+            // stays in shell history — or console history on Windows — long
+            // after. Type in the one shown above when asked.
+            lines.push_str("\nMount it with (each prompts for the password above):\n\n");
             lines.push_str(&format!(
-                "  Linux    sudo mount -t cifs -o port={port},vers=2.1,username={user},password={pw},ro,uid=$(id -u),gid=$(id -g),file_mode=0444,dir_mode=0555 //127.0.0.1/{share} /mnt/snap\n\n"
+                "  Linux    sudo mount -t cifs -o port={port},vers=2.1,username={user},ro,uid=$(id -u),gid=$(id -g),file_mode=0444,dir_mode=0555 //127.0.0.1/{share} /mnt/snap\n\n"
             ));
             lines.push_str(&format!(
                 "  macOS    mount_smbfs -f 0444 -d 0555 //{user}@127.0.0.1:{port}/{share} /Volumes/snap\n\n"
             ));
             lines.push_str(&format!(
-                "  Windows  net use Z: {} /user:{user} {pw} /TCPPORT:{port}\n",
+                "  Windows  net use Z: {} * /user:{user} /TCPPORT:{port}\n",
                 h.unc()
             ));
             lines.push_str(

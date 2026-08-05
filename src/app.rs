@@ -1292,6 +1292,36 @@ impl App {
         );
     }
 
+    // Stops the share once refused logons reach the server's limit. Shares the
+    // once-a-second wakeup with `poll_smb_lock`.
+    //
+    // The server has already stopped accepting logons by the time this fires,
+    // so nothing is racing here; what remains is to release the repository lock
+    // and tell the user, since a share that silently refuses everyone is
+    // indistinguishable from one that is broken.
+    pub(crate) fn poll_smb_logons(&mut self) {
+        if !self
+            .smb_handle
+            .as_ref()
+            .is_some_and(smb::SmbHandle::logon_limit_reached)
+        {
+            return;
+        }
+        let Some(handle) = self.smb_handle.take() else {
+            return;
+        };
+        let attempts = handle.failed_logons();
+        handle.stop();
+        self.smb_password = None;
+        self.smb_error = Some(format!(
+            "Server stopped: {attempts} logons were refused with no successful one in \
+             between. A client replaying a password saved from an earlier run looks \
+             exactly like this — the share password is new every time — so clear the \
+             saved credential (Windows: cmdkey /delete:<server>) before sharing again. \
+             Press Esc and share again to get a fresh password."
+        ));
+    }
+
     // Start the SMB server for `smb_snapshot_id`. Called from the main loop
     // once the "starting" screen has been drawn, because opening the repository
     // reads the full index — seconds on a large remote repository — and doing

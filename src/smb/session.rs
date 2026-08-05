@@ -185,6 +185,12 @@ fn ntlmssp_challenge(nonce: [u8; 8]) -> Vec<u8> {
 /// Per-connection negotiation state.
 #[derive(Debug, Default)]
 pub(crate) struct SessionState {
+    /// The connection this state belongs to, for the trace. Zero in unit tests,
+    /// which build a state by hand and have no connection.
+    pub(crate) conn_id: u64,
+    /// Consecutive refused logons on this connection. Reset by a successful
+    /// one, and capped by `MAX_FAILED_LOGONS`.
+    pub(crate) failed_logons: u32,
     pub(crate) negotiated: bool,
     pub(crate) session_id: u64,
     pub(crate) authenticated: bool,
@@ -206,6 +212,15 @@ pub(crate) struct SessionState {
 }
 
 impl SessionState {
+    /// State for a fresh connection. `Default` stays available for tests, which
+    /// have no connection to name.
+    pub(crate) fn new(conn_id: u64) -> Self {
+        Self {
+            conn_id,
+            ..Self::default()
+        }
+    }
+
     fn alloc_tree_id(&mut self) -> u32 {
         // Tree id 0 is reserved for "no tree", so start at 1.
         self.next_tree_id += 1;
@@ -420,17 +435,43 @@ pub(crate) fn session_setup(
             // that nonce is gone a replay of the same AUTHENTICATE has nothing
             // to match. A client that gets it wrong starts a fresh exchange,
             // which is what every real one does anyway.
-            let challenge = state.server_challenge.take().ok_or(status::LOGON_FAILURE)?;
+            let challenge = state.server_challenge.take().ok_or_else(|| {
+                conn_log!(state.conn_id, "SESSION_SETUP: AUTHENTICATE with no challenge outstanding");
+                status::LOGON_FAILURE
+            })?;
             let auth =
                 super::ntlm::Authenticate::parse(ntlmssp).ok_or(status::LOGON_FAILURE)?;
+            // Which identity was offered, and how it failed. Windows tries the
+            // interactive user against a server it has no stored credential for
+            // before it tries the one you typed, so "a rejected logon" and "the
+            // wrong account was rejected" look identical without this — and the
+            // second is the client's credential store, not the server.
+            //
+            // The name only. Never the response, the challenge or the key: a
+            // trace is written to a terminal and pasted into bug reports.
             if auth.is_anonymous() {
+                conn_log!(state.conn_id, "SESSION_SETUP: anonymous logon refused");
                 return Err(status::LOGON_FAILURE);
             }
             if !auth.user.eq_ignore_ascii_case(&credentials.user) {
+                conn_log!(
+                    state.conn_id,
+                    "SESSION_SETUP: user {:?} (domain {:?}) is not {:?}",
+                    auth.user,
+                    auth.domain,
+                    credentials.user
+                );
                 return Err(status::LOGON_FAILURE);
             }
             let key = super::ntlm::verify(&auth, &credentials.password, &challenge)
-                .ok_or(status::LOGON_FAILURE)?;
+                .ok_or_else(|| {
+                    conn_log!(
+                        state.conn_id,
+                        "SESSION_SETUP: wrong password for user {:?}",
+                        auth.user
+                    );
+                    status::LOGON_FAILURE
+                })?;
             state.signing_key = Some(key);
             // SessionFlags stays 0: not a guest, not a null session.
             let session_flags = 0u16;
@@ -991,6 +1032,15 @@ mod tests {
         let body = w.into_vec();
         let message = as_message(&body);
         (body, message)
+    }
+
+    #[test]
+    fn session_state_carries_the_connection_id_for_the_trace() {
+        // Every refusal in `session_setup` logs against this, so a state that
+        // lost it would attribute a failed logon to connection 0 — which is the
+        // one thing the trace exists to distinguish.
+        assert_eq!(SessionState::new(7).conn_id, 7);
+        assert_eq!(SessionState::default().conn_id, 0, "no connection in a test");
     }
 
     #[test]

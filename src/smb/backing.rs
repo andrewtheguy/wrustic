@@ -204,10 +204,20 @@ impl Backing for SnapshotBacking {
         // same error kind, so both become OBJECT_NAME_NOT_FOUND. That is the
         // status a client can act on, and the distinction would not change what
         // it does next.
+        //
+        // A backend failure lands here too, though — a cold pack, an S3 hiccup,
+        // a read that timed out — and it is *not* the same thing: the client
+        // shows "no such folder" for something that exists and will work on the
+        // next attempt. The status stays as it is, since nothing a client does
+        // differs, but the reason is traced so an intermittent one is
+        // recognisable as an intermittent one.
         let node = self
             .vfs
             .node_from_path(self.repo.as_ref(), &path.to_vfs_path())
-            .map_err(|_| status::OBJECT_NAME_NOT_FOUND)?;
+            .map_err(|e| {
+                smb_log!("stat {:?} failed: {e}", path.to_vfs_path());
+                status::OBJECT_NAME_NOT_FOUND
+            })?;
         Ok(node_info(&node, self.now))
     }
 
@@ -215,7 +225,10 @@ impl Backing for SnapshotBacking {
         let entries = self
             .vfs
             .dir_entries_from_path(self.repo.as_ref(), &path.to_vfs_path())
-            .map_err(|_| status::OBJECT_PATH_NOT_FOUND)?;
+            .map_err(|e| {
+                smb_log!("list {:?} failed: {e}", path.to_vfs_path());
+                status::OBJECT_PATH_NOT_FOUND
+            })?;
         Ok(entries.iter().map(|n| node_info(n, self.now)).collect())
     }
 
@@ -223,14 +236,17 @@ impl Backing for SnapshotBacking {
         let node = self
             .vfs
             .node_from_path(self.repo.as_ref(), &path.to_vfs_path())
-            .map_err(|_| status::OBJECT_NAME_NOT_FOUND)?;
+            .map_err(|e| {
+                smb_log!("open {:?} failed: {e}", path.to_vfs_path());
+                status::OBJECT_NAME_NOT_FOUND
+            })?;
         if node.is_dir() {
             return Err(status::FILE_IS_A_DIRECTORY);
         }
-        let open_file = self
-            .repo
-            .open_file(&node)
-            .map_err(|_| status::OBJECT_NAME_NOT_FOUND)?;
+        let open_file = self.repo.open_file(&node).map_err(|e| {
+            smb_log!("open_file {:?} failed: {e}", path.to_vfs_path());
+            status::OBJECT_NAME_NOT_FOUND
+        })?;
         Ok(Arc::new(SnapshotFile {
             repo: self.repo.clone(),
             open_file,

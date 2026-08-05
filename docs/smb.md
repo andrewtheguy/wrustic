@@ -211,21 +211,76 @@ error. The server is the only place that can see which command was rejected and
 why, so set `WRUSTIC_SMB_LOG=1` and it traces every command to stderr:
 
 ```
-[smb] SMB1 multi-protocol NEGOTIATE -> SMB2 wildcard 0x02ff
-[smb] client offers dialects [0202, 0210, 0300, 0302, 0311]
-[smb] NEGOTIATE -> SUCCESS (94 bytes)
-[smb] SESSION_SETUP -> MORE_PROCESSING_REQUIRED (147 bytes)
-[smb] SESSION_SETUP -> SUCCESS (17 bytes)
-[smb] TREE_CONNECT -> SUCCESS (16 bytes)
+[smb 04:35:34.087] conn 1: connected from 127.0.0.1:45456
+[smb 04:35:34.090] conn 1: client offers dialects [0202, 0210, 0300, 0302, 0311]
+[smb 04:35:34.090] conn 1: NEGOTIATE -> SUCCESS (94 bytes)
+[smb 04:35:34.092] conn 1: SESSION_SETUP -> MORE_PROCESSING_REQUIRED (147 bytes)
+[smb 04:35:34.093] conn 1: SESSION_SETUP -> SUCCESS (17 bytes)
+[smb 04:35:34.093] conn 1: TREE_CONNECT -> SUCCESS (16 bytes)
+[smb 04:35:34.094] conn 2: connected from 127.0.0.1:60874
+[smb 04:35:34.094] conn 1: CREATE "docs\readme.txt" access 0x00120089
+[smb 04:35:34.095] conn 1: CREATE -> SUCCESS (88 bytes)
 ```
+
+**Every line names its connection**, because a client opens several per mount
+and spreads work across them. Without the id, a failure on one connection sits
+between two successes on another and reads as a server that intermittently
+refuses things — the trace above is four concurrent connections from one
+`smbclient` run. CREATE also logs the path and the requested access mask, since
+"CREATE -> ACCESS_DENIED" alone does not say which path, or what it asked for.
+The timestamp separates a burst from a slow retry loop: the same number of
+failures means different things at 10 ms apart and at 10 minutes apart.
 
 Rejections name the command and the reason:
 
 ```
-[smb] dropping connection: CREATE arrived unsigned
-[smb] dropping connection: READ signature mismatch
-[smb] SESSION_SETUP -> LOGON_FAILURE          <- wrong username or password
+[smb 04:41:02.310] conn 3: dropping: CREATE arrived unsigned
+[smb 04:41:02.311] conn 3: dropping: READ signature mismatch
+[smb 04:41:07.884] conn 4: SESSION_SETUP: user "andrew" (domain "") is not "wrustic"
+[smb 04:41:07.902] conn 4: SESSION_SETUP: wrong password for user "wrustic"
+[smb 04:41:07.915] conn 4: SESSION_SETUP: anonymous logon refused
+[smb 04:41:09.006] conn 5: stat "/Users/andrew/Documents" failed: <the repository error>
 ```
+
+A logon failure names the identity that was offered, never the response or the
+key. That distinction is the whole point: a burst of `LOGON_FAILURE` naming
+*someone else's* username is Windows trying the interactive user against a
+server it has no stored credential for, while a burst naming `wrustic` with the
+wrong password is a **saved credential from an earlier run** — the share
+password is generated fresh each time the server starts, so a client that ticked
+"remember" replays one that will never work again. Clear it and re-map:
+
+```bat
+cmdkey /list | findstr <server>
+cmdkey /delete:<server>
+net use * /delete
+```
+
+A connection is dropped after five consecutive refusals (`MAX_FAILED_LOGONS`).
+One real client sent the same stale password 84 times on a single connection,
+which buries the connection that is actually failing. Dropping locks nothing
+out — the client may reconnect immediately — it just stops one socket being used
+as a retry loop.
+
+Across the whole server, 1000 refusals with **no successful logon in between**
+(`MAX_SERVER_LOGON_FAILURES`) stop the share: every further logon is refused
+from that moment, including the correct password, and the share screen reports
+it and releases the repository lock on its next poll. The number is deliberately
+far above anything a working setup produces — a client replaying a credential
+that went stale across a restart is normal here, and one was seen producing 85
+refusals in a single browsing session — and any successful logon resets it, so a
+working mount holds it at zero indefinitely. Only a client that never
+authenticates can walk it to the limit.
+
+This is defence in depth, not the defence: the password is ~94 bits over a
+loopback socket, so guessing it is not the threat model. It exists so a server
+left running cannot be ground against indefinitely, and so its owner is told.
+
+The `stat`/`list`/`open` lines exist because a repository error and a genuinely
+missing path return the same NTSTATUS — a client can do nothing different with
+them — so without the trace a cold pack or a backend hiccup is indistinguishable
+from "that folder is not in this snapshot", right down to the wording the client
+shows.
 
 On Linux, `sudo dmesg | tail` adds cifs.ko's own complaint, which is often more
 specific than the mount error.

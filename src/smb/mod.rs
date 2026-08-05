@@ -27,11 +27,63 @@
 // 2.1 carries no POSIX mode of its own), and on Windows from the READONLY
 // attribute plus a CREATE that refuses FILE_EXECUTE on files.
 //
-// Mount it with:
-//   Linux    sudo mount -t cifs -o port=<p>,vers=2.1,username=wrustic,password=<pw>,ro,\
+// Mount it with — each prompts for the password, which is never passed as an
+// argument: a command line is readable by every other process while it runs,
+// and lands in shell (or console) history afterwards.
+//   Linux    sudo mount -t cifs -o port=<p>,vers=2.1,username=wrustic,ro,\
 //                       file_mode=0444,dir_mode=0555 //127.0.0.1/snap /mnt
 //   macOS    mount_smbfs -f 0444 -d 0555 //wrustic@127.0.0.1:<p>/snap /Volumes/snap
-//   Windows  net use Z: \\127.0.0.1\snap /user:wrustic <pw>   (add /TCPPORT:<p>)
+//   Windows  net use Z: \\127.0.0.1\snap * /user:wrustic   (add /TCPPORT:<p>)
+
+/// Whether to trace protocol traffic to stderr. Enabled by setting
+/// `WRUSTIC_SMB_LOG` to anything.
+///
+/// Worth having permanently rather than as scaffolding: when a client refuses a
+/// mount it says nothing useful (Linux reports a bare -EIO or -EINVAL, macOS
+/// just times out), and the server is the only place that can see which command
+/// was rejected and why.
+pub(crate) fn log_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("WRUSTIC_SMB_LOG").is_some())
+}
+
+/// Wall-clock stamp for a trace line, to millisecond resolution.
+///
+/// Not decoration: a burst of failed logons and the same number spread over ten
+/// minutes are different problems — a client hammering a stale credential
+/// versus one retrying on a timer — and without a clock the log cannot tell
+/// them apart. Local time, because the reader is looking at their own screen
+/// and correlating with what they just clicked.
+pub(crate) fn log_stamp() -> String {
+    jiff::Zoned::now().strftime("%H:%M:%S%.3f").to_string()
+}
+
+// Defined above the module declarations on purpose: a `macro_rules!` is in
+// scope only for what follows it, and the modules below need it too.
+macro_rules! smb_log {
+    ($($arg:tt)*) => {
+        if $crate::smb::log_enabled() {
+            eprintln!(
+                "[smb {}] {}",
+                $crate::smb::log_stamp(),
+                format!($($arg)*)
+            );
+        }
+    };
+}
+
+/// The same, prefixed with the connection it happened on.
+///
+/// Not cosmetic. A Windows client opens several connections per mount and
+/// spreads work across them, so in a flat trace a failed SESSION_SETUP on one
+/// connection sits between two successful operations on another — which reads
+/// as a server that intermittently refuses folders, rather than as a client
+/// whose extra connections never authenticated.
+macro_rules! conn_log {
+    ($id:expr, $($arg:tt)*) => {
+        smb_log!("conn {}: {}", $id, format_args!($($arg)*))
+    };
+}
 
 mod backing;
 mod files;
@@ -61,26 +113,6 @@ use proto::{HEADER_LEN, Header, NEXT_COMMAND_OFFSET, cmd, status, write_error_bo
 pub(crate) use session::Credentials;
 use session::{SessionState, TreeKind};
 use wire::{MAX_INBOUND_MESSAGE, NBSS_HEADER_LEN, Reader, Writer, nbss_header, nbss_len};
-
-/// Whether to trace protocol traffic to stderr. Enabled by setting
-/// `WRUSTIC_SMB_LOG` to anything.
-///
-/// Worth having permanently rather than as scaffolding: when a client refuses a
-/// mount it says nothing useful (Linux reports a bare -EIO or -EINVAL, macOS
-/// just times out), and the server is the only place that can see which command
-/// was rejected and why.
-pub(crate) fn log_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("WRUSTIC_SMB_LOG").is_some())
-}
-
-macro_rules! smb_log {
-    ($($arg:tt)*) => {
-        if $crate::smb::log_enabled() {
-            eprintln!("[smb] {}", format!($($arg)*));
-        }
-    };
-}
 
 /// Render an NTSTATUS for a log line.
 fn status_name(status: u32) -> String {
@@ -131,20 +163,41 @@ pub(crate) const DEFAULT_SHARE_USER: &str = "wrustic";
 /// A short random password for a share.
 ///
 /// Generated per server rather than defaulted, because a fixed default password
-/// is the same as no password. Alphanumeric with the visually ambiguous
-/// characters removed, so it survives being read off this screen and typed into
-/// a Windows credential prompt, and needs no shell quoting in a mount command.
+/// is the same as no password.
+///
+/// The alphabet is lower case, upper case, digits and the four RFC 3986
+/// *unreserved* symbols. Unreserved is the point: those four need no
+/// percent-encoding in a URL, no quoting in a shell, and no escaping in
+/// mount.cifs's comma-separated option list, so the password stays literal
+/// wherever it is typed. The visually ambiguous characters are left out
+/// (`l`/`1`/`I`, `O`/`0`), because this is read off a screen and typed into a
+/// credential prompt by hand.
+///
+/// One character of each class is placed first and the result shuffled, so a
+/// password is never all one case by chance — a client or policy that demands
+/// mixed case cannot be handed a draw that happens not to have it.
 pub(crate) fn random_password() -> String {
     use rand::RngExt;
-    // 56 characters does not divide 256, so `random::<u8>() % len` would favour
-    // the first 32 of them (256 % 56 == 32). `random_range` rejects
-    // out-of-range draws instead, keeping all 16 characters uniform (~92 bits
-    // total).
-    const ALPHABET: &[u8] = b"abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    use rand::seq::SliceRandom;
+
+    const LOWER: &[u8] = b"abcdefghijkmnpqrstuvwxyz";
+    const UPPER: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ";
+    const DIGITS: &[u8] = b"23456789";
+    /// The unreserved marks of RFC 3986 §2.3, the whole set.
+    const SYMBOLS: &[u8] = b"-._~";
+    const LEN: usize = 16;
+
     let mut rng = rand::rng();
-    (0..16)
-        .map(|_| ALPHABET[rng.random_range(0..ALPHABET.len())] as char)
-        .collect()
+    // `random_range` rejects out-of-range draws rather than taking a modulus,
+    // which would favour the first `256 % len` characters of an alphabet whose
+    // length does not divide 256. 16 characters over 60 is ~94 bits.
+    let mut pick = |set: &[u8]| set[rng.random_range(0..set.len())] as char;
+
+    let all: Vec<u8> = [LOWER, UPPER, DIGITS, SYMBOLS].concat();
+    let mut chars: Vec<char> = vec![pick(LOWER), pick(UPPER), pick(DIGITS), pick(SYMBOLS)];
+    chars.extend((chars.len()..LEN).map(|_| pick(&all)));
+    chars.shuffle(&mut rng);
+    chars.into_iter().collect()
 }
 
 /// Immutable per-server state shared by every connection.
@@ -166,11 +219,41 @@ struct Ctx {
     /// servers.
     server_guid: [u8; 16],
     boot_time: SystemTime,
+    /// Refused logons across every connection this server has seen, shared with
+    /// the `SmbHandle` so the owner can stop a server being worked over. See
+    /// `MAX_SERVER_LOGON_FAILURES`.
+    failed_logons: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl Ctx {
+    /// Count one refusal, returning the running total. Saturating: a server
+    /// left running for a very long time must not wrap the counter back under
+    /// the limit and start accepting logons again.
+    fn record_failed_logon(&self) -> u32 {
+        use std::sync::atomic::Ordering;
+        self.failed_logons
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_add(1))
+            })
+            .unwrap_or(0)
+            .saturating_add(1)
+    }
+
+    fn clear_failed_logons(&self) {
+        self.failed_logons
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn logon_limit_reached(&self) -> bool {
+        logon_limit_reached(&self.failed_logons)
+    }
 }
 
 pub(crate) struct SmbHandle {
     pub(crate) port: u16,
     pub(crate) share_name: String,
+    /// Shared with `Ctx`. Read by the owner to decide whether to stop.
+    failed_logons: Arc<std::sync::atomic::AtomicU32>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     join_handle: Option<thread::JoinHandle<()>>,
     /// restic's non-exclusive repository lock, held for snapshot shares (test
@@ -192,6 +275,19 @@ impl SmbHandle {
     /// prune could delete data mid-read. The owner must stop the share.
     pub(crate) fn lock_poisoned(&self) -> bool {
         self.lock.as_ref().is_some_and(crate::lock::RepoLock::poisoned)
+    }
+
+    /// True once refused logons since the last successful one have reached
+    /// `MAX_SERVER_LOGON_FAILURES`. The server has already stopped accepting
+    /// logons at this point; the owner is expected to stop it outright.
+    pub(crate) fn logon_limit_reached(&self) -> bool {
+        logon_limit_reached(&self.failed_logons)
+    }
+
+    /// Refused logons since the last successful one, for the message the owner
+    /// shows when it stops.
+    pub(crate) fn failed_logons(&self) -> u32 {
+        self.failed_logons.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn stop(mut self) {
@@ -279,6 +375,7 @@ pub(crate) fn start(
         .port();
 
     let share_name = share_name.into();
+    let failed_logons = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let ctx = Arc::new(Ctx {
         share_name: share_name.clone(),
         backing,
@@ -286,6 +383,7 @@ pub(crate) fn start(
         volume_serial: rand::random::<u32>(),
         server_guid: rand::random::<[u8; 16]>(),
         boot_time: SystemTime::now(),
+        failed_logons: failed_logons.clone(),
     });
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -315,6 +413,7 @@ pub(crate) fn start(
     Ok(SmbHandle {
         port: bound_port,
         share_name,
+        failed_logons,
         shutdown_tx: Some(shutdown_tx),
         join_handle: Some(join),
         lock: None,
@@ -422,8 +521,60 @@ async fn accept_loop(
 /// it would hold its task and socket for as long as the server ran.
 const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
+/// Refused logons across the whole server, since the last successful one,
+/// before it stops serving.
+///
+/// Deliberately far above anything a working setup produces. A client replaying
+/// a credential that went stale across a restart is *normal* here — the share
+/// password is generated per run — and one was observed sending 85 refused
+/// logons during a single browsing session without anything being wrong. A
+/// limit that a mount could trip by accident would turn a cosmetic annoyance
+/// into a share that stops mid-read, which is worse than the thing it guards
+/// against.
+///
+/// It resets on every successful logon, so a working mount holds it near zero
+/// indefinitely, and only a client that never authenticates can walk it up.
+/// That is what makes a high ceiling safe: 1000 refusals with not one success
+/// in between is not a stale credential, it is something trying passwords.
+///
+/// This is defence in depth rather than the defence. The password is ~94 bits
+/// of entropy over a loopback socket; guessing it is not the threat model. The
+/// limit exists so a server left running cannot be ground against indefinitely,
+/// and so the owner is told.
+const MAX_SERVER_LOGON_FAILURES: u32 = 1000;
+
+/// Whether a refusal counter has reached the server-wide limit. Shared by the
+/// two readers — the server, deciding whether to accept a logon, and the owning
+/// handle, deciding whether to stop — so they cannot drift apart on either the
+/// threshold or the ordering.
+fn logon_limit_reached(failed: &std::sync::atomic::AtomicU32) -> bool {
+    failed.load(std::sync::atomic::Ordering::Relaxed) >= MAX_SERVER_LOGON_FAILURES
+}
+
+/// Consecutive refused logons before a connection is dropped.
+///
+/// A real client tries a small number of identities: the interactive user, then
+/// a saved credential, then whatever it prompts for. Anything past that is a
+/// client replaying a credential the server will never accept — one was
+/// observed sending the same stale password 84 times on a single connection,
+/// which is both pointless work and a trace full of noise hiding the connection
+/// that was actually failing. Dropping it does not lock anything out: the
+/// client is free to reconnect and try again, with the round trip as the only
+/// cost.
+const MAX_FAILED_LOGONS: u32 = 5;
+
 async fn serve_connection(mut stream: tokio::net::TcpStream, ctx: Arc<Ctx>) {
     let mut conn = Conn::new(ctx);
+    if log_enabled() {
+        // How many connections a mount opens, and when, is half the story when
+        // one of them misbehaves: a client that spreads work across several
+        // shows up here as several ids, not as one busy session.
+        let peer = match stream.peer_addr() {
+            Ok(a) => a.to_string(),
+            Err(_) => "<unknown>".to_string(),
+        };
+        conn_log!(conn.id, "connected from {peer}");
+    }
     let mut nb = [0u8; NBSS_HEADER_LEN];
     loop {
         // Only the wait for a *new* message is bounded. Once a header has
@@ -433,7 +584,7 @@ async fn serve_connection(mut stream: tokio::net::TcpStream, ctx: Arc<Ctx>) {
             Ok(Ok(_)) => {}
             Ok(Err(_)) => return,
             Err(_) => {
-                smb_log!("dropping connection: idle for {}s", IDLE_TIMEOUT.as_secs());
+                conn_log!(conn.id, "dropping: idle for {}s", IDLE_TIMEOUT.as_secs());
                 return;
             }
         }
@@ -461,14 +612,15 @@ async fn serve_connection(mut stream: tokio::net::TcpStream, ctx: Arc<Ctx>) {
         if let Some(key) = conn.state.signing_key {
             let verdict = sign::verify(&key, &msg);
             if !verdict.is_valid() {
-                smb_log!("dropping connection: {}", verdict.describe());
+                conn_log!(conn.id, "dropping: {}", verdict.describe());
                 return;
             }
         }
 
         let Some(mut resp) = tokio::task::block_in_place(|| conn.handle_message(&msg)) else {
-            smb_log!(
-                "dropping connection: unparseable message, first bytes {:02x?}",
+            conn_log!(
+                conn.id,
+                "dropping: unparseable message, first bytes {:02x?}",
                 &msg[..msg.len().min(8)]
             );
             // Unparseable, or an SMB1 negotiate. Dropping the connection is the
@@ -497,6 +649,16 @@ async fn serve_connection(mut stream: tokio::net::TcpStream, ctx: Arc<Ctx>) {
             return;
         }
         if stream.write_all(&resp).await.is_err() {
+            return;
+        }
+        // Checked after the reply is on the wire, so the client still learns why
+        // its last attempt was refused rather than seeing a bare disconnect.
+        if conn.state.failed_logons >= MAX_FAILED_LOGONS {
+            conn_log!(
+                conn.id,
+                "dropping: {} refused logons in a row",
+                conn.state.failed_logons
+            );
             return;
         }
     }
@@ -541,17 +703,31 @@ impl Reply {
 /// Per-connection protocol state.
 struct Conn {
     ctx: Arc<Ctx>,
+    /// Identifies this connection in the trace. Process-wide and monotonic
+    /// rather than derived from the socket: a peer address is reused as soon as
+    /// a port is, and two connections from the same client are exactly what has
+    /// to be told apart.
+    id: u64,
     state: SessionState,
     /// Open handles are per-connection: SMB2 file ids are scoped to the
     /// connection that created them and do not survive a reconnect.
     handles: Handles,
 }
 
+/// Hands out `Conn::id`. Starts at 1 so id 0 can mean "no connection" in the
+/// session state a unit test builds by hand.
+fn next_conn_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 impl Conn {
     fn new(ctx: Arc<Ctx>) -> Self {
+        let id = next_conn_id();
         Self {
             ctx,
-            state: SessionState::default(),
+            id,
+            state: SessionState::new(id),
             handles: Handles::default(),
         }
     }
@@ -565,7 +741,7 @@ impl Conn {
         // the SMB2 wildcard dialect is what gets the client to re-negotiate in
         // SMB2; dropping it leaves the client waiting for a timeout.
         if session::is_smb1_negotiate(msg) {
-            smb_log!("SMB1 multi-protocol NEGOTIATE -> SMB2 wildcard 0x02ff");
+            conn_log!(self.id, "SMB1 multi-protocol NEGOTIATE -> SMB2 wildcard 0x02ff");
             return Some(session::smb1_negotiate_response(
                 &self.ctx.server_guid,
                 self.ctx.boot_time,
@@ -574,7 +750,7 @@ impl Conn {
         if session::is_smb1(msg) {
             // Any other SMB1 command. We do not speak SMB1, and there is no
             // SMB2 status that means "wrong protocol", so the connection goes.
-            smb_log!("dropping connection: SMB1 command {:#04x}", msg[4]);
+            conn_log!(self.id, "dropping: SMB1 command {:#04x}", msg[4]);
             return None;
         }
 
@@ -601,13 +777,24 @@ impl Conn {
             let is_only = first && next == 0;
 
             if log_enabled() && hdr.command == cmd::NEGOTIATE {
-                smb_log!("client offers dialects {:04x?}", session::peek_dialects(body));
+                conn_log!(
+                    self.id,
+                    "client offers dialects {:04x?}",
+                    session::peek_dialects(body)
+                );
+            }
+            if log_enabled()
+                && hdr.command == cmd::CREATE
+                && let Some((name, access)) = files::peek_create(body, chunk)
+            {
+                conn_log!(self.id, "CREATE \"{name}\" access {access:#010x}");
             }
 
             let start = out.len();
             match self.execute(&hdr, body, chunk, is_only) {
                 Some(Ok(reply)) => {
-                    smb_log!(
+                    conn_log!(
+                        self.id,
                         "{} -> {} ({} bytes)",
                         cmd::name(hdr.command),
                         status_name(reply.status),
@@ -623,7 +810,7 @@ impl Conn {
                     out.bytes(&reply.body);
                 }
                 Some(Err(st)) => {
-                    smb_log!("{} -> {}", cmd::name(hdr.command), status_name(st));
+                    conn_log!(self.id, "{} -> {}", cmd::name(hdr.command), status_name(st));
                     hdr.write_response(
                         &mut out,
                         st,
@@ -684,8 +871,45 @@ impl Conn {
             .map(Reply::ok),
 
             cmd::SESSION_SETUP => {
-                session::session_setup(body, message, &mut self.state, &self.ctx.credentials)
-                    .map(|(st, b)| {
+                // Once the server-wide limit is reached, nothing authenticates
+                // again — not even the right password. The owner stops the
+                // server on its next poll; this closes the window in between,
+                // so the limit is a limit rather than a notification.
+                if self.ctx.logon_limit_reached() {
+                    conn_log!(
+                        self.id,
+                        "SESSION_SETUP refused: server logon limit ({MAX_SERVER_LOGON_FAILURES}) reached"
+                    );
+                    return Some(Err(status::LOGON_FAILURE));
+                }
+                let result =
+                    session::session_setup(body, message, &mut self.state, &self.ctx.credentials);
+                // Count consecutive refusals so a client replaying a credential
+                // that will never work cannot do it indefinitely.
+                //
+                // Only a *successful* logon clears the count. The intermediate
+                // leg must not, tempting as it looks: a client retrying a stale
+                // credential runs the whole two-leg exchange every time, so
+                // clearing on the challenge would put the count back to zero
+                // before each refusal and make the cap unreachable — which is
+                // precisely the client this exists for. A client trying a
+                // second identity after a refused first one is unaffected;
+                // MAX_FAILED_LOGONS leaves room for several.
+                if matches!(&result, Err(st) if *st == status::LOGON_FAILURE) {
+                    self.state.failed_logons += 1;
+                    let total = self.ctx.record_failed_logon();
+                    if total >= MAX_SERVER_LOGON_FAILURES {
+                        conn_log!(
+                            self.id,
+                            "server logon limit reached: {total} refused logons with no \
+                             successful one in between — refusing every logon from here"
+                        );
+                    }
+                } else if matches!(&result, Ok((st, _)) if *st == status::SUCCESS) {
+                    self.state.failed_logons = 0;
+                    self.ctx.clear_failed_logons();
+                }
+                result.map(|(st, b)| {
                     // Both legs must carry the server-assigned session id: the
                     // client reads it off the first response and uses it from
                     // then on.
@@ -853,6 +1077,7 @@ mod tests {
             volume_serial: 0x1234_5678,
             server_guid: [7u8; 16],
             boot_time: SystemTime::UNIX_EPOCH,
+            failed_logons: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         })
     }
 
@@ -942,7 +1167,11 @@ mod tests {
     /// Drive a connection through negotiate + both session-setup legs,
     /// returning the connection and its session id.
     fn connected() -> (Conn, u64) {
-        let mut conn = Conn::new(ctx());
+        connected_with(ctx())
+    }
+
+    fn connected_with(ctx: Arc<Ctx>) -> (Conn, u64) {
+        let mut conn = Conn::new(ctx);
 
         let resp = conn
             .handle_message(&request(cmd::NEGOTIATE, 0, 0, &negotiate_body(&[0x0210, 0x0311])))
@@ -973,6 +1202,197 @@ mod tests {
         assert!(conn.state.signing_key.is_some(), "session must be signed");
 
         (conn, session_id)
+    }
+
+    /// One bad-credential exchange: NEGOTIATE leg, then an AUTHENTICATE built
+    /// with the wrong password. Mirrors a client replaying a stale saved
+    /// credential, which is what ran a real connection up to 84 attempts.
+    fn refused_logon(conn: &mut Conn) {
+        let resp = conn
+            .handle_message(&request(cmd::SESSION_SETUP, 0, 0, &session_setup_body(1)))
+            .expect("challenge leg answered");
+        let session_id = parse_response(&resp).session_id;
+        let auth = crate::smb::ntlm::tests_support::build_authenticate(
+            TEST_USER,
+            "",
+            "not-the-password",
+            &conn.state.server_challenge.expect("a challenge was issued"),
+            None,
+        );
+        let resp = conn
+            .handle_message(&request(
+                cmd::SESSION_SETUP,
+                session_id,
+                0,
+                &session_setup_body_with(&auth),
+            ))
+            .expect("refusal is answered, not dropped");
+        assert_eq!(parse_response(&resp).status, status::LOGON_FAILURE);
+    }
+
+    #[test]
+    fn refused_logons_are_counted_up_to_the_cap() {
+        let mut conn = Conn::new(ctx());
+        let _ = conn.handle_message(&request(cmd::NEGOTIATE, 0, 0, &negotiate_body(&[0x0210])));
+
+        for expected in 1..=MAX_FAILED_LOGONS {
+            refused_logon(&mut conn);
+            assert_eq!(
+                conn.state.failed_logons, expected,
+                "every consecutive refusal counts"
+            );
+        }
+        // `serve_connection` drops the connection at this point, having already
+        // written the refusal so the client learns why.
+        assert!(conn.state.failed_logons >= MAX_FAILED_LOGONS);
+    }
+
+    #[test]
+    fn a_successful_logon_clears_the_refusal_count() {
+        // A client may try an identity or two before the one that works, and
+        // must not be dropped mid-mount for the ones that came first.
+        let mut conn = Conn::new(ctx());
+        let _ = conn.handle_message(&request(cmd::NEGOTIATE, 0, 0, &negotiate_body(&[0x0210])));
+        refused_logon(&mut conn);
+        refused_logon(&mut conn);
+        assert_eq!(conn.state.failed_logons, 2);
+
+        let resp = conn
+            .handle_message(&request(cmd::SESSION_SETUP, 0, 0, &session_setup_body(1)))
+            .expect("challenge leg answered");
+        let session_id = parse_response(&resp).session_id;
+        let auth = crate::smb::ntlm::tests_support::build_authenticate(
+            TEST_USER,
+            "",
+            TEST_PASSWORD,
+            &conn.state.server_challenge.expect("a challenge was issued"),
+            None,
+        );
+        let resp = conn
+            .handle_message(&request(
+                cmd::SESSION_SETUP,
+                session_id,
+                0,
+                &session_setup_body_with(&auth),
+            ))
+            .expect("session setup answered");
+        assert_eq!(parse_response(&resp).status, status::SUCCESS);
+        assert_eq!(conn.state.failed_logons, 0, "success clears the count");
+    }
+
+    #[test]
+    fn the_server_refuses_every_logon_once_its_limit_is_reached() {
+        use std::sync::atomic::Ordering;
+
+        let ctx = ctx();
+        // Fast-forward to one below the limit rather than sending a thousand
+        // messages: the counting itself is covered above, and the behaviour
+        // under test is what happens at the boundary.
+        ctx.failed_logons
+            .store(MAX_SERVER_LOGON_FAILURES - 1, Ordering::Relaxed);
+        assert!(!ctx.logon_limit_reached(), "one short of the limit");
+
+        let mut conn = Conn::new(ctx.clone());
+        let _ = conn.handle_message(&request(cmd::NEGOTIATE, 0, 0, &negotiate_body(&[0x0210])));
+        refused_logon(&mut conn);
+        assert!(ctx.logon_limit_reached(), "the last refusal trips it");
+
+        // From here even the right password is refused, on a fresh connection,
+        // starting with the very first leg of the exchange. Waiting for the
+        // owner to poll would leave a window in which the limit was advice.
+        let mut fresh = Conn::new(ctx.clone());
+        let _ = fresh.handle_message(&request(cmd::NEGOTIATE, 0, 0, &negotiate_body(&[0x0210])));
+        let resp = fresh
+            .handle_message(&request(cmd::SESSION_SETUP, 0, 0, &session_setup_body(1)))
+            .expect("refused, not dropped");
+        assert_eq!(parse_response(&resp).status, status::LOGON_FAILURE);
+        assert!(fresh.state.server_challenge.is_none(), "no challenge issued");
+    }
+
+    #[test]
+    fn a_successful_logon_clears_the_server_counter() {
+        use std::sync::atomic::Ordering;
+
+        // What makes a high limit safe: a working mount holds the count at zero
+        // however much noise a client makes in between, so only a client that
+        // never authenticates can walk it up to the limit.
+        let ctx = ctx();
+        ctx.failed_logons
+            .store(MAX_SERVER_LOGON_FAILURES - 1, Ordering::Relaxed);
+        let (_conn, _session_id) = connected_with(ctx.clone());
+        assert_eq!(ctx.failed_logons.load(Ordering::Relaxed), 0);
+        assert!(!ctx.logon_limit_reached());
+    }
+
+    #[test]
+    fn the_server_logon_counter_saturates_rather_than_wrapping() {
+        use std::sync::atomic::Ordering;
+
+        // Wrapping past u32::MAX would drop the count back under the limit and
+        // quietly start accepting logons again on a long-lived server.
+        let ctx = ctx();
+        ctx.failed_logons.store(u32::MAX, Ordering::Relaxed);
+        assert_eq!(ctx.record_failed_logon(), u32::MAX);
+        assert!(ctx.logon_limit_reached());
+    }
+
+    #[test]
+    fn random_password_covers_every_class_and_stays_url_safe() {
+        // RFC 3986 §2.3 unreserved: safe unencoded in a URL, unquoted in a
+        // shell, and unescaped in mount.cifs's comma-separated option list.
+        const SYMBOLS: [char; 4] = ['-', '.', '_', '~'];
+        let mut symbol_positions = std::collections::HashSet::new();
+
+        for _ in 0..200 {
+            let pw = random_password();
+            assert_eq!(pw.chars().count(), 16);
+            assert!(pw.chars().any(|c| c.is_ascii_lowercase()), "{pw}");
+            assert!(pw.chars().any(|c| c.is_ascii_uppercase()), "{pw}");
+            assert!(pw.chars().any(|c| c.is_ascii_digit()), "{pw}");
+            assert!(pw.chars().any(|c| SYMBOLS.contains(&c)), "{pw}");
+
+            for c in pw.chars() {
+                assert!(
+                    c.is_ascii_alphanumeric() || SYMBOLS.contains(&c),
+                    "{c:?} would need escaping somewhere"
+                );
+                assert!(
+                    !"lIO01".contains(c),
+                    "{c:?} is ambiguous read off a screen"
+                );
+            }
+            symbol_positions.extend(
+                pw.char_indices()
+                    .filter(|(_, c)| SYMBOLS.contains(c))
+                    .map(|(i, _)| i),
+            );
+        }
+
+        // The guaranteed characters are generated in class order, so without the
+        // shuffle the symbol would sit at index 3 every time — which leaks the
+        // shape of every password the server ever issues.
+        assert!(
+            symbol_positions.len() > 1,
+            "guaranteed characters must be shuffled, not left in class order"
+        );
+        assert_ne!(random_password(), random_password());
+    }
+
+    #[test]
+    fn connections_get_distinct_ids_for_the_trace() {
+        let a = Conn::new(ctx());
+        let b = Conn::new(ctx());
+        assert_ne!(a.id, b.id);
+        assert_eq!(a.state.conn_id, a.id, "state logs against the same id");
+        assert_ne!(a.id, 0, "id 0 means 'no connection'");
+    }
+
+    #[test]
+    fn log_stamp_is_a_wall_clock_time_to_milliseconds() {
+        let s = log_stamp();
+        assert_eq!(s.len(), 12, "HH:MM:SS.mmm, got {s:?}");
+        assert_eq!(s.as_bytes()[2], b':');
+        assert_eq!(s.as_bytes()[8], b'.');
     }
 
     #[test]
@@ -1418,13 +1838,13 @@ mod tests {
         eprintln!();
         eprintln!("Mount it with:");
         eprintln!(
-            "  Linux    sudo mount -t cifs -o port={port},vers=2.1,username={TEST_USER},password={password},ro,uid=$(id -u),gid=$(id -g),file_mode=0444,dir_mode=0555 //{host}/{DEFAULT_SHARE_NAME} /mnt/snap"
+            "  Linux    sudo mount -t cifs -o port={port},vers=2.1,username={TEST_USER},ro,uid=$(id -u),gid=$(id -g),file_mode=0444,dir_mode=0555 //{host}/{DEFAULT_SHARE_NAME} /mnt/snap"
         );
         eprintln!(
             "  macOS    mount_smbfs -f 0444 -d 0555 //{TEST_USER}@{host}:{port}/{DEFAULT_SHARE_NAME} /Volumes/snap"
         );
         eprintln!(
-            "  Windows  net use Z: \\\\{host}\\{DEFAULT_SHARE_NAME} /user:{TEST_USER} {password} /TCPPORT:{port}"
+            "  Windows  net use Z: \\\\{host}\\{DEFAULT_SHARE_NAME} * /user:{TEST_USER} /TCPPORT:{port}"
         );
         std::thread::sleep(std::time::Duration::from_secs(secs));
         handle.stop();
