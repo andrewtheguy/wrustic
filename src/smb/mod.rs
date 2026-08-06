@@ -23,16 +23,17 @@
 // A mount is for browsing a snapshot, not for restoring or running one:
 // symlinks cannot survive SMB 2.1 anyway, so nothing here pretends to be a
 // faithful copy of the original tree. Files come out 0444 and directories 0555
-// — on Linux and macOS from the mode options in the mount commands below (SMB
-// 2.1 carries no POSIX mode of its own), and on Windows from the READONLY
-// attribute plus a CREATE that refuses FILE_EXECUTE on files.
+// — on Linux from the mode options in the mount command below (SMB 2.1 carries
+// no POSIX mode of its own), and on Windows from the READONLY attribute plus a
+// CREATE that refuses FILE_EXECUTE on files. A macOS Finder mount shows the
+// client's default modes instead; the server refuses writes regardless.
 //
 // Mount it with — each prompts for the password, which is never passed as an
 // argument: a command line is readable by every other process while it runs,
 // and lands in shell (or console) history afterwards.
 //   Linux    sudo mount -t cifs -o port=<p>,vers=2.1,username=wrustic,ro,\
 //                       file_mode=0444,dir_mode=0555 //127.0.0.1/snap /mnt
-//   macOS    mount_smbfs -f 0444 -d 0555 //wrustic@127.0.0.1:<p>/snap /Volumes/snap
+//   macOS    Finder → Go → Connect to Server (Cmd+K): smb://wrustic@127.0.0.1:<p>/snap
 //   Windows  net use Z: \\127.0.0.1\snap * /user:wrustic   (add /TCPPORT:<p>)
 
 /// Whether to trace protocol traffic to stderr. Enabled by setting
@@ -1842,7 +1843,7 @@ mod tests {
             "  Linux    sudo mount -t cifs -o port={port},vers=2.1,username={TEST_USER},ro,uid=$(id -u),gid=$(id -g),file_mode=0444,dir_mode=0555 //{host}/{DEFAULT_SHARE_NAME} /mnt/snap"
         );
         eprintln!(
-            "  macOS    mount_smbfs -f 0444 -d 0555 //{TEST_USER}@{host}:{port}/{DEFAULT_SHARE_NAME} /Volumes/snap"
+            "  macOS    Finder → Go → Connect to Server (Cmd+K): smb://{TEST_USER}@{host}:{port}/{DEFAULT_SHARE_NAME}"
         );
         eprintln!(
             "  Windows  net use Z: \\\\{host}\\{DEFAULT_SHARE_NAME} * /user:{TEST_USER} /TCPPORT:{port}"

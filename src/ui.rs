@@ -1437,7 +1437,8 @@ fn render_snapshot_smb(frame: &mut Frame, app: &mut App, area: Rect) {
                 "  Linux    sudo mount -t cifs -o port={port},vers=2.1,username={user},ro,uid=$(id -u),gid=$(id -g),file_mode=0444,dir_mode=0555 //127.0.0.1/{share} /mnt/snap\n\n"
             ));
             lines.push_str(&format!(
-                "  macOS    mount_smbfs -f 0444 -d 0555 //{user}@127.0.0.1:{port}/{share} /Volumes/snap\n\n"
+                "  macOS    Finder → Go → Connect to Server (Cmd+K), then enter:\n\
+                 \x20          smb://{user}@127.0.0.1:{port}/{share}\n\n"
             ));
             lines.push_str(&format!(
                 "  Windows  net use Z: {} * /user:{user} /TCPPORT:{port}\n",
@@ -1469,9 +1470,10 @@ fn render_snapshot_smb(frame: &mut Frame, app: &mut App, area: Rect) {
     lines.push_str(
         "\nEvery client authenticates and authenticated session messages are signed. \
          Writes are refused at the protocol level, and so is opening a file for execute — \
-         the Linux and macOS commands above mount files 0444 and directories 0555, since \
-         this is a way to browse a snapshot rather than to restore one. Leaving this screen \
-         stops the server, and any mount still using it.",
+         this is a way to browse a snapshot rather than to restore one. The Linux mount \
+         options above additionally display files as 0444 and directories as 0555; a \
+         Finder mount shows the client's default modes, but the server refuses writes \
+         either way. Leaving this screen stops the server, and any mount still using it.",
     );
 
     let para = Paragraph::new(lines)
