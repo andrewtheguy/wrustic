@@ -5,10 +5,12 @@ repositories, built on [`rustic_core`](https://crates.io/crates/rustic_core)
 and [`ratatui`](https://crates.io/crates/ratatui).
 
 `wrustic` is read-mostly by design: reads are native via `rustic_core`, and
-the few write operations it exposes (snapshot delete, prune, stale-lock
-removal) are native too, guarded by restic-compatible repository locks
-(docs/locking.md). Everything else that writes stays on the `restic` CLI —
-docs/restic-usage.md is the overview of exactly which workflows that means.
+the write operations it exposes (snapshot delete, prune) are native too,
+guarded by restic-compatible repository locks (docs/locking.md). Stale-lock
+removal is also native, but takes no lock itself — like `restic unlock`, it
+only deletes lock files that are provably stale. Everything else that writes
+stays on the `restic` CLI — docs/restic-usage.md is the overview of exactly
+which workflows that means.
 
 ## Features
 
@@ -239,10 +241,11 @@ Then in the TUI:
 
 `wrustic` needs no `restic` executable at runtime — every feature is
 native. `rustic_core` reads the on-disk repository format, and the write
-operations wrustic exposes (snapshot delete, prune, stale-lock removal)
-hold restic-compatible repository locks, so they coexist safely with
-concurrent restic processes; the prune always uses instant delete, so the
-repository state it leaves is indistinguishable from `restic prune`
+operations wrustic exposes (snapshot delete, prune) hold restic-compatible
+repository locks, so they coexist safely with concurrent restic processes;
+stale-lock removal takes no lock — like `restic unlock`, it only deletes
+lock files that are provably stale. The prune always uses instant delete,
+so the repository state it leaves is indistinguishable from `restic prune`
 (docs/locking.md has the full safety argument).
 [`docs/restic-usage.md`](docs/restic-usage.md) is the per-workflow overview
 of what still uses (or is expected to use) the restic CLI.

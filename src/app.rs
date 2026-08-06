@@ -363,11 +363,13 @@ pub(crate) struct App {
     pub(crate) prune_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     pub(crate) prune_started: Option<Instant>,
     pub(crate) prune_scroll: u16,
-    // A native prune cannot be cancelled mid-flight, so Ctrl+C on the running
-    // screen arms a force-quit instead; true once the first Ctrl+C landed
-    // (the second one quits the app). The progress buffer holds one line per
-    // prune phase, rewritten in place by the worker's progress adapter.
-    pub(crate) prune_quit_armed: bool,
+    // A native prune cannot be cancelled mid-flight by the user, so Ctrl+C
+    // on the running screen arms a force-quit instead; Some(when) while the
+    // arm is live (a second Ctrl+C within the arm window quits the app, and
+    // the main loop disarms it after the window passes). The progress buffer
+    // holds one line per prune phase, rewritten in place by the worker's
+    // progress adapter.
+    pub(crate) prune_quit_armed: Option<Instant>,
     pub(crate) prune_progress: Option<std::sync::Arc<std::sync::Mutex<String>>>,
 
     // Outer rect of the currently-rendered list/paragraph (bordered area).
@@ -503,7 +505,7 @@ impl App {
             prune_rx: None,
             prune_started: None,
             prune_scroll: 0,
-            prune_quit_armed: false,
+            prune_quit_armed: None,
             prune_progress: None,
             list_area: None,
             list_header_rows: 0,

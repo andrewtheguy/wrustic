@@ -337,38 +337,97 @@ pub(crate) fn delete_snapshot(profile: &Profile, snapshot_id: &str) -> Result<()
 ///
 /// Progress lines are written into `progress` for the TUI to render; the
 /// returned report summarizes the executed plan.
+///
+/// Restic's refreshability-abort rule (`RepoLock::poisoned()`, the
+/// 22.5-minute cutoff) is enforced *throughout*: rustic_core takes no
+/// cancellation token, but it ticks the progress adapter continuously —
+/// per file during deletions, per blob batch during repack — so the
+/// adapter probes the lock on phase starts and on its ~10 Hz render ticks
+/// and panics with [`POISON_ABORT`] when the lock can no longer be
+/// trusted. [`abort_if_lock_poisoned`] catches that unwind and turns it
+/// into an ordinary error, stopping the prune before further writes or
+/// deletions. An abort mid-run is safe for the same reason a crash is:
+/// everything new is written before anything old is deleted.
 pub(crate) fn prune(
     profile: &Profile,
     progress: std::sync::Arc<std::sync::Mutex<String>>,
 ) -> Result<String> {
     let backends = build_backends(profile)?;
+    let progress_bars = TuiProgressBars {
+        buf: progress,
+        poison: std::sync::Arc::new(std::sync::OnceLock::new()),
+    };
+    let poison = std::sync::Arc::clone(&progress_bars.poison);
     let repo = Repository::new_with_progress(
         &RepositoryOptions::default(),
         &backends,
-        TuiProgressBars { buf: progress },
+        progress_bars,
     )?
     .open(&Credentials::password(profile.password()))?;
     let crypto = lock::RepoCrypto::from_repo(&repo)?;
-    let repo_lock =
-        lock::RepoLock::acquire_exclusive(lock::backend_for_profile(profile)?, crypto)?;
+    let repo_lock = std::sync::Arc::new(lock::RepoLock::acquire_exclusive(
+        lock::backend_for_profile(profile)?,
+        crypto,
+    )?);
+    // Arm the progress adapter's poison probe now that the lock exists; the
+    // probe stays a no-op for the open above, which needs no lock.
+    {
+        let repo_lock = std::sync::Arc::clone(&repo_lock);
+        let _ = poison.set(std::sync::Arc::new(move || repo_lock.poisoned()));
+    }
 
     let opts = PruneOptions::default()
         .instant_delete(true)
         .max_repack(LimitOption::Unlimited);
-    let plan = repo.prune_plan(&opts)?;
+    let plan =
+        abort_if_lock_poisoned(std::panic::AssertUnwindSafe(|| repo.prune_plan(&opts)))??;
     let report = prune_report(&plan.stats);
     // Planning walks every snapshot tree and can take a long time on a big
-    // repo. Apply restic's refreshability-abort rule at the last gate before
-    // anything destructive: a lock that went unrefreshed for 22.5 minutes may
-    // already have been judged stale and removed by another process.
+    // repo. The progress probe covers it too, but a poison that lands
+    // between ticks is still caught here, at the last gate before anything
+    // destructive.
     if repo_lock.poisoned() {
         bail!(
             "the repository lock could not be refreshed while the prune was being planned; \
              aborting before deleting anything (the repository is unchanged)"
         );
     }
-    repo.prune(&opts, plan)?;
+    abort_if_lock_poisoned(std::panic::AssertUnwindSafe(|| repo.prune(&opts, plan)))??;
     Ok(report)
+}
+
+/// Panic payload marker the progress adapter raises when the poison probe
+/// trips mid-prune — the only way to stop rustic_core's executor, which
+/// takes no cancellation token. Matched by [`abort_if_lock_poisoned`].
+const POISON_ABORT: &str = "wrustic-prune-lock-poisoned";
+
+/// Runs one rustic_core prune stage, converting the [`POISON_ABORT`] panic
+/// the progress adapter raises into an ordinary error. Any other panic is
+/// resumed unchanged.
+fn abort_if_lock_poisoned<T, F: FnOnce() -> T>(
+    f: std::panic::AssertUnwindSafe<F>,
+) -> Result<T> {
+    match std::panic::catch_unwind(f) {
+        Ok(value) => Ok(value),
+        Err(payload) => {
+            let is_poison = payload
+                .downcast_ref::<&str>()
+                .is_some_and(|s| s.contains(POISON_ABORT))
+                || payload
+                    .downcast_ref::<String>()
+                    .is_some_and(|s| s.contains(POISON_ABORT));
+            if is_poison {
+                Err(anyhow!(
+                    "the repository lock could not be refreshed for 22.5 minutes while the \
+                     prune was running — other processes may treat it as stale and remove it, \
+                     so the prune was aborted before deleting anything further. The repository \
+                     stays valid; the next prune finishes the remaining work"
+                ))
+            } else {
+                std::panic::resume_unwind(payload)
+            }
+        }
+    }
 }
 
 /// Plain-text summary of a prune plan, in the spirit of `restic prune`'s
@@ -471,13 +530,25 @@ pub(crate) fn human_bytes(n: u64) -> String {
     }
 }
 
+/// Probe the progress adapter consults to learn whether the operation's
+/// repository lock is still trustworthy; `true` aborts the run via
+/// [`POISON_ABORT`]. Unset (empty `OnceLock`) means no lock to watch yet.
+type PoisonProbe = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// Adapter feeding rustic_core's per-phase progress into the shared text
 /// buffer the prune screen renders. Each phase gets one line in the buffer,
 /// updated in place as the phase advances, so the screen shows the newest
-/// state of every phase rather than a scrolling log.
-#[derive(Debug)]
+/// state of every phase rather than a scrolling log. Doubles as the abort
+/// channel: see [`prune`] and [`POISON_ABORT`].
 struct TuiProgressBars {
     buf: std::sync::Arc<std::sync::Mutex<String>>,
+    poison: std::sync::Arc<std::sync::OnceLock<PoisonProbe>>,
+}
+
+impl std::fmt::Debug for TuiProgressBars {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TuiProgressBars").finish_non_exhaustive()
+    }
 }
 
 impl ProgressBars for TuiProgressBars {
@@ -493,6 +564,7 @@ impl ProgressBars for TuiProgressBars {
         };
         Progress::new(TuiProgress {
             buf: std::sync::Arc::clone(&self.buf),
+            poison: std::sync::Arc::clone(&self.poison),
             line,
             title: std::sync::Mutex::new(prefix.to_string()),
             kind: progress_type,
@@ -507,9 +579,9 @@ impl ProgressBars for TuiProgressBars {
 /// One phase's progress line. `inc` can fire per blob during a repack, so
 /// re-rendering is throttled to ~10 Hz — the TUI polls the buffer at a
 /// similar rate anyway.
-#[derive(Debug)]
 struct TuiProgress {
     buf: std::sync::Arc<std::sync::Mutex<String>>,
+    poison: std::sync::Arc<std::sync::OnceLock<PoisonProbe>>,
     line: usize,
     title: std::sync::Mutex<String>,
     kind: ProgressType,
@@ -519,7 +591,28 @@ struct TuiProgress {
     last_render_ms: AtomicU64,
 }
 
+impl std::fmt::Debug for TuiProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TuiProgress")
+            .field("line", &self.line)
+            .finish_non_exhaustive()
+    }
+}
+
 impl TuiProgress {
+    /// Aborts the owning operation when the poison probe trips — the panic
+    /// unwinds out of rustic_core (which takes no cancellation token) and is
+    /// mapped back to an error by [`abort_if_lock_poisoned`]. Called on
+    /// phase starts and on the throttled render ticks, so an untrusted lock
+    /// stops the run within ~100 ms / one progress tick.
+    fn check_poison(&self) {
+        if let Some(probe) = self.poison.get()
+            && probe()
+        {
+            panic!("{POISON_ABORT}");
+        }
+    }
+
     fn render(&self, finished: bool) {
         use std::sync::PoisonError;
         let title = self
@@ -567,6 +660,7 @@ impl RusticProgress for TuiProgress {
     }
 
     fn set_length(&self, len: u64) {
+        self.check_poison();
         self.len.store(len, Ordering::Relaxed);
         self.render(false);
     }
@@ -587,6 +681,7 @@ impl RusticProgress for TuiProgress {
                 .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
         {
+            self.check_poison();
             self.render(false);
         }
     }
@@ -1033,6 +1128,45 @@ mod tests {
         assert!(ensure_full_snapshot_id(&bad).is_err());
     }
 
+    // Failure injection for the mid-prune lock-loss abort: a tripped poison
+    // probe must panic the progress adapter out of the (simulated) executor,
+    // and `abort_if_lock_poisoned` must turn exactly that panic into an
+    // error while resuming every other panic unchanged.
+    #[test]
+    fn poisoned_lock_aborts_through_the_progress_adapter() {
+        use std::panic::AssertUnwindSafe;
+
+        let bars = TuiProgressBars {
+            buf: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
+            poison: std::sync::Arc::new(std::sync::OnceLock::new()),
+        };
+
+        // Probe unset (before the lock exists): progress must not abort.
+        let p = bars.progress(ProgressType::Counter, "phase");
+        p.set_length(3);
+
+        // Probe tripped: the next phase start aborts, and the mapper turns
+        // the unwind into an error naming the lock.
+        let _ = bars.poison.set(std::sync::Arc::new(|| true) as PoisonProbe);
+        let err = abort_if_lock_poisoned(AssertUnwindSafe(|| p.set_length(4)))
+            .expect_err("a tripped probe must abort the stage");
+        assert!(
+            format!("{err:#}").contains("lock could not be refreshed"),
+            "unexpected error: {err:#}"
+        );
+
+        // A stage that panics for any other reason is not swallowed — the
+        // panic resumes past the mapper.
+        let other = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            abort_if_lock_poisoned(AssertUnwindSafe(|| panic!("boom")))
+        }));
+        assert!(other.is_err(), "unrelated panics must resume, not map");
+
+        // And a healthy stage's value passes through.
+        let ok = abort_if_lock_poisoned(AssertUnwindSafe(|| 7)).expect("healthy stage");
+        assert_eq!(ok, 7);
+    }
+
     // End-to-end interop with the restic CLI against a fresh local repo:
     // restic must see (and be blocked by) wrustic's native lock, `restic
     // unlock` must not remove it while fresh, and the native delete must
@@ -1208,18 +1342,22 @@ mod tests {
         assert_eq!(locks, 0, "the prune must not leave a lock behind");
 
         // restic's verdict. `check --read-data` re-reads every pack and
-        // validates it against the index; instant delete must leave no
-        // orphaned ("additional") files either.
-        let check = crate::restic::run(&profile, &["check", "--read-data"])
+        // validates it against the index; the JSON summary is asserted
+        // structurally: zero errors, and no `suggest_prune`, which restic
+        // sets exactly when it finds orphaned ("additional") packs — so this
+        // also proves instant delete left no orphans behind.
+        let check = crate::restic::run(&profile, &["check", "--read-data", "--json"])
             .expect("restic check after native prune");
         let check_text = String::from_utf8_lossy(&check);
-        assert!(
-            check_text.contains("no errors were found"),
-            "restic check must pass: {check_text}"
-        );
-        assert!(
-            !check_text.contains("additional files were found"),
-            "instant delete must leave no orphaned packs: {check_text}"
+        let summary = check_text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|v| v["message_type"] == "summary")
+            .unwrap_or_else(|| panic!("no check summary in JSON output: {check_text}"));
+        assert_eq!(summary["num_errors"], 0, "restic check must pass: {summary}");
+        assert_eq!(
+            summary["suggest_prune"], false,
+            "instant delete must leave no orphaned packs: {summary}"
         );
 
         // The surviving snapshot must restore intact through restic.

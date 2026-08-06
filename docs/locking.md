@@ -179,15 +179,24 @@ rustic_core 0.12.0 source.
 - *Lock coverage*: the exclusive lock is acquired **before planning**,
   not just execution. rustic_core's executor never re-validates the plan
   (no re-read of snapshots), so the snapshot set enumerated at plan time
-  must stay frozen throughout. Planning can take long, so `repo::prune`
-  checks `RepoLock::poisoned()` (the 22.5-minute refreshability rule)
-  after planning, at the last gate before anything destructive.
-  rustic_core takes no cancellation token, so a poison observed *during*
-  execution cannot abort it — the residual gap vs. restic, mitigated by
-  the crash-safe ordering and by the fact that an unrefreshable lock
-  implies backend failures that would abort the prune's own writes
-  anyway. For the same reason the TUI cannot cancel a running prune;
-  Ctrl+C twice force-quits the app instead (safe, leaves a stale lock).
+  must stay frozen throughout. `RepoLock::poisoned()` (the 22.5-minute
+  refreshability rule) is enforced for the whole run: rustic_core takes
+  no cancellation token, but it ticks its progress callbacks
+  continuously — per file during deletions, per blob batch during
+  repack — so `repo::prune`'s progress adapter probes the lock on every
+  phase start and on its ~10 Hz render ticks and, when poisoned, panics
+  with a marker that `abort_if_lock_poisoned` catches and maps to an
+  ordinary error. A lock that can no longer be trusted therefore aborts
+  planning *and* execution within roughly one progress tick, before
+  further writes or deletions; an explicit post-planning check covers a
+  poison landing between ticks. An abort mid-run is safe for the same
+  reason a crash is (see *Crash safety*). The mechanism is
+  failure-injection tested
+  (`poisoned_lock_aborts_through_the_progress_adapter`): a tripped probe
+  aborts a stage and maps to the lock error, unrelated panics resume
+  unchanged. What remains impossible is *user* cancellation of a healthy
+  run — Ctrl+C twice force-quits the app instead (safe, leaves a stale
+  lock).
 
 **Long-running reads — non-exclusive lock (implemented):** the snapshot
 SMB share (`smb::start_snapshot_share`). Reads take no lock in wrustic's

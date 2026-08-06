@@ -450,7 +450,7 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
                      snapshot list."
                 )
             } else {
-                msg.clone()
+                format!("{msg}\n\nPress any key to return to the snapshot list.")
             };
             let para = Paragraph::new(body)
                 .style(Style::new().fg(Color::Red))
@@ -920,11 +920,12 @@ fn render_prune_running(frame: &mut Frame, app: &App, area: Rect) {
         secs / 60,
         secs % 60
     );
-    if app.prune_quit_armed {
+    if app.prune_quit_armed.is_some() {
         body.push_str(
-            "Ctrl+C again force-quits wrustic. The repository stays valid —\n\
-             the interrupted work is redone by the next prune — but the\n\
-             leftover lock must be removed later (u on the lock error).\n\n",
+            "Ctrl+C again within a few seconds force-quits wrustic. The\n\
+             repository stays valid — the interrupted work is redone by the\n\
+             next prune — but the leftover lock must be removed later\n\
+             (u on the lock error).\n\n",
         );
     } else {
         body.push_str(

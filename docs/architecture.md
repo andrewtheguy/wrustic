@@ -6,9 +6,11 @@ update this file.
 
 ## What wrustic is
 
-A read-only terminal UI for browsing restic backup repositories. It opens a
+A read-oriented terminal UI for restic backup repositories. It opens a
 repo, lists snapshots, lets you walk the file tree, inspect file details,
 diff two snapshots, and download a single file via a localhost signed URL.
+Its write surface is deliberately small and fully native: snapshot
+deletion, prune, and stale-lock removal (details below).
 
 **Scope: single-user, single-device.** wrustic is a personal tool — one
 person, one machine (or one account on a shared box that they fully own).

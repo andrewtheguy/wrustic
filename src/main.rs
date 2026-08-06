@@ -89,6 +89,11 @@ fn main() -> Result<()> {
     result
 }
 
+// How long an armed prune force-quit stays live before it disarms itself —
+// long enough for a deliberate double Ctrl+C, short enough that a stray
+// press is forgotten.
+const PRUNE_QUIT_ARM_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+
 fn run(
     terminal: &mut DefaultTerminal,
     paths: Paths,
@@ -411,7 +416,7 @@ fn run(
                 });
                 app.prune_rx = Some(rx);
                 app.prune_progress = Some(progress);
-                app.prune_quit_armed = false;
+                app.prune_quit_armed = None;
                 app.prune_started = Some(std::time::Instant::now());
             }
             let rx = app.prune_rx.as_ref().expect("receiver set above");
@@ -419,7 +424,7 @@ fn run(
                 Ok(outcome) => {
                     app.prune_rx = None;
                     app.prune_progress = None;
-                    app.prune_quit_armed = false;
+                    app.prune_quit_armed = None;
                     app.prune_started = None;
                     app.prune_scroll = 0;
                     app.screen = match outcome {
@@ -429,24 +434,34 @@ fn run(
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
                     // Wait briefly so the loop redraws the elapsed clock and
-                    // progress without spinning. A native prune cannot be
-                    // cancelled mid-flight (rustic_core takes no cancellation
-                    // token), so Ctrl+C arms a force-quit and a second Ctrl+C
-                    // exits the app, killing the worker with the process.
-                    // That is safe for the repository — prune writes all new
-                    // data and the new index before deleting anything old —
-                    // but skips the lock guard's cleanup, so a stale lock
-                    // file stays behind until an unlock removes it.
+                    // progress without spinning (a swallowed resize is
+                    // repainted at the next tick). A native prune cannot be
+                    // cancelled mid-flight by the user (rustic_core takes no
+                    // cancellation token), so Ctrl+C arms a force-quit and a
+                    // second Ctrl+C exits the app, killing the worker with
+                    // the process. That is safe for the repository — prune
+                    // writes all new data and the new index before deleting
+                    // anything old — but skips the lock guard's cleanup, so
+                    // a stale lock file stays behind until an unlock removes
+                    // it. The arm expires after a few seconds, so a stray
+                    // Ctrl+C from earlier can never pair with a later one
+                    // into an accidental quit.
+                    if app
+                        .prune_quit_armed
+                        .is_some_and(|t| t.elapsed() > PRUNE_QUIT_ARM_WINDOW)
+                    {
+                        app.prune_quit_armed = None;
+                    }
                     if event::poll(std::time::Duration::from_millis(150))?
                         && let Event::Key(key) = event::read()?
                         && key.kind == KeyEventKind::Press
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                         && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
                     {
-                        if app.prune_quit_armed {
+                        if app.prune_quit_armed.is_some() {
                             app.quit = true;
                         } else {
-                            app.prune_quit_armed = true;
+                            app.prune_quit_armed = Some(std::time::Instant::now());
                         }
                     }
                 }
