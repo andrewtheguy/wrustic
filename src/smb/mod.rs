@@ -907,6 +907,12 @@ impl Conn {
             {
                 conn_log!(self.id, "CREATE \"{name}\" access {access:#010x}");
             }
+            if log_enabled()
+                && hdr.command == cmd::QUERY_INFO
+                && let Some((ty, class, output_len)) = files::peek_query_info(body)
+            {
+                conn_log!(self.id, "QUERY_INFO type {ty} class {class} buffer {output_len}");
+            }
 
             let start = out.len();
             match self.execute(&hdr, body, chunk, is_only) {
@@ -1156,7 +1162,7 @@ impl Conn {
                 self.ctx.boot_time,
                 self.ctx.volume_serial,
             )
-            .map(Reply::ok),
+            .map(|(body, st)| Reply::ok(body).status(st)),
             _ => Err(status::NOT_SUPPORTED),
         }
     }
