@@ -24,28 +24,6 @@ Options:
                               port: Linux (-o port=), macOS, and Windows 11 24H2
                               or newer (/TCPPORT:). Earlier Windows builds only
                               speak to port 445 and cannot use this share.
-      --no-restic-cache       Turn off restic's on-disk cache: every restic call
-                              runs --no-cache. On by default, restic keeps its
-                              cache in a 'wrustic' directory under your
-                              platform's per-user cache root, private to your
-                              account: $XDG_CACHE_HOME or ~/.cache on Linux,
-                              ~/Library/Caches on macOS, %LOCALAPPDATA% on
-                              Windows. On a machine where no such root can be
-                              determined, --no-cache is passed anyway rather
-                              than falling back to restic's shared default
-                              cache. Only affects the restic CLI commands
-                              wrustic can shell out for (maintenance-class);
-                              native reads/writes never use a restic cache.
-                              The cache
-                              speeds up repeated restic work against a remote
-                              repository at the cost of disk space — it can
-                              reach hundreds of megabytes for a large
-                              repository. Cached calls also pass
-                              --cleanup-cache, so restic itself drops the
-                              per-repository subdirectories there that go 30
-                              days unused. To clean it out by hand, point restic
-                              at the same directory:
-                              'restic --cache-dir <that path> cache --cleanup'.
       --no-mouse              Disable mouse reporting (useful for QA / copy-paste).
       --no-keychain           Disable keychain integration even when the binary
                               was built with the 'keychain' feature.
@@ -57,7 +35,6 @@ pub(crate) struct Cli {
     pub(crate) config_dir: Option<PathBuf>,
     pub(crate) port: u16,
     pub(crate) smb_port: u16,
-    pub(crate) restic_cache: bool,
     pub(crate) no_mouse: bool,
     pub(crate) no_keychain: bool,
     pub(crate) show_version: bool,
@@ -70,7 +47,6 @@ impl Default for Cli {
             config_dir: None,
             port: DEFAULT_SERVER_PORT,
             smb_port: DEFAULT_SMB_PORT,
-            restic_cache: true,
             no_mouse: false,
             no_keychain: false,
             show_version: false,
@@ -86,7 +62,6 @@ pub(crate) fn parse_cli() -> Result<Cli> {
         match arg.as_str() {
             "-h" | "--help" => cli.show_help = true,
             "-V" | "--version" | "version" => cli.show_version = true,
-            "--no-restic-cache" => cli.restic_cache = false,
             "--no-mouse" => cli.no_mouse = true,
             "--no-keychain" => cli.no_keychain = true,
             "-c" | "--config-dir" => {

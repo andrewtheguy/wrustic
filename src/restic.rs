@@ -1,18 +1,21 @@
-//! Secure harness for running restic CLI commands.
+//! Secure harness for running restic CLI commands — **test-only**.
 //!
-//! Every TUI flow is native now (src/repo.rs + src/lock.rs: snapshot delete,
-//! unlock, the SMB share's lock, prune); this module is the one sanctioned
-//! way to trigger the restic commands wrustic deliberately does not
-//! reimplement (repair, migrate, dev-flow repo setup — today that means the
-//! live tests' init/backup, and any future maintenance flow).
+//! wrustic never invokes restic at runtime: every TUI flow is native
+//! (src/repo.rs + src/lock.rs: snapshot delete, unlock, the SMB share's
+//! lock, prune), and anything wrustic does not implement (init, backup,
+//! repair, migrate, key management) is for the user to run with the restic
+//! CLI outside the app. This module is compiled only for tests
+//! (`#[cfg(test)] mod restic` in main.rs) and is the one sanctioned way for
+//! the live interop tests to drive restic: dev-flow repo setup
+//! (init/backup) and restic-side observations (snapshots, check, restore,
+//! forget, unlock, prune).
 //! Launch semantics mirror resterm's: secrets never touch argv — the
 //! master password is piped through the child's stdin (`--password-file
 //! /dev/stdin` on Unix; on Windows restic reads its non-terminal stdin
 //! directly), the repo URL and any cloud credentials go through env vars —
 //! and restic's on-disk cache is pointed at a directory private to wrustic
 //! (`--cache-dir`, plus `--cleanup-cache` so restic garbage collects unused
-//! per-repository subdirectories there) unless the user opts out with
-//! `--no-restic-cache`, which turns caching off entirely (`--no-cache`).
+//! per-repository subdirectories there).
 //!
 //! Restic checks the repository lock before any of these commands run, so a
 //! leftover lock blocks them with "repository is already locked". wrustic
@@ -29,7 +32,6 @@
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Result, anyhow};
 
@@ -48,23 +50,12 @@ fn cache_dir() -> Option<PathBuf> {
     Some(dirs::cache_dir()?.join("wrustic"))
 }
 
-/// Whether the restic cache is on. On by default: caching is what makes
-/// repeated restic work against a remote repository fast. `--no-restic-cache`
-/// turns it off for users who would rather not spend the disk space —
-/// hundreds of megabytes for a large repository.
-static CACHE_ENABLED: AtomicBool = AtomicBool::new(true);
-
-/// Set once from the command line, before any restic call is made.
-pub(crate) fn set_cache_enabled(enabled: bool) {
-    CACHE_ENABLED.store(enabled, Ordering::Relaxed);
-}
-
 /// Add the cache flags every restic invocation carries.
 ///
-/// Default points restic at [`cache_dir`]; `--no-restic-cache` passes
-/// `--no-cache` instead. Caching also stays off when no per-user cache root
-/// can be named, rather than falling back to restic's own default, which
-/// wrustic must not share with other restic CLI instances.
+/// Points restic at [`cache_dir`]. Caching stays off (`--no-cache`) when no
+/// per-user cache root can be named, rather than falling back to restic's
+/// own default, which wrustic must not share with other restic CLI
+/// instances.
 ///
 /// The cached path also carries `--cleanup-cache`, so restic itself garbage
 /// collects the per-repository subdirectories it keeps under that directory
@@ -81,7 +72,7 @@ pub(crate) fn set_cache_enabled(enabled: bool) {
 /// modification time. Sweeping happens once, at repository open, not in the
 /// background.
 fn apply_cache_flag(cmd: &mut Command) {
-    match cache_dir().filter(|_| CACHE_ENABLED.load(Ordering::Relaxed)) {
+    match cache_dir() {
         Some(dir) => {
             cmd.arg("--cache-dir").arg(dir).arg("--cleanup-cache");
         }
@@ -158,7 +149,6 @@ fn lock_requirement(args: &[&str]) -> LockRequirement {
 /// details, returned for the caller to surface. restic re-runs the same
 /// check in-process at startup, so a lock appearing in the window between
 /// our re-check and the spawn still fails safely inside restic.
-#[allow(dead_code)] // no TUI caller since prune went native; kept for future non-interactive flows (repair, migrate) and exercised by the live test
 pub(crate) fn run_unsticking_locks(profile: &Profile, args: &[&str]) -> Result<Vec<u8>> {
     unstick_if_blocked(profile, args)?;
     run(profile, args)
@@ -189,8 +179,8 @@ fn unstick_if_blocked(profile: &Profile, args: &[&str]) -> Result<()> {
 /// through).
 ///
 /// Every command built here also carries the cache flags from
-/// [`apply_cache_flag`]: `--cache-dir <per-user path> --cleanup-cache` by
-/// default, or `--no-cache` under `--no-restic-cache`. Either way wrustic never
+/// [`apply_cache_flag`]: `--cache-dir <per-user path> --cleanup-cache`, or
+/// `--no-cache` when no per-user cache root exists. Either way wrustic never
 /// lets restic use its default on-disk cache, which other restic CLI instances
 /// share.
 fn command(profile: &Profile, args: &[&str]) -> Result<Command> {
@@ -372,11 +362,8 @@ mod tests {
             .collect()
     }
 
-    // Both halves live in one test because the cache switch is process-wide,
-    // and Rust runs tests in the same process on parallel threads — as two
-    // tests they would race over it.
     #[test]
-    fn cache_defaults_to_a_private_per_user_directory_and_opts_out_to_no_cache() {
+    fn cache_is_a_private_per_user_directory_or_off() {
         // The tail of every command, whatever the cache mode prepends.
         #[cfg(unix)]
         let tail: &[&str] = &["--password-file", "/dev/stdin", "snapshots", "--json"];
@@ -419,18 +406,6 @@ mod tests {
                 assert_eq!(args, expected);
             }
         }
-
-        // `--no-restic-cache` turns caching off outright.
-        set_cache_enabled(false);
-        let opted_out = command_args(&test_profile());
-        // Restored, so the default-path assertions above still hold for any
-        // test that runs after this one.
-        set_cache_enabled(true);
-
-        let mut expected = vec!["--no-cache".to_string()];
-        expected.extend(tail.iter().map(|s| s.to_string()));
-        assert_eq!(opted_out, expected);
-        assert_eq!(command_args(&test_profile()), args);
     }
 
     #[test]

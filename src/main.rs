@@ -8,6 +8,9 @@ mod local_server;
 mod lock;
 mod passphrase;
 mod repo;
+// restic is never invoked at runtime — the harness exists for the live
+// interop tests only (dev-flow repo setup, restic-side observations).
+#[cfg(test)]
 mod restic;
 mod s3_backend;
 mod share;
@@ -55,8 +58,6 @@ fn main() -> Result<()> {
         println!("{USAGE}");
         return Ok(());
     }
-
-    restic::set_cache_enabled(cli.restic_cache);
 
     #[cfg(feature = "keychain")]
     let no_keychain = cli.no_keychain || !keychain::init_store();
