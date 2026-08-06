@@ -75,13 +75,46 @@ and creates no subnet route at all.
 
 `wintun.dll` (427 KB, signed by WireGuard LLC) is embedded with `include_bytes!`
 from `vendor/wintun/`, and written to the config directory on first use so
-wrustic stays a single binary. The Wintun *Prebuilt Binaries License* §3(d)
-permits redistribution alongside software that uses it only through the
-documented API, which is all `src/smb/tun.rs` does. `vendor/wintun/LICENSE.txt`
-is the copy that governs it.
+wrustic stays a single binary — `install.ps1` delivers one `.exe` and no side
+files. The Wintun *Prebuilt Binaries License* §3(d) permits redistribution
+alongside software that uses it only through the documented API, which is all
+`src/smb/tun.rs` does. `vendor/wintun/LICENSE.txt` is the copy that governs it.
 
-This is why the feature is off by default: it embeds a driver in the binary and
-only earns its keep if you actually want UNC paths.
+This is why the feature is off by default everywhere except the shipped Windows
+binary: it embeds a driver, and only earns its keep if you want UNC paths.
+
+### Provenance and integrity
+
+| | |
+| --- | --- |
+| Source | `wintun-0.14.1.zip` from <https://www.wintun.net/builds/> |
+| Archive SHA-256 | `07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51` — matches the value published on wintun.net |
+| `wintun-amd64.dll` SHA-256 | `e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce` |
+| Authenticode | Valid, `CN=WireGuard LLC`, thumbprint `DF98E075A012ED8C86FBCF14854B8F9555CB3D45` |
+
+A checksum verified only at download time protects nothing afterwards, so the
+DLL hash is pinned as `WINTUN_DLL_SHA256` and checked twice:
+
+- `embedded_driver_matches_its_pinned_hash` fails the build if the vendored
+  binary ever changes without the constant changing with it;
+- `materialise_dll` re-hashes the file in the config directory and rewrites it
+  unless it is byte-for-byte the shipped driver. Nothing is passed to
+  `LoadLibrary` that has not just been verified.
+
+That second check is the one that matters at runtime: the previous version
+compared only file *length*, which a same-length impostor would have passed —
+`materialise_replaces_a_file_that_does_not_match` pins that behaviour.
+
+It narrows the window rather than closing it. Between the hash check and the
+load, a writer could still swap the file. The directory is the user's own config
+directory, so anything able to win that race can already replace the wrustic
+binary itself; this defends against a stale or corrupted copy, not against an
+attacker who is already inside that trust boundary.
+
+**Updating the driver:** verify the new archive against the SHA2-256 published
+on wintun.net *and* its Authenticode signature, then update both
+`vendor/wintun/wintun-amd64.dll` and `WINTUN_DLL_SHA256`. The test will fail
+until they agree, which is the point.
 
 ## Tests
 

@@ -34,5 +34,7 @@ jobs:
       - name: Test
         run: cargo test --all-features
 
-      - name: Release build (keychain enabled, like the shipped Windows binary)
-        run: cargo build --release --features keychain
+      # Must stay in step with the windows-amd64 row of release.yml, or CI stops
+      # building what users actually download.
+      - name: Release build (same features as the shipped Windows binary)
+        run: cargo build --release --features keychain,smb-tun

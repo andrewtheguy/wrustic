@@ -76,9 +76,15 @@ jobs:
             ext: ""
           # Windows Credential Manager is part of the OS — no build or runtime
           # dependency to install, so `keychain` ships enabled.
+          #
+          # `smb-tun` ships too, otherwise `--smb-tun` exists only for people who
+          # build from source: install.ps1 delivers this binary and nothing else,
+          # and the wintun driver rides inside it rather than being a separate
+          # asset. Costs ~564 KiB of embedded, signed driver (measured: 14,159,872
+          # -> 14,737,408 bytes); see docs/smb-tun.md.
           - runner: windows-latest
             label: windows-amd64
-            features: "--features keychain"
+            features: "--features keychain,smb-tun"
             ext: ".exe"
     runs-on: ${{ matrix.runner }}
     steps:
