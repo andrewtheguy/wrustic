@@ -334,6 +334,9 @@ pub(crate) struct App {
     // Whether the `?` key overlay is showing. Screen-relative: it renders the
     // key list for whatever screen is underneath.
     pub(crate) help_overlay: bool,
+    // Whether the `i` overlay on the snapshot list is showing: the selected
+    // snapshot's full details, for when the table truncates them (long paths).
+    pub(crate) snapshot_info_overlay: bool,
     pub(crate) error_is_fatal: bool,
     pub(crate) quit: bool,
 
@@ -486,6 +489,7 @@ impl App {
             smb_error: None,
             unlock_return: UnlockReturn::default(),
             help_overlay: false,
+            snapshot_info_overlay: false,
             error_is_fatal: false,
             quit: false,
             delete_target: None,
@@ -1380,10 +1384,14 @@ impl App {
 
     // The snapshot currently selected in the (possibly filtered) list.
     fn selected_snapshot_id(&self) -> Option<String> {
+        Some(self.selected_snapshot()?.id.clone())
+    }
+
+    pub(crate) fn selected_snapshot(&self) -> Option<&crate::repo::SnapshotRow> {
         let visible = self.visible_snapshot_indices();
         let pos = self.list_state.selected()?;
         let abs = *visible.get(pos)?;
-        Some(self.snapshots.get(abs)?.id.clone())
+        self.snapshots.get(abs)
     }
 
     fn activate_backend(&mut self) {
@@ -1413,6 +1421,11 @@ impl App {
         // never asked for.
         if self.help_overlay {
             self.help_overlay = false;
+            return;
+        }
+        // The `i` snapshot-details overlay is modal for the same reason.
+        if self.snapshot_info_overlay {
+            self.snapshot_info_overlay = false;
             return;
         }
         if key.code == KeyCode::Char('?') && crate::ui::help_rows(&self.screen).is_some() {
@@ -1628,6 +1641,11 @@ impl App {
                 }
                 KeyCode::Char('p') => {
                     self.screen = Screen::PruneConfirm;
+                }
+                KeyCode::Char('i') => {
+                    if self.selected_snapshot().is_some() {
+                        self.snapshot_info_overlay = true;
+                    }
                 }
                 KeyCode::Char('s') => {
                     if let Some(id) = self.selected_snapshot_id() {
@@ -2288,6 +2306,10 @@ impl App {
             self.help_overlay = false;
             return;
         }
+        if self.snapshot_info_overlay {
+            self.snapshot_info_overlay = false;
+            return;
+        }
         // Only left-click and the vertical scroll wheel are wired up;
         // right/middle/drag/motion are ignored.
         match m.kind {
@@ -2828,6 +2850,38 @@ mod tests {
             "the key that closes the help must not also be handled",
         );
         assert!(app.delete_target.is_none());
+    }
+
+    #[test]
+    fn info_overlay_opens_and_the_next_key_only_closes_it() {
+        let mut app = boot_app_with_snapshots(vec![row_with_id("aaa")]);
+        app.screen = Screen::Snapshots;
+        app.list_state.select(Some(0));
+
+        press(&mut app, KeyCode::Char('i'));
+        assert!(app.snapshot_info_overlay);
+        assert!(matches!(app.screen, Screen::Snapshots), "i must not navigate");
+
+        // `d` would normally open the delete flow. Dismissing the overlay must
+        // not also act on the screen behind it.
+        press(&mut app, KeyCode::Char('d'));
+        assert!(!app.snapshot_info_overlay);
+        assert!(
+            matches!(app.screen, Screen::Snapshots),
+            "the key that closes the overlay must not also be handled",
+        );
+        assert!(app.delete_target.is_none());
+    }
+
+    #[test]
+    fn info_overlay_needs_a_selected_snapshot() {
+        let mut app = boot_app_with_snapshots(vec![]);
+        app.screen = Screen::Snapshots;
+
+        press(&mut app, KeyCode::Char('i'));
+
+        assert!(!app.snapshot_info_overlay);
+        assert!(matches!(app.screen, Screen::Snapshots));
     }
 
     #[test]

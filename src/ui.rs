@@ -27,6 +27,12 @@ pub(crate) fn render(frame: &mut Frame, app: &mut App) {
     if app.help_overlay && let Some(rows) = help_rows(&app.screen) {
         render_help_overlay(frame, body, rows);
     }
+    if app.snapshot_info_overlay
+        && matches!(app.screen, Screen::Snapshots)
+        && let Some(s) = app.selected_snapshot()
+    {
+        render_snapshot_info_overlay(frame, body, s);
+    }
 }
 
 /// The full key list for a screen, shown by `?`. `None` means the screen has no
@@ -51,6 +57,7 @@ pub(crate) fn help_rows(screen: &Screen) -> Option<&'static [(&'static str, &'st
             ("PgUp/PgDn", "page"),
             ("g / G", "jump to the first / last snapshot"),
             ("Enter", "browse this snapshot's files"),
+            ("i", "show this snapshot's full details (untruncated paths)"),
             ("s", "share this snapshot as a read-only SMB mount"),
             ("c", "compare this snapshot against another"),
             ("f", "filter the list by host, tag or path"),
@@ -122,7 +129,7 @@ fn render_help_overlay(frame: &mut Frame, area: Rect, rows: &[(&str, &str)]) {
         .collect();
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        " any key closes this",
+        " press any key to close this",
         Style::new().fg(Color::DarkGray),
     )));
 
@@ -132,6 +139,84 @@ fn render_help_overlay(frame: &mut Frame, area: Rect, rows: &[(&str, &str)]) {
     let para = Paragraph::new(lines).block(
         Block::bordered()
             .title("Keys")
+            .border_style(Style::new().fg(Color::Cyan)),
+    );
+    frame.render_widget(para, popup);
+}
+
+/// A centred box with every field of the selected snapshot in full — the
+/// escape hatch for when the table truncates a column (long path lists, most
+/// commonly). Long values wrap onto continuation lines instead of truncating;
+/// showing them whole is the point of the overlay.
+fn render_snapshot_info_overlay(frame: &mut Frame, area: Rect, s: &crate::repo::SnapshotRow) {
+    let tags = if s.tags.is_empty() {
+        "-".to_string()
+    } else {
+        s.tags.join(", ")
+    };
+    let size = s.size.map(human_size).unwrap_or_else(|| "-".to_string());
+
+    let mut rows: Vec<(&str, String)> = vec![
+        ("ID", s.id.clone()),
+        ("Time", s.time.clone()),
+        ("Host", s.host.clone()),
+        ("Tags", tags),
+        ("Size", size),
+    ];
+    if s.paths.is_empty() {
+        rows.push(("Paths", "-".to_string()));
+    } else {
+        rows.push(("Paths", s.paths[0].clone()));
+        for p in &s.paths[1..] {
+            rows.push(("", p.clone()));
+        }
+    }
+
+    let key_width = "Paths".len();
+    // Each line renders as " <label padded to key_width>  <value>".
+    let longest = rows.iter().map(|(_, v)| v.chars().count()).max().unwrap_or(0);
+    let content_width = 1 + key_width + 2 + longest;
+    // +2 for the border, +1 for a right-hand margin.
+    let w = ((content_width + 3) as u16).min(area.width);
+    let inner_w = (w.saturating_sub(2) as usize).max(1);
+
+    // Height accounts for wrapping: a value wider than the popup folds onto
+    // extra lines, and those lines need rows or the dismiss hint scrolls off.
+    let text_rows: usize = rows
+        .iter()
+        .map(|(_, v)| (1 + key_width + 2 + v.chars().count()).div_ceil(inner_w).max(1))
+        .sum();
+    // +2 for the border, +2 for the trailing blank line and the dismiss hint.
+    let h = ((text_rows + 4) as u16).min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+
+    let mut lines: Vec<Line> = rows
+        .iter()
+        .map(|(k, v)| {
+            Line::from(vec![
+                Span::styled(
+                    format!(" {k:key_width$}  "),
+                    Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(v.clone(), Style::new().fg(Color::White)),
+            ])
+        })
+        .collect();
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " press any key to close this",
+        Style::new().fg(Color::DarkGray),
+    )));
+
+    frame.render_widget(ratatui::widgets::Clear, popup);
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+        Block::bordered()
+            .title("Snapshot")
             .border_style(Style::new().fg(Color::Cyan)),
     );
     frame.render_widget(para, popup);
@@ -202,7 +287,7 @@ fn footer_text(screen: &Screen, keychain_enabled: bool) -> &'static str {
         // past the width of a terminal again.
         Screen::Home => "Enter open  n new  e edit  d delete  ? keys  q quit",
         Screen::Snapshots => {
-            "Enter browse  s share  c compare  f filter  d delete  ? keys  q/Esc back"
+            "Enter browse  i info  s share  c compare  f filter  d delete  p prune  r reload  ? keys  q/Esc back"
         }
         Screen::SnapshotFilterDim => "Up/Dn move  PgUp/PgDn page  Enter pick  Esc back",
         Screen::SnapshotFilterValue => {
@@ -1352,7 +1437,8 @@ fn render_snapshot_smb(frame: &mut Frame, app: &mut App, area: Rect) {
                 "  Linux    sudo mount -t cifs -o port={port},vers=2.1,username={user},ro,uid=$(id -u),gid=$(id -g),file_mode=0444,dir_mode=0555 //127.0.0.1/{share} /mnt/snap\n\n"
             ));
             lines.push_str(&format!(
-                "  macOS    mount_smbfs -f 0444 -d 0555 //{user}@127.0.0.1:{port}/{share} /Volumes/snap\n\n"
+                "  macOS    Finder → Go → Connect to Server (Cmd+K), then enter:\n\
+                 \x20          smb://{user}@127.0.0.1:{port}/{share}\n\n"
             ));
             lines.push_str(&format!(
                 "  Windows  net use Z: {} * /user:{user} /TCPPORT:{port}\n",
@@ -1384,9 +1470,10 @@ fn render_snapshot_smb(frame: &mut Frame, app: &mut App, area: Rect) {
     lines.push_str(
         "\nEvery client authenticates and authenticated session messages are signed. \
          Writes are refused at the protocol level, and so is opening a file for execute — \
-         the Linux and macOS commands above mount files 0444 and directories 0555, since \
-         this is a way to browse a snapshot rather than to restore one. Leaving this screen \
-         stops the server, and any mount still using it.",
+         this is a way to browse a snapshot rather than to restore one. The Linux mount \
+         options above additionally display files as 0444 and directories as 0555; a \
+         Finder mount shows the client's default modes, but the server refuses writes \
+         either way. Leaving this screen stops the server, and any mount still using it.",
     );
 
     let para = Paragraph::new(lines)

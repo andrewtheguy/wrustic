@@ -23,7 +23,7 @@ keep serving a repo other processes may now treat as unlocked. Details in
 ## Using it
 
 `s` on the snapshot list starts a server on `127.0.0.1:4456` and shows the
-username, the generated password, and a ready mount command for each platform.
+username, the generated password, and ready mount instructions for each platform.
 Leaving the screen stops the server (releasing the repository lock) and breaks
 any mount using it. `--smb-port <N>` picks a different port.
 
@@ -32,13 +32,6 @@ The share root contains a single directory named with the snapshot's short id
 commands — and the snapshot's tree lives inside it. The share name and mount
 commands stay fixed (`\\127.0.0.1\snap`, fstab-safe), while the mount's
 contents, and anything copied out of it, say which snapshot they came from.
-
-That is the entire user-facing surface. There is deliberately no `serve`
-subcommand: a share is scoped to the screen that created it and is always
-loopback, so the share cannot outlive the UI that is telling you it exists.
-Everything a manual cross-platform test needs — a long-lived server, a
-non-loopback bind — lives in the test harness instead, see
-[Testing against a real client](#testing-against-a-real-client).
 
 ## Mounting
 
@@ -51,10 +44,15 @@ password shown on the share screen when asked.
 # Linux — mount.cifs prompts for the password
 sudo mount -t cifs -o port=4456,vers=2.1,username=wrustic,ro,uid=$(id -u),gid=$(id -g),file_mode=0444,dir_mode=0555 \
     //127.0.0.1/snap /mnt/snap
-
-# macOS
-mount_smbfs -f 0444 -d 0555 //wrustic@127.0.0.1:4456/snap /Volumes/snap
 ```
+
+On macOS, use Finder → Go → Connect to Server (⌘K) and enter
+
+```
+smb://wrustic@127.0.0.1:4456/snap
+```
+
+Finder pre-fills the username from the URL and prompts for the password.
 
 ```bat
 :: Windows 11 24H2 or newer — * makes net use prompt
@@ -67,7 +65,7 @@ their secure defaults.
 
 ### Permissions: readable by everyone, executable by no one
 
-On Linux and macOS, every file mounts as `0444` and every directory as `0555` —
+On Linux, every file mounts as `0444` and every directory as `0555` —
 readable and listable by any local user, writable and runnable by none. Windows
 has no POSIX mode to set; there the same intent is carried by the read-only
 attribute and the server-side execute refusal below. A share is a way to
@@ -76,12 +74,13 @@ already lost on the way through SMB 2.1 (see [Known
 limitations](#known-limitations)), so a tree copied out of a mount is not a
 faithful restore however it is executed. Use `restic restore` for that.
 
-The mode itself is a client-side setting on those two, because SMB 2.1 carries
-no POSIX mode: `file_mode=`/`dir_mode=` on Linux and `-f`/`-d` on macOS, which is why
-the commands above pass them. Dropping those options does not open the share up
-to writes — every write is refused by the server regardless — it only makes the
-client display a mode the server never claimed, typically `0555` from the
-kernel's own default with the read-only attribute applied.
+The mode itself is a client-side setting there, because SMB 2.1 carries no
+POSIX mode: `file_mode=`/`dir_mode=` on Linux, which is why the command above
+passes them. A Finder mount has no equivalent, and dropping the options does
+not open the share up to writes either — every write is refused by the server
+regardless — it only makes the client display a mode the server never claimed,
+typically `0555` from the kernel's own default with the read-only attribute
+applied.
 
 The execute bit is enforced server-side, though, since Windows checks it there:
 a CREATE naming a file and asking for `FILE_EXECUTE` (which is how Windows
