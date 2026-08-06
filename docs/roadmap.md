@@ -28,6 +28,6 @@
 ## Ideas (Currently out of scope but worth considering for the future)
 
 - More native write operations via rustic_core under the restic-compatible
-  lock module (docs/locking.md) — snapshot delete and unlock are already
-  native; next is backup under a non-exclusive lock, then copy / key add.
-  prune/repair/migrate stay on the restic CLI
+  lock module (docs/locking.md) — snapshot delete, prune, and unlock are
+  already native; next is backup under a non-exclusive lock, then copy /
+  key add. repair/migrate stay on the restic CLI

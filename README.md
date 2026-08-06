@@ -5,10 +5,12 @@ repositories, built on [`rustic_core`](https://crates.io/crates/rustic_core)
 and [`ratatui`](https://crates.io/crates/ratatui).
 
 `wrustic` is read-mostly by design: reads are native via `rustic_core`, and
-the few write operations it exposes (snapshot delete, stale-lock removal)
-are native too, guarded by restic-compatible repository locks
-(docs/locking.md). Everything else that writes stays on the `restic` CLI —
-docs/restic-usage.md is the overview of exactly which workflows that means.
+the write operations it exposes (snapshot delete, prune) are native too,
+guarded by restic-compatible repository locks (docs/locking.md). Stale-lock
+removal is also native, but takes no lock itself — like `restic unlock`, it
+only deletes lock files that are provably stale. Everything else that writes
+stays on the `restic` CLI — docs/restic-usage.md is the overview of exactly
+which workflows that means.
 
 ## Features
 
@@ -23,9 +25,9 @@ docs/restic-usage.md is the overview of exactly which workflows that means.
   repository lock; when the repo is locked, `u` on the error screen removes
   stale locks (live ones are kept) and retries
 - **Prune** (`p` on the snapshot list): reclaim the space deleted snapshots
-  left behind — runs `restic prune` (the one feature that needs restic, >=
-  0.19, on PATH), unsticking stale repository locks first, with live
-  progress and safe cancellation via Ctrl+C
+  left behind — native, under the same exclusive repository lock restic's
+  own prune takes, with live progress; on a lock conflict, `u` removes
+  stale locks and retries
 - **File sharing**: one-time signed download URLs served from localhost
 - **Snapshot sharing over SMB** (`s` on the snapshot list): mount a whole
   snapshot read-only from Linux, macOS, or Windows 11 24H2+, served by a
@@ -164,7 +166,9 @@ Linux, macOS, and Windows 11 24H2 or newer all can — earlier Windows builds
 cannot, and should use the per-file HTTP share instead. See
 [`docs/smb.md`](docs/smb.md).
 
-The restic CLI commands wrustic shells out for (prune-class operations) keep
+The restic CLI commands wrustic can shell out for (maintenance-class
+operations like repair, plus the dev-flow tests; no interactive feature
+does anymore) keep
 an on-disk cache by default, in a `wrustic` directory under your platform's
 own per-user cache root — `$XDG_CACHE_HOME` or `~/.cache` on Linux,
 `~/Library/Caches` on macOS, `%LOCALAPPDATA%` on Windows — so it stays
@@ -191,15 +195,15 @@ an operation that had been running for a month.
 
 To clean up by hand, point restic at the same directory:
 `restic --cache-dir <that path> cache --cleanup`. **Stop all restic activity
-first** — quit your wrustic instances and let any prune finish. Deleting a
+against that cache first.** Deleting a
 cache directory out from under a live restic aborts that command (the
 repository itself is unharmed — no lock is left behind and `restic check`
-stays clean — but the prune has to be rerun). Lowering `--max-age` is what
+stays clean — but the command has to be rerun). Lowering `--max-age` is what
 makes this reachable, and `--max-age 0` guarantees it by making every
 subdirectory eligible, in-use ones included. A smaller `--max-age` is not a
 safe substitute for stopping first: that timestamp is set once at open and
 is never refreshed while the command runs, so an operation that outlives the
-window — a long prune against a slow remote — is treated as idle and swept.
+window — a long run against a slow remote — is treated as idle and swept.
 
 `--no-keychain` disables keychain integration at runtime, even when the
 binary was built with the `keychain` feature. See
@@ -235,13 +239,14 @@ Then in the TUI:
 
 ## Relationship to the `restic` binary
 
-`wrustic` calls out to the `restic` executable for exactly one feature —
-the prune action — because mixing prune implementations on one repo is the
-riskiest place to go native (docs/locking.md). Everything else is native:
-`rustic_core` reads the on-disk repository format, and the other write
-operations wrustic exposes (snapshot delete, stale-lock removal) hold
-restic-compatible repository locks (docs/locking.md). You do not need
-`restic` installed to run `wrustic` — only to prune from it.
+`wrustic` needs no `restic` executable at runtime — every feature is
+native. `rustic_core` reads the on-disk repository format, and the write
+operations wrustic exposes (snapshot delete, prune) hold restic-compatible
+repository locks, so they coexist safely with concurrent restic processes;
+stale-lock removal takes no lock — like `restic unlock`, it only deletes
+lock files that are provably stale. The prune always uses instant delete,
+so the repository state it leaves is indistinguishable from `restic prune`
+(docs/locking.md has the full safety argument).
 [`docs/restic-usage.md`](docs/restic-usage.md) is the per-workflow overview
 of what still uses (or is expected to use) the restic CLI.
 

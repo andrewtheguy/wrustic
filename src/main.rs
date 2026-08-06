@@ -28,7 +28,7 @@ use ratatui::{
 
 use ratatui::widgets::TableState;
 
-use crate::app::{App, BrowseFrame, Screen};
+use crate::app::{App, BrowseFrame, Screen, UnlockReturn};
 use crate::cli::{USAGE, parse_cli};
 use crate::config::{ConfigLock, Paths};
 use crate::repo::{
@@ -88,6 +88,11 @@ fn main() -> Result<()> {
     ratatui::restore();
     result
 }
+
+// How long an armed prune force-quit stays live before it disarms itself —
+// long enough for a deliberate double Ctrl+C, short enough that a stray
+// press is forgotten.
+const PRUNE_QUIT_ARM_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
 
 fn run(
     terminal: &mut DefaultTerminal,
@@ -254,41 +259,52 @@ fn run(
 
         if matches!(app.screen, Screen::Unlocking) {
             // Which flow asked for the unlock decides where its outcome goes:
-            // the SMB share retries starting (its lock conflict is why `u` was
-            // offered), the delete flow re-enters its confirmation.
-            let from_smb = std::mem::take(&mut app.unlock_from_smb);
+            // the SMB share and the prune retry their operation (a lock
+            // conflict is why `u` was offered), the delete flow re-enters its
+            // confirmation.
+            let return_to = std::mem::take(&mut app.unlock_return);
             let idx = app.loading_index;
             let Some((_, profile)) = app.config.profile_at(idx) else {
                 let msg = "Selected profile no longer exists.".to_string();
-                app.screen = if from_smb {
-                    app.smb_error = Some(msg);
-                    Screen::SnapshotSmb
-                } else {
-                    Screen::SnapshotDeleteError(msg)
+                app.screen = match return_to {
+                    UnlockReturn::Smb => {
+                        app.smb_error = Some(msg);
+                        Screen::SnapshotSmb
+                    }
+                    UnlockReturn::Prune => Screen::PruneError(msg),
+                    UnlockReturn::Delete => Screen::SnapshotDeleteError(msg),
                 };
                 continue;
             };
             match unlock(profile) {
-                Ok(_removed) if from_smb => {
-                    app.screen = Screen::SnapshotSmbStarting;
-                }
-                // Re-enter the delete flow so details/preview are rebuilt and
-                // the confirmation is asked again; without a pending target
-                // there is nothing to retry, so just refresh the list.
                 Ok(_removed) => {
-                    app.delete_info = None;
-                    app.screen = if app.delete_target.is_some() {
-                        Screen::SnapshotDeleteLoading
-                    } else {
-                        Screen::Loading
+                    app.screen = match return_to {
+                        UnlockReturn::Smb => Screen::SnapshotSmbStarting,
+                        UnlockReturn::Prune => Screen::PruneRunning,
+                        // Re-enter the delete flow so details/preview are
+                        // rebuilt and the confirmation is asked again; without
+                        // a pending target there is nothing to retry, so just
+                        // refresh the list.
+                        UnlockReturn::Delete => {
+                            app.delete_info = None;
+                            if app.delete_target.is_some() {
+                                Screen::SnapshotDeleteLoading
+                            } else {
+                                Screen::Loading
+                            }
+                        }
                     };
                 }
-                Err(e) if from_smb => {
-                    app.smb_error = Some(format!("unlock failed: {e:#}"));
-                    app.screen = Screen::SnapshotSmb;
-                }
                 Err(e) => {
-                    app.screen = Screen::SnapshotDeleteError(format!("unlock failed: {e:#}"));
+                    let msg = format!("unlock failed: {e:#}");
+                    app.screen = match return_to {
+                        UnlockReturn::Smb => {
+                            app.smb_error = Some(msg);
+                            Screen::SnapshotSmb
+                        }
+                        UnlockReturn::Prune => Screen::PruneError(msg),
+                        UnlockReturn::Delete => Screen::SnapshotDeleteError(msg),
+                    };
                 }
             }
             continue;
@@ -390,88 +406,67 @@ fn run(
                 };
                 let profile = profile.clone();
                 let (tx, rx) = std::sync::mpsc::channel();
-                let tracker = std::sync::Arc::new(restic::ChildTracker::default());
                 let progress = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-                let worker_tracker = tracker.clone();
                 let worker_progress = progress.clone();
                 std::thread::spawn(move || {
-                    let result = (|| -> Result<Vec<u8>> {
-                        if let Err(e) = restic::detect() {
-                            return Err(anyhow::anyhow!(e.user_message()));
-                        }
-                        // No `--json`: restic 0.19 has no JSON output for
-                        // prune (the flag is accepted and ignored). The
-                        // report is displayed verbatim, never parsed.
-                        restic::run_unsticking_locks_streaming(
-                            &profile,
-                            &["prune"],
-                            &worker_tracker,
-                            &worker_progress,
-                        )
-                    })();
                     // The receiver is gone only if the app quit; nothing to do.
-                    let _ = tx.send(result.map_err(|e| format!("{e:#}")));
+                    let _ = tx.send(
+                        repo::prune(&profile, worker_progress).map_err(|e| format!("{e:#}")),
+                    );
                 });
                 app.prune_rx = Some(rx);
-                app.prune_tracker = Some(tracker);
                 app.prune_progress = Some(progress);
-                app.prune_cancel_requested = false;
+                app.prune_quit_armed = None;
                 app.prune_started = Some(std::time::Instant::now());
             }
             let rx = app.prune_rx.as_ref().expect("receiver set above");
             match rx.try_recv() {
                 Ok(outcome) => {
-                    let cancelled = app.prune_cancel_requested;
                     app.prune_rx = None;
-                    app.prune_tracker = None;
                     app.prune_progress = None;
-                    app.prune_cancel_requested = false;
+                    app.prune_quit_armed = None;
                     app.prune_started = None;
                     app.prune_scroll = 0;
                     app.screen = match outcome {
-                        // A cancel that raced restic's own finish is still a
-                        // finish — the report is real either way.
-                        Ok(stdout) => {
-                            let report = String::from_utf8_lossy(&stdout).into_owned();
-                            Screen::PruneDone(if report.trim().is_empty() {
-                                "prune finished (restic produced no output)".into()
-                            } else {
-                                report
-                            })
-                        }
-                        Err(msg) if cancelled => Screen::PruneError(format!(
-                            "Prune cancelled — restic was interrupted before finishing.\n\n\
-                             The repository stays valid: restic never removes data still \
-                             in use, and the next prune redoes the remaining work.\n\n\
-                             restic said: {msg}"
-                        )),
+                        Ok(report) => Screen::PruneDone(report),
                         Err(msg) => Screen::PruneError(msg),
                     };
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
                     // Wait briefly so the loop redraws the elapsed clock and
-                    // streamed progress without spinning. Ctrl+C interrupts
-                    // the restic child (safe: restic never removes data still
-                    // in use); every other event is swallowed, with resize
-                    // picked up by the redraw. Every Ctrl+C re-sends the
-                    // interrupt: a press that lands before the child is
-                    // tracked (detect / the unstick pre-check) is a no-op on
-                    // the tracker, so a repeat must still be able to reach
-                    // the child once it exists.
+                    // progress without spinning (a swallowed resize is
+                    // repainted at the next tick). A native prune cannot be
+                    // cancelled mid-flight by the user (rustic_core takes no
+                    // cancellation token), so Ctrl+C arms a force-quit and a
+                    // second Ctrl+C exits the app, killing the worker with
+                    // the process. That is safe for the repository — prune
+                    // writes all new data and the new index before deleting
+                    // anything old — but skips the lock guard's cleanup, so
+                    // a stale lock file stays behind until an unlock removes
+                    // it. The arm expires after a few seconds, so a stray
+                    // Ctrl+C from earlier can never pair with a later one
+                    // into an accidental quit.
+                    if app
+                        .prune_quit_armed
+                        .is_some_and(|t| t.elapsed() > PRUNE_QUIT_ARM_WINDOW)
+                    {
+                        app.prune_quit_armed = None;
+                    }
                     if event::poll(std::time::Duration::from_millis(150))?
                         && let Event::Key(key) = event::read()?
                         && key.kind == KeyEventKind::Press
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                         && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
-                        && let Some(tracker) = &app.prune_tracker
                     {
-                        tracker.interrupt();
-                        app.prune_cancel_requested = true;
+                        if app.prune_quit_armed.is_some() {
+                            app.quit = true;
+                        } else {
+                            app.prune_quit_armed = Some(std::time::Instant::now());
+                        }
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     app.prune_rx = None;
-                    app.prune_tracker = None;
                     app.prune_progress = None;
                     app.prune_started = None;
                     app.screen =

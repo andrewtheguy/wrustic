@@ -254,9 +254,15 @@ fn footer_text(screen: &Screen, keychain_enabled: bool) -> &'static str {
         | Screen::Unlocking
         | Screen::SnapshotCompareLoading => "working…",
         Screen::PruneConfirm => "y start prune  n/Esc cancel",
-        Screen::PruneRunning => "running restic prune — Ctrl+C cancel (safe), other keys disabled",
+        Screen::PruneRunning => "pruning natively — Ctrl+C twice force-quits, other keys disabled",
         Screen::PruneDone(_) => "Up/Dn scroll  PgUp/PgDn page  g/G top/bottom  q/Esc back",
-        Screen::PruneError(_) => "any key to continue",
+        Screen::PruneError(msg) => {
+            if crate::lock::is_lock_error(msg) {
+                "u remove stale locks and retry  any other key to continue"
+            } else {
+                "any key to continue"
+            }
+        }
         Screen::CreateProfileName => "type  Enter submit  Esc cancel",
         Screen::BackendChoice => "Up/Dn move  PgUp/PgDn page  Enter pick  Esc back",
         Screen::LocalPath => "type  Enter submit  Esc back",
@@ -437,7 +443,16 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
             render_prune_done(frame, app, area, &report);
         }
         Screen::PruneError(msg) => {
-            let para = Paragraph::new(msg.as_str())
+            let body = if crate::lock::is_lock_error(msg) {
+                format!(
+                    "{msg}\n\nPress u to remove stale repository locks (live locks are \
+                     kept) and retry the prune, or any other key to return to the \
+                     snapshot list."
+                )
+            } else {
+                format!("{msg}\n\nPress any key to return to the snapshot list.")
+            };
+            let para = Paragraph::new(body)
                 .style(Style::new().fg(Color::Red))
                 .wrap(Wrap { trim: false })
                 .block(Block::bordered().title("Prune failed"));
@@ -874,19 +889,16 @@ fn render_compare_results(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn render_prune_confirm(frame: &mut Frame, app: &App, area: Rect) {
     let profile = app.active_profile_name.as_deref().unwrap_or("?");
-    let cache = if crate::restic::cache_enabled() {
-        "wrustic's private cache directory (start wrustic with --no-restic-cache to save disk space)"
-    } else {
-        "no cache (--no-cache)"
-    };
     let body = format!(
         "Prune repository of profile `{profile}`?\n\n\
-         This runs `restic prune`, which rewrites and deletes pack files to\n\
-         reclaim the space left behind by deleted snapshots. It takes an\n\
-         exclusive repository lock — concurrent backups are blocked while it\n\
-         runs — and can take a long time on a large or remote repository.\n\
-         Progress is shown live, and Ctrl+C cancels safely at any point.\n\n\
-         Requires restic >= 0.19 on PATH. Cache: {cache}.\n\n\
+         This prunes natively, rewriting and deleting pack files to reclaim\n\
+         the space left behind by deleted snapshots. It takes an exclusive\n\
+         repository lock — concurrent backups are blocked while it runs —\n\
+         and can take a long time on a large or remote repository.\n\
+         Progress is shown live. A running prune cannot be cancelled;\n\
+         pressing Ctrl+C twice force-quits wrustic instead, which is safe\n\
+         for the repository (nothing old is deleted before everything new\n\
+         is written) but leaves a stale lock for a later unlock.\n\n\
          y/Enter start   n/Esc cancel"
     );
     let para = Paragraph::new(body)
@@ -904,20 +916,25 @@ fn render_prune_running(frame: &mut Frame, app: &App, area: Rect) {
     let spinner = FRAMES[(elapsed.as_millis() / 150) as usize % FRAMES.len()];
     let secs = elapsed.as_secs();
     let mut body = format!(
-        "{spinner} Running `restic prune`…  elapsed {}m{:02}s\n\n",
+        "{spinner} Pruning repository…  elapsed {}m{:02}s\n\n",
         secs / 60,
         secs % 60
     );
-    if app.prune_cancel_requested {
-        body.push_str("Cancelling — waiting for restic to stop…\n\n");
+    if app.prune_quit_armed.is_some() {
+        body.push_str(
+            "Ctrl+C again within a few seconds force-quits wrustic. The\n\
+             repository stays valid — the interrupted work is redone by the\n\
+             next prune — but the leftover lock must be removed later\n\
+             (u on the lock error).\n\n",
+        );
     } else {
         body.push_str(
-            "Ctrl+C cancels safely: restic never removes data still in use; an\n\
-             interrupted prune leaves the remaining work for the next run.\n\n",
+            "A native prune cannot be cancelled. Ctrl+C twice force-quits\n\
+             wrustic; the repository stays valid either way.\n\n",
         );
     }
-    // Tail of restic's streamed stdout — on a pipe restic reports progress
-    // roughly every 10 s, so long repacks show movement here.
+    // One line per prune phase, rewritten in place as the phase advances
+    // (newest phases at the bottom).
     if let Some(progress) = &app.prune_progress {
         let progress = progress.lock().unwrap_or_else(|p| p.into_inner());
         // Reserve the 2 border rows plus however many rows the header text
@@ -941,13 +958,11 @@ fn render_prune_running(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_prune_done(frame: &mut Frame, app: &mut App, area: Rect, report: &str) {
-    // restic's own report, shown verbatim: prune has no JSON output in
-    // restic 0.19 and wrustic does not parse human-readable output.
     let max_scroll = (report.lines().count() as u16).saturating_sub(1);
     app.prune_scroll = app.prune_scroll.min(max_scroll);
     let para = Paragraph::new(report)
         .scroll((app.prune_scroll, 0))
-        .block(Block::bordered().title("Prune finished — restic report"));
+        .block(Block::bordered().title("Prune finished"));
     record_list_area(app, area);
     frame.render_widget(para, area);
 }

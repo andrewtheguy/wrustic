@@ -108,31 +108,95 @@ safety rationale behind that split.)
 Restic's own table above *is* the safety map. Tiered by lock type, with
 each operation's implementation status (see Phases below for the history).
 Implemented today: **forget / delete snapshots** (`repo::delete_snapshot`,
-the TUI delete flow), the **snapshot SMB share** (a long-running *read*
-under the same non-exclusive lock `restic mount` takes — see "Long-running
-reads" below), and — outside these tables because it takes no lock —
-**unlock** (`repo::unlock`, native stale-lock removal behind the TUI's `u`
-shortcut, plus the pre-spawn unstick in `restic::run_unsticking_locks`).
+the TUI delete flow), **prune** (`repo::prune`, the TUI's `p` action —
+see "Native prune" below), the **snapshot SMB share** (a long-running
+*read* under the same non-exclusive lock `restic mount` takes — see
+"Long-running reads" below), and — outside these tables because it takes
+no lock — **unlock** (`repo::unlock`, native stale-lock removal behind
+the TUI's `u` shortcut, plus the pre-spawn unstick in
+`restic::run_unsticking_locks`).
 
 **Tier 1 — non-exclusive lock (coexists with running restic backups):**
 
 | Operation | rustic_core API | Status | Why safe |
 |---|---|---|---|
-| backup | `Repository::backup` | planned — phase 3, next up | pure append: packs → index → snapshot, the ordering the design doc requires for concurrent-append safety |
+| backup | `Repository::backup` | planned — phase 5, next up | pure append: packs → index → snapshot, the ordering the design doc requires for concurrent-append safety |
 | copy into repo | `Repository::copy` (dest side) | planned — after backup | append-only |
 | key add | `Repository::add_key` | planned — after backup | writes one new key file |
 
-**Tier 2 — exclusive lock (blocks restic briefly; fully safe):**
+**Tier 2 — exclusive lock (blocks restic while held; fully safe):**
 
 | Operation | rustic_core API | Status |
 |---|---|---|
 | forget / delete snapshots | `delete_snapshots` | **implemented** — `repo::delete_snapshot` (phase 2) |
+| prune | `prune_plan` + `prune` | **implemented** — `repo::prune` (phase 4) |
 | tag / description edits | `save_snapshots` + `delete_snapshots` | not planned yet |
 | key remove | `delete_key` | not planned yet |
 
-These have tiny critical sections (seconds); a concurrent restic command
-gets the ordinary "repository is already locked" error it is designed to
-handle.
+Apart from prune these have tiny critical sections (seconds); a
+concurrent restic command gets the ordinary "repository is already
+locked" error it is designed to handle. Prune holds the lock for its
+whole run — exactly like `restic prune` does.
+
+**Native prune (implemented):** `repo::prune` was originally Tier 3
+("stays on the restic CLI"), on two stated grounds: rustic_core's
+two-phase delete bookkeeping and its `keep_pack = 0` default. Both
+concerns predate the lock module and dissolve under a real exclusive
+lock; the facts below were verified against restic 0.19.1 and
+rustic_core 0.12.0 source.
+
+- *Grace periods*: restic itself has **no** time-based grace anywhere —
+  its prune never reads a pack mtime (`internal/repository/prune.go`
+  enumerates packs as `(id, size)` only); safety comes purely from the
+  exclusive lock (`cmd_prune.go` refuses `--no-lock`). Under wrustic's
+  lock there is no concurrent writer to protect, which is the same
+  argument restic relies on. (`keep_pack` could not protect
+  restic-written packs anyway: it compares the index entry's `time`
+  field, which restic's index format doesn't have.)
+- *Two-phase delete*: opt-out. `repo::prune` always sets
+  `instant_delete`, and rustic_core then never writes its rustic-only
+  `packs_to_delete` index extension (every `add_remove` call site in
+  `commands/prune.rs` is behind `!instant_delete`) — which matters
+  because restic 0.19 decodes only the `packs` key (unknown JSON keys are
+  silently ignored), treats marked packs as orphans, deletes them on its
+  next prune, and drops the extension when it rewrites an index. Instant
+  delete *is* restic's own semantic, and needs no grace period under the
+  lock (see above). `max_repack` is lifted to unlimited to match restic;
+  `early_delete_index` stays off (it inverts the crash-safe ordering).
+- *Resulting state*: new index files covering exactly the surviving
+  packs (`supersedes` unset — restic 0.17 dropped the field), old
+  indexes and unused packs deleted. restic keeps no provenance and
+  re-derives everything from listing `index/` and `data/`, so this is
+  indistinguishable from a restic prune. Verified live:
+  `live_native_prune_interop_with_restic` (repack-forcing shape) passes
+  `restic check --read-data` with zero errors and zero orphaned packs,
+  restores the surviving snapshot, and a follow-up `restic prune` runs
+  clean.
+- *Crash safety*: rustic_core's execution order matches restic's
+  spec-mandated one — write repacked packs → write new index → delete
+  old indexes → delete packs — so an interruption leaves a valid repo
+  plus garbage the next prune collects.
+- *Lock coverage*: the exclusive lock is acquired **before planning**,
+  not just execution. rustic_core's executor never re-validates the plan
+  (no re-read of snapshots), so the snapshot set enumerated at plan time
+  must stay frozen throughout. `RepoLock::poisoned()` (the 22.5-minute
+  refreshability rule) is enforced for the whole run: rustic_core takes
+  no cancellation token, but it ticks its progress callbacks
+  continuously — per file during deletions, per blob batch during
+  repack — so `repo::prune`'s progress adapter probes the lock on every
+  phase start and on its ~10 Hz render ticks and, when poisoned, panics
+  with a marker that `abort_if_lock_poisoned` catches and maps to an
+  ordinary error. A lock that can no longer be trusted therefore aborts
+  planning *and* execution within roughly one progress tick, before
+  further writes or deletions; an explicit post-planning check covers a
+  poison landing between ticks. An abort mid-run is safe for the same
+  reason a crash is (see *Crash safety*). The mechanism is
+  failure-injection tested
+  (`poisoned_lock_aborts_through_the_progress_adapter`): a tripped probe
+  aborts a stage and maps to the lock error, unrelated panics resume
+  unchanged. What remains impossible is *user* cancellation of a healthy
+  run — Ctrl+C twice force-quits the app instead (safe, leaves a stale
+  lock).
 
 **Long-running reads — non-exclusive lock (implemented):** the snapshot
 SMB share (`smb::start_snapshot_share`). Reads take no lock in wrustic's
@@ -160,12 +224,12 @@ unlocked. Poisoning is a latch: a refresh that succeeds after the timeout
 was observed does not resurrect trust, since an unlock + prune may have
 happened in the gap.
 
-**Tier 3 — stays on the restic CLI indefinitely:** prune, repair index,
-migrate. Technically possible under an exclusive lock, but rustic_core's
-prune semantics differ from restic's (two-phase delete with 23 h
-`keep_delete`; `keep_pack` defaults to 0 so concurrently-written packs
-get no grace period), and mixing two prune implementations on one repo is
-where the real blast radius lives. No plan to go native here.
+**Tier 3 — stays on the restic CLI indefinitely:** repair index,
+migrate. Rare, hand-run recovery/upgrade operations with no TUI action
+today; if the TUI ever grows them they go through the spawn harness
+(`restic::run_unsticking_locks`), not rustic_core. (Prune sat here until
+the exclusive lock landed; see "Native prune" above for why its original
+rationale no longer applied.)
 
 ## wrustic lock module design
 
@@ -256,14 +320,16 @@ A `RepoLock` guard type that mirrors restic exactly:
    exclusive lock (`repo::delete_snapshot`), and the `u` shortcut's
    `restic unlock` became native stale-lock removal (`repo::unlock`).
    The restic/rustic metadata cross-check and `restic snapshots --json`
-   fetch went away with it; since then the only feature that needs the
-   restic binary is the TUI's prune action (`p` on the Snapshots screen).
-   `src/restic.rs` is the secure spawn harness behind it (stdin-piped
+   fetch went away with it; from then until phase 4 the only feature that
+   needed the restic binary was the TUI's prune action (`p` on the
+   Snapshots screen).
+   `src/restic.rs` is the secure spawn harness (stdin-piped
    password, env-var credentials, resterm's launch semantics including
    its private cache directory, off with `--no-restic-cache`) for
    triggering the restic commands
-   wrustic deliberately does not reimplement — prune and friends
-   (Tier 3). Before spawning one of those,
+   wrustic deliberately does not reimplement — repair and friends
+   (Tier 3), plus dev-flow repo setup in the live tests. Before spawning
+   one of those,
    `restic::run_unsticking_locks` performs restic's acquisition conflict
    check natively: the subcommand maps to the lock restic takes for it
    (the per-command table above) and `lock::check_blocking_locks`
@@ -285,11 +351,22 @@ A `RepoLock` guard type that mirrors restic exactly:
    in place (and its SIGHUP probe doesn't kill the process). On a lock
    conflict at share start, the share screen offers `u` — native
    stale-lock removal, then retry.
-4. **Native backup** under a non-exclusive lock (the headline win:
+4. **Native prune** — DONE. The TUI's last restic shell-out became
+   `repo::prune`: rustic_core's `prune_plan` + `prune` with instant
+   delete under the native exclusive lock, acquired before planning and
+   poison-checked after it (see "Native prune" above for the full safety
+   argument). The old prune-specific machinery in `src/restic.rs`
+   (version detection, the streaming runner, the child tracker) went
+   away with it; the harness itself stays for Tier 3 and dev-flow.
+   Verified live: `live_native_prune_interop_with_restic` forces a
+   repack, then passes `restic check --read-data` with zero errors and
+   zero orphans, restores the surviving snapshot through restic, and a
+   follow-up `restic prune` runs clean.
+5. **Native backup** under a non-exclusive lock (the headline win:
    wrustic backups running concurrently with restic cron backups), then
    copy / key add as wanted. The refreshability-abort rule it needs is
    already in place (phase 3).
 
-Non-goals: native prune/repair/migrate (Tier 3), multi-host clock-skew
+Non-goals: native repair/migrate (Tier 3), multi-host clock-skew
 mitigation beyond what restic itself does, and any restic < 0.19
 compatibility.
