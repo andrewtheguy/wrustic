@@ -251,8 +251,13 @@ pub(crate) struct App {
     /// expects it to be).
     pub(crate) cipher: Option<Cipher>,
     pub(crate) server_port: u16,
-    /// Localhost port the snapshot SMB share listens on (`--smb-port`).
-    pub(crate) smb_port: u16,
+    /// How the snapshot SMB share is exposed (`--smb-port`, `--smb-tun`,
+    /// `--smb-tun-subnet`).
+    ///
+    /// The tun fields are carried on every platform so `boot` has one signature
+    /// everywhere; only a Windows build with the `smb-tun` feature has anything
+    /// to read them with, and the flags are rejected at parse time elsewhere.
+    pub(crate) smb: crate::cli::SmbOptions,
     pub(crate) passphrase_instance_input: Input,
     pub(crate) passphrase_input: Input,
     pub(crate) passphrase_confirm: Input,
@@ -418,7 +423,7 @@ impl App {
         paths: Paths,
         config_lock: ConfigLock,
         server_port: u16,
-        smb_port: u16,
+        smb: crate::cli::SmbOptions,
         no_keychain: bool,
     ) -> Result<Self> {
         let mut auth_method_list = ListState::default();
@@ -433,7 +438,7 @@ impl App {
             config: Config::default(),
             cipher: None,
             server_port,
-            smb_port,
+            smb,
             passphrase_instance_input: Input::default(),
             passphrase_input: Input::default(),
             passphrase_confirm: Input::default(),
@@ -1368,9 +1373,23 @@ impl App {
         // drive mapping has to keep pointing somewhere. The cost is that a
         // second wrustic, or a manual test harness, collides here — which
         // surfaces as an inline "address already in use".
-        let port = self.smb_port;
-        match smb::start_snapshot_share(port, &profile, &snap_id, smb::Bind::Loopback, credentials)
-        {
+        let port = self.smb.port;
+        // With --smb-tun the share is fronted by a private tun adapter on port
+        // 445, and `port` becomes the ephemeral loopback socket behind it —
+        // which nothing outside this process ever connects to.
+        #[cfg(all(windows, feature = "smb-tun"))]
+        let bind = if self.smb.tun {
+            smb::Bind::Tun(smb::TunConfig {
+                state_dir: self.paths.dir.clone(),
+                port: smb::STANDARD_SMB_PORT,
+                subnet: self.smb.tun_subnet,
+            })
+        } else {
+            smb::Bind::Loopback
+        };
+        #[cfg(not(all(windows, feature = "smb-tun")))]
+        let bind = smb::Bind::Loopback;
+        match smb::start_snapshot_share(port, &profile, &snap_id, bind, credentials) {
             Ok(h) => {
                 self.smb_password = Some(password);
                 self.smb_error = None;
@@ -2640,7 +2659,8 @@ mod tests {
         ));
         let paths = config::paths(Some(tmp)).expect("paths");
         let lock = config::acquire_lock(&paths).expect("lock fresh test config dir");
-        let mut app = App::boot(paths, lock, 7834, 4456, false).expect("boot");
+        let mut app =
+            App::boot(paths, lock, 7834, crate::cli::SmbOptions::default(), false).expect("boot");
         app.snapshots = snaps;
         app
     }

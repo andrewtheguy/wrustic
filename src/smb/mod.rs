@@ -16,9 +16,12 @@
 // signing, no encryption, loopback by default. 2.1 is the newest dialect that
 // avoids pre-auth integrity hashes, negotiate contexts and AES-GCM; NTLMv2 plus
 // signing is the floor Windows 11 24H2 accepts, and all three client platforms
-// support it, so there is no guest path to keep working. Every write command is
+// support it, so there is no guest path to keep working. Write commands are
 // refused at the protocol level in addition to there being no code that could
-// perform one.
+// perform one — with a single, bounded exception: a WRITE to the `srvsvc` pipe
+// on IPC$, which is how a client asks what shares exist (see `srvsvc.rs`). It
+// buffers in memory, is gated on the tree being IPC$ and the pipe being open,
+// and has no route to a snapshot.
 //
 // A mount is for browsing a snapshot, not for restoring or running one:
 // symlinks cannot survive SMB 2.1 anyway, so nothing here pretends to be a
@@ -95,6 +98,13 @@ mod path;
 mod proto;
 mod session;
 mod sign;
+mod srvsvc;
+// Windows-only and off by default. The tun transport exists solely to get
+// around srvnet.sys owning port 445, which is not a problem any other platform
+// has, and it costs an embedded driver in the binary — so it is gated on both
+// the target and the `smb-tun` feature.
+#[cfg(all(windows, feature = "smb-tun"))]
+pub(crate) mod tun;
 mod wire;
 
 use std::net::TcpListener as StdTcpListener;
@@ -156,6 +166,11 @@ const MAX_CREDITS: u16 = 512;
 
 /// The share name clients connect to: `\\127.0.0.1\snap`.
 pub(crate) const DEFAULT_SHARE_NAME: &str = "snap";
+
+/// SMB's registered port, and the only one a Windows UNC path will ever try.
+/// A share reachable here needs no port option in any mount command, and works
+/// in Explorer's address bar rather than only as a mapped drive.
+pub(crate) const STANDARD_SMB_PORT: u16 = 445;
 
 /// The account clients authenticate as. Fixed rather than configurable in the
 /// TUI: the password is what protects the share, and a second thing to type
@@ -251,13 +266,33 @@ impl Ctx {
     }
 }
 
+/// Where a client should point, which is not the socket the server bound when
+/// the tun transport fronts the share: there the SMB code listens on an
+/// ephemeral loopback port while clients connect to the tun address on 445.
+#[derive(Debug, Clone)]
+pub(crate) struct MountPoint {
+    pub(crate) host: String,
+    pub(crate) port: u16,
+}
+
 pub(crate) struct SmbHandle {
+    /// The port the SMB listener actually bound. Equal to the mount port for
+    /// every transport except the tun, where it is the private loopback socket
+    /// the proxy talks to — which is why nothing user-facing reads it, and only
+    /// the tests and the manual harness do.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) port: u16,
     pub(crate) share_name: String,
+    mount: MountPoint,
     /// Shared with `Ctx`. Read by the owner to decide whether to stop.
     failed_logons: Arc<std::sync::atomic::AtomicU32>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     join_handle: Option<thread::JoinHandle<()>>,
+    /// The tun stack, when one fronts this share. Declared before `lock` so
+    /// drop order tears the client-facing transport down before the repository
+    /// lock is released — no client can still be reading when the lock goes.
+    #[cfg(all(windows, feature = "smb-tun"))]
+    tun: Option<tun::TunShare>,
     /// restic's non-exclusive repository lock, held for snapshot shares (test
     /// servers over an in-memory backing carry no lock). Declared after the
     /// shutdown fields so drop order releases the lock only once the shutdown
@@ -268,7 +303,18 @@ pub(crate) struct SmbHandle {
 impl SmbHandle {
     /// UNC path for a Linux `mount -t cifs`.
     pub(crate) fn unc(&self) -> String {
-        format!(r"\\127.0.0.1\{}", self.share_name)
+        format!(r"\\{}\{}", self.mount.host, self.share_name)
+    }
+
+    /// Host and port a client mounts, as opposed to the bound listener.
+    pub(crate) fn mount(&self) -> &MountPoint {
+        &self.mount
+    }
+
+    /// Whether the share is reachable on SMB's standard port, and so mountable
+    /// as a plain UNC path with no port option anywhere in the command.
+    pub(crate) fn on_standard_port(&self) -> bool {
+        self.mount.port == STANDARD_SMB_PORT
     }
 
     /// restic's abort-if-unrefreshable rule: true once the held lock went
@@ -293,6 +339,10 @@ impl SmbHandle {
     }
 
     pub(crate) fn stop(mut self) {
+        // Take the client-facing transport down first, so no new connection is
+        // accepted into a server that is already shutting down.
+        #[cfg(all(windows, feature = "smb-tun"))]
+        drop(self.tun.take());
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
@@ -327,8 +377,24 @@ sudo setcap cap_net_bind_service=+ep <path-to-wrustic>\n\
     )
 }
 
+/// Where the tun transport materialises its driver and which port it serves.
+#[cfg(all(windows, feature = "smb-tun"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TunConfig {
+    /// Directory the embedded wintun driver is written to before loading. Must
+    /// be one only this user can write, since it is then loaded as code.
+    pub(crate) state_dir: std::path::PathBuf,
+    /// Port served on the tun address — 445 in normal use, which is the whole
+    /// point of the transport.
+    pub(crate) port: u16,
+    /// Private subnet to claim (`--smb-tun-subnet`).
+    pub(crate) subnet: crate::cli::TunSubnet,
+}
+
 /// Which interfaces to accept connections on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// No longer `Copy`: the tun variant carries the path its driver is unpacked to.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) enum Bind {
     /// 127.0.0.1 and ::1 only. The default, and the only one the shipped binary
     /// ever asks for.
@@ -344,6 +410,14 @@ pub(crate) enum Bind {
     /// feature to offer.
     #[cfg_attr(not(test), allow(dead_code))]
     AllInterfaces,
+    /// A user-space TCP stack on a Wintun adapter, so the share can hold port
+    /// 445 — the only port a Windows UNC path will use — without taking the
+    /// host's own SMB server down to get it. See `smb::tun`.
+    ///
+    /// The socket the SMB code actually accepts on is still an ordinary
+    /// loopback listener on an ephemeral port; the tun stack proxies to it.
+    #[cfg(all(windows, feature = "smb-tun"))]
+    Tun(TunConfig),
 }
 
 /// Start the server on `port` (0 picks an ephemeral one). Binding happens
@@ -356,8 +430,13 @@ pub(crate) fn start(
     bind: Bind,
     credentials: Credentials,
 ) -> Result<SmbHandle> {
-    let listeners_std = match bind {
+    let listeners_std = match &bind {
         Bind::Loopback => local_server::bind_localhost(port).map_err(|e| privileged_hint(e, port))?,
+        // The SMB code always accepts on a real loopback socket. With a tun in
+        // front the port is ephemeral and private to the proxy, so nothing here
+        // has to care that the client-visible endpoint is elsewhere.
+        #[cfg(all(windows, feature = "smb-tun"))]
+        Bind::Tun(_) => local_server::bind_localhost(0)?,
         Bind::AllInterfaces => {
             let listener = StdTcpListener::bind((std::net::Ipv6Addr::UNSPECIFIED, port))
                 .or_else(|_| StdTcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)))
@@ -375,6 +454,33 @@ pub(crate) fn start(
         .local_addr()
         .map_err(|e| anyhow!("read bound listener address: {e}"))?
         .port();
+
+    // Brought up before the server thread is spawned: if the adapter cannot be
+    // created — almost always because wrustic is not elevated — the listeners
+    // are simply dropped, rather than leaving a server thread running behind a
+    // transport that never appeared.
+    #[cfg(all(windows, feature = "smb-tun"))]
+    let (tun, mount) = match &bind {
+        Bind::Tun(cfg) => {
+            let forward_to =
+                std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, bound_port));
+            let share = tun::TunShare::start(&cfg.state_dir, cfg.port, forward_to, cfg.subnet)?;
+            let host = share.virtual_ip().to_string();
+            (Some(share), MountPoint { host, port: cfg.port })
+        }
+        _ => (
+            None,
+            MountPoint {
+                host: "127.0.0.1".to_string(),
+                port: bound_port,
+            },
+        ),
+    };
+    #[cfg(not(all(windows, feature = "smb-tun")))]
+    let mount = MountPoint {
+        host: "127.0.0.1".to_string(),
+        port: bound_port,
+    };
 
     let share_name = share_name.into();
     let failed_logons = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -415,9 +521,12 @@ pub(crate) fn start(
     Ok(SmbHandle {
         port: bound_port,
         share_name,
+        mount,
         failed_logons,
         shutdown_tx: Some(shutdown_tx),
         join_handle: Some(join),
+        #[cfg(all(windows, feature = "smb-tun"))]
+        tun,
         lock: None,
     })
 }
@@ -714,6 +823,12 @@ struct Conn {
     /// Open handles are per-connection: SMB2 file ids are scoped to the
     /// connection that created them and do not survive a reconnect.
     handles: Handles,
+    /// The srvsvc pipe, when one is open on this connection's IPC$ tree.
+    ///
+    /// Kept out of `Handles`, which is built around snapshot files — paths,
+    /// readers, directory cursors — none of which a pipe has. A connection can
+    /// hold at most one IPC$ tree and so at most one of these.
+    pipe: Option<srvsvc::Pipe>,
 }
 
 /// Hands out `Conn::id`. Starts at 1 so id 0 can mean "no connection" in the
@@ -731,6 +846,7 @@ impl Conn {
             id,
             state: SessionState::new(id),
             handles: Handles::default(),
+            pipe: None,
         }
     }
 
@@ -790,6 +906,12 @@ impl Conn {
                 && let Some((name, access)) = files::peek_create(body, chunk)
             {
                 conn_log!(self.id, "CREATE \"{name}\" access {access:#010x}");
+            }
+            if log_enabled()
+                && hdr.command == cmd::QUERY_INFO
+                && let Some((ty, class, output_len)) = files::peek_query_info(body)
+            {
+                conn_log!(self.id, "QUERY_INFO type {ty} class {class} buffer {output_len}");
             }
 
             let start = out.len();
@@ -927,6 +1049,9 @@ impl Conn {
                 // signature is on, and `authenticated` being false is what
                 // refuses every later command in the meantime.
                 self.handles.close_all();
+                // Same reasoning as the handles: the session is gone, so no
+                // file id in it can ever be named again.
+                self.pipe = None;
                 Ok(Reply::ok(session::simple_ack()))
             }
 
@@ -950,6 +1075,9 @@ impl Conn {
                     }
                     if self.state.ipc_tree_id == Some(hdr.tree_id) {
                         self.state.ipc_tree_id = None;
+                        // The pipe lives on that tree; leaving it open would
+                        // strand a buffer no command could reach again.
+                        self.pipe = None;
                     }
                     Ok(Reply::ok(session::simple_ack()))
                 }
@@ -962,28 +1090,40 @@ impl Conn {
             cmd::CANCEL if is_only => return None,
             cmd::CANCEL => Err(status::NOT_SUPPORTED),
 
-            // Every mutating command, refused at the protocol level so a client
-            // learns the share is read-only from the operation itself rather
-            // than from a confusing failure further along.
+            // The one write wrustic accepts: a DCE/RPC request handed to the
+            // srvsvc pipe on IPC$, which lands in a bounded in-memory buffer.
+            // Everything else, on any tree, stays refused at the protocol level
+            // so a client learns the share is read-only from the operation
+            // itself rather than from a confusing failure further along. The
+            // snapshot tree has no writable path at all, here or below.
+            cmd::WRITE if self.is_srvsvc_pipe(hdr) => {
+                srvsvc::write(body, message, &mut self.pipe, &self.ctx.share_name).map(Reply::ok)
+            }
             cmd::WRITE | cmd::SET_INFO | cmd::FLUSH => Err(status::MEDIA_WRITE_PROTECTED),
 
-            // File commands. All of them need the disk tree: reaching them
-            // through IPC$, or through a tree id that was never connected, is
-            // refused before any path is resolved.
+            // File commands. All of them need the disk tree, except the handful
+            // that drive the srvsvc pipe: reaching them through IPC$ otherwise,
+            // or through a tree id that was never connected, is refused before
+            // any path is resolved.
             cmd::CREATE
             | cmd::CLOSE
             | cmd::READ
             | cmd::QUERY_DIRECTORY
             | cmd::QUERY_INFO => match self.tree_kind(hdr.tree_id) {
                 Some(TreeKind::Disk) => self.file_command(hdr, body, message),
-                Some(TreeKind::Ipc) => Err(status::NOT_SUPPORTED),
+                Some(TreeKind::Ipc) => self.ipc_command(hdr, body, message),
                 None => Err(status::NETWORK_NAME_DELETED),
             },
 
-            // IOCTL is refused wholesale. macOS probes FSCTL_DFS_GET_REFERRALS
-            // and a couple of others during mount; NOT_SUPPORTED is the answer
-            // that makes a client move on, and never implementing one keeps the
-            // FSCTL surface at zero.
+            // IOCTL exists for exactly one FSCTL: PIPE_TRANSCEIVE on the srvsvc
+            // pipe, which is how Windows carries RPC. macOS probes
+            // FSCTL_DFS_GET_REFERRALS and a couple of others during mount;
+            // NOT_SUPPORTED is the answer that makes a client move on, and
+            // `srvsvc::transceive` returns it for every code but its own.
+            cmd::IOCTL if self.is_srvsvc_pipe(hdr) => {
+                srvsvc::transceive(body, message, &mut self.pipe, &self.ctx.share_name)
+                    .map(Reply::ok)
+            }
             cmd::IOCTL => Err(status::NOT_SUPPORTED),
 
             // Byte-range locks on immutable data protect nothing, and there is
@@ -1022,7 +1162,29 @@ impl Conn {
                 self.ctx.boot_time,
                 self.ctx.volume_serial,
             )
-            .map(Reply::ok),
+            .map(|(body, st)| Reply::ok(body).status(st)),
+            _ => Err(status::NOT_SUPPORTED),
+        }
+    }
+
+    /// Whether this request is addressed to an open srvsvc pipe.
+    ///
+    /// The gate on the WRITE and IOCTL arms above, and the whole extent of the
+    /// exception to "nothing is writable": the tree must be IPC$ *and* a pipe
+    /// must already have been opened on it by CREATE. A request on the snapshot
+    /// tree can never satisfy this.
+    fn is_srvsvc_pipe(&self, hdr: &Header) -> bool {
+        matches!(self.tree_kind(hdr.tree_id), Some(TreeKind::Ipc)) && self.pipe.is_some()
+    }
+
+    /// Commands on the IPC$ tree, which exists only to carry share enumeration.
+    fn ipc_command(&mut self, hdr: &Header, body: &[u8], message: &[u8]) -> Result<Reply, u32> {
+        match hdr.command {
+            cmd::CREATE => srvsvc::create(body, message, &mut self.pipe).map(Reply::ok),
+            cmd::CLOSE => srvsvc::close(&mut self.pipe).map(Reply::ok),
+            cmd::READ => srvsvc::read(body, &mut self.pipe).map(Reply::ok),
+            // A pipe is not a directory and has no file metadata worth
+            // reporting; clients ask neither of these on one.
             _ => Err(status::NOT_SUPPORTED),
         }
     }
@@ -1700,6 +1862,127 @@ mod tests {
         );
     }
 
+    /// End-to-end over the tun transport: a real Windows mount of
+    /// `\\10.99.0.1\snap` on the standard SMB port, with the host's own
+    /// srvnet.sys still holding 445 throughout.
+    ///
+    /// Ignored by default because it needs administrator rights (creating a
+    /// network adapter always does) and briefly adds a 10.99.0.0/24 route.
+    /// Run it with:
+    ///   cargo test --features smb-tun tun_mount_on_the_standard_port -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs administrator rights and creates a network adapter"]
+    #[cfg(all(windows, feature = "smb-tun"))]
+    fn tun_mount_on_the_standard_port() {
+        use std::process::Command;
+
+        let subnet = crate::cli::DEFAULT_SMB_TUN_SUBNET;
+        let unc = format!(r"\\{}\{}", subnet.virtual_ip(), DEFAULT_SHARE_NAME);
+        let net_use = |args: &[&str]| {
+            Command::new("net")
+                .arg("use")
+                .args(args)
+                .output()
+                .expect("net.exe runs")
+        };
+        // Deleting a mapping that is not there costs 272 seconds: `net use
+        // /delete` tries to reach the server first, and an address with no
+        // route makes that a full TCP timeout. Listing is instant, so only
+        // delete when there is something to delete.
+        let drop_stale_mapping = || {
+            let listed = net_use(&[]);
+            if String::from_utf8_lossy(&listed.stdout).contains(&unc) {
+                let _ = net_use(&[&unc, "/delete", "/y"]);
+            }
+        };
+
+        let state_dir = tempdir_path("smb-tun");
+        let handle = start(
+            0,
+            DEFAULT_SHARE_NAME,
+            test_backing(),
+            Bind::Tun(TunConfig {
+                state_dir,
+                port: STANDARD_SMB_PORT,
+                subnet,
+            }),
+            test_credentials(),
+        )
+        .expect("tun share starts (are you elevated?)");
+
+        // Only now, with the adapter up and the route in place, is talking to
+        // the address cheap.
+        drop_stale_mapping();
+
+        assert!(handle.on_standard_port());
+        assert_eq!(handle.unc(), unc);
+
+        // Everything fallible is captured rather than asserted, so the mapping
+        // is always torn down before the test can fail out.
+        let connect = net_use(&[&unc, TEST_PASSWORD, &format!("/user:{TEST_USER}")]);
+        let read = std::fs::read_to_string(format!(r"{unc}\docs\readme.txt"));
+        let listing = std::fs::read_dir(format!(r"{unc}\docs")).map(|d| {
+            let mut names: Vec<String> = d
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect();
+            names.sort();
+            names
+        });
+        // The whole point of the design: the host's SMB server is untouched.
+        let host_445 = Command::new("netstat")
+            .args(["-ano", "-p", "TCP"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("0.0.0.0:445"))
+            .unwrap_or(false);
+
+        drop_stale_mapping();
+        handle.stop();
+
+        assert!(
+            connect.status.success(),
+            "net use failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&connect.stdout),
+            String::from_utf8_lossy(&connect.stderr),
+        );
+        assert_eq!(read.expect("readme is readable"), "hello from a snapshot\n");
+        assert_eq!(listing.expect("docs lists"), ["notes.md", "readme.txt"]);
+        assert!(
+            host_445,
+            "the host's own srvnet listener on 445 disappeared; the tun transport \
+             must never disturb it"
+        );
+    }
+
+    /// Hold a tun share open so an external client can be timed against it.
+    /// Serves the in-memory test tree; no repository needed.
+    ///   cargo test --features smb-tun smb_manual_tun -- --ignored --nocapture
+    #[test]
+    #[ignore = "manual harness: needs administrator rights"]
+    #[cfg(all(windows, feature = "smb-tun"))]
+    fn smb_manual_tun() {
+        let secs: u64 = std::env::var("WRUSTIC_SMB_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(180);
+        let state_dir = tempdir_path("smb-tun");
+        let handle = start(
+            0,
+            DEFAULT_SHARE_NAME,
+            test_backing(),
+            Bind::Tun(TunConfig {
+                state_dir,
+                port: STANDARD_SMB_PORT,
+                subnet: crate::cli::DEFAULT_SMB_TUN_SUBNET,
+            }),
+            test_credentials(),
+        )
+        .expect("tun share starts (are you elevated?)");
+        eprintln!("READY {} user={TEST_USER} pass={TEST_PASSWORD}", handle.unc());
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+        handle.stop();
+    }
+
     /// Run one smbclient command against a fresh server, returning its stdout.
     /// Returns None when smbclient is not installed.
     fn smbclient(command: &str) -> Option<String> {
@@ -1807,6 +2090,9 @@ mod tests {
         } else {
             Bind::Loopback
         };
+        // Captured before the move: `Bind` carries a path in its tun variant
+        // and so is no longer `Copy`.
+        let bind_all = matches!(bind, Bind::AllInterfaces);
         let password = std::env::var("WRUSTIC_SMB_SHARE_PASSWORD")
             .unwrap_or_else(|_| TEST_PASSWORD.to_string());
         let handle = start_snapshot_share(
@@ -1820,17 +2106,13 @@ mod tests {
             },
         )
         .expect("snapshot share starts");
-        let host = if matches!(bind, Bind::AllInterfaces) {
-            "<this-host>"
-        } else {
-            "127.0.0.1"
-        };
+        let host = if bind_all { "<this-host>" } else { "127.0.0.1" };
         let port = handle.port;
         eprintln!("serving snapshot {snapshot} on {host}:{port} for {secs}s");
         eprintln!();
         eprintln!("  username  {TEST_USER}");
         eprintln!("  password  {password}");
-        if matches!(bind, Bind::AllInterfaces) {
+        if bind_all {
             eprintln!();
             eprintln!(
                 "NOTE: listening on every interface. Traffic is signed but not encrypted, \

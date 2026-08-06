@@ -122,6 +122,40 @@ write access bits (`ACCESS_DENIED`), write dispositions and `DELETE_ON_CLOSE`
 (`MEDIA_WRITE_PROTECTED`), so a client sees "read-only filesystem" at the point
 it asks rather than an error partway through.
 
+`SMB2 WRITE` has exactly one destination that is not an outright refusal: the
+`srvsvc` pipe on the IPC$ tree, where a client writes the DCE/RPC request that
+asks what shares exist (see [Share enumeration](#share-enumeration)). It lands
+in a bounded in-memory buffer, is gated on the tree being IPC$ *and* the pipe
+having been opened, and has no path to a snapshot — the disk tree still has no
+writable route at all. The "impossible" half of the guarantee is unchanged;
+only "every WRITE is refused" needed qualifying.
+
+## Share enumeration
+
+A client that knows the full path has always worked — `\\host\snap`,
+`smb://host/snap`. A client asked to *list* what the server offers had nothing
+to go on, because IPC$ was accepted (macOS connects to it during mount) but
+answered `NOT_SUPPORTED` to every command, so the `srvsvc` pipe could never be
+opened. In Explorer that was typing `\\host\` and waiting; in Finder it was
+connecting to `smb://host` and being offered no share to pick, leaving the user
+to reach the mount point by hand.
+
+`srvsvc.rs` answers the one call that question needs: **NetrShareEnum**
+(opnum 15), info level 1, over DCE/RPC on the pipe. Windows carries RPC with
+`FSCTL_PIPE_TRANSCEIVE`; other clients use a WRITE/READ pair — both are
+supported, and a Windows `net view` was observed using both in one exchange.
+
+Everything else — every other opnum, every other interface — gets a DCE/RPC
+fault. That is a well-formed "no" a client acts on, as opposed to silence,
+which makes it retry and stall. This is not an RPC stack; it is the smallest
+thing that answers "what shares do you have?" truthfully.
+
+One thing enumeration does *not* fix: an **unauthenticated** `net view` still
+takes tens of seconds before it gets anywhere, because Windows spends that time
+on credential negotiation before it sends a single byte we would see. Measured
+on the same build, authenticated enumeration takes ~70 ms and lists the share;
+unauthenticated took 18.9 s. That wait is the client's, not the server's.
+
 ## Scope
 
 SMB **2.1 only** (`0x0210`). Deliberate: 2.1 is the newest dialect that avoids
@@ -161,6 +195,7 @@ refused with a specific NTSTATUS.
 | `session.rs` | NEGOTIATE, SESSION_SETUP, TREE_CONNECT, SPNEGO framing |
 | `ntlm.rs` | NTLMv2 challenge/response, session key derivation |
 | `sign.rs` | HMAC-SHA256 signing and verification over compound chains |
+| `srvsvc.rs` | share enumeration: the IPC$ `srvsvc` pipe, DCE/RPC, NetrShareEnum |
 | `path.rs` | the trust boundary — SMB path parsing and rejection |
 | `name.rs` | filenames as restic quotes them, and back |
 | `backing.rs` | the `Backing`/`FileReader` seam over the repository |
