@@ -1414,12 +1414,27 @@ fn render_snapshot_smb(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut lines = String::new();
     match (app.smb_handle.as_ref(), app.smb_password.as_deref()) {
         (Some(h), Some(pw)) => {
-            let port = h.port;
             let user = crate::smb::DEFAULT_SHARE_USER;
             let share = &h.share_name;
-            lines.push_str(&format!(
-                "Server: listening on 127.0.0.1:{port}  (read-only, this machine only)\n"
-            ));
+            // Not `h.port`: with the tun transport that is the private loopback
+            // socket the proxy talks to, and printing it would send the reader
+            // to an endpoint no mount command should ever name.
+            let host = &h.mount().host;
+            let port = h.mount().port;
+            if h.on_standard_port() {
+                lines.push_str(&format!(
+                    "Server: listening on {host}:{port}  (read-only, this machine only)\n"
+                ));
+                lines.push_str(
+                    "Tun:    private adapter, standard SMB port. The machine's own file \
+                     sharing is untouched; 10.99.0.0/24 routes here until this screen \
+                     closes.\n",
+                );
+            } else {
+                lines.push_str(&format!(
+                    "Server: listening on {host}:{port}  (read-only, this machine only)\n"
+                ));
+            }
             lines.push_str(
                 "Lock:   holding restic's non-exclusive repository lock — concurrent \
                  backups keep working; prune/forget are blocked until this screen \
@@ -1433,21 +1448,44 @@ fn render_snapshot_smb(frame: &mut Frame, app: &mut App, area: Rect) {
             // stays in shell history — or console history on Windows — long
             // after. Type in the one shown above when asked.
             lines.push_str("\nMount it with (each prompts for the password above):\n\n");
-            lines.push_str(&format!(
-                "  Linux    sudo mount -t cifs -o port={port},vers=2.1,username={user},ro,uid=$(id -u),gid=$(id -g),file_mode=0444,dir_mode=0555 //127.0.0.1/{share} /mnt/snap\n\n"
-            ));
-            lines.push_str(&format!(
-                "  macOS    Finder → Go → Connect to Server (Cmd+K), then enter:\n\
-                 \x20          smb://{user}@127.0.0.1:{port}/{share}\n\n"
-            ));
-            lines.push_str(&format!(
-                "  Windows  net use Z: {} * /user:{user} /TCPPORT:{port}\n",
-                h.unc()
-            ));
-            lines.push_str(
-                "           Needs Windows 11 24H2 or newer for the custom port. On older \
-                 builds, browse the snapshot and share individual files over HTTP instead.\n",
-            );
+            if h.on_standard_port() {
+                // On the standard port there is no port option to carry, which
+                // is the entire reason the tun exists: a UNC path works in
+                // Explorer's address bar and in any program that takes one,
+                // not only as a mapped drive letter.
+                lines.push_str(&format!(
+                    "  Linux    sudo mount -t cifs -o vers=2.1,username={user},ro,uid=$(id -u),gid=$(id -g),file_mode=0444,dir_mode=0555 //{host}/{share} /mnt/snap\n\n"
+                ));
+                lines.push_str(&format!(
+                    "  macOS    Finder → Go → Connect to Server (Cmd+K), then enter:\n\
+                     \x20          smb://{user}@{host}/{share}\n\n"
+                ));
+                lines.push_str(&format!(
+                    "  Windows  net use Z: {} * /user:{user}\n",
+                    h.unc()
+                ));
+                lines.push_str(&format!(
+                    "           Or paste {} straight into Explorer's address bar.\n",
+                    h.unc()
+                ));
+            } else {
+                lines.push_str(&format!(
+                    "  Linux    sudo mount -t cifs -o port={port},vers=2.1,username={user},ro,uid=$(id -u),gid=$(id -g),file_mode=0444,dir_mode=0555 //{host}/{share} /mnt/snap\n\n"
+                ));
+                lines.push_str(&format!(
+                    "  macOS    Finder → Go → Connect to Server (Cmd+K), then enter:\n\
+                     \x20          smb://{user}@{host}:{port}/{share}\n\n"
+                ));
+                lines.push_str(&format!(
+                    "  Windows  net use Z: {} * /user:{user} /TCPPORT:{port}\n",
+                    h.unc()
+                ));
+                lines.push_str(
+                    "           Needs Windows 11 24H2 or newer for the custom port. On older \
+                     builds, start wrustic with --smb-tun to serve the standard port \
+                     instead.\n",
+                );
+            }
         }
         _ => {
             lines.push_str("Server: not running\n");

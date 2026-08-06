@@ -82,7 +82,14 @@ fn main() -> Result<()> {
     // selection; users can hold Shift to bypass and select text.
     let mouse_enabled = !cli.no_mouse
         && crossterm::execute!(std::io::stdout(), EnableMouseCapture).is_ok();
-    let result = run(&mut terminal, paths, config_lock, cli.port, cli.smb_port, no_keychain);
+    let result = run(
+        &mut terminal,
+        paths,
+        config_lock,
+        cli.port,
+        cli.smb,
+        no_keychain,
+    );
     if mouse_enabled {
         let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     }
@@ -100,10 +107,10 @@ fn run(
     paths: Paths,
     config_lock: ConfigLock,
     server_port: u16,
-    smb_port: u16,
+    smb: cli::SmbOptions,
     no_keychain: bool,
 ) -> Result<()> {
-    let mut app = App::boot(paths, config_lock, server_port, smb_port, no_keychain)?;
+    let mut app = App::boot(paths, config_lock, server_port, smb, no_keychain)?;
 
     while !app.quit {
         terminal.draw(|f| render(f, &mut app))?;
