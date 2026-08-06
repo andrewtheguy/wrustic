@@ -96,6 +96,15 @@ jobs:
       - name: Build
         run: cargo build --release ${{ matrix.features }}
 
+      # The vendored wintun driver is a committed binary loaded as code, and its
+      # hash is pinned in WINTUN_DLL_SHA256. Nothing else in the release path
+      # would notice the two drifting apart, so assert it here rather than ship
+      # a driver the constant no longer describes. Windows-only: the test is
+      # compiled out everywhere else, and a filter matching nothing still exits 0.
+      - name: Verify the embedded driver matches its pinned hash
+        if: matrix.label == 'windows-amd64'
+        run: cargo test --release ${{ matrix.features }} embedded_driver_matches_its_pinned_hash
+
       # bash is present on the Windows runners too, so one rename works
       # everywhere instead of a pwsh variant.
       - name: Rename binary

@@ -1839,7 +1839,7 @@ mod tests {
             }
         };
 
-        let state_dir = std::path::Path::new("tmp").join("smb-tun-test");
+        let state_dir = tempdir_path("smb-tun");
         let handle = start(
             0,
             DEFAULT_SHARE_NAME,
@@ -1908,7 +1908,7 @@ mod tests {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(180);
-        let state_dir = std::path::Path::new("tmp").join("smb-tun-test");
+        let state_dir = tempdir_path("smb-tun");
         let handle = start(
             0,
             DEFAULT_SHARE_NAME,

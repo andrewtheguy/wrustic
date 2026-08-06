@@ -1421,18 +1421,19 @@ fn render_snapshot_smb(frame: &mut Frame, app: &mut App, area: Rect) {
             // to an endpoint no mount command should ever name.
             let host = &h.mount().host;
             let port = h.mount().port;
-            if h.on_standard_port() {
+            lines.push_str(&format!(
+                "Server: listening on {host}:{port}  (read-only, this machine only)\n"
+            ));
+            // Keyed on the transport actually in use, not on the port number:
+            // `--smb-port 445` reaches 445 without a tun anywhere (on platforms
+            // where that bind succeeds), and claiming a private adapter exists
+            // when none does would be simply wrong. The subnet comes from
+            // `--smb-tun-subnet` rather than a hardcoded default.
+            if app.smb.tun {
                 lines.push_str(&format!(
-                    "Server: listening on {host}:{port}  (read-only, this machine only)\n"
-                ));
-                lines.push_str(
                     "Tun:    private adapter, standard SMB port. The machine's own file \
-                     sharing is untouched; 10.99.0.0/24 routes here until this screen \
-                     closes.\n",
-                );
-            } else {
-                lines.push_str(&format!(
-                    "Server: listening on {host}:{port}  (read-only, this machine only)\n"
+                     sharing is untouched; {} routes here until this screen closes.\n",
+                    app.smb.tun_subnet
                 ));
             }
             lines.push_str(

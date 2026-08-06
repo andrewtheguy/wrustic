@@ -64,12 +64,50 @@ buffer, which is nothing next to a repository read.
   adapter. Change it with `--smb-tun-subnet 192.168.77.0/30` if that collides
   with a network the machine already uses; wrustic refuses to start if a more
   specific route for the range already exists (`GetBestRoute2`).
-- **Nothing persists.** Dropping the share removes the adapter, and with it the
-  address and the route.
+- **Nothing persists**, and not only on the tidy path. Dropping the share
+  removes the adapter, and with it the address and the routes. A crash or a
+  forced kill does the same: see below.
 
 `/30` is the smallest usable subnet: the transport needs two addresses in one
 subnet, so a `/31` has no room for both, and a `/32` assigns a single address
 and creates no subnet route at all.
+
+### What happens if wrustic crashes
+
+Nothing is left behind, and this is measured rather than assumed. Killing the
+process with `taskkill /T /F` — `TerminateProcess`, so no destructor and none of
+wrustic's own cleanup runs — was followed immediately by:
+
+```
+share running     adapter=wrustic address=10.99.0.2 route=10.99.0.255/32,10.99.0.2/32,10.99.0.0/24
+right after kill  adapter=none    address=none      route=none
+```
+
+The cleanup does not depend on wrustic's `Drop`. A Wintun adapter is owned by
+the handle that created it, so when the process dies the kernel closes that
+handle and the driver removes the adapter, taking its addresses and routes with
+it. The same holds for a failure part-way through startup: if address assignment
+fails after the adapter exists, the error path drops the adapter and the address
+goes with it.
+
+So there is no stale-adapter recovery procedure, because there is no stale
+adapter. If you ever want to check anyway:
+
+```powershell
+Get-NetAdapter -IncludeHidden | Where-Object Name -match 'wrustic'
+Get-NetIPAddress -AddressFamily IPv4 | Where-Object IPAddress -like '10.99.*'
+Get-NetRoute -AddressFamily IPv4 | Where-Object DestinationPrefix -like '10.99.*'
+```
+
+An adapter that does show up belongs to a *live* process — a hung or suspended
+wrustic still holds its handle. Stop that process and the adapter goes with it;
+there is nothing to remove by hand.
+
+The one thing that does persist is `wintun.dll` in the config directory. That is
+deliberate, so the driver is not rewritten on every run, and it is re-verified
+against `WINTUN_DLL_SHA256` before each load — a stale or altered copy is
+replaced rather than trusted. Deleting it is safe; it is written again on next
+use.
 
 ## The embedded driver
 

@@ -468,7 +468,18 @@ struct Bridge {
     to_upstream: VecDeque<u8>,
     /// Server bytes waiting to be written back to the client.
     to_client: VecDeque<u8>,
+    /// The server → proxy direction is finished: the loopback read returned EOF
+    /// or failed. This alone gates the response pump and the client-side close.
     upstream_eof: bool,
+    /// We have already half-closed *our* write side to the loopback server,
+    /// because the client stopped sending.
+    ///
+    /// Deliberately separate from `upstream_eof`. Conflating the two meant a
+    /// client half-closing after its last request immediately stopped us reading
+    /// the server's reply and closed the client side, discarding a response that
+    /// was still in flight. A shut write half says nothing about whether the
+    /// server has finished answering.
+    upstream_write_closed: bool,
 }
 
 impl Bridge {
@@ -477,6 +488,19 @@ impl Bridge {
         self.to_upstream.clear();
         self.to_client.clear();
         self.upstream_eof = false;
+        self.upstream_write_closed = false;
+    }
+}
+
+/// Return a finished connection's socket to the listening pool.
+///
+/// Shared by the two paths that can observe a closed socket — the one that runs
+/// before an upstream exists and the one after teardown — so they cannot drift
+/// apart on what "recycled" means.
+fn recycle(bridge: &mut Bridge, sock: &mut tcp::Socket, port: u16) {
+    bridge.reset();
+    if let Err(e) = sock.listen(port) {
+        smb_log!("tun: re-listen failed: {e:?}");
     }
 }
 
@@ -519,6 +543,7 @@ fn poll_loop(
                 to_upstream: VecDeque::new(),
                 to_client: VecDeque::new(),
                 upstream_eof: false,
+                upstream_write_closed: false,
             }
         })
         .collect();
@@ -594,10 +619,7 @@ fn pump(
         // Still listening, or already torn down: recycle a socket that has
         // finished closing so the pool keeps accepting.
         if !sock.is_open() {
-            bridge.reset();
-            if let Err(e) = sock.listen(port) {
-                smb_log!("tun: re-listen failed: {e:?}");
-            }
+            recycle(bridge, sock, port);
             return true;
         }
         return did_work;
@@ -625,7 +647,12 @@ fn pump(
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(_) => {
-                bridge.upstream_eof = true;
+                // The write half is unusable, so pending request bytes can never
+                // be delivered and retrying them would spin. The read half is
+                // left alone: it is what decides whether the server still has
+                // something to say, and it will surface the same failure.
+                bridge.to_upstream.clear();
+                bridge.upstream_write_closed = true;
                 break;
             }
         }
@@ -671,18 +698,17 @@ fn pump(
         sock.close();
         did_work = true;
     }
-    if !sock.may_recv() && bridge.to_upstream.is_empty() && !bridge.upstream_eof {
+    if !sock.may_recv() && bridge.to_upstream.is_empty() && !bridge.upstream_write_closed {
         // The client is done sending: half-close upstream so the SMB server's
-        // read loop sees EOF and drops its own state.
+        // read loop sees EOF and drops its own state. Only our write half goes —
+        // the server may still be answering the request it just received, and
+        // the loop above keeps draining it until a real read EOF arrives.
         let _ = upstream.shutdown(std::net::Shutdown::Write);
-        bridge.upstream_eof = true;
+        bridge.upstream_write_closed = true;
         did_work = true;
     }
     if !sock.is_open() {
-        bridge.reset();
-        if let Err(e) = sock.listen(port) {
-            smb_log!("tun: re-listen failed: {e:?}");
-        }
+        recycle(bridge, sock, port);
         did_work = true;
     }
 
