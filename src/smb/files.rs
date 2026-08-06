@@ -662,24 +662,27 @@ pub(crate) fn query_info(
         // string get the portion that fits plus STATUS_BUFFER_OVERFLOW — a
         // warning, delivered with a normal data-bearing response — and the
         // embedded length field still reports the full string so the caller
-        // can size a retry. Fixed sizes are the wire offsets of each class's
-        // trailing string. Everything else has nothing sensible to truncate
-        // and hard-fails with INFO_LENGTH_MISMATCH, which also remains the
-        // answer when even the fixed part does not fit.
-        let fixed = match (ty, class) {
-            (info_type::FILE, file_class::NAME) => Some(4),
-            (info_type::FILE, file_class::ALL) => Some(100),
-            (info_type::FILESYSTEM, fs_class::VOLUME) => Some(18),
-            (info_type::FILESYSTEM, fs_class::ATTRIBUTE) => Some(12),
-            _ => None,
-        };
-        match fixed {
-            Some(fixed) if output_len >= fixed => {
-                buf.truncate(output_len);
-                reply_status = status::BUFFER_OVERFLOW;
-            }
+        // can size a retry. The minimum accepted buffer is each class's
+        // C-struct size — the NT I/O manager's own check, which counts the
+        // struct's one-WCHAR name array and tail padding — not the wire
+        // offset of the string, so a 20-byte FileFsVolumeInformation query is
+        // refused even though the label starts at byte 18. The string is cut
+        // on a UTF-16 code-unit boundary; half a unit would decode as a
+        // garbage final character. Everything else has nothing sensible to
+        // truncate and hard-fails with INFO_LENGTH_MISMATCH, which also
+        // remains the answer below a class's minimum.
+        let (min_len, string_off) = match (ty, class) {
+            (info_type::FILE, file_class::NAME) => (8, 4),
+            (info_type::FILE, file_class::ALL) => (104, 100),
+            (info_type::FILESYSTEM, fs_class::VOLUME) => (24, 18),
+            (info_type::FILESYSTEM, fs_class::ATTRIBUTE) => (16, 12),
             _ => return Err(status::INFO_LENGTH_MISMATCH),
+        };
+        if output_len < min_len {
+            return Err(status::INFO_LENGTH_MISMATCH);
         }
+        buf.truncate(string_off + (output_len - string_off) / 2 * 2);
+        reply_status = status::BUFFER_OVERFLOW;
     }
 
     let mut w = Writer::with_capacity(8 + buf.len());
@@ -1418,6 +1421,49 @@ mod tests {
         let full_name = utf16le("\\dir\\a.txt");
         assert_eq!(name_len, full_name.len(), "FileNameLength is the full name");
         assert_eq!(resp[12..16], full_name[..4], "then as much name as fits");
+    }
+
+    /// The minimum accepted buffer is the class's C-struct size — what the NT
+    /// I/O manager itself enforces — not the wire offset of the trailing
+    /// string, and truncation never splits a UTF-16 code unit.
+    #[test]
+    fn truncation_minimums_match_the_io_managers_and_keep_whole_code_units() {
+        let b = backing();
+        let mut h = Handles::default();
+        let id = open_path(&b, &mut h, "dir\\a.txt").unwrap();
+
+        // FileFsVolumeInformation: the label starts at byte 18, but the
+        // kernel refuses anything under sizeof(FILE_FS_VOLUME_INFORMATION),
+        // which is 24 — so 18 through 23 are mismatches, not truncations.
+        for len in 18u32..24 {
+            let body = query_info_body(info_type::FILESYSTEM, fs_class::VOLUME, id, len);
+            assert_eq!(
+                query_info(&body, &b, &h, UNIX_EPOCH, 1).unwrap_err(),
+                status::INFO_LENGTH_MISMATCH,
+                "volume buffer of {len}"
+            );
+        }
+
+        // FileNameInformation: minimum is sizeof(FILE_NAME_INFORMATION) = 8.
+        let body = query_info_body(info_type::FILE, file_class::NAME, id, 7);
+        assert_eq!(
+            query_info(&body, &b, &h, UNIX_EPOCH, 1).unwrap_err(),
+            status::INFO_LENGTH_MISMATCH
+        );
+
+        // An 8-byte buffer holds the length field and two whole name units; a
+        // 9-byte one must return the same, because the ninth byte would be
+        // half a UTF-16 unit.
+        for len in [8u32, 9] {
+            let body = query_info_body(info_type::FILE, file_class::NAME, id, len);
+            let (resp, st) = query_info(&body, &b, &h, UNIX_EPOCH, 1).unwrap();
+            assert_eq!(st, status::BUFFER_OVERFLOW, "buffer of {len}");
+            assert_eq!(
+                u32::from_le_bytes(resp[4..8].try_into().unwrap()),
+                8,
+                "buffer of {len} returns whole code units only"
+            );
+        }
     }
 
     #[test]

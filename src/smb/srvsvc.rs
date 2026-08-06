@@ -272,7 +272,7 @@ pub(crate) fn transceive(
     w.u32(ctl_code);
     w.u64(PIPE_FILE_ID); // FileId, persistent
     w.u64(PIPE_FILE_ID); // FileId, volatile
-    w.u32(output_off); // InputOffset
+    w.u32(0); // InputOffset — no input is echoed back, so it points nowhere
     w.u32(0); // InputCount
     w.u32(output_off); // OutputOffset
     w.u32(output.len() as u32); // OutputCount
@@ -325,6 +325,15 @@ struct PduHeader {
 impl PduHeader {
     fn parse(buf: &[u8]) -> Option<Self> {
         if buf.len() < 16 || buf[0] != 5 {
+            return None;
+        }
+        // frag_length must describe exactly this buffer. Shorter means
+        // trailing bytes that would be silently ignored; longer means a
+        // fragment of a larger PDU, which this server does not reassemble.
+        // Either way the input is not the single complete PDU the dispatcher
+        // assumes, so it faults rather than guesses.
+        let frag_length = u16::from_le_bytes([buf[8], buf[9]]) as usize;
+        if frag_length != buf.len() {
             return None;
         }
         Some(Self {
@@ -492,6 +501,15 @@ fn ndr_string(w: &mut Writer, s: &str) {
 mod tests {
     use super::*;
 
+    /// Stamp the real frag_length into a finished PDU. The fixtures only know
+    /// their length once the body is built, and `parse` rejects a PDU whose
+    /// frag_length does not match the bytes delivered.
+    fn seal(mut pdu: Vec<u8>) -> Vec<u8> {
+        let len = pdu.len() as u16;
+        pdu[8..10].copy_from_slice(&len.to_le_bytes());
+        pdu
+    }
+
     fn bind_pdu(call_id: u32) -> Vec<u8> {
         let mut w = Writer::new();
         write_pdu_header(&mut w, ptype::BIND, 0, call_id);
@@ -506,7 +524,7 @@ mod tests {
         w.zeros(20); // abstract syntax
         w.bytes(&NDR_SYNTAX);
         w.u32(NDR_SYNTAX_VERSION);
-        w.into_vec()
+        seal(w.into_vec())
     }
 
     fn enum_request(call_id: u32, level: u32) -> Vec<u8> {
@@ -517,7 +535,7 @@ mod tests {
         w.u16(OPNUM_NET_SHARE_ENUM);
         w.u32(0); // NULL ServerName
         w.u32(level);
-        w.into_vec()
+        seal(w.into_vec())
     }
 
     #[test]
@@ -605,6 +623,29 @@ mod tests {
             let reply = dispatch(&junk, "snap");
             assert_eq!(reply[2], ptype::FAULT, "junk {junk:?} must fault");
         }
+    }
+
+    /// A frag_length that does not match the delivered bytes is either a
+    /// malformed PDU or a fragment of a larger one; both are refused, since
+    /// nothing here reassembles fragments.
+    #[test]
+    fn a_wrong_frag_length_faults() {
+        // Claims zero.
+        let mut req = enum_request(4, 1);
+        req[8..10].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(dispatch(&req, "snap")[2], ptype::FAULT);
+
+        // Claims more than was delivered.
+        let mut req = enum_request(5, 1);
+        let claim = ((req.len() + 4) as u16).to_le_bytes();
+        req[8..10].copy_from_slice(&claim);
+        assert_eq!(dispatch(&req, "snap")[2], ptype::FAULT);
+
+        // Claims less: the trailing bytes would be silently dropped.
+        let mut req = enum_request(6, 1);
+        let claim = ((req.len() - 4) as u16).to_le_bytes();
+        req[8..10].copy_from_slice(&claim);
+        assert_eq!(dispatch(&req, "snap")[2], ptype::FAULT);
     }
 
     /// The level is read from the request, and a non-NULL ServerName shifts
