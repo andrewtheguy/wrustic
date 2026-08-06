@@ -16,9 +16,12 @@
 // signing, no encryption, loopback by default. 2.1 is the newest dialect that
 // avoids pre-auth integrity hashes, negotiate contexts and AES-GCM; NTLMv2 plus
 // signing is the floor Windows 11 24H2 accepts, and all three client platforms
-// support it, so there is no guest path to keep working. Every write command is
+// support it, so there is no guest path to keep working. Write commands are
 // refused at the protocol level in addition to there being no code that could
-// perform one.
+// perform one — with a single, bounded exception: a WRITE to the `srvsvc` pipe
+// on IPC$, which is how a client asks what shares exist (see `srvsvc.rs`). It
+// buffers in memory, is gated on the tree being IPC$ and the pipe being open,
+// and has no route to a snapshot.
 //
 // A mount is for browsing a snapshot, not for restoring or running one:
 // symlinks cannot survive SMB 2.1 anyway, so nothing here pretends to be a
@@ -95,6 +98,7 @@ mod path;
 mod proto;
 mod session;
 mod sign;
+mod srvsvc;
 // Windows-only and off by default. The tun transport exists solely to get
 // around srvnet.sys owning port 445, which is not a problem any other platform
 // has, and it costs an embedded driver in the binary — so it is gated on both
@@ -819,6 +823,12 @@ struct Conn {
     /// Open handles are per-connection: SMB2 file ids are scoped to the
     /// connection that created them and do not survive a reconnect.
     handles: Handles,
+    /// The srvsvc pipe, when one is open on this connection's IPC$ tree.
+    ///
+    /// Kept out of `Handles`, which is built around snapshot files — paths,
+    /// readers, directory cursors — none of which a pipe has. A connection can
+    /// hold at most one IPC$ tree and so at most one of these.
+    pipe: Option<srvsvc::Pipe>,
 }
 
 /// Hands out `Conn::id`. Starts at 1 so id 0 can mean "no connection" in the
@@ -836,6 +846,7 @@ impl Conn {
             id,
             state: SessionState::new(id),
             handles: Handles::default(),
+            pipe: None,
         }
     }
 
@@ -1032,6 +1043,9 @@ impl Conn {
                 // signature is on, and `authenticated` being false is what
                 // refuses every later command in the meantime.
                 self.handles.close_all();
+                // Same reasoning as the handles: the session is gone, so no
+                // file id in it can ever be named again.
+                self.pipe = None;
                 Ok(Reply::ok(session::simple_ack()))
             }
 
@@ -1055,6 +1069,9 @@ impl Conn {
                     }
                     if self.state.ipc_tree_id == Some(hdr.tree_id) {
                         self.state.ipc_tree_id = None;
+                        // The pipe lives on that tree; leaving it open would
+                        // strand a buffer no command could reach again.
+                        self.pipe = None;
                     }
                     Ok(Reply::ok(session::simple_ack()))
                 }
@@ -1067,28 +1084,40 @@ impl Conn {
             cmd::CANCEL if is_only => return None,
             cmd::CANCEL => Err(status::NOT_SUPPORTED),
 
-            // Every mutating command, refused at the protocol level so a client
-            // learns the share is read-only from the operation itself rather
-            // than from a confusing failure further along.
+            // The one write wrustic accepts: a DCE/RPC request handed to the
+            // srvsvc pipe on IPC$, which lands in a bounded in-memory buffer.
+            // Everything else, on any tree, stays refused at the protocol level
+            // so a client learns the share is read-only from the operation
+            // itself rather than from a confusing failure further along. The
+            // snapshot tree has no writable path at all, here or below.
+            cmd::WRITE if self.is_srvsvc_pipe(hdr) => {
+                srvsvc::write(body, message, &mut self.pipe, &self.ctx.share_name).map(Reply::ok)
+            }
             cmd::WRITE | cmd::SET_INFO | cmd::FLUSH => Err(status::MEDIA_WRITE_PROTECTED),
 
-            // File commands. All of them need the disk tree: reaching them
-            // through IPC$, or through a tree id that was never connected, is
-            // refused before any path is resolved.
+            // File commands. All of them need the disk tree, except the handful
+            // that drive the srvsvc pipe: reaching them through IPC$ otherwise,
+            // or through a tree id that was never connected, is refused before
+            // any path is resolved.
             cmd::CREATE
             | cmd::CLOSE
             | cmd::READ
             | cmd::QUERY_DIRECTORY
             | cmd::QUERY_INFO => match self.tree_kind(hdr.tree_id) {
                 Some(TreeKind::Disk) => self.file_command(hdr, body, message),
-                Some(TreeKind::Ipc) => Err(status::NOT_SUPPORTED),
+                Some(TreeKind::Ipc) => self.ipc_command(hdr, body, message),
                 None => Err(status::NETWORK_NAME_DELETED),
             },
 
-            // IOCTL is refused wholesale. macOS probes FSCTL_DFS_GET_REFERRALS
-            // and a couple of others during mount; NOT_SUPPORTED is the answer
-            // that makes a client move on, and never implementing one keeps the
-            // FSCTL surface at zero.
+            // IOCTL exists for exactly one FSCTL: PIPE_TRANSCEIVE on the srvsvc
+            // pipe, which is how Windows carries RPC. macOS probes
+            // FSCTL_DFS_GET_REFERRALS and a couple of others during mount;
+            // NOT_SUPPORTED is the answer that makes a client move on, and
+            // `srvsvc::transceive` returns it for every code but its own.
+            cmd::IOCTL if self.is_srvsvc_pipe(hdr) => {
+                srvsvc::transceive(body, message, &mut self.pipe, &self.ctx.share_name)
+                    .map(Reply::ok)
+            }
             cmd::IOCTL => Err(status::NOT_SUPPORTED),
 
             // Byte-range locks on immutable data protect nothing, and there is
@@ -1128,6 +1157,28 @@ impl Conn {
                 self.ctx.volume_serial,
             )
             .map(Reply::ok),
+            _ => Err(status::NOT_SUPPORTED),
+        }
+    }
+
+    /// Whether this request is addressed to an open srvsvc pipe.
+    ///
+    /// The gate on the WRITE and IOCTL arms above, and the whole extent of the
+    /// exception to "nothing is writable": the tree must be IPC$ *and* a pipe
+    /// must already have been opened on it by CREATE. A request on the snapshot
+    /// tree can never satisfy this.
+    fn is_srvsvc_pipe(&self, hdr: &Header) -> bool {
+        matches!(self.tree_kind(hdr.tree_id), Some(TreeKind::Ipc)) && self.pipe.is_some()
+    }
+
+    /// Commands on the IPC$ tree, which exists only to carry share enumeration.
+    fn ipc_command(&mut self, hdr: &Header, body: &[u8], message: &[u8]) -> Result<Reply, u32> {
+        match hdr.command {
+            cmd::CREATE => srvsvc::create(body, message, &mut self.pipe).map(Reply::ok),
+            cmd::CLOSE => srvsvc::close(&mut self.pipe).map(Reply::ok),
+            cmd::READ => srvsvc::read(body, &mut self.pipe).map(Reply::ok),
+            // A pipe is not a directory and has no file metadata worth
+            // reporting; clients ask neither of these on one.
             _ => Err(status::NOT_SUPPORTED),
         }
     }
