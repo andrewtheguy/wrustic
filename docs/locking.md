@@ -114,7 +114,7 @@ see "Native prune" below), the **snapshot SMB share** (a long-running
 "Long-running reads" below), and — outside these tables because it takes
 no lock — **unlock** (`repo::unlock`, native stale-lock removal behind
 the TUI's `u` shortcut, plus the pre-spawn unstick in
-`restic::run_unsticking_locks`).
+`restic::run_unsticking_locks`, nowadays test-only).
 
 **Tier 1 — non-exclusive lock (coexists with running restic backups):**
 
@@ -224,12 +224,12 @@ unlocked. Poisoning is a latch: a refresh that succeeds after the timeout
 was observed does not resurrect trust, since an unlock + prune may have
 happened in the gap.
 
-**Tier 3 — stays on the restic CLI indefinitely:** repair index,
-migrate. Rare, hand-run recovery/upgrade operations with no TUI action
-today; if the TUI ever grows them they go through the spawn harness
-(`restic::run_unsticking_locks`), not rustic_core. (Prune sat here until
-the exclusive lock landed; see "Native prune" above for why its original
-rationale no longer applied.)
+**Tier 3 — stays on a user-run restic CLI indefinitely:** repair index,
+migrate. Rare, hand-run recovery/upgrade operations with no TUI action —
+the user runs them with restic outside the app; wrustic itself never
+spawns restic (the harness in `src/restic.rs` is test-only). (Prune sat
+here until the exclusive lock landed; see "Native prune" above for why
+its original rationale no longer applied.)
 
 ## wrustic lock module design
 
@@ -325,11 +325,10 @@ A `RepoLock` guard type that mirrors restic exactly:
    Snapshots screen).
    `src/restic.rs` is the secure spawn harness (stdin-piped
    password, env-var credentials, resterm's launch semantics including
-   its private cache directory, off with `--no-restic-cache`) for
-   triggering the restic commands
-   wrustic deliberately does not reimplement — repair and friends
-   (Tier 3), plus dev-flow repo setup in the live tests. Before spawning
-   one of those,
+   its private cache directory) the live tests use to drive restic —
+   dev-flow repo setup plus restic-side observations; since phase 4 it
+   is a `#[cfg(test)]`-only module, as wrustic itself never spawns
+   restic. Before spawning a lock-taking command,
    `restic::run_unsticking_locks` performs restic's acquisition conflict
    check natively: the subcommand maps to the lock restic takes for it
    (the per-command table above) and `lock::check_blocking_locks`
@@ -357,7 +356,9 @@ A `RepoLock` guard type that mirrors restic exactly:
    poison-checked after it (see "Native prune" above for the full safety
    argument). The old prune-specific machinery in `src/restic.rs`
    (version detection, the streaming runner, the child tracker) went
-   away with it; the harness itself stays for Tier 3 and dev-flow.
+   away with it, and the harness itself became test-only — wrustic never
+   spawns restic; the restic CLI is for the user (Tier 3, init, backup)
+   and for the live tests.
    Verified live: `live_native_prune_interop_with_restic` forces a
    repack, then passes `restic check --read-data` with zero errors and
    zero orphans, restores the surviving snapshot through restic, and a

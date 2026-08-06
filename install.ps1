@@ -431,15 +431,16 @@ function Install-Binary {
     }
 }
 
-# wrustic runs without restic (reads and its write operations are native),
-# but the maintenance commands it deliberately leaves to the restic CLI
-# (prune and friends) need restic >= 0.19 on PATH — so mention it.
+# wrustic runs without restic (reads and its write operations — snapshot
+# delete, prune, stale-lock removal — are native), but the commands it
+# deliberately leaves to the restic CLI (init, backup, repair and friends)
+# need restic >= 0.19 on PATH — so mention it.
 function Test-ResticPresent {
     $restic = Get-Command restic -ErrorAction SilentlyContinue
     if (-not $restic) {
         Print-Warn "restic was not found on your PATH."
-        Print-Warn "wrustic runs without it, but restic >= 0.19 is needed for repository"
-        Print-Warn "maintenance (prune and friends). Install it with:"
+        Print-Warn "wrustic runs without it, but restic >= 0.19 is needed for the"
+        Print-Warn "operations wrustic leaves to it (init, backup, repair). Install it with:"
         Print-Warn "  winget install restic.restic"
         Print-Warn "or grab a binary from https://github.com/restic/restic/releases"
         return
@@ -488,8 +489,9 @@ Supported platforms: Windows (amd64). The Windows build ships with the
 'keychain' feature enabled, so passphrases can be saved to Windows Credential
 Manager.
 
-Note: wrustic runs without restic, but repository maintenance (prune and
-friends) shells out to it — restic >= 0.19 on PATH is recommended
+Note: wrustic runs without restic (snapshot delete, prune, and stale-lock
+removal are native), but the operations it leaves to the restic CLI (init,
+backup, repair) need restic >= 0.19 on PATH — recommended
 ('winget install restic.restic').
 Note: Installation as administrator is not recommended. Use -Admin to override.
 "@

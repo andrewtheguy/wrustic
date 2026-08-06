@@ -200,52 +200,33 @@ docs/locking.md for the full design. rustic_core itself is lock-oblivious,
 so every native write MUST hold a `lock::RepoLock` — that discipline lives
 in `repo.rs`, not in rustic_core.
 
-No TUI flow shells out to restic — prune (`p` on the Snapshots screen)
+wrustic never shells out to restic — prune (`p` on the Snapshots screen)
 is native too: `repo::prune` runs rustic_core's prune with instant
 delete under the exclusive lock, on a worker thread so the TUI stays
 responsive (docs/restic-usage.md is the per-workflow overview, and
 docs/locking.md "Native prune" has the safety argument). Write
 operations without a native + locked implementation (init, backup, key
-management) stay on the restic CLI — when code needs to trigger one of
-those, it goes through the secure spawn harness kept in `src/restic.rs`,
-whose launch semantics mirror resterm's:
+management, repair, migrate) are for the user to run with the restic CLI
+outside the app.
+
+The only code that spawns restic is the test suite, through the secure
+harness in `src/restic.rs` (a `#[cfg(test)]`-only module) — the live
+interop tests use it for dev-flow repo setup and for observing lock/prune
+behavior from restic's side. Its launch semantics mirror resterm's:
 - `restic::run(profile, args)` pipes the master password via the child's
   stdin (`--password-file /dev/stdin`) and passes the repo URL and cloud
   credentials via env vars, so secrets never appear on argv; inherited
   `RESTIC_PASSWORD*` variables are scrubbed from the child environment.
 - Every call carries `--cache-dir` pointed at a `wrustic` directory under
-  the platform's own per-user cache root (`dirs::cache_dir()`: `~/.cache`
-  on Linux, `~/Library/Caches` on macOS, `%LOCALAPPDATA%` on Windows),
-  together with `--cleanup-cache`, which lets restic garbage collect the
-  per-repository subdirectories it keeps there once they go 30 days
-  unused. `--no-restic-cache` opts out and passes `--no-cache` instead —
-  restic's default shared cache is never used either way. The cache path
-  is independent of `--config-dir`, so instances on different config
-  directories share it; that is safe, and so is the sweep, because restic
-  stamps a subdirectory's timestamp when it *opens* that repository — the
-  stamp is not refreshed as the command runs, so the 30-day threshold is
-  what keeps an in-use cache out of reach, not the fact of it being in
-  use. Lowering the threshold by hand erodes that. `restic cache`
-  itself never opens the repository (no `--repo`, no password, no lock) —
-  the only way to break a running command is a manual
-  `cache --cleanup --max-age 0`, which ignores the in-use exemption.
-- restic checks the repository lock before any of these commands run, so
-  a leftover (crashed-holder) lock blocks them with "repository is
-  already locked". wrustic speaks the lock protocol natively, so
-  `restic::run_unsticking_locks(profile, args)` performs that same check
-  itself *before* spawning: it maps the subcommand to the lock restic
-  takes for it (restic 0.19.1's per-command table,
-  `restic::lock_requirement`) and evaluates the repo's lock files with
-  `lock::check_blocking_locks` — restic's acquisition conflict rules,
-  without writing a lock. Only when blocked does it run restic's own
-  `unlock` through the same harness (`restic::unlock`) and re-check —
-  never the native stale-lock removal in `src/lock.rs`, which backs the
-  TUI's `u` shortcut for *native* write failures. `unlock` removes only
-  provably-stale locks, so a live holder still fails the re-check and
-  that error (carrying the holder's details) is surfaced without
-  spawning restic at all. restic re-runs the same check in-process at
-  startup, so a lock appearing between our re-check and the spawn still
-  fails safely inside restic.
+  the platform's own per-user cache root (`dirs::cache_dir()`) together
+  with `--cleanup-cache`, so restic garbage collects the per-repository
+  subdirectories it keeps there once they go 30 days unused — restic's
+  default shared cache is never used.
+- `restic::run_unsticking_locks(profile, args)` additionally performs
+  restic's acquisition-time lock check natively *before* spawning (via
+  `restic::lock_requirement` and `lock::check_blocking_locks`, both
+  test-only now) and runs restic's own `unlock` when a stale lock would
+  block the command.
 
 ## Verification and dev flow
 

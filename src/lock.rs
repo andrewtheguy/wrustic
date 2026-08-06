@@ -723,7 +723,9 @@ fn check_for_other_locks(
 /// Callers use this to know *before spawning restic* that the repo is locked
 /// (restic itself never auto-removes stale locks during acquisition, so even
 /// a stale lock blocks). The error carries the holder's details and matches
-/// [`is_lock_error`].
+/// [`is_lock_error`]. Test-only, like its only caller — the restic spawn
+/// harness (`src/restic.rs`) — since no runtime flow spawns restic anymore.
+#[cfg(test)]
 pub(crate) fn check_blocking_locks(
     backend: &dyn LockBackend,
     crypto: &RepoCrypto,
