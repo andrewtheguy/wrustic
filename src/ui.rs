@@ -1481,10 +1481,19 @@ fn render_snapshot_smb(frame: &mut Frame, app: &mut App, area: Rect) {
                     "  Windows  net use Z: {} * /user:{user} /TCPPORT:{port}\n",
                     h.unc()
                 ));
+                // A custom port is reachable only as a mapped drive, and only
+                // from 24H2 or newer — two separate limits, both lifted by
+                // serving the standard port, so --smb-tun is not just the
+                // older-Windows fallback.
+                lines.push_str(&format!(
+                    "           A mapped drive is the only way in: no UNC path can carry a \
+                     port, so {} on its own goes to 445 and never reaches this share.\n",
+                    h.unc()
+                ));
                 lines.push_str(
-                    "           Needs Windows 11 24H2 or newer for the custom port. On older \
-                     builds, start wrustic with --smb-tun to serve the standard port \
-                     instead.\n",
+                    "           /TCPPORT: also needs Windows 11 24H2 or newer. Starting \
+                     wrustic with --smb-tun serves the standard port instead — a UNC path \
+                     Explorer accepts, and the only way in from older builds.\n",
                 );
             }
         }

@@ -35,7 +35,11 @@ which workflows that means.
   and signing. Files mount `0444` and directories `0555` on Linux and macOS,
   and on every client opening a file for execute is refused — a share is for
   browsing a snapshot, not restoring from one; see
-  [`docs/smb.md`](docs/smb.md)
+  [`docs/smb.md`](docs/smb.md). On Windows, `--smb-tun` serves the standard SMB
+  port over a private adapter, which is both the only way to get a real UNC path
+  (`\\169.254.255.1\snap`, usable in Explorer rather than only as a mapped
+  drive) and the only way in from builds before 24H2; see
+  [`docs/smb-tun.md`](docs/smb-tun.md)
 - **Keyboard and mouse navigation**: Vim-style keys, arrow keys, PgUp/PgDn,
   mouse click/scroll; `--no-mouse` to disable
 - **Passphrase entry**: masked TUI input, with optional keychain auto-unlock
@@ -162,9 +166,21 @@ give each its own `--config-dir`.
 (default: 4456). It is fixed rather than picked per run so a mount command,
 an `/etc/fstab` line, or a saved Windows drive mapping keeps working across
 restarts. Mounting needs a client that can be pointed at a non-standard port:
-Linux, macOS, and Windows 11 24H2 or newer all can — earlier Windows builds
-cannot, and should use the per-file HTTP share instead. See
+Linux, macOS, and Windows 11 24H2 or newer all can, though on Windows that
+mounts as a drive letter only, since no UNC path can carry a port. Earlier
+Windows builds cannot reach a custom port at all. `--smb-tun` covers both cases
+by serving the standard port; see [`docs/smb-tun.md`](docs/smb-tun.md) and
 [`docs/smb.md`](docs/smb.md).
+
+`--smb-tun` (Windows only, and only in builds compiled with
+`--features smb-tun`) serves that share on SMB's standard port instead, over a
+private tun adapter. Two independent reasons to want it: it is the only way to
+get a real UNC path — `\\169.254.255.1\snap`, usable in Explorer's address bar
+and in any program that takes one — and the only way in from Windows builds
+before 11 24H2. It needs administrator rights to create the adapter, leaves the
+host's own file sharing untouched, and while a share is open two link-local
+`/32` host routes point at the tun — no subnet is claimed. `--smb-tun-ip <IPv4>`
+moves them.
 
 wrustic never invokes restic at runtime, so there is nothing restic-related
 to configure here — the test suite's restic invocations keep their cache in

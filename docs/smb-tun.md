@@ -1,8 +1,16 @@
 # Serving the snapshot share on port 445 (Windows)
 
-`--smb-tun` serves the snapshot share on SMB's standard port so it mounts as a
-plain UNC path — `\\169.254.255.1\snap` works in Explorer's address bar and in
-any program that takes a UNC path, not only as a mapped drive letter.
+`--smb-tun` serves the snapshot share on SMB's standard port. That buys two
+things, and neither is a legacy concern alone:
+
+- **A real UNC path.** `\\169.254.255.1\snap` works in Explorer's address bar
+  and in any program that takes a UNC path, not only as a mapped drive letter.
+  No UNC syntax can carry a port, so the standard port is the *only* way to get
+  one — including on Windows 11 24H2, where `net use /TCPPORT:` does reach a
+  custom port, but only ever as a mapped drive.
+- **Windows before 11 24H2.** Those builds speak to no port but 445, so the
+  default `--smb-port 4456` share is unreachable from them at all. This is the
+  only way they mount a snapshot.
 
 Windows-only, off by default, and only present in builds compiled with
 `--features smb-tun`. Nothing about it is configurable from the config file.
