@@ -248,7 +248,13 @@ fn negotiate_response_body(
     w.u32(CAP_LARGE_MTU);
     w.u32(MAX_READ_SIZE); // MaxTransactSize
     w.u32(MAX_READ_SIZE); // MaxReadSize
-    w.u32(MAX_READ_SIZE); // MaxWriteSize — advertised, but every WRITE is refused
+    // MaxWriteSize is deliberately small. Every WRITE is refused, so this only
+    // decides how large a doomed request a client may build — and a maximal one
+    // at MAX_READ_SIZE would exceed the inbound cap (header and body sit on top
+    // of the data), so it would be answered by a dropped connection rather than
+    // by MEDIA_WRITE_PROTECTED. Advertising a size the transport can actually
+    // receive keeps the refusal legible.
+    w.u32(64 * 1024); // MaxWriteSize
     w.u64(to_filetime(std::time::SystemTime::now())); // SystemTime
     w.u64(to_filetime(boot_time)); // ServerStartTime
     // Offsets are measured from the start of this response's SMB2 header, and

@@ -27,8 +27,19 @@ pub(crate) fn nbss_header(len: usize) -> [u8; NBSS_HEADER_LEN] {
     [0, (len >> 16) as u8, (len >> 8) as u8, len as u8]
 }
 
-pub(crate) fn nbss_len(hdr: &[u8; NBSS_HEADER_LEN]) -> usize {
-    ((hdr[1] as usize) << 16) | ((hdr[2] as usize) << 8) | hdr[3] as usize
+/// Payload length from a NetBIOS session header, or `None` if the header is not
+/// one this transport accepts.
+///
+/// Direct-TCP SMB2 requires the first byte to be zero — a session *message*.
+/// The NBT session service on port 139 uses other values there (0x81 session
+/// request, 0x85 keepalive), and reading one of those as a length prefix turns
+/// a wrong-transport client into a confusing SMB2 parse failure several steps
+/// later instead of a clean refusal here.
+pub(crate) fn nbss_len(hdr: &[u8; NBSS_HEADER_LEN]) -> Option<usize> {
+    if hdr[0] != 0 {
+        return None;
+    }
+    Some(((hdr[1] as usize) << 16) | ((hdr[2] as usize) << 8) | hdr[3] as usize)
 }
 
 /// Cursor over an inbound message. Every accessor is bounds-checked and returns
@@ -228,8 +239,18 @@ mod tests {
     #[test]
     fn nbss_length_round_trips() {
         for len in [0usize, 1, 255, 256, 65535, 65536, 0xFF_FFFF] {
-            assert_eq!(nbss_len(&nbss_header(len)), len, "length {len}");
+            assert_eq!(nbss_len(&nbss_header(len)), Some(len), "length {len}");
         }
+    }
+
+    /// Direct-TCP SMB2 carries only session messages. An NBT type byte from a
+    /// port-139 client must be refused rather than read as part of a length.
+    #[test]
+    fn nbss_rejects_a_non_session_message() {
+        for ty in [0x81u8, 0x82, 0x83, 0x85] {
+            assert_eq!(nbss_len(&[ty, 0, 0, 8]), None, "type {ty:#04x}");
+        }
+        assert_eq!(nbss_len(&[0, 0, 0, 8]), Some(8));
     }
 
     #[test]

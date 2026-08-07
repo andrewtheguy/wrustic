@@ -8,6 +8,21 @@
 // security choice; they are what NTLMv2 is specified in terms of, and a client
 // will not interoperate with anything else. The security of this share comes
 // from the password and from being on a trusted network, not from these.
+//
+// Deliberately not implemented: the AUTHENTICATE **MIC**. A client that sets
+// MsvAvFlags bit 0x02 in its NTLMv2 blob has included an HMAC-MD5 over the
+// three-message exchange, and a full server checks it (Samba:
+// `auth/ntlmssp/ntlmssp_server.c:570-597` and `:1088-1158`) — that check is
+// what CVE-2019-1040 was about. It is omitted here because the attack it stops
+// is NTLM *relay*: tampering with the negotiate flags of an exchange being
+// forwarded to a third party. This server is the only party, authenticates a
+// single fixed local account, ignores the client's negotiate flags entirely
+// (so there is nothing in them to downgrade), and mandates signing on every
+// message after the handshake. Implementing it would mean retaining the raw
+// NEGOTIATE and CHALLENGE blobs per connection and parsing the AV-pair list,
+// for a guarantee nothing here rests on. If this ever grows a second account,
+// a non-loopback default, or any form of pass-through authentication, that
+// reasoning expires and the MIC becomes mandatory.
 
 use hmac::{Hmac, Mac};
 use md4::Md4;
@@ -50,6 +65,11 @@ fn nt_hash(password: &str) -> [u8; 16] {
 /// The username is upper-cased but the domain is not — an asymmetry in the spec
 /// that is easy to "fix" into a bug, because getting it wrong yields a proof
 /// string that never matches and an authentication that always fails.
+///
+/// `to_uppercase` is Rust's full Unicode mapping, where Windows uses the
+/// invariant table — they disagree on characters like ß (which Rust expands to
+/// SS). Irrelevant while the account is the fixed ASCII `wrustic`, and noted
+/// here because it stops being irrelevant the moment the user name is not.
 fn ntowf_v2(password: &str, user: &str, domain: &str) -> [u8; 16] {
     let mut mac = HmacMd5::new_from_slice(&nt_hash(password)).expect("HMAC takes any key length");
     mac.update(&utf16le(&user.to_uppercase()));
@@ -164,16 +184,19 @@ pub(crate) fn verify(
     // With key exchange the client generates the real session key, encrypts it
     // under the base key with RC4, and we recover it. Without it, the base key
     // is the session key.
-    if auth.flags & flags::NEGOTIATE_KEY_EXCH != 0 && auth.encrypted_session_key.len() == 16 {
-        let mut buf = [0u8; 16];
-        buf.copy_from_slice(&auth.encrypted_session_key);
-        let mut cipher =
-            Rc4::new_from_slice(&session_base_key).expect("16-byte RC4 key is in range");
-        cipher.apply_keystream(&mut buf);
-        Some(buf)
-    } else {
-        Some(session_base_key)
+    if auth.flags & flags::NEGOTIATE_KEY_EXCH == 0 {
+        return Some(session_base_key);
     }
+    // KEY_EXCH negotiated, so the exported key *is* the decrypted field —
+    // MS-NLMP 3.1.5.1.2 defines no fallback. Falling back to the base key
+    // anyway would let a non-conforming client "authenticate" and then have
+    // every subsequent message fail its signature, which is the least
+    // diagnosable outcome available. Samba refuses it outright
+    // (`ntlmssp_server.c:1038-1043`, "session key was of invalid length").
+    let mut buf: [u8; 16] = auth.encrypted_session_key.as_slice().try_into().ok()?;
+    let mut cipher = Rc4::new_from_slice(&session_base_key).expect("16-byte RC4 key is in range");
+    cipher.apply_keystream(&mut buf);
+    Some(buf)
 }
 
 #[cfg(test)]
