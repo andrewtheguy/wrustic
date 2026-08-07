@@ -88,17 +88,26 @@ pub(crate) fn sign(key: &[u8; 16], buf: &mut [u8]) {
 /// accepted unverified — precisely the downgrade signing exists to stop. Once a
 /// session is signed, every message in it must be signed.
 ///
-/// The one exception is a PDU that names no session at all (SessionId 0), and
-/// only for the two commands that legitimately carry none. MS-SMB2 3.3.5.2.4
-/// scopes signature verification to the session in the header, and Samba
-/// implements exactly that — its check runs only once the session id resolves
-/// to a session (`smb2_server.c:3096-3105`, `:3189`). Two real cases need it:
-/// cifs.ko sends its keepalive ECHO with a NULL tcon and so an unsigned,
-/// session-0 header every `echo_interval`, and a client starting a *new*
-/// session on an existing connection sends an unsigned SESSION_SETUP. Refusing
-/// either drops a connection that is working. Neither reaches anything
-/// privileged: ECHO is answered with a fixed acknowledgement, and SESSION_SETUP
-/// is the authentication exchange itself.
+/// The one exception is the keepalive: a PDU that names no session at all
+/// (SessionId 0) and is an ECHO. MS-SMB2 3.3.5.2.4 scopes signature
+/// verification to the session in the header, and Samba implements exactly
+/// that — its check runs only once the session id resolves to a session
+/// (`smb2_server.c:3096-3105`, `:3189`). cifs.ko sends its keepalive with a
+/// NULL tcon and so an unsigned, session-0 header every `echo_interval`;
+/// refusing it drops the connection that keepalive exists to hold open, and it
+/// reaches nothing privileged — ECHO is answered with a fixed acknowledgement.
+///
+/// SESSION_SETUP is deliberately *not* exempt, though it too is legitimately
+/// unsigned. It only ever needs to be when the connection has no key yet, and
+/// this function is not called then: the caller verifies with the key held
+/// before the message is processed, so a connection still logging in never
+/// reaches here. Exempting it would therefore only ever admit an unsigned
+/// SESSION_SETUP on a connection that is already authenticated — letting anyone
+/// able to inject a packet restart the NTLM exchange under the live session,
+/// replace its outstanding challenge, and spend the server-wide logon-failure
+/// budget on responses they could not sign for. Samba can allow it because a
+/// session-0 SESSION_SETUP there opens a *new* session beside the existing one;
+/// here there is one session per connection, so it lands on the live one.
 pub(crate) fn verify(key: &[u8; 16], buf: &[u8]) -> Verdict {
     use super::proto::cmd;
 
@@ -116,9 +125,7 @@ pub(crate) fn verify(key: &[u8; 16], buf: &[u8]) -> Verdict {
             u64::from_le_bytes(buf[start + 40..start + 48].try_into().expect("8 bytes"));
 
         if flags_val & flags::SIGNED == 0 {
-            let sessionless = session_id == 0
-                && matches!(command, cmd::ECHO | cmd::SESSION_SETUP);
-            if sessionless {
+            if session_id == 0 && command == cmd::ECHO {
                 continue;
             }
             return Verdict::Unsigned(command);
@@ -269,6 +276,34 @@ mod tests {
         // Otherwise clearing one flag bit bypasses authentication entirely.
         let buf = pdu(0, 8);
         assert!(!verify(&[0x66u8; 16], &buf).is_valid());
+    }
+
+    /// Only cifs.ko's session-less keepalive may arrive unsigned on a keyed
+    /// connection. An unsigned SESSION_SETUP is legitimate only *before* the
+    /// connection has a key, and this function is not called then — so admitting
+    /// one here would only ever admit an injected packet restarting the NTLM
+    /// exchange under a live authenticated session.
+    #[test]
+    fn only_the_session_less_keepalive_is_exempt_from_signing() {
+        let key = [0xABu8; 16];
+        let unsigned = |command: u16, session_id: u64| {
+            let mut buf = pdu(0, 8);
+            buf[12..14].copy_from_slice(&command.to_le_bytes());
+            buf[40..48].copy_from_slice(&session_id.to_le_bytes());
+            verify(&key, &buf)
+        };
+
+        assert_eq!(unsigned(cmd::ECHO, 0), Verdict::Valid, "the keepalive");
+        assert_eq!(
+            unsigned(cmd::ECHO, 7),
+            Verdict::Unsigned(cmd::ECHO),
+            "an ECHO inside the session is signed like everything else"
+        );
+        assert_eq!(
+            unsigned(cmd::SESSION_SETUP, 0),
+            Verdict::Unsigned(cmd::SESSION_SETUP),
+            "a keyed connection has already logged in; this can only be injected"
+        );
     }
 
     #[test]

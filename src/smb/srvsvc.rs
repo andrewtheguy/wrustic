@@ -838,6 +838,28 @@ mod tests {
         assert!(reply.windows(16).any(|w| w == NDR_SYNTAX));
     }
 
+    /// Two contexts both offering NDR32. Only the first can be accepted: a
+    /// second acceptance would bind the same interface again under a different
+    /// context id, and nothing here tracks more than one binding. The reply
+    /// still has to account for the context rather than omit it.
+    #[test]
+    fn a_repeated_ndr32_context_is_rejected_rather_than_bound_twice() {
+        let reply = dispatch(&bind_pdu_with(0x55, &[&[NDR_SYNTAX], &[NDR_SYNTAX]]), "snap");
+        assert_eq!(reply[2], ptype::BIND_ACK);
+
+        let (count, results) = bind_results(&reply);
+        assert_eq!(count, 2, "one result per presented context");
+        assert_eq!(results[0], (bind_result::ACCEPTANCE, 0));
+        assert_eq!(
+            results[1],
+            (
+                bind_result::PROVIDER_REJECTION,
+                REASON_TRANSFER_SYNTAXES_NOT_SUPPORTED
+            ),
+            "the second binding must be refused, not silently accepted"
+        );
+    }
+
     /// A client that offers only NDR64 gets a well-formed refusal rather than
     /// an acceptance naming a syntax it never proposed.
     #[test]
@@ -937,6 +959,111 @@ mod tests {
         assert_eq!(
             u32::from_le_bytes(reply[24..28].try_into().unwrap()),
             NCA_S_OP_RNG_ERROR
+        );
+    }
+
+    /// An IOCTL request carrying `input`, and the message it sits in. Buffer
+    /// offsets count the SMB2 header, and the fixed part of the request is 56
+    /// bytes, so the input follows at that distance.
+    fn transceive_request(input: &[u8], max_output: u32) -> (Vec<u8>, Vec<u8>) {
+        const FSCTL_PIPE_TRANSCEIVE: u32 = 0x0011_C017;
+        let mut w = Writer::new();
+        w.u16(57); // StructureSize
+        w.u16(0); // Reserved
+        w.u32(FSCTL_PIPE_TRANSCEIVE);
+        w.u64(PIPE_FILE_ID); // FileId, persistent
+        w.u64(PIPE_FILE_ID); // FileId, volatile
+        w.u32((crate::smb::proto::HEADER_LEN + 56) as u32); // InputOffset
+        w.u32(input.len() as u32); // InputCount
+        w.u32(0); // MaxInputResponse
+        w.u32(0); // OutputOffset
+        w.u32(0); // OutputCount
+        w.u32(max_output); // MaxOutputResponse
+        w.u32(0); // Flags
+        w.u32(0); // Reserved2
+        w.bytes(input);
+        let body = w.into_vec();
+
+        let mut message = vec![0u8; crate::smb::proto::HEADER_LEN];
+        message.extend_from_slice(&body);
+        (body, message)
+    }
+
+    /// A READ collecting whatever the pipe still has queued.
+    fn read_request(length: u32) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.u16(49); // StructureSize
+        w.u8(0); // Padding
+        w.u8(0); // Flags
+        w.u32(length);
+        w.u64(0); // Offset
+        w.u64(PIPE_FILE_ID); // FileId, persistent
+        w.u64(PIPE_FILE_ID); // FileId, volatile
+        w.u32(0); // MinimumCount
+        w.u32(0); // Channel
+        w.u32(0); // RemainingBytes
+        w.u16(0); // ReadChannelInfoOffset
+        w.u16(0); // ReadChannelInfoLength
+        w.into_vec()
+    }
+
+    /// The client's output buffer is not a promise about the answer's size. What
+    /// does not fit stays queued for a follow-up READ, and BUFFER_OVERFLOW is
+    /// the warning that sends the client back for it — dropping the remainder
+    /// instead hands over a truncated NDR structure that parses as garbage.
+    #[test]
+    fn a_transceive_past_the_output_buffer_queues_the_remainder_for_a_read() {
+        let mut pipe = Some(Pipe::default());
+        // A reply from an earlier exchange that the client never collected. A
+        // transceive starts a fresh one, so this must not be prepended to it.
+        pipe.as_mut().expect("open").pending = b"stale".to_vec();
+
+        let whole = dispatch(&enum_request(11, 1), "snap");
+        const MAX_OUTPUT: usize = 16;
+        assert!(
+            whole.len() > MAX_OUTPUT,
+            "the reply has to overflow the buffer or nothing here is tested"
+        );
+
+        let (body, message) = transceive_request(&enum_request(11, 1), MAX_OUTPUT as u32);
+        let (resp, st) = transceive(&body, &message, &mut pipe, "snap").unwrap();
+        assert_eq!(st, status::BUFFER_OVERFLOW, "a partial answer, not an error");
+
+        // OutputCount, then the output itself after the 48-byte response body.
+        let count = u32::from_le_bytes(resp[36..40].try_into().unwrap()) as usize;
+        assert_eq!(count, MAX_OUTPUT, "exactly what the client made room for");
+        assert_eq!(&resp[48..48 + count], &whole[..MAX_OUTPUT]);
+
+        let read_resp = read(&read_request(4096), &mut pipe).unwrap();
+        let data_len = u32::from_le_bytes(read_resp[4..8].try_into().unwrap()) as usize;
+        assert_eq!(
+            &read_resp[16..16 + data_len],
+            &whole[MAX_OUTPUT..],
+            "the READ must return the rest of this answer, not the stale one"
+        );
+        assert_eq!(
+            u32::from_le_bytes(read_resp[8..12].try_into().unwrap()),
+            0,
+            "and nothing is left queued behind it"
+        );
+    }
+
+    /// An answer that fits is delivered whole, with nothing left over to make a
+    /// later READ hand back a fragment of a finished exchange.
+    #[test]
+    fn a_transceive_that_fits_leaves_nothing_queued() {
+        let mut pipe = Some(Pipe::default());
+        let whole = dispatch(&enum_request(12, 1), "snap");
+
+        let (body, message) = transceive_request(&enum_request(12, 1), 4096);
+        let (resp, st) = transceive(&body, &message, &mut pipe, "snap").unwrap();
+        assert_eq!(st, status::SUCCESS);
+        let count = u32::from_le_bytes(resp[36..40].try_into().unwrap()) as usize;
+        assert_eq!(count, whole.len());
+        assert_eq!(&resp[48..48 + count], whole.as_slice());
+        assert_eq!(
+            read(&read_request(4096), &mut pipe).unwrap_err(),
+            status::END_OF_FILE
         );
     }
 

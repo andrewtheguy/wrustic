@@ -512,29 +512,78 @@ mod dos_wildcard {
     pub(super) const DOT: u8 = b'"';
 }
 
+/// Longest pattern the matcher will walk.
+///
+/// Recursion depth follows the pattern length — every branch below consumes a
+/// pattern byte, but only some of them consume a name byte — and the pattern
+/// arrives off the wire in a 16-bit length field, so a client can ask for tens
+/// of thousands of frames. That overflows the stack, which aborts the process
+/// rather than failing the request, and no step budget can catch it because the
+/// frames are spent before the steps are. A search pattern is a file name with
+/// wildcards in it and a name is at most 255 characters, so nothing a client
+/// legitimately sends comes near this.
+const MAX_PATTERN: usize = 1024;
+
 /// Match a QUERY_DIRECTORY search pattern. Clients almost always send `*`, but
 /// a lookup of a single name by pattern is legal and macOS does it.
 fn pattern_matches(pattern: &str, name: &str) -> bool {
     if pattern.is_empty() || pattern == "*" {
         return true;
     }
-    glob_match(pattern.as_bytes(), name.as_bytes())
+    let (pattern, name) = (pattern.as_bytes(), name.as_bytes());
+    if pattern.len() > MAX_PATTERN {
+        return false;
+    }
+    let mut budget = match_budget(pattern, name);
+    glob_match(pattern, name, &mut budget)
+}
+
+/// How many calls `glob_match` may make for one name before giving up and
+/// reporting no match.
+///
+/// The matcher backtracks, so its cost is exponential in the number of `*`-like
+/// wildcards rather than linear in the pattern: `**********x` against a name
+/// with no `x` explores every way of dividing the name between the ten stars,
+/// and does not finish in any useful time. The pattern comes straight from the
+/// client, and this runs once per directory entry, so the bound has to be here
+/// rather than in what the caller is willing to accept.
+///
+/// A matcher that memoised would visit each (pattern position, name position)
+/// pair once, which makes the pair count the natural unit; the multiplier is
+/// how much re-visiting this one is allowed before it concedes. Both sit far
+/// above what the patterns clients actually send need — `*`, a literal name,
+/// `<.txt`, `<"*`, none with more than two wildcards — so a budget is only ever
+/// exhausted by a pattern built to exhaust it, for which "no match" is the
+/// honest answer anyway.
+fn match_budget(pattern: &[u8], name: &[u8]) -> u32 {
+    const REVISITS: u32 = 64;
+    const CEILING: u32 = 100_000;
+    let pairs = (pattern.len() as u32)
+        .saturating_add(1)
+        .saturating_mul(name.len() as u32 + 1);
+    pairs.saturating_mul(REVISITS).min(CEILING)
 }
 
 /// Wildcard matcher for `*` and `?` plus the three DOS wildcards.
 ///
-/// Recursive at the wildcards only, and each recursion consumes a pattern byte,
-/// so depth is bounded by the pattern length — which is bounded by the SMB2
-/// request that carried it. The iterative form does not survive the DOS
+/// Recursive at the wildcards only. The iterative form does not survive the DOS
 /// wildcards: `>` and `"` can match the empty string in the middle of a name,
-/// so a single backtrack point is no longer enough.
+/// so a single backtrack point is no longer enough. `budget` is what keeps the
+/// backtracking from running away — see `match_budget`.
 ///
 /// Case-insensitivity is **ASCII-only**: the comparison is over raw UTF-8 bytes,
 /// so `A` matches `a` but `É` does not match `é`. Real Unicode case folding
 /// would mean decoding both sides and carrying a folding table, and the clients
 /// that send a pattern at all send `*` or a literal name they read back from us
 /// moments earlier.
-fn glob_match(pattern: &[u8], name: &[u8]) -> bool {
+fn glob_match(pattern: &[u8], name: &[u8], budget: &mut u32) -> bool {
+    // Charged per call, including the ones that return immediately: it is the
+    // number of calls, not the depth, that runs away.
+    if *budget == 0 {
+        return false;
+    }
+    *budget -= 1;
+
     let Some((&p, rest)) = pattern.split_first() else {
         // Pattern exhausted: a match only if the name is too.
         return name.is_empty();
@@ -543,7 +592,20 @@ fn glob_match(pattern: &[u8], name: &[u8]) -> bool {
     match p {
         // `*` matches any run of characters, so try the rest of the pattern at
         // every position including the end of the name.
-        b'*' => (0..=name.len()).any(|skip| glob_match(rest, &name[skip..])),
+        b'*' => {
+            for skip in 0..=name.len() {
+                if glob_match(rest, &name[skip..], budget) {
+                    return true;
+                }
+                // Nothing further can succeed once the budget is gone, and the
+                // loops already on the stack would otherwise each spin out
+                // their full range over calls that return false on entry.
+                if *budget == 0 {
+                    return false;
+                }
+            }
+            false
+        }
 
         // DOS_STAR is `*` that stops at the name's *last* dot: it may end
         // before that dot or step over it, but never runs past it. That is what
@@ -552,16 +614,19 @@ fn glob_match(pattern: &[u8], name: &[u8]) -> bool {
         dos_wildcard::STAR => {
             let last_dot = name.iter().rposition(|&c| c == b'.');
             for skip in 0..name.len() {
-                if glob_match(rest, &name[skip..]) {
+                if glob_match(rest, &name[skip..], budget) {
                     return true;
                 }
                 if last_dot == Some(skip) {
                     // The one position past the last dot, and then no further.
-                    return glob_match(rest, &name[skip + 1..]);
+                    return glob_match(rest, &name[skip + 1..], budget);
+                }
+                if *budget == 0 {
+                    return false;
                 }
             }
             // Ran out of name without meeting a dot.
-            glob_match(rest, &[])
+            glob_match(rest, &[], budget)
         }
 
         // DOS_QM matches one character — except at the end of the name, or
@@ -569,26 +634,26 @@ fn glob_match(pattern: &[u8], name: &[u8]) -> bool {
         // consume the dot.
         dos_wildcard::QM => {
             if name.is_empty() || name[0] == b'.' {
-                glob_match(rest, name)
+                glob_match(rest, name, budget)
             } else {
-                glob_match(rest, &name[1..])
+                glob_match(rest, &name[1..], budget)
             }
         }
 
         // DOS_DOT is a soft dot: a literal dot, or nothing at the end of a name.
         dos_wildcard::DOT => {
             if name.is_empty() {
-                glob_match(rest, name)
+                glob_match(rest, name, budget)
             } else {
-                name[0] == b'.' && glob_match(rest, &name[1..])
+                name[0] == b'.' && glob_match(rest, &name[1..], budget)
             }
         }
 
-        b'?' => !name.is_empty() && glob_match(rest, &name[1..]),
+        b'?' => !name.is_empty() && glob_match(rest, &name[1..], budget),
         literal => {
             !name.is_empty()
                 && literal.eq_ignore_ascii_case(&name[0])
-                && glob_match(rest, &name[1..])
+                && glob_match(rest, &name[1..], budget)
         }
     }
 }
@@ -682,8 +747,17 @@ pub(crate) fn query_directory(
     let max_len = output_len.min(MAX_READ_SIZE as usize);
     let single = flags & query_dir_flags::RETURN_SINGLE_ENTRY != 0;
     // An entry is at least its class's fixed part, so this many can fit at
-    // most; a shorter buffer just means the encoder stops earlier.
-    let page_cap = if single { 1 } else { matched.len() };
+    // most; a shorter buffer just means the encoder stops earlier. An unknown
+    // class caps at one and is refused by the encoder a few lines below, which
+    // is where that error belongs.
+    let page_cap = if single {
+        1
+    } else {
+        info::dir_entry_fixed_len(class)
+            .map_or(1, |fixed| max_len / fixed)
+            .max(1)
+            .min(matched.len())
+    };
     let page: Vec<(NodeInfo, u64)> =
         matched.iter().take(page_cap).map(|&i| all[i].clone()).collect();
 
@@ -1545,6 +1619,42 @@ mod tests {
 
         // Case-insensitive, like every other form.
         assert!(pattern_matches("<.TXT", "a.txt"));
+    }
+
+    /// The matcher backtracks, so a pattern with many `*`s explores every way of
+    /// dividing the name between them — `**********b` against sixty-four `a`s is
+    /// 64^10 attempts, and the pattern comes from the client. Both forms have to
+    /// concede rather than run, and this test failing looks like a hang.
+    #[test]
+    fn a_pattern_built_to_backtrack_gives_up_rather_than_running_forever() {
+        let name = "a".repeat(64);
+        assert!(!pattern_matches("**********b", &name));
+        assert!(!pattern_matches("<<<<<<<<<<b", &name));
+        assert!(!pattern_matches("*a*a*a*a*a*a*a*a*a*b", &name));
+    }
+
+    /// Depth follows the pattern length, and the length field on the wire allows
+    /// far more frames than the stack holds — which aborts the process rather
+    /// than failing the request, so it is refused before it is walked.
+    #[test]
+    fn a_pattern_longer_than_any_name_is_refused() {
+        assert!(!pattern_matches(&"*".repeat(MAX_PATTERN + 1), "a"));
+        assert!(!pattern_matches(&">".repeat(MAX_PATTERN + 1), ""));
+        // A pattern right at the limit is still matched as before.
+        assert!(pattern_matches(&"*".repeat(MAX_PATTERN), "anything"));
+    }
+
+    /// The budget is generous enough that nothing a client sends notices it: a
+    /// full-length name against a two-wildcard pattern is the realistic worst
+    /// case, and it must still answer truthfully rather than concede.
+    #[test]
+    fn the_budget_does_not_disturb_a_realistic_worst_case() {
+        let name = format!("{}.txt", "a".repeat(250));
+        assert!(pattern_matches("<.txt", &name));
+        assert!(pattern_matches("<\"*", &name));
+        assert!(!pattern_matches("<.log", &name));
+        // Two stars either side of a literal that is only present at the end.
+        assert!(pattern_matches(&format!("*{}*", "a".repeat(200)), &name));
     }
 
     /// A first scan that matches nothing and an enumeration that has run out are

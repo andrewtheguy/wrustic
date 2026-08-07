@@ -230,12 +230,17 @@ impl SessionState {
         }
     }
 
-    fn alloc_tree_id(&mut self) -> u32 {
-        // Tree id 0 is reserved for "no tree", so start at 1. Ids are never
-        // reused within a connection: a stale id from a disconnected tree must
-        // stay unrecognised rather than resolve to whatever was connected next.
-        self.next_tree_id += 1;
-        self.next_tree_id
+    /// The next tree id, or None once the space is spent.
+    ///
+    /// Tree id 0 is reserved for "no tree", so this starts at 1. Ids are never
+    /// reused within a connection: a stale id from a disconnected tree must
+    /// stay unrecognised rather than resolve to whatever was connected next.
+    /// Wrapping would break exactly that — it hands back 0 and then re-issues
+    /// ids a client may still be holding — so an exhausted space refuses the
+    /// connect instead. In a debug build the increment would have panicked.
+    fn alloc_tree_id(&mut self) -> Option<u32> {
+        self.next_tree_id = self.next_tree_id.checked_add(1)?;
+        Some(self.next_tree_id)
     }
 
     /// What `tree_id` points at, or None if it was never handed out on this
@@ -583,7 +588,7 @@ pub(crate) fn tree_connect(
     if state.trees.len() >= MAX_TREES {
         return Err(status::REQUEST_NOT_ACCEPTED);
     }
-    let tree_id = state.alloc_tree_id();
+    let tree_id = state.alloc_tree_id().ok_or(status::REQUEST_NOT_ACCEPTED)?;
     state.trees.insert(tree_id, kind);
 
     let mut w = Writer::with_capacity(16);
@@ -1173,6 +1178,24 @@ mod tests {
         let live = *state.trees.keys().next().expect("table is full");
         state.remove_tree(live);
         tree_connect(&body, &message, "snap", &mut state).expect("a slot was freed");
+    }
+
+    /// Ids are never reused, so the space can run out rather than wrap. Wrapping
+    /// would hand back 0 — which means "no tree" — and then re-issue ids a
+    /// client may still be holding, which is the bug the table exists to fix.
+    #[test]
+    fn an_exhausted_tree_id_space_refuses_the_connect() {
+        let mut state = SessionState {
+            next_tree_id: u32::MAX,
+            ..Default::default()
+        };
+        let (body, message) = tree_connect_request(r"\\127.0.0.1\snap");
+        assert_eq!(
+            tree_connect(&body, &message, "snap", &mut state).unwrap_err(),
+            status::REQUEST_NOT_ACCEPTED
+        );
+        assert!(state.trees.is_empty(), "nothing was recorded for a refusal");
+        assert_eq!(state.tree_kind(0), None, "0 is never handed out");
     }
 
     #[test]
