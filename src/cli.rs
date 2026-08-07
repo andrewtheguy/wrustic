@@ -80,8 +80,11 @@ fn parse_tun_ip(value: &str, flag: &str) -> Result<TunAddrs> {
     // Both derived addresses have to be usable, so a mount address that is fine
     // on its own but borders a reserved range is refused too.
     for addr in [virtual_ip, adapter_ip] {
-        if addr.is_loopback() || addr.is_multicast() || addr.is_broadcast() || addr.is_unspecified()
-        {
+        // The octet ranges are 0.0.0.0/8 ("this network", covering unspecified)
+        // and 240.0.0.0/4 (class E, covering broadcast) — no stable is_* helper
+        // spans either, and Windows refuses to assign both.
+        let first_octet = addr.octets()[0];
+        if addr.is_loopback() || addr.is_multicast() || first_octet == 0 || first_octet >= 240 {
             bail!(
                 "{flag}: the transport needs {virtual_ip} and the next address up, \
 and {addr} is in a range the local stack reserves"
@@ -312,14 +315,26 @@ mod tests {
         for bad in [
             "127.0.0.1",         // loopback
             "224.0.0.1",         // multicast
+            "239.255.255.255",   // last multicast address
             "0.0.0.0",           // unspecified
+            "0.0.0.1",           // 0.0.0.0/8, "this network"
+            "0.255.255.255",     // last of 0.0.0.0/8
+            "240.0.0.0",         // first of class E
+            "240.0.0.1",         // class E
             "255.255.255.255",   // broadcast, and +1 overflows too
-            "255.255.255.254",   // adapter address would be the broadcast
-            "223.255.255.255",   // adapter address would be multicast
+            "255.255.255.254",   // class E, and the adapter address would be broadcast
+            "223.255.255.255",   // usable itself, but the adapter address would be multicast
         ] {
             assert!(
                 parse_tun_ip(bad, "--smb-tun-ip").is_err(),
                 "{bad} should be refused"
+            );
+        }
+        // The edges just outside the reserved ranges still parse.
+        for good in ["1.0.0.0", "223.255.255.254"] {
+            assert!(
+                parse_tun_ip(good, "--smb-tun-ip").is_ok(),
+                "{good} should parse"
             );
         }
     }
