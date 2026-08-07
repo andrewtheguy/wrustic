@@ -35,12 +35,16 @@ These stay on a user-run `restic` (>= 0.19), outside wrustic — wrustic
 itself will never run them:
 
 - `restic init` — creating a new repository
-- `restic backup` — creating snapshots, until native backup ships
+- `restic backup` — creating snapshots
 - maintenance beyond prune: `repair`, `migrate`, key management
 
-Planned as *native* operations under a non-exclusive repo lock, not as
-restic calls: **backup**, **copy into repo**, and **key add** (locking.md
-Tier 1); backup is next up.
+Planned native: **tag edits**, under the same exclusive
+restic-compatible lock as delete and prune (locking.md Tier 2, "Native
+tag edits"). Description edits are not planned — `description` is a
+rustic-only snapshot field that restic silently drops on any rewrite,
+and wrustic only implements features common to both tools. Native
+backup, copy, and key management were considered (locking.md Tier 1)
+and dropped from the plan — they stay on the restic CLI indefinitely.
 
 ## Tests only
 

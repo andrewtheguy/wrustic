@@ -120,9 +120,9 @@ the TUI's `u` shortcut, plus the pre-spawn unstick in
 
 | Operation | rustic_core API | Status | Why safe |
 |---|---|---|---|
-| backup | `Repository::backup` | planned — phase 5, next up | pure append: packs → index → snapshot, the ordering the design doc requires for concurrent-append safety |
-| copy into repo | `Repository::copy` (dest side) | planned — after backup | append-only |
-| key add | `Repository::add_key` | planned — after backup | writes one new key file |
+| backup | `Repository::backup` | not planned — stays on the restic CLI | pure append: packs → index → snapshot, the ordering the design doc requires for concurrent-append safety |
+| copy into repo | `Repository::copy` (dest side) | not planned | append-only |
+| key add | `Repository::add_key` | not planned | writes one new key file |
 
 **Tier 2 — exclusive lock (blocks restic while held; fully safe):**
 
@@ -130,8 +130,9 @@ the TUI's `u` shortcut, plus the pre-spawn unstick in
 |---|---|---|
 | forget / delete snapshots | `delete_snapshots` | **implemented** — `repo::delete_snapshot` (phase 2) |
 | prune | `prune_plan` + `prune` | **implemented** — `repo::prune` (phase 4) |
-| tag / description edits | `save_snapshots` + `delete_snapshots` | not planned yet |
-| key remove | `delete_key` | not planned yet |
+| tag edits | `save_snapshots` + `delete_snapshots` | planned — phase 5, next up |
+| description edits | `save_snapshots` + `delete_snapshots` | not planned — `description` is rustic-only; restic silently drops it on any rewrite, so wrustic only implements what both tools share |
+| key remove | `delete_key` | not planned |
 
 Apart from prune these have tiny critical sections (seconds); a
 concurrent restic command gets the ordinary "repository is already
@@ -197,6 +198,50 @@ rustic_core 0.12.0 source.
   unchanged. What remains impossible is *user* cancellation of a healthy
   run — Ctrl+C twice force-quits the app instead (safe, leaves a stale
   lock).
+
+**Native tag edits (planned — phase 5):** what `restic tag` does,
+verified against restic 0.19.1 (`cmd/restic/cmd_tag.go`), and what
+wrustic must mimic. Tags only — description edits are out of scope
+because `description` is a rustic-only field restic cannot preserve
+(see the round-trip bullet below); wrustic implements only features
+common to both tools:
+
+- restic takes the **exclusive** lock (`openWithExclusiveLock`) even
+  though the edit only touches snapshot files, and resolves the target
+  snapshots *under* the lock. wrustic must do the same — re-read the
+  snapshot after acquiring the lock, exactly like `repo::delete_snapshot`
+  does, because the row the TUI shows was read lock-free and may have
+  been retagged or deleted in the meantime (a retag changes the snapshot
+  id, so a stale id fails cleanly instead of editing the wrong file).
+- Edit semantics: `time` is preserved; `original` is set to the pre-edit
+  id if not already set ("retain the original snapshot id over all tag
+  changes"); the **new snapshot file is saved first, then the old one
+  deleted** (`SaveSnapshot` → `RemoveUnpacked`), so there is never a
+  moment where the snapshot doesn't exist. rustic_core supports exactly
+  this order: its loader already does `original.get_or_insert(id)`
+  (`snapshotfile.rs` `set_id`), `save_snapshots` clears `id` and writes a
+  new file, then `delete_snapshots` removes the old id. Snapshot files
+  are not indexed, so nothing else needs rebuilding; the critical section
+  is sub-second.
+- Cross-tool field round-trip (restic 0.19.1 `internal/data/snapshot.go`
+  vs rustic_core 0.12.0 `SnapshotFile`): `description` (and `label`,
+  `delete`) are rustic-only — restic ignores them on read and silently
+  drops them when *it* rewrites the snapshot (`restic tag`/`rewrite`
+  round-trip through Go structs that don't have the fields). This is why
+  description edits are out of scope: the field cannot survive a mixed
+  restic/wrustic workflow. Mirror image: rustic_core's `SnapshotFile`
+  has no `excludes` field, so a typed round-trip of a
+  `restic backup --exclude` snapshot silently drops `excludes` (cosmetic
+  metadata; data is unaffected). If losslessness is wanted, the
+  implementation can instead edit the raw snapshot JSON
+  (`serde_json::Value`) and write it through wrustic's own unpacked-file
+  envelope (`RepoCrypto`, already proven for lock files) — decide at
+  implementation time. rustic-only fields are all skipped-when-unset, so
+  editing a restic-created snapshot injects no rustic-only keys, and
+  rustic's `summary` struct is a superset of restic's, so summaries
+  survive. Cosmetic delta: rustic serializes
+  `uid`/`gid`/`hostname`/`username` even when zero/empty where restic
+  omits them — harmless, the rewritten file gets a new id regardless.
 
 **Long-running reads — non-exclusive lock (implemented):** the snapshot
 SMB share (`smb::start_snapshot_share`). Reads take no lock in wrustic's
@@ -363,11 +408,16 @@ A `RepoLock` guard type that mirrors restic exactly:
    repack, then passes `restic check --read-data` with zero errors and
    zero orphans, restores the surviving snapshot through restic, and a
    follow-up `restic prune` runs clean.
-5. **Native backup** under a non-exclusive lock (the headline win:
-   wrustic backups running concurrently with restic cron backups), then
-   copy / key add as wanted. The refreshability-abort rule it needs is
-   already in place (phase 3).
+5. **Native tag edits** under the exclusive lock — next up; see "Native
+   tag edits" above for the verified restic semantics (lock kind,
+   resolve-under-lock, `original`, save-new-then-delete-old) the
+   implementation must follow. Description edits are out of scope
+   (rustic-only field, not restic-preservable). Native backup / copy /
+   key management, formerly this phase, were dropped from the plan — the
+   restic CLI keeps them.
 
-Non-goals: native repair/migrate (Tier 3), multi-host clock-skew
+Non-goals: native backup, copy, and key management (the restic CLI
+keeps them; the Tier 1 rows above remain as the safety map should that
+ever change), native repair/migrate (Tier 3), multi-host clock-skew
 mitigation beyond what restic itself does, and any restic < 0.19
 compatibility.
