@@ -11,6 +11,8 @@
 // session cannot sign. Linux and macOS accept the same configuration, so one
 // authenticated path serves all three.
 
+use std::collections::HashMap;
+
 use anyhow::Result;
 
 use super::proto::{
@@ -205,9 +207,16 @@ pub(crate) struct SessionState {
     /// Set once a client authenticates with NTLMv2. Its presence is what makes
     /// the connection sign responses and require signatures on requests.
     pub(crate) signing_key: Option<[u8; 16]>,
-    /// Tree ids handed out by TREE_CONNECT, mapped to what they point at.
-    pub(crate) disk_tree_id: Option<u32>,
-    pub(crate) ipc_tree_id: Option<u32>,
+    /// Every tree id handed out by TREE_CONNECT, mapped to what it points at.
+    ///
+    /// A table rather than one id per kind, because a client may hold several
+    /// connects to the same share at once and macOS routinely does: it connects
+    /// the tree again while the mount is still live. Remembering only the newest
+    /// id retired the one the mount was using, so every command on it answered
+    /// NETWORK_NAME_DELETED and the share read as having vanished — an empty
+    /// directory in Finder and `ls`. Samba keeps a per-session tcon table for
+    /// the same reason (`smbXsrv_tcon_table`, source3/smbd/smbXsrv_tcon.c).
+    trees: HashMap<u32, TreeKind>,
     next_tree_id: u32,
 }
 
@@ -222,11 +231,34 @@ impl SessionState {
     }
 
     fn alloc_tree_id(&mut self) -> u32 {
-        // Tree id 0 is reserved for "no tree", so start at 1.
+        // Tree id 0 is reserved for "no tree", so start at 1. Ids are never
+        // reused within a connection: a stale id from a disconnected tree must
+        // stay unrecognised rather than resolve to whatever was connected next.
         self.next_tree_id += 1;
         self.next_tree_id
     }
+
+    /// What `tree_id` points at, or None if it was never handed out on this
+    /// connection or has since been disconnected.
+    pub(crate) fn tree_kind(&self, tree_id: u32) -> Option<TreeKind> {
+        self.trees.get(&tree_id).copied()
+    }
+
+    /// Retire a tree id, reporting what it pointed at. None means it was not
+    /// live, which is the caller's cue to answer NETWORK_NAME_DELETED.
+    pub(crate) fn remove_tree(&mut self, tree_id: u32) -> Option<TreeKind> {
+        self.trees.remove(&tree_id)
+    }
 }
+
+/// Ceiling on trees connected at once on one connection.
+///
+/// Every TREE_CONNECT costs a table entry that only the client can release, so
+/// without a bound an authenticated client could grow the table until the
+/// process ran out of memory. Real clients hold a handful — macOS peaked at
+/// five during a single mount — so this is far above any legitimate use, and it
+/// is per connection, not global.
+const MAX_TREES: usize = 64;
 
 /// Build the fixed part of a NEGOTIATE response for `dialect`.
 ///
@@ -548,11 +580,11 @@ pub(crate) fn tree_connect(
         return Err(status::BAD_NETWORK_NAME);
     };
 
-    let tree_id = state.alloc_tree_id();
-    match kind {
-        TreeKind::Disk => state.disk_tree_id = Some(tree_id),
-        TreeKind::Ipc => state.ipc_tree_id = Some(tree_id),
+    if state.trees.len() >= MAX_TREES {
+        return Err(status::REQUEST_NOT_ACCEPTED);
     }
+    let tree_id = state.alloc_tree_id();
+    state.trees.insert(tree_id, kind);
 
     let mut w = Writer::with_capacity(16);
     w.u16(16); // StructureSize
@@ -1056,7 +1088,7 @@ mod tests {
         let (resp, kind, tree_id) = tree_connect(&body, &message, "snap", &mut state).unwrap();
         assert_eq!(kind, TreeKind::Disk);
         assert_ne!(tree_id, 0, "tree id 0 means no tree");
-        assert_eq!(state.disk_tree_id, Some(tree_id));
+        assert_eq!(state.tree_kind(tree_id), Some(TreeKind::Disk));
 
         assert_eq!(u16::from_le_bytes(resp[0..2].try_into().unwrap()), 16);
         assert_eq!(resp[2], SHARE_TYPE_DISK);
@@ -1072,7 +1104,7 @@ mod tests {
         let (resp, kind, tree_id) = tree_connect(&body, &message, "snap", &mut state).unwrap();
         assert_eq!(kind, TreeKind::Ipc);
         assert_eq!(resp[2], SHARE_TYPE_PIPE);
-        assert_eq!(state.ipc_tree_id, Some(tree_id));
+        assert_eq!(state.tree_kind(tree_id), Some(TreeKind::Ipc));
         assert_eq!(u32::from_le_bytes(resp[12..16].try_into().unwrap()), 0);
     }
 
@@ -1094,6 +1126,53 @@ mod tests {
         let (b2, m2) = tree_connect_request(r"\\127.0.0.1\IPC$");
         let (_, _, second) = tree_connect(&b2, &m2, "snap", &mut state).unwrap();
         assert_ne!(first, second);
+    }
+
+    /// macOS connects the same share several times over one mount. Each connect
+    /// has to stay usable until the client disconnects it by name: retiring the
+    /// earlier id when a later one arrives is what made the mount go blank.
+    #[test]
+    fn repeated_connects_to_one_share_all_stay_live() {
+        let mut state = SessionState::default();
+        let (body, message) = tree_connect_request(r"\\127.0.0.1\snap");
+
+        let ids: Vec<u32> = (0..4)
+            .map(|_| tree_connect(&body, &message, "snap", &mut state).unwrap().2)
+            .collect();
+
+        for &id in &ids {
+            assert_eq!(
+                state.tree_kind(id),
+                Some(TreeKind::Disk),
+                "tree {id} must survive the connects that followed it"
+            );
+        }
+
+        // Disconnecting one leaves the rest alone, and its id never comes back.
+        assert_eq!(state.remove_tree(ids[1]), Some(TreeKind::Disk));
+        assert_eq!(state.tree_kind(ids[1]), None);
+        assert_eq!(state.remove_tree(ids[1]), None, "a stale id is not live");
+        for &id in [ids[0], ids[2], ids[3]].iter() {
+            assert_eq!(state.tree_kind(id), Some(TreeKind::Disk));
+        }
+    }
+
+    #[test]
+    fn the_tree_table_is_bounded() {
+        let mut state = SessionState::default();
+        let (body, message) = tree_connect_request(r"\\127.0.0.1\snap");
+        for _ in 0..MAX_TREES {
+            tree_connect(&body, &message, "snap", &mut state).expect("under the cap");
+        }
+        assert_eq!(
+            tree_connect(&body, &message, "snap", &mut state).unwrap_err(),
+            status::REQUEST_NOT_ACCEPTED
+        );
+
+        // Disconnecting frees a slot, so a client that cleans up is never stuck.
+        let live = *state.trees.keys().next().expect("table is full");
+        state.remove_tree(live);
+        tree_connect(&body, &message, "snap", &mut state).expect("a slot was freed");
     }
 
     #[test]

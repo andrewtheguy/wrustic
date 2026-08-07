@@ -1248,28 +1248,29 @@ impl Conn {
                 Reply::ok(b).tree(tree_id)
             }),
 
-            cmd::TREE_DISCONNECT => {
-                if self.tree_kind(req.tree_id).is_none() {
-                    Err(status::NETWORK_NAME_DELETED)
-                } else {
+            cmd::TREE_DISCONNECT => match self.state.remove_tree(req.tree_id) {
+                None => Err(status::NETWORK_NAME_DELETED),
+                Some(kind) => {
                     // Handles opened through this tree die with it. A client is
                     // supposed to CLOSE each one first, but nothing makes it,
                     // and a handle left behind is unreachable — its tree id is
                     // gone — while still pinning an open file and its blob
-                    // index for as long as the connection lasts.
+                    // index for as long as the connection lasts. Only this
+                    // tree's handles: another tree may still be connected to
+                    // the same share, and its opens have to survive.
                     self.handles.close_tree(req.tree_id);
-                    if self.state.disk_tree_id == Some(req.tree_id) {
-                        self.state.disk_tree_id = None;
-                    }
-                    if self.state.ipc_tree_id == Some(req.tree_id) {
-                        self.state.ipc_tree_id = None;
+                    if kind == TreeKind::Ipc {
                         // The pipe lives on that tree; leaving it open would
-                        // strand a buffer no command could reach again.
+                        // strand a buffer no command could reach again. There
+                        // is one pipe per connection, so a second IPC$ tree
+                        // would have to reopen it — which is what a client that
+                        // wants one does anyway, and TREE_CONNECT to IPC$
+                        // already clears it for that reason.
                         self.pipe = None;
                     }
                     Ok(Reply::ok(session::simple_ack()))
                 }
-            }
+            },
 
             cmd::ECHO => Ok(Reply::ok(session::simple_ack())),
 
@@ -1381,13 +1382,7 @@ impl Conn {
     }
 
     fn tree_kind(&self, tree_id: u32) -> Option<TreeKind> {
-        if self.state.disk_tree_id == Some(tree_id) {
-            Some(TreeKind::Disk)
-        } else if self.state.ipc_tree_id == Some(tree_id) {
-            Some(TreeKind::Ipc)
-        } else {
-            None
-        }
+        self.state.tree_kind(tree_id)
     }
 }
 
@@ -2318,6 +2313,49 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(parse_response(&resp).status, status::NETWORK_NAME_DELETED);
+    }
+
+    /// macOS connects the share again while the mount is still live, then drops
+    /// the extra tree. Remembering a single disk tree id per session meant the
+    /// second connect retired the first, so everything the mount did afterwards
+    /// answered NETWORK_NAME_DELETED — Finder and `ls` reported an empty share
+    /// over a mount that was otherwise fine. Measured against macOS 26.6 smbfs,
+    /// which opened and dropped five trees over one mount.
+    #[test]
+    fn a_later_connect_to_the_same_share_leaves_the_earlier_tree_usable() {
+        let (mut conn, session_id) = connected();
+        let first = connect_tree(&mut conn, session_id);
+        let second = connect_tree(&mut conn, session_id);
+        assert_ne!(first, second, "each connect gets its own id");
+
+        let opens = |conn: &mut Conn, tree: u32| {
+            let resp = conn
+                .handle_message(&request(cmd::CREATE, session_id, tree, &create_body_for("docs")))
+                .expect("answered");
+            parse_response(&resp).status
+        };
+
+        assert_eq!(
+            opens(&mut conn, first),
+            status::SUCCESS,
+            "the earlier tree must survive a later connect to the same share"
+        );
+
+        let resp = conn
+            .handle_message(&request(
+                cmd::TREE_DISCONNECT,
+                session_id,
+                second,
+                &[4, 0, 0, 0],
+            ))
+            .expect("answered");
+        assert_eq!(parse_response(&resp).status, status::SUCCESS);
+
+        assert_eq!(
+            opens(&mut conn, first),
+            status::SUCCESS,
+            "disconnecting one tree must not take another one down with it"
+        );
     }
 
     #[test]
