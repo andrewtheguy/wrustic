@@ -13,99 +13,82 @@ pub(crate) const DEFAULT_SMB_PORT: u16 = 4456;
 /// Windows-only, and only when compiled with the `smb-tun` feature.
 pub(crate) const SMB_TUN_SUPPORTED: bool = cfg!(all(windows, feature = "smb-tun"));
 
-/// The private subnet the tun transport uses when `--smb-tun-subnet` is not
-/// given. Nothing about 10.99.0.0/24 is special beyond being unlikely to
-/// collide with a network the machine already routes.
-pub(crate) const DEFAULT_SMB_TUN_SUBNET: TunSubnet = TunSubnet {
-    network: std::net::Ipv4Addr::new(10, 99, 0, 0),
-    prefix_len: 24,
+/// The address pair the tun transport uses when `--smb-tun-ip` is not given.
+///
+/// 169.254.255.x is link-local, and inside the block RFC 3927 *reserves*:
+/// APIPA only ever self-assigns from 169.254.1.0–169.254.254.255, so these two
+/// can never collide with an auto-configured address, and link-local traffic
+/// is never routed off the machine at all — unlike a private subnet, there is
+/// no corporate VPN or LAN range this default can shadow.
+pub(crate) const DEFAULT_SMB_TUN_ADDRS: TunAddrs = TunAddrs {
+    virtual_ip: std::net::Ipv4Addr::new(169, 254, 255, 1),
 };
 
-/// The IPv4 subnet the tun transport claims while a share is open.
+/// The two host addresses the tun transport claims while a share is open.
 ///
-/// Two addresses are derived from it, and the split matters: the *second*
-/// address is assigned to the adapter, and the *first* is assigned to nothing
-/// and answered for by wrustic's own TCP stack. An address Windows holds
-/// itself would be looped back internally and hit srvnet.sys's port 445
-/// reservation, which is the whole thing the tun exists to avoid.
+/// There is no subnet: each address is a /32, and the transport's entire
+/// routing footprint is two host routes. The split matters: the adapter gets
+/// the *second* address, and the *first* is assigned to nothing — wrustic's
+/// own TCP stack answers for it, reached through an explicit on-link /32
+/// route. An address Windows holds itself would be looped back internally and
+/// hit srvnet.sys's port 445 reservation, which is the whole thing the tun
+/// exists to avoid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TunSubnet {
-    network: std::net::Ipv4Addr,
-    prefix_len: u8,
+pub(crate) struct TunAddrs {
+    virtual_ip: std::net::Ipv4Addr,
 }
 
 // The flag parses and validates on every platform, so a Linux user gets a real
 // error rather than "unknown argument", but only the Windows tun build has
 // anything that consumes the derived addresses.
 #[cfg_attr(not(all(windows, feature = "smb-tun")), allow(dead_code))]
-impl TunSubnet {
+impl TunAddrs {
     /// The address the share answers on, and the one that goes in the UNC path.
     pub(crate) fn virtual_ip(&self) -> std::net::Ipv4Addr {
-        std::net::Ipv4Addr::from(u32::from(self.network) + 1)
+        self.virtual_ip
     }
 
-    /// The address assigned to the tun adapter, which is what gives Windows a
-    /// source address and an on-link route for the subnet.
+    /// The address assigned to the tun adapter — the next one up, which is
+    /// what gives Windows a source address and an interface to route through.
     pub(crate) fn adapter_ip(&self) -> std::net::Ipv4Addr {
-        std::net::Ipv4Addr::from(u32::from(self.network) + 2)
-    }
-
-    pub(crate) fn prefix_len(&self) -> u8 {
-        self.prefix_len
-    }
-
-    /// For messages that have to name the route being added.
-    pub(crate) fn cidr(&self) -> String {
-        format!("{}/{}", self.network, self.prefix_len)
+        std::net::Ipv4Addr::from(u32::from(self.virtual_ip) + 1)
     }
 }
 
-impl std::fmt::Display for TunSubnet {
+impl std::fmt::Display for TunAddrs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.cidr())
+        write!(f, "{}/32 and {}/32", self.virtual_ip(), self.adapter_ip())
     }
 }
 
-/// Parse `a.b.c.d/len`, rounding down to the network address.
+/// Parse the `--smb-tun-ip` override: the address clients mount, with the next
+/// address up going on the adapter.
 ///
-/// Rejects ranges that cannot work rather than failing later at adapter
-/// creation: anything the local stack treats specially, and prefixes too short
-/// to be plausible or too long to hold the two addresses the design needs.
-fn parse_tun_subnet(value: &str, flag: &str) -> Result<TunSubnet> {
-    let (addr, len) = value
-        .split_once('/')
-        .ok_or_else(|| anyhow::anyhow!("{flag} expects a subnet like 10.99.0.0/24, got `{value}`"))?;
-    let addr: std::net::Ipv4Addr = addr
+/// Rejects addresses that cannot work rather than failing later at adapter
+/// creation — anything the local stack treats specially, for either of the
+/// two derived addresses.
+fn parse_tun_ip(value: &str, flag: &str) -> Result<TunAddrs> {
+    let virtual_ip: std::net::Ipv4Addr = value
         .parse()
-        .map_err(|_| anyhow::anyhow!("{flag}: `{addr}` is not an IPv4 address"))?;
-    let prefix_len: u8 = len
-        .parse()
-        .map_err(|_| anyhow::anyhow!("{flag}: `{len}` is not a prefix length"))?;
-
-    // /30 is the floor, and not an arbitrary one. The transport needs two
-    // addresses in one subnet: the adapter takes the second, and Windows
-    // installs an on-link route for the whole subnet, which is what carries
-    // traffic for the first — the unassigned one wrustic answers for. A /31 has
-    // no room for both, and a /32 assigns a single address and creates no
-    // subnet route at all, so nothing would ever reach the stack.
-    // Below /8 the range is far too large to be anyone's spare segment.
-    if !(8..=30).contains(&prefix_len) {
-        bail!(
-            "{flag}: prefix length must be between 8 and 30, got /{prefix_len}. \
-The transport needs two addresses in one subnet — one for the adapter and one, \
-deliberately unassigned, for the share — so /30 is the smallest that works."
-        );
+        .map_err(|_| anyhow::anyhow!("{flag} expects an IPv4 address like 169.254.255.1, got `{value}`"))?;
+    let adapter_ip = u32::from(virtual_ip)
+        .checked_add(1)
+        .map(std::net::Ipv4Addr::from)
+        .ok_or_else(|| {
+            anyhow::anyhow!("{flag}: the adapter takes the next address after {virtual_ip}, and there is none")
+        })?;
+    // Both derived addresses have to be usable, so a mount address that is fine
+    // on its own but borders a reserved range is refused too.
+    for addr in [virtual_ip, adapter_ip] {
+        if addr.is_loopback() || addr.is_multicast() || addr.is_broadcast() || addr.is_unspecified()
+        {
+            bail!(
+                "{flag}: the transport needs {virtual_ip} and the next address up, \
+and {addr} is in a range the local stack reserves"
+            );
+        }
     }
-    if addr.is_loopback() || addr.is_multicast() || addr.is_link_local() || addr.is_unspecified() {
-        bail!("{flag}: {addr} is in a range the local stack reserves; pick a private subnet");
-    }
-
-    let mask = u32::MAX << (32 - prefix_len);
-    let network = std::net::Ipv4Addr::from(u32::from(addr) & mask);
-    Ok(TunSubnet {
-        network,
-        prefix_len,
-    })
+    Ok(TunAddrs { virtual_ip })
 }
 
 /// Everything that decides how the snapshot SMB share is exposed.
@@ -120,8 +103,8 @@ pub(crate) struct SmbOptions {
     pub(crate) port: u16,
     /// Serve on port 445 through the tun transport instead of a plain socket.
     pub(crate) tun: bool,
-    /// Subnet the tun transport claims. Only meaningful with `tun`.
-    pub(crate) tun_subnet: TunSubnet,
+    /// Address pair the tun transport claims. Only meaningful with `tun`.
+    pub(crate) tun_addrs: TunAddrs,
 }
 
 impl Default for SmbOptions {
@@ -129,7 +112,7 @@ impl Default for SmbOptions {
         Self {
             port: DEFAULT_SMB_PORT,
             tun: false,
-            tun_subnet: DEFAULT_SMB_TUN_SUBNET,
+            tun_addrs: DEFAULT_SMB_TUN_ADDRS,
         }
     }
 }
@@ -151,18 +134,19 @@ Options:
                               speak to port 445 and cannot use this share.
       --smb-tun               Serve the snapshot share on the standard SMB port
                               (445) over a private tun adapter, so it mounts as
-                              a plain UNC path (\\\\10.99.0.1\\snap) and works in
-                              Explorer, not only as a mapped drive. Needs
+                              a plain UNC path (\\\\169.254.255.1\\snap) and works
+                              in Explorer, not only as a mapped drive. Needs
                               administrator rights to create the adapter; the
-                              host's own file sharing is left untouched. While
-                              a share is open, 10.99.0.0/24 routes to the tun.
-                              Windows only, and only in builds compiled with
-                              --features smb-tun.
-      --smb-tun-subnet <CIDR> Private subnet for --smb-tun. Default 10.99.0.0/24.
-                              The first address (.1) is what clients mount and
-                              is deliberately assigned to nothing; the second
-                              (.2) goes on the adapter. Change it if the default
-                              collides with a network this machine routes.
+                              host's own file sharing is left untouched. While a
+                              share is open, two /32 host routes point at the
+                              tun — no subnet is claimed. Windows only, and only
+                              in builds compiled with --features smb-tun.
+      --smb-tun-ip <IPv4>     Mount address for --smb-tun. Default 169.254.255.1
+                              — link-local, in the block RFC 3927 keeps clear of
+                              APIPA autoconfiguration, so it collides with
+                              nothing. The address is deliberately assigned to
+                              nothing; the next one up (.2) goes on the adapter,
+                              and only those two /32s are claimed.
       --no-mouse              Disable mouse reporting (useful for QA / copy-paste).
       --no-keychain           Disable keychain integration even when the binary
                               was built with the 'keychain' feature.
@@ -213,15 +197,15 @@ requires compiling with `--features smb-tun`"
                 }
                 cli.smb.tun = true;
             }
-            "--smb-tun-subnet" => {
+            "--smb-tun-ip" => {
                 let value = args
                     .next()
-                    .ok_or_else(|| anyhow::anyhow!("{arg} requires a subnet in CIDR form"))?;
-                cli.smb.tun_subnet = parse_tun_subnet(&value, arg.as_str())?;
+                    .ok_or_else(|| anyhow::anyhow!("{arg} requires an IPv4 address"))?;
+                cli.smb.tun_addrs = parse_tun_ip(&value, arg.as_str())?;
             }
-            other if other.starts_with("--smb-tun-subnet=") => {
-                let value = &other["--smb-tun-subnet=".len()..];
-                cli.smb.tun_subnet = parse_tun_subnet(value, "--smb-tun-subnet=")?;
+            other if other.starts_with("--smb-tun-ip=") => {
+                let value = &other["--smb-tun-ip=".len()..];
+                cli.smb.tun_addrs = parse_tun_ip(value, "--smb-tun-ip=")?;
             }
             "--no-mouse" => cli.no_mouse = true,
             "--no-keychain" => cli.no_keychain = true,
@@ -278,15 +262,15 @@ fn parse_port(value: &str, flag: &str) -> Result<u16> {
 }
 
 /// Constructors the rest of the crate's tests need, without exposing a way to
-/// build an unvalidated subnet in normal code.
+/// build an unvalidated address pair in normal code.
 #[cfg(test)]
 pub(crate) mod tests_support {
-    use super::TunSubnet;
+    use super::TunAddrs;
 
-    /// Parse a CIDR that the caller knows is valid. Only the tun tests need it.
+    /// Parse an address the caller knows is valid. Only the tun tests need it.
     #[cfg_attr(not(all(windows, feature = "smb-tun")), allow(dead_code))]
-    pub(crate) fn subnet(cidr: &str) -> TunSubnet {
-        super::parse_tun_subnet(cidr, "--smb-tun-subnet").expect("valid test subnet")
+    pub(crate) fn addrs(ip: &str) -> TunAddrs {
+        super::parse_tun_ip(ip, "--smb-tun-ip").expect("valid test address")
     }
 }
 
@@ -294,60 +278,59 @@ pub(crate) mod tests_support {
 mod tests {
     use super::*;
 
-    /// The derivation is the contract the tun transport depends on: `.1` is
-    /// answered for by wrustic's own stack and must stay unassigned, `.2` goes
-    /// on the adapter. Getting these the wrong way round silently reintroduces
-    /// the srvnet port conflict the whole design exists to avoid.
+    /// The derivation is the contract the tun transport depends on: the given
+    /// address is answered for by wrustic's own stack and must stay unassigned,
+    /// the next one up goes on the adapter. Getting these the wrong way round
+    /// silently reintroduces the srvnet port conflict the whole design exists
+    /// to avoid.
     #[test]
-    fn subnet_derives_the_virtual_and_adapter_addresses() {
-        let s = parse_tun_subnet("10.99.0.0/24", "--smb-tun-subnet").expect("parses");
-        assert_eq!(s.virtual_ip(), std::net::Ipv4Addr::new(10, 99, 0, 1));
-        assert_eq!(s.adapter_ip(), std::net::Ipv4Addr::new(10, 99, 0, 2));
-        assert_eq!(s.cidr(), "10.99.0.0/24");
+    fn tun_ip_derives_the_adapter_address() {
+        let a = parse_tun_ip("10.99.0.1", "--smb-tun-ip").expect("parses");
+        assert_eq!(a.virtual_ip(), std::net::Ipv4Addr::new(10, 99, 0, 1));
+        assert_eq!(a.adapter_ip(), std::net::Ipv4Addr::new(10, 99, 0, 2));
     }
 
-    /// A host address is rounded down rather than rejected, so `10.99.0.1/24`
-    /// means what someone writing it plainly intends.
+    /// The default has to sit in 169.254.255.x: link-local, so it is never
+    /// routed off the machine, and inside the block RFC 3927 reserves — APIPA
+    /// self-assigns only from 169.254.1.0–169.254.254.255, so no interface
+    /// waiting on DHCP can ever autoconfigure either of these addresses.
     #[test]
-    fn subnet_rounds_down_to_the_network_address() {
-        let s = parse_tun_subnet("192.168.44.37/24", "--smb-tun-subnet").expect("parses");
-        assert_eq!(s.cidr(), "192.168.44.0/24");
-        assert_eq!(s.virtual_ip(), std::net::Ipv4Addr::new(192, 168, 44, 1));
-    }
-
-    /// /30 is the smallest usable subnet, and both derived addresses have to
-    /// land inside it.
-    #[test]
-    fn thirty_is_the_smallest_subnet_that_works() {
-        let s = parse_tun_subnet("192.168.77.0/30", "--smb-tun-subnet").expect("/30 parses");
-        assert_eq!(s.virtual_ip(), std::net::Ipv4Addr::new(192, 168, 77, 1));
-        assert_eq!(s.adapter_ip(), std::net::Ipv4Addr::new(192, 168, 77, 2));
-
-        // A /31 has room for one address and a /32 creates no subnet route at
-        // all, so neither can carry this design.
-        for too_small in ["192.168.77.0/31", "192.168.77.1/32"] {
-            let err = parse_tun_subnet(too_small, "--smb-tun-subnet")
-                .expect_err("must be refused")
-                .to_string();
-            assert!(err.contains("between 8 and 30"), "{too_small}: {err}");
+    fn default_addresses_sit_in_the_reserved_link_local_block() {
+        let d = DEFAULT_SMB_TUN_ADDRS;
+        for addr in [d.virtual_ip(), d.adapter_ip()] {
+            assert!(addr.is_link_local(), "{addr}");
+            assert_eq!(addr.octets()[2], 255, "{addr} is in APIPA's pick range");
         }
+        assert_eq!(d.virtual_ip(), std::net::Ipv4Addr::new(169, 254, 255, 1));
+        assert_eq!(d.adapter_ip(), std::net::Ipv4Addr::new(169, 254, 255, 2));
     }
 
+    /// Both derived addresses have to be usable, including the adapter's — a
+    /// mount address that borders a reserved range fails the pair.
     #[test]
-    fn subnet_rejects_ranges_the_local_stack_reserves() {
-        for bad in ["127.0.0.0/8", "224.0.0.0/24", "169.254.0.0/16", "0.0.0.0/8"] {
+    fn tun_ip_rejects_addresses_the_local_stack_reserves() {
+        for bad in [
+            "127.0.0.1",         // loopback
+            "224.0.0.1",         // multicast
+            "0.0.0.0",           // unspecified
+            "255.255.255.255",   // broadcast, and +1 overflows too
+            "255.255.255.254",   // adapter address would be the broadcast
+            "223.255.255.255",   // adapter address would be multicast
+        ] {
             assert!(
-                parse_tun_subnet(bad, "--smb-tun-subnet").is_err(),
+                parse_tun_ip(bad, "--smb-tun-ip").is_err(),
                 "{bad} should be refused"
             );
         }
     }
 
     #[test]
-    fn subnet_rejects_malformed_input() {
-        for bad in ["10.99.0.0", "10.99.0.0/", "nonsense/24", "10.99.0.0/abc"] {
+    fn tun_ip_rejects_malformed_input() {
+        // A CIDR is malformed here on purpose: the transport claims two /32s
+        // and there is no subnet size to configure.
+        for bad in ["10.99.0.0/24", "169.254.255.1/32", "nonsense", ""] {
             assert!(
-                parse_tun_subnet(bad, "--smb-tun-subnet").is_err(),
+                parse_tun_ip(bad, "--smb-tun-ip").is_err(),
                 "{bad} should be refused"
             );
         }

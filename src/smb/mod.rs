@@ -410,8 +410,8 @@ pub(crate) struct TunConfig {
     /// Port served on the tun address — 445 in normal use, which is the whole
     /// point of the transport.
     pub(crate) port: u16,
-    /// Private subnet to claim (`--smb-tun-subnet`).
-    pub(crate) subnet: crate::cli::TunSubnet,
+    /// Host address pair to claim (`--smb-tun-ip`).
+    pub(crate) addrs: crate::cli::TunAddrs,
 }
 
 /// Which interfaces to accept connections on.
@@ -487,7 +487,7 @@ pub(crate) fn start(
         Bind::Tun(cfg) => {
             let forward_to =
                 std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, bound_port));
-            let share = tun::TunShare::start(&cfg.state_dir, cfg.port, forward_to, cfg.subnet)?;
+            let share = tun::TunShare::start(&cfg.state_dir, cfg.port, forward_to, cfg.addrs)?;
             let host = share.virtual_ip().to_string();
             (Some(share), MountPoint { host, port: cfg.port })
         }
@@ -2421,11 +2421,11 @@ mod tests {
     }
 
     /// End-to-end over the tun transport: a real Windows mount of
-    /// `\\10.99.0.1\snap` on the standard SMB port, with the host's own
+    /// `\\169.254.255.1\snap` on the standard SMB port, with the host's own
     /// srvnet.sys still holding 445 throughout.
     ///
     /// Ignored by default because it needs administrator rights (creating a
-    /// network adapter always does) and briefly adds a 10.99.0.0/24 route.
+    /// network adapter always does) and briefly adds two /32 host routes.
     /// Run it with:
     ///   cargo test --features smb-tun tun_mount_on_the_standard_port -- --ignored --nocapture
     #[test]
@@ -2434,8 +2434,8 @@ mod tests {
     fn tun_mount_on_the_standard_port() {
         use std::process::Command;
 
-        let subnet = crate::cli::DEFAULT_SMB_TUN_SUBNET;
-        let unc = format!(r"\\{}\{}", subnet.virtual_ip(), DEFAULT_SHARE_NAME);
+        let addrs = crate::cli::DEFAULT_SMB_TUN_ADDRS;
+        let unc = format!(r"\\{}\{}", addrs.virtual_ip(), DEFAULT_SHARE_NAME);
         let net_use = |args: &[&str]| {
             Command::new("net")
                 .arg("use")
@@ -2462,7 +2462,7 @@ mod tests {
             Bind::Tun(TunConfig {
                 state_dir,
                 port: STANDARD_SMB_PORT,
-                subnet,
+                addrs,
             }),
             test_credentials(),
         )
@@ -2531,7 +2531,7 @@ mod tests {
             Bind::Tun(TunConfig {
                 state_dir,
                 port: STANDARD_SMB_PORT,
-                subnet: crate::cli::DEFAULT_SMB_TUN_SUBNET,
+                addrs: crate::cli::DEFAULT_SMB_TUN_ADDRS,
             }),
             test_credentials(),
         )

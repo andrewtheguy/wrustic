@@ -1427,13 +1427,13 @@ fn render_snapshot_smb(frame: &mut Frame, app: &mut App, area: Rect) {
             // Keyed on the transport actually in use, not on the port number:
             // `--smb-port 445` reaches 445 without a tun anywhere (on platforms
             // where that bind succeeds), and claiming a private adapter exists
-            // when none does would be simply wrong. The subnet comes from
-            // `--smb-tun-subnet` rather than a hardcoded default.
+            // when none does would be simply wrong. The addresses come from
+            // `--smb-tun-ip` rather than a hardcoded default.
             if app.smb.tun {
                 lines.push_str(&format!(
                     "Tun:    private adapter, standard SMB port. The machine's own file \
-                     sharing is untouched; {} routes here until this screen closes.\n",
-                    app.smb.tun_subnet
+                     sharing is untouched; {} route here until this screen closes.\n",
+                    app.smb.tun_addrs
                 ));
             }
             lines.push_str(

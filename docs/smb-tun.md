@@ -1,8 +1,8 @@
 # Serving the snapshot share on port 445 (Windows)
 
 `--smb-tun` serves the snapshot share on SMB's standard port so it mounts as a
-plain UNC path — `\\10.99.0.1\snap` works in Explorer's address bar and in any
-program that takes a UNC path, not only as a mapped drive letter.
+plain UNC path — `\\169.254.255.1\snap` works in Explorer's address bar and in
+any program that takes a UNC path, not only as a mapped drive letter.
 
 Windows-only, off by default, and only present in builds compiled with
 `--features smb-tun`. Nothing about it is configurable from the config file.
@@ -41,13 +41,26 @@ host file sharing is untouched for the share's whole lifetime.
 
 The routing trick that makes it work, and the part that is easy to get wrong:
 
-- the **adapter** is assigned the subnet's *second* address (`10.99.0.2`);
-- wrustic answers for the *first* (`10.99.0.1`), which is assigned to **nothing**.
+- the **adapter** is assigned `169.254.255.2/32`;
+- wrustic answers for `169.254.255.1`, which is assigned to **nothing** — an
+  explicit on-link `/32` host route (`CreateIpForwardEntry2` against the
+  interface LUID, next hop unspecified — the same shape WireGuard and Tailscale
+  install) points it at the tun.
 
-Windows sees an on-link route for the subnet and pushes packets for `.1` out
-through the tun ring. Assign `.1` to the adapter instead and Windows treats it
-as a local address, loops the traffic back internally, and the port reservation
-applies again — the exact failure the design exists to avoid.
+Windows pushes packets for `.1` out through the tun ring; there is no subnet,
+and the two host routes are the transport's entire routing footprint. Assign
+`.1` to the adapter instead and Windows treats it as a local address, loops the
+traffic back internally, and the port reservation applies again — the exact
+failure the design exists to avoid.
+
+The addresses live in IPv4 link-local space on purpose, and in a corner of it
+APIPA can never touch: RFC 3927 reserves `169.254.0.x` and `169.254.255.x`, and
+autoconfiguration only ever self-assigns from `169.254.1.0`–`169.254.254.255`.
+So the defaults collide with nothing — not with an interface waiting on DHCP
+(its `169.254.0.0/16` on-link route loses to our `/32`s on longest-prefix
+match), and not with any routed network, because link-local traffic never
+leaves the machine at all. A private-range default like `10.99.0.0/24` could
+shadow a corporate VPN subnet; this cannot.
 
 The SMB protocol code is deliberately untouched by all of this. smoltcp
 terminates the connection and proxies it to the ordinary loopback listener
@@ -60,17 +73,15 @@ buffer, which is nothing next to a repository read.
 - **Administrator rights**, because creating a network adapter always requires
   them. Nothing else needs elevation, and no existing service, binding or
   adapter is modified.
-- **A routed subnet.** While a share is open, `10.99.0.0/24` routes to the tun
-  adapter. Change it with `--smb-tun-subnet 192.168.77.0/30` if that collides
-  with a network the machine already uses; wrustic refuses to start if a more
-  specific route for the range already exists (`GetBestRoute2`).
+- **Two host routes.** While a share is open, `169.254.255.1/32` and
+  `169.254.255.2/32` route to the tun adapter — nothing wider. The mount
+  address can be moved with `--smb-tun-ip` (the next address up goes on the
+  adapter); there is no subnet and no subnet size to configure. wrustic refuses
+  to start if either exact address is already owned by the machine
+  (`GetBestRoute2` returning a `/32` match).
 - **Nothing persists**, and not only on the tidy path. Dropping the share
   removes the adapter, and with it the address and the routes. A crash or a
   forced kill does the same: see below.
-
-`/30` is the smallest usable subnet: the transport needs two addresses in one
-subnet, so a `/31` has no room for both, and a `/32` assigns a single address
-and creates no subnet route at all.
 
 ### What happens if wrustic crashes
 
@@ -79,24 +90,25 @@ process with `taskkill /T /F` — `TerminateProcess`, so no destructor and none 
 wrustic's own cleanup runs — was followed immediately by:
 
 ```
-share running     adapter=wrustic address=10.99.0.2 route=10.99.0.255/32,10.99.0.2/32,10.99.0.0/24
-right after kill  adapter=none    address=none      route=none
+share running     adapter=wrustic address=169.254.255.2 route=169.254.255.1/32,169.254.255.2/32
+right after kill  adapter=none    address=none          route=none
 ```
 
 The cleanup does not depend on wrustic's `Drop`. A Wintun adapter is owned by
 the handle that created it, so when the process dies the kernel closes that
 handle and the driver removes the adapter, taking its addresses and routes with
-it. The same holds for a failure part-way through startup: if address assignment
-fails after the adapter exists, the error path drops the adapter and the address
-goes with it.
+it — including the explicitly added `169.254.255.1/32`, because a route created
+against an interface LUID is owned by that interface. The same holds for a
+failure part-way through startup: if address assignment fails after the adapter
+exists, the error path drops the adapter and the address goes with it.
 
 So there is no stale-adapter recovery procedure, because there is no stale
 adapter. If you ever want to check anyway:
 
 ```powershell
 Get-NetAdapter -IncludeHidden | Where-Object Name -match 'wrustic'
-Get-NetIPAddress -AddressFamily IPv4 | Where-Object IPAddress -like '10.99.*'
-Get-NetRoute -AddressFamily IPv4 | Where-Object DestinationPrefix -like '10.99.*'
+Get-NetIPAddress -AddressFamily IPv4 | Where-Object IPAddress -like '169.254.255.*'
+Get-NetRoute -AddressFamily IPv4 | Where-Object DestinationPrefix -like '169.254.255.*'
 ```
 
 An adapter that does show up belongs to a *live* process — a hung or suspended
@@ -158,7 +170,7 @@ until they agree, which is the point.
 
     cargo test --features smb-tun tun_mount_on_the_standard_port -- --ignored
 
-Mounts `\\10.99.0.1\snap` for real, reads a file, lists a directory, and asserts
+Mounts `\\169.254.255.1\snap` for real, reads a file, lists a directory, and asserts
 that the host's own `0.0.0.0:445` listener is still there afterwards. Ignored by
 default because it needs administrator rights and creates an adapter.
 
