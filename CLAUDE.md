@@ -1,4 +1,5 @@
 - no backward compatibility of any kind since it is a private and personal project.
+- git is for tracking change logs, don't add any additional change logs on documentations or codes
 - wrustic never invokes restic at runtime: all runtime operations use rustic_core natively. Native write operations are allowed only under the restic-compatible lock module (src/lock.rs, docs/locking.md): currently snapshot delete + prune (always instant delete, lock acquired before planning) + unlock. Operations wrustic doesn't implement (init, backup, key management, repair, migrate) are for the user to run with the restic cli outside the app. The only code allowed to spawn restic is the test suite — always via the test-only secure spawn harness in src/restic.rs (#[cfg(test)]; restic::run pipes the password over stdin and credentials over env; never put secrets on argv), used for dev-flow repo setup and restic-side interop checks (snapshots --json, check --read-data --json, restore, forget, unlock, prune)
 - use restic --json output for parsing and avoid parsing human-readable output
 - use this project root's tmp/ folder for dev/test data and workspace to avoid permission issues

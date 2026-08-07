@@ -59,6 +59,12 @@ Finder pre-fills the username from the URL and prompts for the password.
 net use Z: \\127.0.0.1\snap * /user:wrustic /TCPPORT:4456
 ```
 
+That gets a mapped drive and nothing else. A UNC path has no syntax for a port,
+so `\\127.0.0.1\snap` on its own goes to 445 and never reaches this share — in
+Explorer's address bar, in a file dialog, or anywhere else a program takes a UNC
+string. For a path those accept, serve the standard port with
+[`--smb-tun`](smb-tun.md).
+
 Windows needs **no client-side policy changes**. Sessions are authenticated and
 signed, so `EnableInsecureGuestLogons` and `RequireSecuritySignature` stay at
 their secure defaults.
@@ -88,14 +94,21 @@ activates an image) is answered `ACCESS_DENIED`, so a binary in a snapshot
 cannot be launched from a mapped drive. The same bit on a *directory* means
 `FILE_TRAVERSE` and is granted — without it a client cannot descend.
 
-### Older Windows
+### Older Windows, and UNC paths
 
 Windows builds before 11 24H2 can only reach port 445, which wrustic will not
-take: 445 is a privileged port, and binding it means either running the whole
-TUI as root or colliding with the system's own SMB service. On those builds,
-use the per-file HTTP share (`s` on a file's details screen) instead. Pointing
-port 445 at wrustic with a port-forwarding rule works, but it is a local
-networking workaround, not something this project sets up or supports.
+bind: 445 is a privileged port, and taking it means either running the whole
+TUI as root or colliding with the system's own SMB service.
+
+[`--smb-tun`](smb-tun.md) reaches the standard port without binding it,
+by terminating the connection in its own TCP/IP stack on a private adapter. It
+is the answer for these builds, and equally for anyone on 24H2 who wants a UNC
+path rather than a drive letter — the two reasons are independent. Windows-only,
+and only in builds compiled with `--features smb-tun`.
+
+Failing that, use the per-file HTTP share (`s` on a file's details screen).
+Pointing port 445 at wrustic with a port-forwarding rule works too, but it is a
+local networking workaround, not something this project sets up or supports.
 
 ## Security
 

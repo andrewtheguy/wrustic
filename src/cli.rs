@@ -133,17 +133,23 @@ Options:
                               the snapshot list). Default: 4456. Mounting needs
                               a client that can be pointed at a non-standard
                               port: Linux (-o port=), macOS, and Windows 11 24H2
-                              or newer (/TCPPORT:). Earlier Windows builds only
-                              speak to port 445 and cannot use this share.
+                              or newer (/TCPPORT:). On Windows a custom port
+                              mounts as a drive letter only, since no UNC path
+                              can carry one; earlier builds cannot reach it at
+                              all. --smb-tun answers both.
       --smb-tun               Serve the snapshot share on the standard SMB port
                               (445) over a private tun adapter, so it mounts as
                               a plain UNC path (\\\\169.254.255.1\\snap) and works
-                              in Explorer, not only as a mapped drive. Needs
-                              administrator rights to create the adapter; the
-                              host's own file sharing is left untouched. While a
-                              share is open, two /32 host routes point at the
-                              tun — no subnet is claimed. Windows only, and only
-                              in builds compiled with --features smb-tun.
+                              in Explorer, not only as a mapped drive — no UNC
+                              path can carry a port, so this is the only way to
+                              get one. It is also the only way in from Windows
+                              builds before 11 24H2, which speak to no port but
+                              445. Needs administrator rights to create the
+                              adapter; the host's own file sharing is left
+                              untouched. While a share is open, two /32 host
+                              routes point at the tun — no subnet is claimed.
+                              Windows only, and only in builds compiled with
+                              --features smb-tun.
       --smb-tun-ip <IPv4>     Mount address for --smb-tun. Default 169.254.255.1
                               — link-local, in the block RFC 3927 keeps clear of
                               APIPA autoconfiguration, so it collides with
