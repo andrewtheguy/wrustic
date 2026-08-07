@@ -52,7 +52,11 @@ On macOS, use Finder → Go → Connect to Server (⌘K) and enter
 smb://wrustic@127.0.0.1:4456/snap
 ```
 
-Finder pre-fills the username from the URL and prompts for the password.
+Finder pre-fills the username from the URL and prompts for the password. Enter
+the whole path including `/snap`: connecting to `smb://127.0.0.1:4456` alone
+and expecting a share to pick from does not work on macOS, whatever the server
+answers — see [macOS only ever enumerates the standard
+port](#macos-only-ever-enumerates-the-standard-port).
 
 ```bat
 :: Windows 11 24H2 or newer — * makes net use prompt
@@ -151,7 +155,9 @@ to go on, because IPC$ was accepted (macOS connects to it during mount) but
 answered `NOT_SUPPORTED` to every command, so the `srvsvc` pipe could never be
 opened. In Explorer that was typing `\\host\` and waiting; in Finder it was
 connecting to `smb://host` and being offered no share to pick, leaving the user
-to reach the mount point by hand.
+to reach the mount point by hand. Explorer is answered now. Finder is answered
+only on port 445, for a client-side reason covered
+[below](#macos-only-ever-enumerates-the-standard-port).
 
 `srvsvc.rs` answers the one call that question needs: **NetrShareEnum**
 (opnum 15), info level 1, over DCE/RPC on the pipe. Windows carries RPC with
@@ -168,6 +174,41 @@ takes tens of seconds before it gets anywhere, because Windows spends that time
 on credential negotiation before it sends a single byte we would see. Measured
 on the same build, authenticated enumeration takes ~70 ms and lists the share;
 unauthenticated took 18.9 s. That wait is the client's, not the server's.
+
+### macOS only ever enumerates the standard port
+
+Finder lists this share when it is served on 445 and never otherwise, and the
+reason is entirely client-side. Connect to `smb://127.0.0.1:4456` and the
+negotiate, the NTLM sign-on and the `IPC$` TREE_CONNECT all succeed on that
+port — and then macOS opens a **second TCP connection** for the `srvsvc` call,
+to `127.0.0.1:445`, and when that is refused to `127.0.0.1:139`. The port the
+URL was reached on is not carried into that step. Both connections are refused,
+`smbutil view` reports `unable to list resources: Broken pipe`, and the server
+log shows the IPC$ tree connected and disconnected again with nothing in
+between:
+
+```
+[smb 20:51:35.636] conn 1: TREE_CONNECT -> SUCCESS (16 bytes)
+[smb 20:51:35.795] conn 1: TREE_DISCONNECT -> SUCCESS (4 bytes)
+[smb 20:51:35.796] conn 1: LOGOFF -> SUCCESS (4 bytes)
+```
+
+That trace reads exactly like a server that gave up half way through a tree it
+had just accepted, which is why it is written down here: the 159 ms gap is the
+client failing to reach two ports this server was never on. Nothing in
+`srvsvc.rs` participates — the client never gets as far as opening the pipe.
+The same build served on 445 instead (as root, which is precisely what wrustic
+will not do) lists `snap` in ~60 ms, over `CREATE srvsvc` and two
+`FSCTL_PIPE_TRANSCEIVE`s carried on the connection that was already open.
+
+`smbutil view` and Finder's own browsing both go through
+`SMBClient.framework`, so this is not a quirk of the command-line tool, and an
+already-mounted share on the custom port does not prime it either — the
+enumeration redials regardless of what is mounted. Mounting is unaffected,
+because that whole exchange stays on the connection the URL opened:
+`smb://wrustic@127.0.0.1:4456/snap` mounts, lists and reads normally. That is
+why the share screen prints the full path and not the server on its own.
+Measured against macOS 26.6 (Darwin 25.6.0).
 
 ## Scope
 
