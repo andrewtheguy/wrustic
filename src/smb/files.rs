@@ -38,7 +38,8 @@ mod options {
 mod query_dir_flags {
     pub(super) const RESTART_SCANS: u8 = 0x01;
     pub(super) const RETURN_SINGLE_ENTRY: u8 = 0x02;
-    pub(super) const INDEX_SPECIFIED: u8 = 0x04;
+    // SMB2_INDEX_SPECIFIED (0x04) is deliberately absent: see the FileIndex
+    // comment in `query_directory`.
     pub(super) const REOPEN: u8 = 0x10;
 }
 
@@ -69,6 +70,11 @@ pub(crate) struct OpenHandle {
     /// to live with the handle regardless.
     dir_entries: Option<Vec<(NodeInfo, u64)>>,
     dir_pos: usize,
+    /// Whether a QUERY_DIRECTORY on this handle has already returned entries.
+    /// Distinguishes "this search matched nothing" from "the enumeration is
+    /// finished", which are different statuses to a client. Reset by
+    /// RESTART_SCANS/REOPEN along with the cursor.
+    scanned: bool,
 }
 
 /// Per-connection open handles.
@@ -99,17 +105,28 @@ impl Handles {
         id
     }
 
-    fn get_mut(&mut self, id: u64) -> Option<&mut OpenHandle> {
-        let id = self.resolve(id)?;
+    /// Forget the related-compound placeholder.
+    ///
+    /// Called by the dispatcher before every request that is *not* related, so
+    /// the placeholder never outlives the chain that set it. Without this, a
+    /// stray 0xFF..FF — or a related request whose own CREATE failed — resolves
+    /// onto whatever handle the previous chain happened to open, and a CLOSE
+    /// carrying it shuts a file the client still believes is open.
+    pub(crate) fn clear_chain(&mut self) {
+        self.last_created = None;
+    }
+
+    fn get_mut(&mut self, id: u64, related: bool) -> Option<&mut OpenHandle> {
+        let id = self.resolve(id, related)?;
         self.open.get_mut(&id)
     }
 
-    fn get(&self, id: u64) -> Option<&OpenHandle> {
-        self.open.get(&self.resolve(id)?)
+    fn get(&self, id: u64, related: bool) -> Option<&OpenHandle> {
+        self.open.get(&self.resolve(id, related)?)
     }
 
-    fn remove(&mut self, id: u64) -> Option<OpenHandle> {
-        let id = self.resolve(id)?;
+    fn remove(&mut self, id: u64, related: bool) -> Option<OpenHandle> {
+        let id = self.resolve(id, related)?;
         if self.last_created == Some(id) {
             self.last_created = None;
         }
@@ -149,8 +166,12 @@ impl Handles {
     }
 
     /// Map the compound placeholder onto the handle the chain just opened.
-    fn resolve(&self, id: u64) -> Option<u64> {
-        if id == RELATED_FILE_ID {
+    ///
+    /// Only inside a related chain: outside one the placeholder names nothing,
+    /// and falling through to the ordinary lookup gives it the FILE_CLOSED it
+    /// deserves rather than someone else's handle.
+    fn resolve(&self, id: u64, related: bool) -> Option<u64> {
+        if id == RELATED_FILE_ID && related {
             self.last_created
         } else {
             Some(id)
@@ -228,11 +249,15 @@ pub(crate) fn create(
     let create_options = r.u32().map_err(|_| status::INVALID_PARAMETER)?;
     let name_off = r.u16().map_err(|_| status::INVALID_PARAMETER)? as usize;
     let name_len = r.u16().map_err(|_| status::INVALID_PARAMETER)? as usize;
-    // CreateContexts are deliberately not parsed. macOS sends an AAPL context
-    // to negotiate its extensions, and Windows clients send durable-handle and
-    // maximal-access requests; ignoring them all is valid — a server signals
-    // "not supported" by returning no context in the response — and it means an
-    // unfamiliar context can never break an open.
+    let contexts_off = r.u32().map_err(|_| status::INVALID_PARAMETER)? as usize;
+    let contexts_len = r.u32().map_err(|_| status::INVALID_PARAMETER)? as usize;
+    // Only one create context is answered, and only because its absence is
+    // actively misleading: MxAc asks "what could I do with this file?", and a
+    // client that gets no answer assumes the maximum. Windows Explorer then
+    // offers rename and delete on every file in the share and fails them one by
+    // one. Every other context — macOS's AAPL, durable handles, leases — is
+    // still ignored, which is valid: returning no context for one is exactly
+    // how a server says it does not support it.
 
     // Refuse anything that intends to modify. Checked before the path is even
     // resolved so that a write attempt fails identically whether or not the
@@ -278,6 +303,12 @@ pub(crate) fn create(
         return Err(status::FILE_IS_A_DIRECTORY);
     }
 
+    let granted = access::read_only(info.kind.is_dir());
+    let wants_max_access = msg_reader
+        .slice_at(contexts_off, contexts_len)
+        .map(|c| has_create_context(c, MAX_ACCESS_TAG))
+        .unwrap_or(false);
+
     let file_id = handles.insert(OpenHandle {
         tree_id,
         path,
@@ -285,6 +316,7 @@ pub(crate) fn create(
         reader: None,
         dir_entries: None,
         dir_pos: 0,
+        scanned: false,
     });
 
     let mut w = Writer::with_capacity(88);
@@ -302,13 +334,71 @@ pub(crate) fn create(
     w.u32(info::file_attributes(info.kind)); // FileAttributes
     w.u32(0); // Reserved2
     write_file_id(&mut w, file_id);
-    w.u32(0); // CreateContextsOffset — none returned
-    w.u32(0); // CreateContextsLength
+    if wants_max_access {
+        // Offsets count from the SMB2 header, and the fixed part of a CREATE
+        // response is 88 bytes.
+        let context = max_access_context(granted);
+        w.u32((HEADER_LEN + 88) as u32); // CreateContextsOffset
+        w.u32(context.len() as u32); // CreateContextsLength
+        w.bytes(&context);
+    } else {
+        w.u32(0); // CreateContextsOffset — none returned
+        w.u32(0); // CreateContextsLength
+    }
     Ok(w.into_vec())
 }
 
+/// `MxAc` — the maximal-access create context tag (MS-SMB2 2.2.13.2.5).
+const MAX_ACCESS_TAG: &[u8; 4] = b"MxAc";
+
+/// Whether a create-context chain carries the context named by `tag`.
+///
+/// The chain is a list of (Next, NameOffset, NameLength, ...) records, each
+/// linked by a byte distance from its own start and terminated by a zero. Only
+/// the names are read; no context's payload is interpreted.
+fn has_create_context(buf: &[u8], tag: &[u8; 4]) -> bool {
+    let mut at = 0usize;
+    loop {
+        let Some(rec) = buf.get(at..) else { return false };
+        if rec.len() < 16 {
+            return false;
+        }
+        let next = u32::from_le_bytes(rec[0..4].try_into().expect("4 bytes")) as usize;
+        let name_off = u16::from_le_bytes(rec[4..6].try_into().expect("2 bytes")) as usize;
+        let name_len = u16::from_le_bytes(rec[6..8].try_into().expect("2 bytes")) as usize;
+        if rec.get(name_off..name_off.saturating_add(name_len)) == Some(tag.as_slice()) {
+            return true;
+        }
+        // A zero Next terminates; anything that does not advance would spin.
+        if next < 16 {
+            return false;
+        }
+        at += next;
+    }
+}
+
+/// The `MxAc` response context: the access this open would actually be granted.
+fn max_access_context(granted: u32) -> Vec<u8> {
+    let mut w = Writer::with_capacity(32);
+    w.u32(0); // Next — the only context returned
+    w.u16(16); // NameOffset, from the start of this record
+    w.u16(4); // NameLength
+    w.u16(0); // Reserved
+    w.u16(24); // DataOffset
+    w.u32(8); // DataLength
+    w.bytes(MAX_ACCESS_TAG); // 16 Name
+    w.zeros(4); // padding to the 8-byte-aligned data
+    w.u32(status::SUCCESS); // 24 QueryStatus
+    w.u32(granted); // 28 MaximalAccess
+    w.into_vec()
+}
+
 /// CLOSE (MS-SMB2 2.2.15 request, 2.2.16 response).
-pub(crate) fn close(body: &[u8], handles: &mut Handles) -> Result<Vec<u8>, u32> {
+pub(crate) fn close(
+    body: &[u8],
+    handles: &mut Handles,
+    related: bool,
+) -> Result<Vec<u8>, u32> {
     const POSTQUERY_ATTRIB: u16 = 0x0001;
 
     let mut r = Reader::new(body);
@@ -319,7 +409,7 @@ pub(crate) fn close(body: &[u8], handles: &mut Handles) -> Result<Vec<u8>, u32> 
     r.skip(4).map_err(|_| status::INVALID_PARAMETER)?; // Reserved
     let file_id = read_file_id(&mut r)?;
 
-    let handle = handles.remove(file_id).ok_or(status::FILE_CLOSED)?;
+    let handle = handles.remove(file_id, related).ok_or(status::FILE_CLOSED)?;
 
     let mut w = Writer::with_capacity(60);
     w.u16(60); // StructureSize
@@ -350,6 +440,7 @@ pub(crate) fn read(
     body: &[u8],
     backing: &dyn Backing,
     handles: &mut Handles,
+    related: bool,
 ) -> Result<Vec<u8>, u32> {
     let mut r = Reader::new(body);
     if r.u16().map_err(|_| status::INVALID_PARAMETER)? != 49 {
@@ -366,7 +457,7 @@ pub(crate) fn read(
     // maximum in NEGOTIATE, but nothing forces a client to honour it.
     let length = length.min(MAX_READ_SIZE);
 
-    let handle = handles.get_mut(file_id).ok_or(status::FILE_CLOSED)?;
+    let handle = handles.get_mut(file_id, related).ok_or(status::FILE_CLOSED)?;
     if handle.info.kind.is_dir() {
         return Err(status::INVALID_DEVICE_REQUEST);
     }
@@ -378,9 +469,11 @@ pub(crate) fn read(
     let reader = handle.reader.as_ref().expect("just opened");
     let data = reader.read_at(offset, length)?;
 
-    if data.is_empty() {
-        // A zero-length read is end-of-file, not a successful empty read; a
-        // client that got SUCCESS with no data would loop forever.
+    // No data where some was asked for means end of file; a client that got
+    // SUCCESS with an empty buffer would loop forever. A read that asked for
+    // nothing is not that — it succeeds, empty. Samba draws the same line
+    // (`nread == 0 && in_length != 0`, smb2_read.c:404-408).
+    if data.is_empty() && length > 0 {
         return Err(status::END_OF_FILE);
     }
     if (data.len() as u32) < minimum_count {
@@ -398,51 +491,171 @@ pub(crate) fn read(
     Ok(w.into_vec())
 }
 
+/// The three DOS wildcards, which are ordinary characters on the wire and
+/// wildcards only to a filename matcher (MS-FSA 2.1.4.4).
+///
+/// Windows does *not* send `*.txt`. Its runtime rewrites a Win32 mask into
+/// these before it ever reaches a server: `*` before a dot becomes DOS_STAR,
+/// `?` becomes DOS_QM, and a dot before `*`, `?` or the end becomes DOS_DOT. So
+/// `dir *.txt` arrives as `<.txt` and `dir *.*` as `<"*`. Treating them as
+/// literals — which is what not implementing them means, since no filename can
+/// contain one — matches nothing, and every wildcard listing from cmd.exe comes
+/// back "File Not Found". Samba implements exactly these three, for the same
+/// reason (`lib/util/ms_fnmatch.c:39-153`).
+mod dos_wildcard {
+    /// `<` — like `*`, but never matches the final dot of a name.
+    pub(super) const STAR: u8 = b'<';
+    /// `>` — like `?`, but also matches "nothing" at the end of a name or
+    /// before a dot.
+    pub(super) const QM: u8 = b'>';
+    /// `"` — matches a literal dot, or nothing at the end of a name.
+    pub(super) const DOT: u8 = b'"';
+}
+
+/// Longest pattern the matcher will walk.
+///
+/// Recursion depth follows the pattern length — every branch below consumes a
+/// pattern byte, but only some of them consume a name byte — and the pattern
+/// arrives off the wire in a 16-bit length field, so a client can ask for tens
+/// of thousands of frames. That overflows the stack, which aborts the process
+/// rather than failing the request, and no step budget can catch it because the
+/// frames are spent before the steps are. A search pattern is a file name with
+/// wildcards in it and a name is at most 255 characters, so nothing a client
+/// legitimately sends comes near this.
+const MAX_PATTERN: usize = 1024;
+
 /// Match a QUERY_DIRECTORY search pattern. Clients almost always send `*`, but
 /// a lookup of a single name by pattern is legal and macOS does it.
 fn pattern_matches(pattern: &str, name: &str) -> bool {
-    if pattern.is_empty() || pattern == "*" || pattern == "*.*" {
+    if pattern.is_empty() || pattern == "*" {
         return true;
     }
-    glob_match(pattern.as_bytes(), name.as_bytes())
+    let (pattern, name) = (pattern.as_bytes(), name.as_bytes());
+    if pattern.len() > MAX_PATTERN {
+        return false;
+    }
+    let mut budget = match_budget(pattern, name);
+    glob_match(pattern, name, &mut budget)
 }
 
-/// Wildcard matcher for `*` and `?`, iterative so a pathological pattern cannot
-/// blow the stack.
+/// How many calls `glob_match` may make for one name before giving up and
+/// reporting no match.
+///
+/// The matcher backtracks, so its cost is exponential in the number of `*`-like
+/// wildcards rather than linear in the pattern: `**********x` against a name
+/// with no `x` explores every way of dividing the name between the ten stars,
+/// and does not finish in any useful time. The pattern comes straight from the
+/// client, and this runs once per directory entry, so the bound has to be here
+/// rather than in what the caller is willing to accept.
+///
+/// A matcher that memoised would visit each (pattern position, name position)
+/// pair once, which makes the pair count the natural unit; the multiplier is
+/// how much re-visiting this one is allowed before it concedes. Both sit far
+/// above what the patterns clients actually send need — `*`, a literal name,
+/// `<.txt`, `<"*`, none with more than two wildcards — so a budget is only ever
+/// exhausted by a pattern built to exhaust it, for which "no match" is the
+/// honest answer anyway.
+fn match_budget(pattern: &[u8], name: &[u8]) -> u32 {
+    const REVISITS: u32 = 64;
+    const CEILING: u32 = 100_000;
+    let pairs = (pattern.len() as u32)
+        .saturating_add(1)
+        .saturating_mul(name.len() as u32 + 1);
+    pairs.saturating_mul(REVISITS).min(CEILING)
+}
+
+/// Wildcard matcher for `*` and `?` plus the three DOS wildcards.
+///
+/// Recursive at the wildcards only. The iterative form does not survive the DOS
+/// wildcards: `>` and `"` can match the empty string in the middle of a name,
+/// so a single backtrack point is no longer enough. `budget` is what keeps the
+/// backtracking from running away — see `match_budget`.
 ///
 /// Case-insensitivity is **ASCII-only**: the comparison is over raw UTF-8 bytes,
 /// so `A` matches `a` but `É` does not match `é`. Real Unicode case folding
 /// would mean decoding both sides and carrying a folding table, and the clients
 /// that send a pattern at all send `*` or a literal name they read back from us
 /// moments earlier.
-fn glob_match(pattern: &[u8], name: &[u8]) -> bool {
-    let (mut p, mut n) = (0usize, 0usize);
-    let (mut star, mut backtrack) = (usize::MAX, 0usize);
+fn glob_match(pattern: &[u8], name: &[u8], budget: &mut u32) -> bool {
+    // Charged per call, including the ones that return immediately: it is the
+    // number of calls, not the depth, that runs away.
+    if *budget == 0 {
+        return false;
+    }
+    *budget -= 1;
 
-    while n < name.len() {
-        if p < pattern.len() && (pattern[p] == b'?' || eq_ignore_case(pattern[p], name[n])) {
-            p += 1;
-            n += 1;
-        } else if p < pattern.len() && pattern[p] == b'*' {
-            star = p;
-            backtrack = n;
-            p += 1;
-        } else if star != usize::MAX {
-            p = star + 1;
-            backtrack += 1;
-            n = backtrack;
-        } else {
-            return false;
+    let Some((&p, rest)) = pattern.split_first() else {
+        // Pattern exhausted: a match only if the name is too.
+        return name.is_empty();
+    };
+
+    match p {
+        // `*` matches any run of characters, so try the rest of the pattern at
+        // every position including the end of the name.
+        b'*' => {
+            for skip in 0..=name.len() {
+                if glob_match(rest, &name[skip..], budget) {
+                    return true;
+                }
+                // Nothing further can succeed once the budget is gone, and the
+                // loops already on the stack would otherwise each spin out
+                // their full range over calls that return false on entry.
+                if *budget == 0 {
+                    return false;
+                }
+            }
+            false
+        }
+
+        // DOS_STAR is `*` that stops at the name's *last* dot: it may end
+        // before that dot or step over it, but never runs past it. That is what
+        // makes `<.txt` (which is how `dir *.txt` reaches the wire) match
+        // `a.txt` and `notes.txt` but not `a.txt.bak`.
+        dos_wildcard::STAR => {
+            let last_dot = name.iter().rposition(|&c| c == b'.');
+            for skip in 0..name.len() {
+                if glob_match(rest, &name[skip..], budget) {
+                    return true;
+                }
+                if last_dot == Some(skip) {
+                    // The one position past the last dot, and then no further.
+                    return glob_match(rest, &name[skip + 1..], budget);
+                }
+                if *budget == 0 {
+                    return false;
+                }
+            }
+            // Ran out of name without meeting a dot.
+            glob_match(rest, &[], budget)
+        }
+
+        // DOS_QM matches one character — except at the end of the name, or
+        // where a dot begins, in which case it matches nothing and does *not*
+        // consume the dot.
+        dos_wildcard::QM => {
+            if name.is_empty() || name[0] == b'.' {
+                glob_match(rest, name, budget)
+            } else {
+                glob_match(rest, &name[1..], budget)
+            }
+        }
+
+        // DOS_DOT is a soft dot: a literal dot, or nothing at the end of a name.
+        dos_wildcard::DOT => {
+            if name.is_empty() {
+                glob_match(rest, name, budget)
+            } else {
+                name[0] == b'.' && glob_match(rest, &name[1..], budget)
+            }
+        }
+
+        b'?' => !name.is_empty() && glob_match(rest, &name[1..], budget),
+        literal => {
+            !name.is_empty()
+                && literal.eq_ignore_ascii_case(&name[0])
+                && glob_match(rest, &name[1..], budget)
         }
     }
-    while p < pattern.len() && pattern[p] == b'*' {
-        p += 1;
-    }
-    p == pattern.len()
-}
-
-fn eq_ignore_case(a: u8, b: u8) -> bool {
-    a.eq_ignore_ascii_case(&b)
 }
 
 /// QUERY_DIRECTORY (MS-SMB2 2.2.33 request, 2.2.34 response).
@@ -452,6 +665,7 @@ pub(crate) fn query_directory(
     backing: &dyn Backing,
     handles: &mut Handles,
     now: SystemTime,
+    related: bool,
 ) -> Result<Vec<u8>, u32> {
     let mut r = Reader::new(body);
     if r.u16().map_err(|_| status::INVALID_PARAMETER)? != 33 {
@@ -459,7 +673,12 @@ pub(crate) fn query_directory(
     }
     let class = r.u8().map_err(|_| status::INVALID_PARAMETER)?;
     let flags = r.u8().map_err(|_| status::INVALID_PARAMETER)?;
-    let file_index = r.u32().map_err(|_| status::INVALID_PARAMETER)?;
+    // FileIndex is only meaningful with SMB2_INDEX_SPECIFIED, which no client
+    // sends — NTFS itself cannot restart an enumeration by index, and Samba
+    // ignores the field outright. Skipped rather than honoured: implementing it
+    // would mean defining what an index *means* under a filtering pattern, and
+    // nothing would ever exercise the answer.
+    r.skip(4).map_err(|_| status::INVALID_PARAMETER)?; // FileIndex
     let file_id = read_file_id(&mut r)?;
     let pattern_off = r.u16().map_err(|_| status::INVALID_PARAMETER)? as usize;
     let pattern_len = r.u16().map_err(|_| status::INVALID_PARAMETER)? as usize;
@@ -475,7 +694,7 @@ pub(crate) fn query_directory(
     // ends: `backing.list` is a repository call, and the mutable borrow for the
     // cursor cannot be taken until after it.
     let (path, needs_listing) = {
-        let handle = handles.get(file_id).ok_or(status::FILE_CLOSED)?;
+        let handle = handles.get(file_id, related).ok_or(status::FILE_CLOSED)?;
         if !handle.info.kind.is_dir() {
             return Err(status::NOT_A_DIRECTORY);
         }
@@ -497,15 +716,13 @@ pub(crate) fn query_directory(
         None
     };
 
-    let handle = handles.get_mut(file_id).ok_or(status::FILE_CLOSED)?;
+    let handle = handles.get_mut(file_id, related).ok_or(status::FILE_CLOSED)?;
     if let Some(listing) = listing {
         handle.dir_entries = Some(listing);
     }
     if flags & (query_dir_flags::RESTART_SCANS | query_dir_flags::REOPEN) != 0 {
         handle.dir_pos = 0;
-    }
-    if flags & query_dir_flags::INDEX_SPECIFIED != 0 {
-        handle.dir_pos = file_index as usize;
+        handle.scanned = false;
     }
 
     let all = handle.dir_entries.as_ref().expect("populated above");
@@ -515,35 +732,57 @@ pub(crate) fn query_directory(
     // `[., .., a.txt, b.log]` and `*.log`, one match would move the cursor to 1
     // rather than past `b.log`, and the next call would hand out `b.log` again,
     // for ever.
-    let matched: Vec<(usize, (NodeInfo, u64))> = all
+    //
+    // Positions first, then a clone of only the entries that can fit in this
+    // page. Cloning every remaining match — twice, as this once did — is O(n)
+    // heap allocations per call and quadratic over a large directory's
+    // enumeration, for entries the encoder was going to discard anyway.
+    let matched: Vec<usize> = all
         .iter()
         .enumerate()
         .skip(handle.dir_pos)
         .filter(|(_, (info, _))| pattern_matches(&pattern, &info.name))
-        .map(|(i, entry)| (i, entry.clone()))
+        .map(|(i, _)| i)
         .collect();
-
-    if matched.is_empty() {
-        // The spec's way of saying "enumeration complete". Returning an empty
-        // successful buffer instead makes clients retry forever.
-        return Err(status::NO_MORE_FILES);
-    }
-
-    let remaining: Vec<(NodeInfo, u64)> =
-        matched.iter().map(|(_, entry)| entry.clone()).collect();
     let max_len = output_len.min(MAX_READ_SIZE as usize);
     let single = flags & query_dir_flags::RETURN_SINGLE_ENTRY != 0;
-    let (buf, consumed) = info::encode_dir_entries(
-        class,
-        &remaining,
-        handle.dir_pos as u32,
-        max_len,
-        single,
-    )?;
+    // An entry is at least its class's fixed part, so this many can fit at
+    // most; a shorter buffer just means the encoder stops earlier. An unknown
+    // class caps at one and is refused by the encoder a few lines below, which
+    // is where that error belongs.
+    let page_cap = if single {
+        1
+    } else {
+        info::dir_entry_fixed_len(class)
+            .map_or(1, |fixed| max_len / fixed)
+            .max(1)
+            .min(matched.len())
+    };
+    let page: Vec<(NodeInfo, u64)> =
+        matched.iter().take(page_cap).map(|&i| all[i].clone()).collect();
+
+    if matched.is_empty() {
+        // Exhaustion and "nothing ever matched" are different answers. A first
+        // scan that matches nothing is STATUS_NO_SUCH_FILE, which Windows maps
+        // to ERROR_FILE_NOT_FOUND — what FindFirstFile callers test for;
+        // NO_MORE_FILES is for a continuation that has run out. Samba draws the
+        // same distinction on whether the cursor was just created
+        // (smb2_query_directory.c:408-424).
+        return Err(if handle.scanned {
+            status::NO_MORE_FILES
+        } else {
+            status::NO_SUCH_FILE
+        });
+    }
+
+    let start_index = handle.dir_pos as u32;
+    handle.scanned = true;
+    let (buf, consumed) =
+        info::encode_dir_entries(class, &page, start_index, max_len, single)?;
     // Resume immediately after the last entry actually encoded. `consumed` is
     // never zero here — `encode_dir_entries` errors rather than report an empty
     // page — but the cursor is left alone rather than trusting that.
-    if let Some((last, _)) = consumed.checked_sub(1).and_then(|i| matched.get(i)) {
+    if let Some(&last) = consumed.checked_sub(1).and_then(|i| matched.get(i)) {
         handle.dir_pos = last + 1;
     }
 
@@ -580,6 +819,7 @@ pub(crate) fn query_info(
     handles: &Handles,
     volume_created: SystemTime,
     volume_serial: u32,
+    related: bool,
 ) -> Result<(Vec<u8>, u32), u32> {
     let mut r = Reader::new(body);
     if r.u16().map_err(|_| status::INVALID_PARAMETER)? != 41 {
@@ -595,7 +835,7 @@ pub(crate) fn query_info(
     r.skip(4).map_err(|_| status::INVALID_PARAMETER)?; // Flags
     let file_id = read_file_id(&mut r)?;
 
-    let handle = handles.get(file_id).ok_or(status::FILE_CLOSED)?;
+    let handle = handles.get(file_id, related).ok_or(status::FILE_CLOSED)?;
 
     let buf = match ty {
         info_type::FILE => {
@@ -648,6 +888,25 @@ pub(crate) fn query_info(
         _ => return Err(status::INVALID_PARAMETER),
     };
 
+    // Each class's C-struct size, and where its trailing string starts, for the
+    // classes that have one. The NT I/O manager probes the struct size before
+    // it looks at anything else, so this is checked whether or not the answer
+    // would have fit: a buffer below it is a mismatch even when the payload is
+    // short enough to fit in it. Samba applies the same check in the same order
+    // (smb2_getinfo.c:432-437 for FILE, :493-498 for FILESYSTEM).
+    let (min_len, string_off) = match (ty, class) {
+        (info_type::FILE, file_class::NAME) => (8, Some(4)),
+        (info_type::FILE, file_class::ALL) => (104, Some(100)),
+        (info_type::FILESYSTEM, fs_class::VOLUME) => (24, Some(18)),
+        (info_type::FILESYSTEM, fs_class::ATTRIBUTE) => (16, Some(12)),
+        // Everything else is fixed-size, so its struct size is what it encoded
+        // and it has nothing sensible to truncate.
+        _ => (buf.len(), None),
+    };
+    if output_len < min_len {
+        return Err(status::INFO_LENGTH_MISMATCH);
+    }
+
     let mut buf = buf;
     let mut reply_status = status::SUCCESS;
     if buf.len() > output_len {
@@ -662,25 +921,11 @@ pub(crate) fn query_info(
         // string get the portion that fits plus STATUS_BUFFER_OVERFLOW — a
         // warning, delivered with a normal data-bearing response — and the
         // embedded length field still reports the full string so the caller
-        // can size a retry. The minimum accepted buffer is each class's
-        // C-struct size — the NT I/O manager's own check, which counts the
-        // struct's one-WCHAR name array and tail padding — not the wire
-        // offset of the string, so a 20-byte FileFsVolumeInformation query is
-        // refused even though the label starts at byte 18. The string is cut
-        // on a UTF-16 code-unit boundary; half a unit would decode as a
-        // garbage final character. Everything else has nothing sensible to
-        // truncate and hard-fails with INFO_LENGTH_MISMATCH, which also
-        // remains the answer below a class's minimum.
-        let (min_len, string_off) = match (ty, class) {
-            (info_type::FILE, file_class::NAME) => (8, 4),
-            (info_type::FILE, file_class::ALL) => (104, 100),
-            (info_type::FILESYSTEM, fs_class::VOLUME) => (24, 18),
-            (info_type::FILESYSTEM, fs_class::ATTRIBUTE) => (16, 12),
-            _ => return Err(status::INFO_LENGTH_MISMATCH),
-        };
-        if output_len < min_len {
-            return Err(status::INFO_LENGTH_MISMATCH);
-        }
+        // can size a retry. The string is cut on a UTF-16 code-unit boundary;
+        // half a unit would decode as a garbage final character. Everything
+        // else has nothing sensible to truncate; a buffer too small for one of
+        // those was already refused by the struct-size check above.
+        let string_off = string_off.ok_or(status::INFO_LENGTH_MISMATCH)?;
         buf.truncate(string_off + (output_len - string_off) / 2 * 2);
         reply_status = status::BUFFER_OVERFLOW;
     }
@@ -707,6 +952,39 @@ mod tests {
         let mut m = vec![0u8; HEADER_LEN];
         m.extend_from_slice(body);
         m
+    }
+
+    // The handlers take the related-compound flag, which is only ever true for
+    // a request chained behind a CREATE. These shadow the real functions so
+    // that the ordinary tests — every one that is not about compounds — read as
+    // the standalone requests they are; the compound tests call through to
+    // `super::` with the flag set.
+    fn close(body: &[u8], handles: &mut Handles) -> Result<Vec<u8>, u32> {
+        super::close(body, handles, false)
+    }
+
+    fn read(body: &[u8], b: &dyn Backing, h: &mut Handles) -> Result<Vec<u8>, u32> {
+        super::read(body, b, h, false)
+    }
+
+    fn query_directory(
+        body: &[u8],
+        message: &[u8],
+        b: &dyn Backing,
+        h: &mut Handles,
+        now: SystemTime,
+    ) -> Result<Vec<u8>, u32> {
+        super::query_directory(body, message, b, h, now, false)
+    }
+
+    fn query_info(
+        body: &[u8],
+        b: &dyn Backing,
+        h: &Handles,
+        created: SystemTime,
+        serial: u32,
+    ) -> Result<(Vec<u8>, u32), u32> {
+        super::query_info(body, b, h, created, serial, false)
     }
 
     fn create_body(name: &str, desired: u32, disp: u32, opts: u32) -> Vec<u8> {
@@ -1264,7 +1542,10 @@ mod tests {
         // The compound placeholder pointed at a handle tree 2 owned; it must not
         // resolve onto anything now.
         let body = read_body(RELATED_FILE_ID, 0, 1);
-        assert_eq!(read(&body, &b, &mut h).unwrap_err(), status::FILE_CLOSED);
+        assert_eq!(
+            super::read(&body, &b, &mut h, true).unwrap_err(),
+            status::FILE_CLOSED
+        );
     }
 
     #[test]
@@ -1303,6 +1584,196 @@ mod tests {
         assert!(!pattern_matches("*a*b*", "xxbyyazz"));
         assert!(pattern_matches("exact", "exact"));
         assert!(!pattern_matches("exact", "exactly"));
+    }
+
+    /// Windows never sends `*.txt`. Its runtime rewrites a Win32 mask into the
+    /// DOS wildcards before it reaches the wire, so `dir *.txt` arrives as
+    /// `<.txt`. Treating those three characters as literals — which is what not
+    /// implementing them amounts to, since no filename may contain one — makes
+    /// every wildcard listing from cmd.exe come back "File Not Found".
+    #[test]
+    fn dos_wildcards_match_what_windows_actually_sends() {
+        // `dir *.txt` → `<.txt`. DOS_STAR spans anything but the final dot,
+        // which is what keeps it from matching a doubled extension.
+        assert!(pattern_matches("<.txt", "a.txt"));
+        assert!(pattern_matches("<.txt", "notes.txt"));
+        assert!(!pattern_matches("<.txt", "a.log"));
+        assert!(!pattern_matches("<.txt", "a.txt.bak"));
+
+        // `dir *.*` → `<"*`, which lists everything, extension or not.
+        for name in ["a.txt", "plain", "a.b.c"] {
+            assert!(pattern_matches("<\"*", name), "{name} must match <\"*");
+        }
+
+        // `dir x?.log` → `x>.log`. DOS_QM matches one character, or nothing at
+        // all where the name ends or a dot begins.
+        assert!(pattern_matches("x>.log", "x1.log"));
+        assert!(pattern_matches("x>.log", "x.log"), "DOS_QM may match nothing");
+        assert!(!pattern_matches("x>.log", "x12.log"));
+
+        // DOS_DOT matches a literal dot, or nothing at the end of a name — how
+        // `a.` finds the extensionless `a`.
+        assert!(pattern_matches("a\"", "a."));
+        assert!(pattern_matches("a\"", "a"));
+        assert!(!pattern_matches("a\"", "a.txt"));
+
+        // Case-insensitive, like every other form.
+        assert!(pattern_matches("<.TXT", "a.txt"));
+    }
+
+    /// The matcher backtracks, so a pattern with many `*`s explores every way of
+    /// dividing the name between them — `**********b` against sixty-four `a`s is
+    /// 64^10 attempts, and the pattern comes from the client. Both forms have to
+    /// concede rather than run, and this test failing looks like a hang.
+    #[test]
+    fn a_pattern_built_to_backtrack_gives_up_rather_than_running_forever() {
+        let name = "a".repeat(64);
+        assert!(!pattern_matches("**********b", &name));
+        assert!(!pattern_matches("<<<<<<<<<<b", &name));
+        assert!(!pattern_matches("*a*a*a*a*a*a*a*a*a*b", &name));
+    }
+
+    /// Depth follows the pattern length, and the length field on the wire allows
+    /// far more frames than the stack holds — which aborts the process rather
+    /// than failing the request, so it is refused before it is walked.
+    #[test]
+    fn a_pattern_longer_than_any_name_is_refused() {
+        assert!(!pattern_matches(&"*".repeat(MAX_PATTERN + 1), "a"));
+        assert!(!pattern_matches(&">".repeat(MAX_PATTERN + 1), ""));
+        // A pattern right at the limit is still matched as before.
+        assert!(pattern_matches(&"*".repeat(MAX_PATTERN), "anything"));
+    }
+
+    /// The budget is generous enough that nothing a client sends notices it: a
+    /// full-length name against a two-wildcard pattern is the realistic worst
+    /// case, and it must still answer truthfully rather than concede.
+    #[test]
+    fn the_budget_does_not_disturb_a_realistic_worst_case() {
+        let name = format!("{}.txt", "a".repeat(250));
+        assert!(pattern_matches("<.txt", &name));
+        assert!(pattern_matches("<\"*", &name));
+        assert!(!pattern_matches("<.log", &name));
+        // Two stars either side of a literal that is only present at the end.
+        assert!(pattern_matches(&format!("*{}*", "a".repeat(200)), &name));
+    }
+
+    /// A first scan that matches nothing and an enumeration that has run out are
+    /// different answers: Windows maps NO_SUCH_FILE to ERROR_FILE_NOT_FOUND,
+    /// which is what FindFirstFile callers test for.
+    #[test]
+    fn an_unmatched_first_scan_is_no_such_file_not_no_more_files() {
+        let b = backing();
+        let mut h = Handles::default();
+        let id = open_path(&b, &mut h, "dir").unwrap();
+
+        let body = query_dir_body(id, dir_class::ID_BOTH_DIRECTORY, 0, "*.nope", 65536);
+        assert_eq!(
+            query_directory(&body, &message(&body), &b, &mut h, UNIX_EPOCH).unwrap_err(),
+            status::NO_SUCH_FILE,
+            "nothing ever matched"
+        );
+
+        // Once a scan has returned entries, exhaustion is the other status.
+        let body = query_dir_body(id, dir_class::ID_BOTH_DIRECTORY, 0, "*", 65536);
+        assert!(query_directory(&body, &message(&body), &b, &mut h, UNIX_EPOCH).is_ok());
+        assert_eq!(
+            query_directory(&body, &message(&body), &b, &mut h, UNIX_EPOCH).unwrap_err(),
+            status::NO_MORE_FILES
+        );
+
+        // And a restart puts it back to a first scan.
+        let body = query_dir_body(
+            id,
+            dir_class::ID_BOTH_DIRECTORY,
+            query_dir_flags::RESTART_SCANS,
+            "*.nope",
+            65536,
+        );
+        assert_eq!(
+            query_directory(&body, &message(&body), &b, &mut h, UNIX_EPOCH).unwrap_err(),
+            status::NO_SUCH_FILE
+        );
+    }
+
+    /// A read that asked for nothing succeeds empty; only a read that asked for
+    /// data and got none is end-of-file.
+    #[test]
+    fn a_zero_length_read_succeeds_rather_than_reporting_end_of_file() {
+        let b = backing();
+        let mut h = Handles::default();
+        let id = open_path(&b, &mut h, "dir\\a.txt").unwrap();
+
+        let resp = read(&read_body(id, 0, 0), &b, &mut h).unwrap();
+        assert_eq!(u32::from_le_bytes(resp[4..8].try_into().unwrap()), 0);
+
+        // Past the end, having asked for data, is still END_OF_FILE.
+        assert_eq!(
+            read(&read_body(id, 11, 10), &b, &mut h).unwrap_err(),
+            status::END_OF_FILE
+        );
+    }
+
+    /// Windows sends MxAc on essentially every CREATE. Without an answer it
+    /// assumes the maximum and offers rename and delete on a read-only share.
+    #[test]
+    fn a_maximal_access_request_is_answered_with_the_read_only_mask() {
+        let b = backing();
+        let mut h = Handles::default();
+
+        // A CREATE carrying an MxAc context, appended after the name.
+        let name = utf16le("dir\\a.txt");
+        let mut ctx = Writer::new();
+        ctx.u32(0); // Next
+        ctx.u16(16); // NameOffset
+        ctx.u16(4); // NameLength
+        ctx.u16(0); // Reserved
+        ctx.u16(24); // DataOffset
+        ctx.u32(0); // DataLength — an MxAc request carries none
+        ctx.bytes(MAX_ACCESS_TAG);
+        ctx.zeros(4);
+        let ctx = ctx.into_vec();
+
+        let mut w = Writer::new();
+        w.u16(57);
+        w.u8(0);
+        w.u8(0);
+        w.u32(2);
+        w.u64(0);
+        w.u64(0);
+        w.u32(access::READ_ONLY_FILE);
+        w.u32(0);
+        w.u32(7);
+        w.u32(disposition::OPEN);
+        w.u32(0);
+        w.u16((HEADER_LEN + 56) as u16); // NameOffset
+        w.u16(name.len() as u16);
+        w.u32((HEADER_LEN + 56 + name.len()) as u32); // CreateContextsOffset
+        w.u32(ctx.len() as u32);
+        w.bytes(&name);
+        w.bytes(&ctx);
+        let body = w.into_vec();
+
+        let resp = create(&body, &message(&body), &b, &mut h, TREE).unwrap();
+        let off = u32::from_le_bytes(resp[80..84].try_into().unwrap()) as usize;
+        let len = u32::from_le_bytes(resp[84..88].try_into().unwrap()) as usize;
+        assert_eq!(off, HEADER_LEN + 88, "context follows the fixed part");
+        assert_ne!(len, 0, "MxAc must be answered");
+
+        let returned = &resp[88..88 + len];
+        assert_eq!(&returned[16..20], MAX_ACCESS_TAG, "context is MxAc");
+        assert_eq!(
+            u32::from_le_bytes(returned[24..28].try_into().unwrap()),
+            status::SUCCESS,
+            "QueryStatus"
+        );
+        let maximal = u32::from_le_bytes(returned[28..32].try_into().unwrap());
+        assert_eq!(maximal, access::READ_ONLY_FILE);
+        assert_eq!(maximal & access::WRITE_BITS, 0, "never a write bit");
+
+        // A CREATE without the context still gets none back.
+        let plain = create_body("dir\\a.txt", access::READ_ONLY_FILE, disposition::OPEN, 0);
+        let resp = create(&plain, &message(&plain), &b, &mut h, TREE).unwrap();
+        assert_eq!(u32::from_le_bytes(resp[84..88].try_into().unwrap()), 0);
     }
 
     fn query_info_body(ty: u8, class: u8, file_id: u64, output_len: u32) -> Vec<u8> {
@@ -1503,14 +1974,58 @@ mod tests {
 
         // The placeholder must reach the same handle.
         let body = read_body(RELATED_FILE_ID, 0, 5);
-        let resp = read(&body, &b, &mut h).unwrap();
+        let resp = super::read(&body, &b, &mut h, true).unwrap();
         let len = u32::from_le_bytes(resp[4..8].try_into().unwrap()) as usize;
         assert_eq!(&resp[16..16 + len], b"hello");
 
         // And once that handle is closed, it resolves to nothing.
         close(&close_body(real_id, 0), &mut h).unwrap();
         let body = read_body(RELATED_FILE_ID, 0, 5);
+        assert_eq!(
+            super::read(&body, &b, &mut h, true).unwrap_err(),
+            status::FILE_CLOSED
+        );
+    }
+
+    /// The placeholder is only a placeholder inside a related chain. An
+    /// unrelated request carrying it names nothing — resolving it onto the last
+    /// CREATE would let a stray or replayed request reach a handle it was never
+    /// given, and a CLOSE carrying it would shut a file the client still holds.
+    #[test]
+    fn the_placeholder_means_nothing_outside_a_related_chain() {
+        let b = backing();
+        let mut h = Handles::default();
+        let real_id = open_path(&b, &mut h, "dir\\a.txt").unwrap();
+
+        let body = read_body(RELATED_FILE_ID, 0, 5);
         assert_eq!(read(&body, &b, &mut h).unwrap_err(), status::FILE_CLOSED);
+
+        let body = close_body(RELATED_FILE_ID, 0);
+        assert_eq!(close(&body, &mut h).unwrap_err(), status::FILE_CLOSED);
+        assert_eq!(h.len(), 1, "the live handle must survive");
+        assert!(close(&close_body(real_id, 0), &mut h).is_ok());
+    }
+
+    /// `clear_chain` is what the dispatcher calls before every unrelated
+    /// request, and it is the whole reason a placeholder cannot outlive its
+    /// chain.
+    #[test]
+    fn clearing_the_chain_unbinds_the_placeholder() {
+        let b = backing();
+        let mut h = Handles::default();
+        let real_id = open_path(&b, &mut h, "dir\\a.txt").unwrap();
+
+        let body = read_body(RELATED_FILE_ID, 0, 5);
+        assert!(super::read(&body, &b, &mut h, true).is_ok());
+
+        h.clear_chain();
+        assert_eq!(
+            super::read(&body, &b, &mut h, true).unwrap_err(),
+            status::FILE_CLOSED,
+            "a new chain must not inherit the previous one's handle"
+        );
+        // The handle itself is untouched — only the placeholder binding went.
+        assert!(read(&read_body(real_id, 0, 5), &b, &mut h).is_ok());
     }
 
     #[test]

@@ -116,6 +116,12 @@ pub(crate) fn create(
     if !name.eq_ignore_ascii_case(PIPE_NAME) {
         return Err(status::OBJECT_NAME_NOT_FOUND);
     }
+    if pipe.is_some() {
+        // One pipe per connection, because both opens would answer to the same
+        // fixed file id. Succeeding here instead would silently reset the first
+        // binding's state under a client still using it.
+        return Err(status::OBJECT_NAME_COLLISION);
+    }
 
     *pipe = Some(Pipe::default());
 
@@ -141,8 +147,29 @@ pub(crate) fn create(
     Ok(w.into_vec())
 }
 
+/// Check that a request naming a file id is naming *this* pipe.
+///
+/// The pipe lives outside `Handles` and answers to one fixed id, so without
+/// this any id at all — a stale one, a snapshot handle's — would reach it once
+/// an IPC$ tree was connected.
+fn check_file_id(r: &mut Reader<'_>) -> Result<(), u32> {
+    let persistent = r.u64().map_err(|_| status::INVALID_PARAMETER)?;
+    let volatile = r.u64().map_err(|_| status::INVALID_PARAMETER)?;
+    if persistent != PIPE_FILE_ID || volatile != PIPE_FILE_ID {
+        return Err(status::FILE_CLOSED);
+    }
+    Ok(())
+}
+
 /// CLOSE on the pipe.
-pub(crate) fn close(pipe: &mut Option<Pipe>) -> Result<Vec<u8>, u32> {
+pub(crate) fn close(body: &[u8], pipe: &mut Option<Pipe>) -> Result<Vec<u8>, u32> {
+    let mut r = Reader::new(body);
+    if r.u16().map_err(|_| status::INVALID_PARAMETER)? != 24 {
+        return Err(status::INVALID_PARAMETER);
+    }
+    r.skip(2 + 4).map_err(|_| status::INVALID_PARAMETER)?; // Flags, Reserved
+    check_file_id(&mut r)?;
+
     if pipe.take().is_none() {
         return Err(status::FILE_CLOSED);
     }
@@ -177,6 +204,8 @@ pub(crate) fn write(
     if length > MAX_REQUEST {
         return Err(status::INVALID_PARAMETER);
     }
+    r.skip(8).map_err(|_| status::INVALID_PARAMETER)?; // Offset
+    check_file_id(&mut r)?;
 
     let msg = Reader::new(message);
     let data = msg
@@ -204,6 +233,8 @@ pub(crate) fn read(body: &[u8], pipe: &mut Option<Pipe>) -> Result<Vec<u8>, u32>
     }
     r.skip(1 + 1).map_err(|_| status::INVALID_PARAMETER)?; // Padding, Flags
     let length = r.u32().map_err(|_| status::INVALID_PARAMETER)? as usize;
+    r.skip(8).map_err(|_| status::INVALID_PARAMETER)?; // Offset
+    check_file_id(&mut r)?;
 
     if pipe.pending.is_empty() {
         // Nothing was asked, so there is nothing to collect. END_OF_FILE is how
@@ -233,7 +264,7 @@ pub(crate) fn transceive(
     message: &[u8],
     pipe: &mut Option<Pipe>,
     share_name: &str,
-) -> Result<Vec<u8>, u32> {
+) -> Result<(Vec<u8>, u32), u32> {
     /// FSCTL_PIPE_TRANSCEIVE (MS-SMB2 2.2.31).
     const FSCTL_PIPE_TRANSCEIVE: u32 = 0x0011_C017;
 
@@ -249,19 +280,35 @@ pub(crate) fn transceive(
         // Every other FSCTL stays refused, as it always was.
         return Err(status::NOT_SUPPORTED);
     }
-    r.skip(16).map_err(|_| status::INVALID_PARAMETER)?; // FileId
+    check_file_id(&mut r)?;
     let input_off = r.u32().map_err(|_| status::INVALID_PARAMETER)? as usize;
     let input_len = r.u32().map_err(|_| status::INVALID_PARAMETER)? as usize;
     if input_len > MAX_REQUEST {
         return Err(status::INVALID_PARAMETER);
     }
+    r.skip(4).map_err(|_| status::INVALID_PARAMETER)?; // MaxInputResponse
+    r.skip(4).map_err(|_| status::INVALID_PARAMETER)?; // OutputOffset
+    r.skip(4).map_err(|_| status::INVALID_PARAMETER)?; // OutputCount
+    let max_output = r.u32().map_err(|_| status::INVALID_PARAMETER)? as usize;
 
     let msg = Reader::new(message);
     let input = msg
         .slice_at(input_off, input_len)
         .map_err(|_| status::INVALID_PARAMETER)?;
-    let output = dispatch(input, share_name);
+    let mut output = dispatch(input, share_name);
+    // A transceive starts a fresh exchange, so anything the client never
+    // collected from a previous one is gone.
     pipe_state.pending.clear();
+    // Honour the client's buffer: the part that does not fit stays queued for a
+    // follow-up READ, which is how a pipe reports a partial answer (MS-SMB2
+    // 3.3.5.15.5; Samba's smb2_ioctl_named_pipe.c:136-186 does the same). One
+    // share fits in every buffer a real client offers, so this only matters if
+    // the enumeration ever grows — but the alternative is silently dropping the
+    // remainder.
+    let truncated = output.len() > max_output;
+    if truncated {
+        pipe_state.pending = output.split_off(max_output);
+    }
 
     // OutputOffset counts from the start of the SMB2 header, and the output
     // follows the 48-byte IOCTL response body.
@@ -279,7 +326,14 @@ pub(crate) fn transceive(
     w.u32(0); // Flags
     w.u32(0); // Reserved2
     w.bytes(&output);
-    Ok(w.into_vec())
+    // BUFFER_OVERFLOW is a warning carrying a valid partial response, not an
+    // error: it tells the client to come back with a READ for the rest.
+    let st = if truncated {
+        status::BUFFER_OVERFLOW
+    } else {
+        status::SUCCESS
+    };
+    Ok((w.into_vec(), st))
 }
 
 // ---------------------------------------------------------------------------
@@ -293,27 +347,32 @@ pub(crate) fn transceive(
 /// or a dropped connection retries and stalls.
 fn dispatch(request: &[u8], share_name: &str) -> Vec<u8> {
     let Some(hdr) = PduHeader::parse(request) else {
-        return fault(0, NCA_S_OP_RNG_ERROR);
+        return fault(0, 0, NCA_S_OP_RNG_ERROR);
     };
     match hdr.ptype {
-        ptype::BIND => bind_ack(&hdr, ptype::BIND_ACK),
-        ptype::ALTER_CONTEXT => bind_ack(&hdr, ptype::ALTER_CONTEXT_RESP),
+        ptype::BIND => bind_ack(request, &hdr, ptype::BIND_ACK),
+        ptype::ALTER_CONTEXT => bind_ack(request, &hdr, ptype::ALTER_CONTEXT_RESP),
         ptype::REQUEST => {
             // Request body: alloc_hint (4), context_id (2), opnum (2).
             let Some(stub) = request.get(16..) else {
-                return fault(hdr.call_id, NCA_S_OP_RNG_ERROR);
+                return fault(hdr.call_id, 0, NCA_S_OP_RNG_ERROR);
             };
             if stub.len() < 8 {
-                return fault(hdr.call_id, NCA_S_OP_RNG_ERROR);
+                return fault(hdr.call_id, 0, NCA_S_OP_RNG_ERROR);
             }
+            // Echoed back rather than hardcoded to 0: the response identifies
+            // the presentation context the call ran under, and now that a bind
+            // can accept a context other than the first, 0 is no longer a safe
+            // assumption.
+            let context_id = u16::from_le_bytes([stub[4], stub[5]]);
             let opnum = u16::from_le_bytes([stub[6], stub[7]]);
             if opnum != OPNUM_NET_SHARE_ENUM {
-                return fault(hdr.call_id, NCA_S_OP_RNG_ERROR);
+                return fault(hdr.call_id, context_id, NCA_S_OP_RNG_ERROR);
             }
             let level = requested_level(&stub[8..]);
-            response(hdr.call_id, &net_share_enum(share_name, level))
+            response(hdr.call_id, context_id, &net_share_enum(share_name, level))
         }
-        _ => fault(hdr.call_id, NCA_S_OP_RNG_ERROR),
+        _ => fault(hdr.call_id, 0, NCA_S_OP_RNG_ERROR),
     }
 }
 
@@ -327,13 +386,15 @@ impl PduHeader {
         if buf.len() < 16 || buf[0] != 5 {
             return None;
         }
-        // frag_length must describe exactly this buffer. Shorter means
-        // trailing bytes that would be silently ignored; longer means a
-        // fragment of a larger PDU, which this server does not reassemble.
-        // Either way the input is not the single complete PDU the dispatcher
-        // assumes, so it faults rather than guesses.
+        // frag_length must describe exactly this buffer, and the PDU must be
+        // both the first and the last fragment of its message. The length check
+        // alone does not catch a fragment: in DCE/RPC each fragment carries its
+        // *own* frag_length (C706 §12.6), so the first fragment of a multi-part
+        // request passes it and would be dispatched as if complete, leaving the
+        // continuation to be dispatched as a second request. The flags are what
+        // actually establish the "one complete PDU" the dispatcher assumes.
         let frag_length = u16::from_le_bytes([buf[8], buf[9]]) as usize;
-        if frag_length != buf.len() {
+        if frag_length != buf.len() || buf[3] & PFC_FIRST_LAST != PFC_FIRST_LAST {
             return None;
         }
         Some(Self {
@@ -356,13 +417,101 @@ fn write_pdu_header(w: &mut Writer, ptype: u8, frag_len: u16, call_id: u32) {
     w.u32(call_id);
 }
 
+/// The bind-time feature negotiation pseudo-syntax (MS-RPCE 3.3.1.5.3). Its
+/// first eight bytes are a fixed prefix; the rest carries the requested
+/// features rather than identifying a syntax.
+const BIND_TIME_FEATURE_PREFIX: [u8; 8] =
+    [0x2c, 0x1c, 0xb7, 0x6c, 0x12, 0x98, 0x40, 0x45];
+
+/// Result codes for one presentation context in a bind_ack (C706 §12.6.4.4).
+mod bind_result {
+    pub(super) const ACCEPTANCE: u16 = 0;
+    pub(super) const PROVIDER_REJECTION: u16 = 2;
+    /// MS-RPCE's extension: the context was a feature request, and this is the
+    /// answer to it rather than a syntax being accepted.
+    pub(super) const NEGOTIATE_ACK: u16 = 3;
+}
+
+/// Reason code accompanying a rejection: the proposed transfer syntaxes are not
+/// supported.
+const REASON_TRANSFER_SYNTAXES_NOT_SUPPORTED: u16 = 2;
+
+/// What one presentation context in a BIND asked for.
+enum Presented {
+    /// Offers the NDR32 transfer syntax — the one this server speaks.
+    Ndr32,
+    /// The bind-time feature negotiation pseudo-syntax.
+    FeatureRequest,
+    /// Anything else, NDR64 above all.
+    Unsupported,
+}
+
+/// Read the presentation contexts out of a BIND body.
+///
+/// Every client presents more than one: Windows rpcrt4 offers NDR32, NDR64 and
+/// bind-time feature negotiation, and even smbclient offers two. Each one needs
+/// its own result element in the reply, so they have to be counted rather than
+/// assumed.
+fn presented_contexts(buf: &[u8]) -> Vec<Presented> {
+    // Bind body: max_xmit(2) max_recv(2) assoc_group(4) num_contexts(1)
+    // reserved(3), then each context: id(2) n_transfer(1) reserved(1)
+    // abstract_syntax(20), then n_transfer × 20 bytes of transfer syntax.
+    let Some(body) = buf.get(16..) else {
+        return Vec::new();
+    };
+    let Some(&count) = body.get(8) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(count as usize);
+    let mut at = 12usize;
+    for _ in 0..count {
+        let Some(n_transfer) = body.get(at + 2).copied() else {
+            break;
+        };
+        let syntaxes_at = at + 4 + 20;
+        let mut kind = Presented::Unsupported;
+        for i in 0..n_transfer as usize {
+            let off = syntaxes_at + i * 20;
+            let Some(syntax) = body.get(off..off + 16) else {
+                break;
+            };
+            if syntax == NDR_SYNTAX {
+                kind = Presented::Ndr32;
+                break;
+            }
+            if syntax[..8] == BIND_TIME_FEATURE_PREFIX {
+                kind = Presented::FeatureRequest;
+                break;
+            }
+        }
+        out.push(kind);
+        at = syntaxes_at + n_transfer as usize * 20;
+    }
+    out
+}
+
 /// BIND_ACK / ALTER_CONTEXT_RESP.
 ///
-/// The presented abstract syntax is accepted without inspection: this pipe
-/// serves exactly one interface, so a client that bound to something else will
-/// fault on its first call anyway, which is a clearer failure than a bind_nak.
-fn bind_ack(hdr: &PduHeader, ptype: u8) -> Vec<u8> {
+/// The reply must carry exactly one result per context the client presented,
+/// in the same order (C706 §12.6.4.4; Samba builds `ack_ctx_list` sized
+/// `num_contexts` and sets `num_results` from it, `dcesrv_core.c:1180-1322`).
+/// Answering a three-context Windows bind with a single result is what a
+/// stricter RPC runtime than smbclient's rejects.
+///
+/// The abstract syntax is still accepted without inspection: this pipe serves
+/// exactly one interface, so a client that bound to another will fault on its
+/// first call, which is a clearer failure than a bind_nak.
+fn bind_ack(request: &[u8], hdr: &PduHeader, ptype: u8) -> Vec<u8> {
     let sec_addr = b"\\PIPE\\srvsvc\0";
+
+    let contexts = presented_contexts(request);
+    // A bind whose contexts could not be read at all still gets one acceptance,
+    // which is what every client before this change received.
+    let contexts = if contexts.is_empty() {
+        vec![Presented::Ndr32]
+    } else {
+        contexts
+    };
 
     let mut body = Writer::new();
     body.u16(MAX_FRAG); // max_xmit_frag
@@ -373,12 +522,38 @@ fn bind_ack(hdr: &PduHeader, ptype: u8) -> Vec<u8> {
     // The results list is 4-byte aligned from the start of the PDU. The header
     // is 16 bytes, so aligning the body is equivalent.
     body.align_to(4);
-    body.u8(1); // num_results
+    body.u8(contexts.len() as u8); // num_results
     body.zeros(3); // reserved
-    body.u16(0); // result — acceptance
-    body.u16(0); // reason
-    body.bytes(&NDR_SYNTAX);
-    body.u32(NDR_SYNTAX_VERSION);
+    // Only the first context offering NDR32 is accepted; a second would bind
+    // the same interface twice under a different id, which nothing here tracks.
+    let mut accepted = false;
+    for context in &contexts {
+        match context {
+            Presented::Ndr32 if !accepted => {
+                accepted = true;
+                body.u16(bind_result::ACCEPTANCE);
+                body.u16(0); // reason
+                body.bytes(&NDR_SYNTAX);
+                body.u32(NDR_SYNTAX_VERSION);
+            }
+            Presented::FeatureRequest => {
+                // No optional feature is supported, so the acknowledgement
+                // carries an empty syntax — the answer itself is the result
+                // code, and clients read no more than that.
+                body.u16(bind_result::NEGOTIATE_ACK);
+                body.u16(0); // reason — the negotiated feature bits, none here
+                body.zeros(16);
+                body.u32(0);
+            }
+            // NDR64, or a repeat of NDR32.
+            _ => {
+                body.u16(bind_result::PROVIDER_REJECTION);
+                body.u16(REASON_TRANSFER_SYNTAXES_NOT_SUPPORTED);
+                body.zeros(16); // a rejected result names no syntax
+                body.u32(0);
+            }
+        }
+    }
 
     let body = body.into_vec();
     let mut w = Writer::with_capacity(16 + body.len());
@@ -387,22 +562,22 @@ fn bind_ack(hdr: &PduHeader, ptype: u8) -> Vec<u8> {
     w.into_vec()
 }
 
-fn response(call_id: u32, stub: &[u8]) -> Vec<u8> {
+fn response(call_id: u32, context_id: u16, stub: &[u8]) -> Vec<u8> {
     let mut w = Writer::with_capacity(24 + stub.len());
     write_pdu_header(&mut w, ptype::RESPONSE, (24 + stub.len()) as u16, call_id);
     w.u32(stub.len() as u32); // alloc_hint
-    w.u16(0); // context_id
+    w.u16(context_id);
     w.u8(0); // cancel_count
     w.u8(0); // reserved
     w.bytes(stub);
     w.into_vec()
 }
 
-fn fault(call_id: u32, code: u32) -> Vec<u8> {
+fn fault(call_id: u32, context_id: u16, code: u32) -> Vec<u8> {
     let mut w = Writer::with_capacity(32);
     write_pdu_header(&mut w, ptype::FAULT, 32, call_id);
     w.u32(0); // alloc_hint
-    w.u16(0); // context_id
+    w.u16(context_id);
     w.u8(0); // cancel_count
     w.u8(0); // reserved
     w.u32(code); // status
@@ -555,6 +730,176 @@ mod tests {
         );
     }
 
+    /// Build a BIND presenting several contexts, the way a real client does.
+    /// Each entry is that context's list of transfer syntaxes.
+    fn bind_pdu_with(call_id: u32, contexts: &[&[[u8; 16]]]) -> Vec<u8> {
+        let mut w = Writer::new();
+        write_pdu_header(&mut w, ptype::BIND, 0, call_id);
+        w.u16(MAX_FRAG);
+        w.u16(MAX_FRAG);
+        w.u32(0); // assoc_group_id
+        w.u8(contexts.len() as u8);
+        w.zeros(3); // reserved
+        for (i, syntaxes) in contexts.iter().enumerate() {
+            w.u16(i as u16); // context id
+            w.u8(syntaxes.len() as u8); // n_transfer_syn
+            w.u8(0); // reserved
+            w.zeros(20); // abstract syntax
+            for syntax in syntaxes.iter() {
+                w.bytes(syntax);
+                w.u32(NDR_SYNTAX_VERSION);
+            }
+        }
+        seal(w.into_vec())
+    }
+
+    /// NDR64, which every Windows client offers and this server does not speak.
+    const NDR64_SYNTAX: [u8; 16] = [
+        0x33, 0x05, 0x71, 0x71, 0xba, 0xbe, 0x37, 0x49, 0x83, 0x19, 0xb5, 0xdb, 0xef, 0x9c, 0xcc,
+        0x36,
+    ];
+
+    /// The bind-time feature negotiation pseudo-syntax.
+    fn feature_syntax() -> [u8; 16] {
+        let mut s = [0u8; 16];
+        s[..8].copy_from_slice(&BIND_TIME_FEATURE_PREFIX);
+        s
+    }
+
+    /// Read the results list out of a bind_ack: (num_results, [(result, reason)]).
+    fn bind_results(reply: &[u8]) -> (usize, Vec<(u16, u16)>) {
+        // Body: max_xmit(2) max_recv(2) assoc_group(4) sec_addr_len(2)
+        // sec_addr, padded to 4, then num_results(1) reserved(3), then results.
+        let body = &reply[16..];
+        let sec_len = u16::from_le_bytes([body[8], body[9]]) as usize;
+        let mut at = 10 + sec_len;
+        at = at.next_multiple_of(4);
+        let count = body[at] as usize;
+        at += 4;
+        let results = (0..count)
+            .map(|i| {
+                let off = at + i * 24;
+                (
+                    u16::from_le_bytes([body[off], body[off + 1]]),
+                    u16::from_le_bytes([body[off + 2], body[off + 3]]),
+                )
+            })
+            .collect();
+        (count, results)
+    }
+
+    /// Windows rpcrt4 presents three contexts — NDR32, NDR64 and bind-time
+    /// feature negotiation — and the reply must carry one result per context,
+    /// in order. Answering with a single acceptance is what a stricter runtime
+    /// than smbclient's rejects.
+    #[test]
+    fn a_multi_context_bind_gets_one_result_per_context() {
+        let bind = bind_pdu_with(
+            0x99,
+            &[&[NDR_SYNTAX], &[NDR64_SYNTAX], &[feature_syntax()]],
+        );
+        let reply = dispatch(&bind, "snap");
+        assert_eq!(reply[2], ptype::BIND_ACK);
+        assert_eq!(
+            u16::from_le_bytes([reply[8], reply[9]]) as usize,
+            reply.len(),
+            "frag_length must describe the whole PDU"
+        );
+
+        let (count, results) = bind_results(&reply);
+        assert_eq!(count, 3, "one result per presented context");
+        assert_eq!(
+            results[0],
+            (bind_result::ACCEPTANCE, 0),
+            "NDR32 is the syntax this server speaks"
+        );
+        assert_eq!(
+            results[1],
+            (
+                bind_result::PROVIDER_REJECTION,
+                REASON_TRANSFER_SYNTAXES_NOT_SUPPORTED
+            ),
+            "NDR64 must be refused, not silently accepted"
+        );
+        assert_eq!(
+            results[2].0,
+            bind_result::NEGOTIATE_ACK,
+            "the feature request gets an acknowledgement, not a syntax"
+        );
+    }
+
+    /// The single-context bind smbclient sends still works unchanged.
+    #[test]
+    fn a_single_context_bind_is_accepted() {
+        let reply = dispatch(&bind_pdu_with(1, &[&[NDR_SYNTAX]]), "snap");
+        let (count, results) = bind_results(&reply);
+        assert_eq!(count, 1);
+        assert_eq!(results[0], (bind_result::ACCEPTANCE, 0));
+        assert!(reply.windows(16).any(|w| w == NDR_SYNTAX));
+    }
+
+    /// Two contexts both offering NDR32. Only the first can be accepted: a
+    /// second acceptance would bind the same interface again under a different
+    /// context id, and nothing here tracks more than one binding. The reply
+    /// still has to account for the context rather than omit it.
+    #[test]
+    fn a_repeated_ndr32_context_is_rejected_rather_than_bound_twice() {
+        let reply = dispatch(&bind_pdu_with(0x55, &[&[NDR_SYNTAX], &[NDR_SYNTAX]]), "snap");
+        assert_eq!(reply[2], ptype::BIND_ACK);
+
+        let (count, results) = bind_results(&reply);
+        assert_eq!(count, 2, "one result per presented context");
+        assert_eq!(results[0], (bind_result::ACCEPTANCE, 0));
+        assert_eq!(
+            results[1],
+            (
+                bind_result::PROVIDER_REJECTION,
+                REASON_TRANSFER_SYNTAXES_NOT_SUPPORTED
+            ),
+            "the second binding must be refused, not silently accepted"
+        );
+    }
+
+    /// A client that offers only NDR64 gets a well-formed refusal rather than
+    /// an acceptance naming a syntax it never proposed.
+    #[test]
+    fn a_bind_without_ndr32_is_refused_per_context() {
+        let reply = dispatch(&bind_pdu_with(2, &[&[NDR64_SYNTAX]]), "snap");
+        let (count, results) = bind_results(&reply);
+        assert_eq!(count, 1);
+        assert_eq!(results[0].0, bind_result::PROVIDER_REJECTION);
+    }
+
+    /// Each DCE/RPC fragment carries its own frag_length, so a length check
+    /// alone cannot tell a complete PDU from the first fragment of a larger
+    /// one. The PFC first/last flags are what actually establish it.
+    #[test]
+    fn a_fragment_of_a_larger_pdu_faults() {
+        let mut req = enum_request(8, 1);
+        // Well-formed and self-consistent, but flagged as only the first
+        // fragment — the rest of the request is still to come.
+        req[3] = 0x01; // PFC_FIRST_FRAG without PFC_LAST_FRAG
+        assert_eq!(dispatch(&req, "snap")[2], ptype::FAULT);
+
+        let mut req = enum_request(9, 1);
+        req[3] = 0x02; // PFC_LAST_FRAG without PFC_FIRST_FRAG
+        assert_eq!(dispatch(&req, "snap")[2], ptype::FAULT);
+    }
+
+    /// The response identifies the presentation context the call ran under.
+    #[test]
+    fn a_response_echoes_the_requests_context_id() {
+        let mut req = enum_request(10, 1);
+        req[20..22].copy_from_slice(&7u16.to_le_bytes()); // context_id
+        let reply = dispatch(&req, "snap");
+        assert_eq!(reply[2], ptype::RESPONSE);
+        assert_eq!(
+            u16::from_le_bytes([reply[20], reply[21]]),
+            7,
+            "context_id must be echoed, not hardcoded"
+        );
+    }
+
     #[test]
     fn enumeration_lists_the_share_by_name() {
         let reply = dispatch(&enum_request(7, 1), "snap");
@@ -614,6 +959,111 @@ mod tests {
         assert_eq!(
             u32::from_le_bytes(reply[24..28].try_into().unwrap()),
             NCA_S_OP_RNG_ERROR
+        );
+    }
+
+    /// An IOCTL request carrying `input`, and the message it sits in. Buffer
+    /// offsets count the SMB2 header, and the fixed part of the request is 56
+    /// bytes, so the input follows at that distance.
+    fn transceive_request(input: &[u8], max_output: u32) -> (Vec<u8>, Vec<u8>) {
+        const FSCTL_PIPE_TRANSCEIVE: u32 = 0x0011_C017;
+        let mut w = Writer::new();
+        w.u16(57); // StructureSize
+        w.u16(0); // Reserved
+        w.u32(FSCTL_PIPE_TRANSCEIVE);
+        w.u64(PIPE_FILE_ID); // FileId, persistent
+        w.u64(PIPE_FILE_ID); // FileId, volatile
+        w.u32((crate::smb::proto::HEADER_LEN + 56) as u32); // InputOffset
+        w.u32(input.len() as u32); // InputCount
+        w.u32(0); // MaxInputResponse
+        w.u32(0); // OutputOffset
+        w.u32(0); // OutputCount
+        w.u32(max_output); // MaxOutputResponse
+        w.u32(0); // Flags
+        w.u32(0); // Reserved2
+        w.bytes(input);
+        let body = w.into_vec();
+
+        let mut message = vec![0u8; crate::smb::proto::HEADER_LEN];
+        message.extend_from_slice(&body);
+        (body, message)
+    }
+
+    /// A READ collecting whatever the pipe still has queued.
+    fn read_request(length: u32) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.u16(49); // StructureSize
+        w.u8(0); // Padding
+        w.u8(0); // Flags
+        w.u32(length);
+        w.u64(0); // Offset
+        w.u64(PIPE_FILE_ID); // FileId, persistent
+        w.u64(PIPE_FILE_ID); // FileId, volatile
+        w.u32(0); // MinimumCount
+        w.u32(0); // Channel
+        w.u32(0); // RemainingBytes
+        w.u16(0); // ReadChannelInfoOffset
+        w.u16(0); // ReadChannelInfoLength
+        w.into_vec()
+    }
+
+    /// The client's output buffer is not a promise about the answer's size. What
+    /// does not fit stays queued for a follow-up READ, and BUFFER_OVERFLOW is
+    /// the warning that sends the client back for it — dropping the remainder
+    /// instead hands over a truncated NDR structure that parses as garbage.
+    #[test]
+    fn a_transceive_past_the_output_buffer_queues_the_remainder_for_a_read() {
+        let mut pipe = Some(Pipe::default());
+        // A reply from an earlier exchange that the client never collected. A
+        // transceive starts a fresh one, so this must not be prepended to it.
+        pipe.as_mut().expect("open").pending = b"stale".to_vec();
+
+        let whole = dispatch(&enum_request(11, 1), "snap");
+        const MAX_OUTPUT: usize = 16;
+        assert!(
+            whole.len() > MAX_OUTPUT,
+            "the reply has to overflow the buffer or nothing here is tested"
+        );
+
+        let (body, message) = transceive_request(&enum_request(11, 1), MAX_OUTPUT as u32);
+        let (resp, st) = transceive(&body, &message, &mut pipe, "snap").unwrap();
+        assert_eq!(st, status::BUFFER_OVERFLOW, "a partial answer, not an error");
+
+        // OutputCount, then the output itself after the 48-byte response body.
+        let count = u32::from_le_bytes(resp[36..40].try_into().unwrap()) as usize;
+        assert_eq!(count, MAX_OUTPUT, "exactly what the client made room for");
+        assert_eq!(&resp[48..48 + count], &whole[..MAX_OUTPUT]);
+
+        let read_resp = read(&read_request(4096), &mut pipe).unwrap();
+        let data_len = u32::from_le_bytes(read_resp[4..8].try_into().unwrap()) as usize;
+        assert_eq!(
+            &read_resp[16..16 + data_len],
+            &whole[MAX_OUTPUT..],
+            "the READ must return the rest of this answer, not the stale one"
+        );
+        assert_eq!(
+            u32::from_le_bytes(read_resp[8..12].try_into().unwrap()),
+            0,
+            "and nothing is left queued behind it"
+        );
+    }
+
+    /// An answer that fits is delivered whole, with nothing left over to make a
+    /// later READ hand back a fragment of a finished exchange.
+    #[test]
+    fn a_transceive_that_fits_leaves_nothing_queued() {
+        let mut pipe = Some(Pipe::default());
+        let whole = dispatch(&enum_request(12, 1), "snap");
+
+        let (body, message) = transceive_request(&enum_request(12, 1), 4096);
+        let (resp, st) = transceive(&body, &message, &mut pipe, "snap").unwrap();
+        assert_eq!(st, status::SUCCESS);
+        let count = u32::from_le_bytes(resp[36..40].try_into().unwrap()) as usize;
+        assert_eq!(count, whole.len());
+        assert_eq!(&resp[48..48 + count], whole.as_slice());
+        assert_eq!(
+            read(&read_request(4096), &mut pipe).unwrap_err(),
+            status::END_OF_FILE
         );
     }
 

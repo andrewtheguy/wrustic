@@ -323,7 +323,12 @@ pub(crate) fn fs_sector_size() -> Vec<u8> {
 }
 
 /// Size of the fixed part of a directory-information entry, before the name.
-fn dir_entry_fixed_len(class: u8) -> Option<usize> {
+///
+/// Public because it is also the smallest an entry of this class can be, which
+/// is what `query_directory` sizes a page from: it caps how many matches it
+/// clones at how many could possibly fit, rather than cloning every remaining
+/// one for the encoder to discard.
+pub(crate) fn dir_entry_fixed_len(class: u8) -> Option<usize> {
     Some(match class {
         dir_class::DIRECTORY => 64,
         dir_class::FULL_DIRECTORY => 68,

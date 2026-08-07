@@ -71,8 +71,11 @@ fn decode(s: &str) -> Option<String> {
         match chars.next()? {
             '\\' => out.push(b'\\'),
             '"' => out.push(b'"'),
-            '\'' => out.push(b'\''),
-            '`' => out.push(b'`'),
+            // `\'` and `` \` `` are not decoded: Go's `strconv.Quote` escapes
+            // only the backslash, the double quote and non-printables, so
+            // restic never writes them. Accepting them would decode a name
+            // restic could not have produced, and the round-trip check in
+            // `from_repo` would reject the result anyway.
             'a' => out.push(0x07),
             'b' => out.push(0x08),
             'f' => out.push(0x0c),

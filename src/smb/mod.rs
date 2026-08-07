@@ -23,6 +23,26 @@
 // buffers in memory, is gated on the tree being IPC$ and the pipe being open,
 // and has no route to a snapshot.
 //
+// One protocol detail is worth stating up front because three parts of this
+// module depend on it. A client may pack several requests into one message and
+// flag the later ones RELATED; per MS-SMB2 3.3.5.2.7.1 such a request may carry
+// 0xFF..FF in place of the session, tree and file ids and inherit the real ones
+// from the request before it. So a chain is treated as a unit: identity flows
+// along it (`Chain` in `handle_message`), a CREATE that fails poisons the rest
+// of it rather than letting the survivors resolve onto some other handle, and
+// none of that state outlives the message that established it.
+//
+// Measured, so nobody has to guess how load-bearing this is: Windows 11 (26200)
+// over this share sends RELATED on a couple of QUERY_INFOs per session and
+// *still fills in the real session, tree and file ids* — it never sends a
+// placeholder. cifs.ko does not chain at all. So the inheritance path is
+// conformance rather than something a tested client needs; what it buys is that
+// a client which does use placeholders (the spec allows it, Samba implements
+// it, and smbtorture's compound tests emulate a Windows client that does) is
+// not answered with USER_SESSION_DELETED. The chain-scoping of the file-id
+// placeholder is worth having on its own terms: it is what stops a stale
+// 0xFF..FF from resolving onto an unrelated live handle and closing it.
+//
 // A mount is for browsing a snapshot, not for restoring or running one:
 // symlinks cannot survive SMB 2.1 anyway, so nothing here pretends to be a
 // faithful copy of the original tree. Files come out 0444 and directories 0555
@@ -121,7 +141,7 @@ use crate::config::Profile;
 use crate::local_server;
 use backing::{Backing, SnapshotBacking};
 use files::Handles;
-use proto::{HEADER_LEN, Header, NEXT_COMMAND_OFFSET, cmd, status, write_error_body};
+use proto::{HEADER_LEN, Header, NEXT_COMMAND_OFFSET, cmd, flags, status, write_error_body};
 pub(crate) use session::Credentials;
 use session::{SessionState, TreeKind};
 use wire::{MAX_INBOUND_MESSAGE, NBSS_HEADER_LEN, Reader, Writer, nbss_header, nbss_len};
@@ -132,6 +152,9 @@ fn status_name(status: u32) -> String {
         status::SUCCESS => "SUCCESS",
         status::MORE_PROCESSING_REQUIRED => "MORE_PROCESSING_REQUIRED",
         status::NO_MORE_FILES => "NO_MORE_FILES",
+        status::NO_SUCH_FILE => "NO_SUCH_FILE",
+        status::OBJECT_NAME_COLLISION => "OBJECT_NAME_COLLISION",
+        status::LOGON_FAILURE => "LOGON_FAILURE",
         status::END_OF_FILE => "END_OF_FILE",
         status::NO_EAS_ON_FILE => "NO_EAS_ON_FILE",
         status::NOT_SUPPORTED => "NOT_SUPPORTED",
@@ -699,7 +722,10 @@ async fn serve_connection(mut stream: tokio::net::TcpStream, ctx: Arc<Ctx>) {
                 return;
             }
         }
-        let len = nbss_len(&nb);
+        let Some(len) = nbss_len(&nb) else {
+            conn_log!(conn.id, "dropping: NetBIOS message type {:#04x}", nb[0]);
+            return;
+        };
         if len == 0 {
             // Zero-length NetBIOS message: a keepalive. Nothing to answer.
             continue;
@@ -774,6 +800,54 @@ async fn serve_connection(mut stream: tokio::net::TcpStream, ctx: Arc<Ctx>) {
         }
     }
 }
+
+/// One request out of a (possibly compounded) message, with the identity it
+/// actually runs under.
+///
+/// The ids here are not always the ones in `hdr`: a related request carries
+/// 0xFF..FF placeholders and inherits the real values from the request before
+/// it in the chain. Handlers read them from here so that no handler has to know
+/// whether it is part of a chain.
+struct Request<'a> {
+    hdr: &'a Header,
+    body: &'a [u8],
+    /// The slice this request's offsets are relative to — its own header
+    /// onwards, not the whole compound message.
+    message: &'a [u8],
+    session_id: u64,
+    tree_id: u32,
+    /// Whether SMB2_FLAGS_RELATED_OPERATIONS was set, which is what makes the
+    /// 0xFF..FF FileId placeholder meaningful.
+    related: bool,
+    is_only: bool,
+}
+
+/// State carried along one compound message.
+struct Chain {
+    /// Identity a related request inherits. Initialised to values no session or
+    /// tree ever has, so a chain that opens with a related request — which no
+    /// client sends — is refused rather than inheriting whatever ran last.
+    session_id: u64,
+    tree_id: u32,
+    /// The status of the first CREATE in this chain that failed, if any.
+    create_error: Option<u32>,
+}
+
+impl Default for Chain {
+    fn default() -> Self {
+        Self {
+            session_id: u64::MAX,
+            tree_id: u32::MAX,
+            create_error: None,
+        }
+    }
+}
+
+/// Ceiling on the responses assembled from one compound message. Well above any
+/// real chain — a Windows CREATE+QUERY+CLOSE answers in a few hundred bytes, and
+/// a single READ is capped at `MAX_READ_SIZE` — so it bounds only the
+/// pathological case of a long chain of maximal reads.
+const MAX_COMPOUND_RESPONSE: usize = 8 * 1024 * 1024;
 
 /// A successful response: body plus any header fields the handler needs to
 /// override. Most commands echo the request's session and tree ids, but
@@ -874,7 +948,10 @@ impl Conn {
 
         let mut out = Writer::with_capacity(msg.len().max(256));
         let mut offset = 0usize;
-        let mut first = true;
+        // Identity carried along a related chain, and the failure that poisons
+        // the rest of it. Scoped to this message: a chain cannot reach back into
+        // the one before it.
+        let mut chain = Chain::default();
 
         loop {
             let chunk = msg.get(offset..)?;
@@ -892,7 +969,47 @@ impl Conn {
                 next
             };
             let body = chunk.get(HEADER_LEN..end)?;
-            let is_only = first && next == 0;
+            let is_only = offset == 0 && next == 0;
+
+            // A related request inherits the session and tree of the one before
+            // it (MS-SMB2 3.3.5.2.7.1), which is how a client avoids repeating
+            // ids it may not know yet. Every client tested here fills in the
+            // real ids anyway, so this substitution is a no-op for them — it
+            // exists so that one which sends the 0xFF..FF placeholders is not
+            // refused. Samba substitutes unconditionally on the flag
+            // (smb2_server.c:2580-2582, :2629-2631). The placeholders are *not*
+            // echoed back: the response header carries whatever the request
+            // carried, as Samba's does (smb2_server.c:1192-1195).
+            // A second NEGOTIATE once the dialect is settled is a protocol
+            // error, not a re-negotiation: MS-SMB2 3.3.5.3 has the server drop
+            // the connection, and Samba does (smb2_server.c:3070-3088).
+            // Otherwise a peer could reset the connection's negotiated state
+            // from under an authenticated session. Checked here rather than in
+            // `execute`, because only this level can actually drop — `execute`
+            // returning None means "answer with silence", which is CANCEL's
+            // contract and would leave this client waiting for a timeout.
+            if hdr.command == cmd::NEGOTIATE && self.state.negotiated {
+                conn_log!(self.id, "dropping: NEGOTIATE after the dialect was settled");
+                return None;
+            }
+
+            let related = hdr.flags & flags::RELATED_OPERATIONS != 0;
+            let req = Request {
+                hdr: &hdr,
+                body,
+                message: chunk,
+                session_id: if related { chain.session_id } else { hdr.session_id },
+                tree_id: if related { chain.tree_id } else { hdr.tree_id },
+                related,
+                is_only,
+            };
+            if !related {
+                // The compound placeholder is only meaningful inside a chain.
+                // Samba clears its equivalent on every unchained request
+                // (smb2_server.c:3183-3185); leaving it set would let a later
+                // stray 0xFF..FF resolve onto a handle from an earlier chain.
+                self.handles.clear_chain();
+            }
 
             if log_enabled() && hdr.command == cmd::NEGOTIATE {
                 conn_log!(
@@ -915,7 +1032,16 @@ impl Conn {
             }
 
             let start = out.len();
-            match self.execute(&hdr, body, chunk, is_only) {
+            // A CREATE that failed earlier in this chain poisons every related
+            // request after it: those name its handle, which does not exist.
+            // Answering them individually is what lets a CLOSE addressed to the
+            // failed open resolve onto some *other* live handle and shut it —
+            // Samba returns the original failure instead (smb2_server.c:3319-3325).
+            let outcome = match chain.create_error {
+                Some(st) if related => Some(Err(st)),
+                _ => self.execute(&req),
+            };
+            match outcome {
                 Some(Ok(reply)) => {
                     conn_log!(
                         self.id,
@@ -924,6 +1050,13 @@ impl Conn {
                         status_name(reply.status),
                         reply.body.len()
                     );
+                    // A command that establishes an identity hands it to the
+                    // rest of the chain; everything else confirms the one it
+                    // ran under.
+                    chain.session_id = reply.session_id.unwrap_or(req.session_id);
+                    if hdr.command != cmd::TREE_DISCONNECT {
+                        chain.tree_id = reply.tree_id.unwrap_or(req.tree_id);
+                    }
                     hdr.write_response(
                         &mut out,
                         reply.status,
@@ -935,6 +1068,9 @@ impl Conn {
                 }
                 Some(Err(st)) => {
                     conn_log!(self.id, "{} -> {}", cmd::name(hdr.command), status_name(st));
+                    if hdr.command == cmd::CREATE && chain.create_error.is_none() {
+                        chain.create_error = Some(st);
+                    }
                     hdr.write_response(
                         &mut out,
                         st,
@@ -952,6 +1088,17 @@ impl Conn {
             if next == 0 {
                 break;
             }
+            // One inbound message is capped at MAX_INBOUND_MESSAGE, but its
+            // responses are not bounded by it: a chain of READs is tiny on the
+            // way in and a megabyte each on the way out. Stop assembling rather
+            // than let one message ask for an unbounded allocation.
+            if out.len() > MAX_COMPOUND_RESPONSE {
+                conn_log!(
+                    self.id,
+                    "dropping: compound response exceeded {MAX_COMPOUND_RESPONSE} bytes"
+                );
+                return None;
+            }
             // Each compounded response starts on an 8-byte boundary, and its
             // NextCommand holds the distance to the one that follows.
             out.align_to(8);
@@ -959,7 +1106,6 @@ impl Conn {
             out.patch_u32(start + NEXT_COMMAND_OFFSET, this_len);
 
             offset += next;
-            first = false;
             if offset >= msg.len() {
                 break;
             }
@@ -968,20 +1114,42 @@ impl Conn {
         Some(out.into_vec())
     }
 
-    /// Run one request. `message` is the slice this request's offsets are
-    /// relative to — its own header, not the whole compound message.
-    fn execute(
-        &mut self,
-        hdr: &Header,
-        body: &[u8],
-        message: &[u8],
-        is_only: bool,
-    ) -> Option<Result<Reply, u32>> {
-        // Anything except NEGOTIATE and SESSION_SETUP needs a live session.
-        // Skipping this check would let an unauthenticated peer reach the file
-        // handlers, which is the whole reason a session exists.
-        let needs_session = !matches!(hdr.command, cmd::NEGOTIATE | cmd::SESSION_SETUP);
-        if needs_session && (!self.state.authenticated || hdr.session_id != self.state.session_id) {
+    /// Run one request.
+    fn execute(&mut self, req: &Request<'_>) -> Option<Result<Reply, u32>> {
+        let hdr = req.hdr;
+        let (body, message) = (req.body, req.message);
+
+        // CANCEL is answered with silence (MS-SMB2 3.3.5.16), including when it
+        // names a session that is gone — checked before the session gate, which
+        // would otherwise turn it into an error response and desynchronise the
+        // client's message-id tracking.
+        if hdr.command == cmd::CANCEL {
+            return if req.is_only {
+                None
+            } else {
+                // Compounded CANCEL is not a thing a client sends; refusing it
+                // keeps the chain's response count matching its request count.
+                Some(Err(status::NOT_SUPPORTED))
+            };
+        }
+
+        // Anything except NEGOTIATE, SESSION_SETUP and ECHO needs a live
+        // session. Skipping this check would let an unauthenticated peer reach
+        // the file handlers, which is the whole reason a session exists.
+        //
+        // ECHO is exempt because cifs.ko's keepalive carries no session id at
+        // all — it builds the header with a NULL tcon, so SessionId is 0 — and
+        // an idle mount sends one every `echo_interval` (60s by default).
+        // Refusing it kills the connection the keepalive exists to hold open.
+        // Samba's dispatch table marks SMB2_OP_KEEPALIVE with neither
+        // need_session nor need_tcon (smb2_server.c:139-140).
+        let needs_session = !matches!(
+            hdr.command,
+            cmd::NEGOTIATE | cmd::SESSION_SETUP | cmd::ECHO
+        );
+        if needs_session
+            && (!self.state.authenticated || req.session_id != self.state.session_id)
+        {
             return Some(Err(status::USER_SESSION_DELETED));
         }
 
@@ -993,6 +1161,14 @@ impl Conn {
                 &mut self.state,
             )
             .map(Reply::ok),
+
+            // The mirror of the rule above: nothing may precede NEGOTIATE. A
+            // SESSION_SETUP without one would run the whole NTLM exchange on a
+            // connection that never agreed a dialect.
+            cmd::SESSION_SETUP if !self.state.negotiated => {
+                conn_log!(self.id, "SESSION_SETUP before NEGOTIATE");
+                return Some(Err(status::INVALID_PARAMETER));
+            }
 
             cmd::SESSION_SETUP => {
                 // Once the server-wide limit is reached, nothing authenticates
@@ -1055,40 +1231,48 @@ impl Conn {
                 Ok(Reply::ok(session::simple_ack()))
             }
 
-            cmd::TREE_CONNECT => {
-                session::tree_connect(body, message, &self.ctx.share_name, &mut self.state)
-                    .map(|(b, _kind, tree_id)| Reply::ok(b).tree(tree_id))
-            }
+            cmd::TREE_CONNECT => session::tree_connect(
+                body,
+                message,
+                &self.ctx.share_name,
+                &mut self.state,
+            )
+            .map(|(b, kind, tree_id)| {
+                // A second IPC$ connect replaces the tree id the pipe was
+                // opened under. The pipe itself is per-connection, so leaving
+                // it open would have it answer under the new tree while the
+                // client believes it opened nothing there yet.
+                if kind == TreeKind::Ipc {
+                    self.pipe = None;
+                }
+                Reply::ok(b).tree(tree_id)
+            }),
 
-            cmd::TREE_DISCONNECT => {
-                if self.tree_kind(hdr.tree_id).is_none() {
-                    Err(status::NETWORK_NAME_DELETED)
-                } else {
+            cmd::TREE_DISCONNECT => match self.state.remove_tree(req.tree_id) {
+                None => Err(status::NETWORK_NAME_DELETED),
+                Some(kind) => {
                     // Handles opened through this tree die with it. A client is
                     // supposed to CLOSE each one first, but nothing makes it,
                     // and a handle left behind is unreachable — its tree id is
                     // gone — while still pinning an open file and its blob
-                    // index for as long as the connection lasts.
-                    self.handles.close_tree(hdr.tree_id);
-                    if self.state.disk_tree_id == Some(hdr.tree_id) {
-                        self.state.disk_tree_id = None;
-                    }
-                    if self.state.ipc_tree_id == Some(hdr.tree_id) {
-                        self.state.ipc_tree_id = None;
+                    // index for as long as the connection lasts. Only this
+                    // tree's handles: another tree may still be connected to
+                    // the same share, and its opens have to survive.
+                    self.handles.close_tree(req.tree_id);
+                    if kind == TreeKind::Ipc {
                         // The pipe lives on that tree; leaving it open would
-                        // strand a buffer no command could reach again.
+                        // strand a buffer no command could reach again. There
+                        // is one pipe per connection, so a second IPC$ tree
+                        // would have to reopen it — which is what a client that
+                        // wants one does anyway, and TREE_CONNECT to IPC$
+                        // already clears it for that reason.
                         self.pipe = None;
                     }
                     Ok(Reply::ok(session::simple_ack()))
                 }
-            }
+            },
 
             cmd::ECHO => Ok(Reply::ok(session::simple_ack())),
-
-            // CANCEL has no response. Answering it would desynchronise the
-            // client's message-id tracking.
-            cmd::CANCEL if is_only => return None,
-            cmd::CANCEL => Err(status::NOT_SUPPORTED),
 
             // The one write wrustic accepts: a DCE/RPC request handed to the
             // srvsvc pipe on IPC$, which lands in a bounded in-memory buffer.
@@ -1096,8 +1280,13 @@ impl Conn {
             // so a client learns the share is read-only from the operation
             // itself rather than from a confusing failure further along. The
             // snapshot tree has no writable path at all, here or below.
-            cmd::WRITE if self.is_srvsvc_pipe(hdr) => {
+            cmd::WRITE if self.is_srvsvc_pipe(req.tree_id) => {
                 srvsvc::write(body, message, &mut self.pipe, &self.ctx.share_name).map(Reply::ok)
+            }
+            // A WRITE to IPC$ with no pipe open is a closed handle, not a
+            // read-only medium — IPC$ has no medium to protect.
+            cmd::WRITE if matches!(self.tree_kind(req.tree_id), Some(TreeKind::Ipc)) => {
+                Err(status::FILE_CLOSED)
             }
             cmd::WRITE | cmd::SET_INFO | cmd::FLUSH => Err(status::MEDIA_WRITE_PROTECTED),
 
@@ -1109,9 +1298,9 @@ impl Conn {
             | cmd::CLOSE
             | cmd::READ
             | cmd::QUERY_DIRECTORY
-            | cmd::QUERY_INFO => match self.tree_kind(hdr.tree_id) {
-                Some(TreeKind::Disk) => self.file_command(hdr, body, message),
-                Some(TreeKind::Ipc) => self.ipc_command(hdr, body, message),
+            | cmd::QUERY_INFO => match self.tree_kind(req.tree_id) {
+                Some(TreeKind::Disk) => self.file_command(req),
+                Some(TreeKind::Ipc) => self.ipc_command(req),
                 None => Err(status::NETWORK_NAME_DELETED),
             },
 
@@ -1120,9 +1309,9 @@ impl Conn {
             // FSCTL_DFS_GET_REFERRALS and a couple of others during mount;
             // NOT_SUPPORTED is the answer that makes a client move on, and
             // `srvsvc::transceive` returns it for every code but its own.
-            cmd::IOCTL if self.is_srvsvc_pipe(hdr) => {
+            cmd::IOCTL if self.is_srvsvc_pipe(req.tree_id) => {
                 srvsvc::transceive(body, message, &mut self.pipe, &self.ctx.share_name)
-                    .map(Reply::ok)
+                    .map(|(body, st)| Reply::ok(body).status(st))
             }
             cmd::IOCTL => Err(status::NOT_SUPPORTED),
 
@@ -1138,21 +1327,23 @@ impl Conn {
 
     /// Dispatch to the file handlers. Split out so the tree check above stays
     /// legible and so every one of these shares a single entry point.
-    fn file_command(&mut self, hdr: &Header, body: &[u8], message: &[u8]) -> Result<Reply, u32> {
+    fn file_command(&mut self, req: &Request<'_>) -> Result<Reply, u32> {
         let backing = self.ctx.backing.as_ref();
-        match hdr.command {
+        let (body, message, related) = (req.body, req.message, req.related);
+        match req.hdr.command {
             cmd::CREATE => {
-                files::create(body, message, backing, &mut self.handles, hdr.tree_id)
+                files::create(body, message, backing, &mut self.handles, req.tree_id)
                     .map(Reply::ok)
             }
-            cmd::CLOSE => files::close(body, &mut self.handles).map(Reply::ok),
-            cmd::READ => files::read(body, backing, &mut self.handles).map(Reply::ok),
+            cmd::CLOSE => files::close(body, &mut self.handles, related).map(Reply::ok),
+            cmd::READ => files::read(body, backing, &mut self.handles, related).map(Reply::ok),
             cmd::QUERY_DIRECTORY => files::query_directory(
                 body,
                 message,
                 backing,
                 &mut self.handles,
                 self.ctx.boot_time,
+                related,
             )
             .map(Reply::ok),
             cmd::QUERY_INFO => files::query_info(
@@ -1161,6 +1352,7 @@ impl Conn {
                 &self.handles,
                 self.ctx.boot_time,
                 self.ctx.volume_serial,
+                related,
             )
             .map(|(body, st)| Reply::ok(body).status(st)),
             _ => Err(status::NOT_SUPPORTED),
@@ -1173,16 +1365,16 @@ impl Conn {
     /// exception to "nothing is writable": the tree must be IPC$ *and* a pipe
     /// must already have been opened on it by CREATE. A request on the snapshot
     /// tree can never satisfy this.
-    fn is_srvsvc_pipe(&self, hdr: &Header) -> bool {
-        matches!(self.tree_kind(hdr.tree_id), Some(TreeKind::Ipc)) && self.pipe.is_some()
+    fn is_srvsvc_pipe(&self, tree_id: u32) -> bool {
+        matches!(self.tree_kind(tree_id), Some(TreeKind::Ipc)) && self.pipe.is_some()
     }
 
     /// Commands on the IPC$ tree, which exists only to carry share enumeration.
-    fn ipc_command(&mut self, hdr: &Header, body: &[u8], message: &[u8]) -> Result<Reply, u32> {
-        match hdr.command {
-            cmd::CREATE => srvsvc::create(body, message, &mut self.pipe).map(Reply::ok),
-            cmd::CLOSE => srvsvc::close(&mut self.pipe).map(Reply::ok),
-            cmd::READ => srvsvc::read(body, &mut self.pipe).map(Reply::ok),
+    fn ipc_command(&mut self, req: &Request<'_>) -> Result<Reply, u32> {
+        match req.hdr.command {
+            cmd::CREATE => srvsvc::create(req.body, req.message, &mut self.pipe).map(Reply::ok),
+            cmd::CLOSE => srvsvc::close(req.body, &mut self.pipe).map(Reply::ok),
+            cmd::READ => srvsvc::read(req.body, &mut self.pipe).map(Reply::ok),
             // A pipe is not a directory and has no file metadata worth
             // reporting; clients ask neither of these on one.
             _ => Err(status::NOT_SUPPORTED),
@@ -1190,13 +1382,7 @@ impl Conn {
     }
 
     fn tree_kind(&self, tree_id: u32) -> Option<TreeKind> {
-        if self.state.disk_tree_id == Some(tree_id) {
-            Some(TreeKind::Disk)
-        } else if self.state.ipc_tree_id == Some(tree_id) {
-            Some(TreeKind::Ipc)
-        } else {
-            None
-        }
+        self.state.tree_kind(tree_id)
     }
 }
 
@@ -1631,9 +1817,50 @@ mod tests {
         assert!(!conn.state.authenticated, "but the session is gone");
 
         let resp = conn
-            .handle_message(&request(cmd::ECHO, session_id, 0, &[4, 0, 0, 0]))
+            .handle_message(&request(
+                cmd::TREE_CONNECT,
+                session_id,
+                0,
+                &tree_connect_body(r"\\127.0.0.1\snap"),
+            ))
             .expect("answered");
         assert_eq!(parse_response(&resp).status, status::USER_SESSION_DELETED);
+    }
+
+    /// cifs.ko sends its keepalive with a NULL tcon, so SessionId is 0 and the
+    /// header is unsigned. Requiring a session for ECHO turns the one message
+    /// that exists to hold an idle mount open into the thing that drops it —
+    /// every `echo_interval`, silently. Samba's dispatch table marks
+    /// SMB2_OP_KEEPALIVE with neither need_session nor need_tcon.
+    #[test]
+    fn a_session_less_echo_is_answered_rather_than_refused() {
+        let (mut conn, _session_id) = connected();
+        let resp = conn
+            .handle_message(&request(cmd::ECHO, 0, 0, &[4, 0, 0, 0]))
+            .expect("answered");
+        assert_eq!(parse_response(&resp).status, status::SUCCESS);
+    }
+
+    /// The signing counterpart: that same keepalive carries no signature, and a
+    /// connection that has a key must still not drop it.
+    #[test]
+    fn an_unsigned_session_less_echo_passes_verification() {
+        let (conn, _session_id) = connected();
+        let key = conn.state.signing_key.expect("session is signed");
+
+        let echo = request(cmd::ECHO, 0, 0, &[4, 0, 0, 0]);
+        assert!(
+            sign::verify(&key, &echo).is_valid(),
+            "an unsigned session-0 ECHO must be accepted: {}",
+            sign::verify(&key, &echo).describe()
+        );
+
+        // The exemption is exactly that narrow: the same PDU on a real session
+        // is still refused, and so is any other command at session 0.
+        let echo = request(cmd::ECHO, 1, 0, &[4, 0, 0, 0]);
+        assert!(!sign::verify(&key, &echo).is_valid());
+        let read = request(cmd::READ, 0, 0, &[49, 0]);
+        assert!(!sign::verify(&key, &read).is_valid());
     }
 
     #[test]
@@ -1677,6 +1904,32 @@ mod tests {
             resp[HEADER_LEN + 4..HEADER_LEN + 6].try_into().unwrap(),
         );
         assert_eq!(dialect, proto::DIALECT_SMB_2_1);
+    }
+
+    /// NEGOTIATE settles the dialect once. A second one is a protocol error,
+    /// and answering it would let a peer reset the connection's negotiated
+    /// state from under an authenticated session.
+    #[test]
+    fn a_second_negotiate_drops_the_connection() {
+        let mut conn = Conn::new(ctx());
+        let neg = request(cmd::NEGOTIATE, 0, 0, &negotiate_body(&[0x0210]));
+        assert!(conn.handle_message(&neg).is_some(), "the first is answered");
+        assert!(
+            conn.handle_message(&neg).is_none(),
+            "the second must drop the connection, not be answered"
+        );
+    }
+
+    /// The mirror: the NTLM exchange must not run on a connection that never
+    /// agreed a dialect.
+    #[test]
+    fn session_setup_before_negotiate_is_refused() {
+        let mut conn = Conn::new(ctx());
+        let resp = conn
+            .handle_message(&request(cmd::SESSION_SETUP, 0, 0, &session_setup_body(1)))
+            .expect("answered rather than dropped");
+        assert_eq!(parse_response(&resp).status, status::INVALID_PARAMETER);
+        assert!(conn.state.server_challenge.is_none(), "no challenge issued");
     }
 
     #[test]
@@ -1748,6 +2001,268 @@ mod tests {
         );
     }
 
+    /// Build a compound message from a list of (command, body, related)
+    /// requests, chaining them the way a client does: each padded to an 8-byte
+    /// boundary with NextCommand pointing at the one after it, and every
+    /// related request carrying the 0xFF..FF session and tree placeholders.
+    fn compound(session_id: u64, tree_id: u32, parts: &[(u16, Vec<u8>, bool)]) -> Vec<u8> {
+        let mut msg: Vec<u8> = Vec::new();
+        let mut starts: Vec<usize> = Vec::new();
+        for (command, body, related) in parts {
+            let start = msg.len();
+            starts.push(start);
+            let (sid, tid, flags) = if *related {
+                (u64::MAX, u32::MAX, proto::flags::RELATED_OPERATIONS)
+            } else {
+                (session_id, tree_id, 0)
+            };
+            msg.extend_from_slice(&request_with(*command, sid, tid, body, 0, flags));
+            while !msg.len().is_multiple_of(8) {
+                msg.push(0);
+            }
+        }
+        // Patch each NextCommand to the distance to its successor.
+        for (i, &start) in starts.iter().enumerate() {
+            let end = starts.get(i + 1).copied().unwrap_or(msg.len());
+            let next = if i + 1 < starts.len() {
+                (end - start) as u32
+            } else {
+                0
+            };
+            msg[start + NEXT_COMMAND_OFFSET..start + NEXT_COMMAND_OFFSET + 4]
+                .copy_from_slice(&next.to_le_bytes());
+        }
+        msg
+    }
+
+    /// Walk a compound response into its per-request headers.
+    fn chained_responses(resp: &[u8]) -> Vec<Header> {
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        loop {
+            let h = parse_response(&resp[at..]);
+            let next = h.next_command as usize;
+            out.push(h);
+            if next == 0 {
+                break;
+            }
+            at += next;
+        }
+        out
+    }
+
+    fn create_body_for(name: &str) -> Vec<u8> {
+        let encoded = utf16le(name);
+        let mut w = Writer::new();
+        w.u16(57);
+        w.u8(0); // SecurityFlags
+        w.u8(0); // RequestedOplockLevel
+        w.u32(2); // ImpersonationLevel
+        w.u64(0); // SmbCreateFlags
+        w.u64(0); // Reserved
+        w.u32(0x0012_0089); // DesiredAccess — read
+        w.u32(0); // FileAttributes
+        w.u32(7); // ShareAccess
+        w.u32(1); // CreateDisposition — OPEN
+        w.u32(0); // CreateOptions
+        w.u16((HEADER_LEN + 56) as u16); // NameOffset
+        w.u16(encoded.len() as u16);
+        w.u32(0); // CreateContextsOffset
+        w.u32(0); // CreateContextsLength
+        w.bytes(&encoded);
+        w.into_vec()
+    }
+
+    fn close_body_for(file_id: u64) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.u16(24);
+        w.u16(0); // Flags
+        w.u32(0); // Reserved
+        w.u64(file_id); // Persistent
+        w.u64(file_id); // Volatile
+        w.into_vec()
+    }
+
+    fn query_info_body_for(file_id: u64) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.u16(41);
+        w.u8(1); // InfoType — FILE
+        w.u8(5); // FileStandardInformation
+        w.u32(4096); // OutputBufferLength
+        w.u16(0);
+        w.u16(0);
+        w.u32(0);
+        w.u32(0);
+        w.u32(0);
+        w.u64(file_id);
+        w.u64(file_id);
+        w.into_vec()
+    }
+
+    /// Connect the disk tree and return its id.
+    fn connect_tree(conn: &mut Conn, session_id: u64) -> u32 {
+        let resp = conn
+            .handle_message(&request(
+                cmd::TREE_CONNECT,
+                session_id,
+                0,
+                &tree_connect_body(r"\\127.0.0.1\snap"),
+            ))
+            .expect("tree connect answered");
+        parse_response(&resp).tree_id
+    }
+
+    /// A compound in the fully-placeholder form the spec allows: CREATE, then
+    /// QUERY_INFO and CLOSE chained behind it with placeholder session, tree
+    /// and file ids.
+    ///
+    /// No client tested against this server sends that form — Windows 11 fills
+    /// in the real ids even on the requests it flags RELATED — but the spec
+    /// permits it and Samba implements it, and checking the header's own
+    /// SessionId against the session answers the whole chain with
+    /// USER_SESSION_DELETED. MS-SMB2 3.3.5.2.7.1 has the server inherit them
+    /// from the previous request; Samba substitutes unconditionally on the
+    /// CHAINED flag (smb2_server.c:2580-2582, :2629-2631).
+    #[test]
+    fn a_related_compound_inherits_the_session_and_tree_of_its_chain() {
+        let (mut conn, session_id) = connected();
+        let tree_id = connect_tree(&mut conn, session_id);
+
+        let msg = compound(
+            session_id,
+            tree_id,
+            &[
+                (cmd::CREATE, create_body_for("docs\\readme.txt"), false),
+                (cmd::QUERY_INFO, query_info_body_for(u64::MAX), true),
+                (cmd::CLOSE, close_body_for(u64::MAX), true),
+            ],
+        );
+        let resp = conn.handle_message(&msg).expect("answered");
+        let headers = chained_responses(&resp);
+
+        assert_eq!(headers.len(), 3, "one response per request");
+        for (h, name) in headers.iter().zip(["CREATE", "QUERY_INFO", "CLOSE"]) {
+            assert_eq!(
+                h.status,
+                status::SUCCESS,
+                "{name} in a related chain must succeed, got {}",
+                status_name(h.status)
+            );
+        }
+        assert_eq!(conn.handles.len(), 0, "the chain's CLOSE released the handle");
+    }
+
+    /// A CREATE that fails poisons the rest of its chain. The requests after it
+    /// name a handle that was never opened; answering them individually is what
+    /// lets a CLOSE carrying the placeholder resolve onto some *other* live
+    /// handle and shut it. Windows probes for desktop.ini and Thumbs.db with
+    /// exactly this shape constantly, so a failing one is routine.
+    #[test]
+    fn a_failed_create_poisons_the_rest_of_its_chain() {
+        let (mut conn, session_id) = connected();
+        let tree_id = connect_tree(&mut conn, session_id);
+
+        // A handle the client still holds, opened by an earlier message.
+        let resp = conn
+            .handle_message(&request(
+                cmd::CREATE,
+                session_id,
+                tree_id,
+                &create_body_for("docs\\readme.txt"),
+            ))
+            .expect("answered");
+        assert_eq!(parse_response(&resp).status, status::SUCCESS);
+        assert_eq!(conn.handles.len(), 1);
+
+        // Now the probe: CREATE a path that does not exist, with QUERY_INFO and
+        // CLOSE chained behind it on the placeholder.
+        let msg = compound(
+            session_id,
+            tree_id,
+            &[
+                (cmd::CREATE, create_body_for("docs\\desktop.ini"), false),
+                (cmd::QUERY_INFO, query_info_body_for(u64::MAX), true),
+                (cmd::CLOSE, close_body_for(u64::MAX), true),
+            ],
+        );
+        let resp = conn.handle_message(&msg).expect("answered");
+        let headers = chained_responses(&resp);
+
+        assert_eq!(headers.len(), 3);
+        assert_eq!(headers[0].status, status::OBJECT_NAME_NOT_FOUND);
+        for h in &headers[1..] {
+            assert_eq!(
+                h.status,
+                status::OBJECT_NAME_NOT_FOUND,
+                "the failed CREATE's status must carry down the chain"
+            );
+        }
+        assert_eq!(
+            conn.handles.len(),
+            1,
+            "the unrelated handle the client still holds must survive"
+        );
+    }
+
+    /// TREE_CONNECT hands its new tree id to the rest of the chain, which is
+    /// how a client mounts and opens in one round trip. Samba does the same
+    /// (`req->last_tid = tcon->global->tcon_wire_id`, smb2_tcon.c:510).
+    #[test]
+    fn a_related_request_inherits_a_tree_the_same_chain_connected() {
+        let (mut conn, session_id) = connected();
+        let msg = compound(
+            session_id,
+            0,
+            &[
+                (cmd::TREE_CONNECT, tree_connect_body(r"\\127.0.0.1\snap"), false),
+                (cmd::CREATE, create_body_for("docs"), true),
+            ],
+        );
+        let resp = conn.handle_message(&msg).expect("answered");
+        let headers = chained_responses(&resp);
+        assert_eq!(headers.len(), 2);
+        assert_eq!(headers[0].status, status::SUCCESS, "tree connect");
+        assert_eq!(
+            headers[1].status,
+            status::SUCCESS,
+            "the CREATE must run on the tree its chain just connected, got {}",
+            status_name(headers[1].status)
+        );
+    }
+
+    /// The placeholder must not survive the message that set it. Two separate
+    /// messages are two separate chains, however they are flagged.
+    #[test]
+    fn the_compound_placeholder_does_not_leak_between_messages() {
+        let (mut conn, session_id) = connected();
+        let tree_id = connect_tree(&mut conn, session_id);
+
+        let resp = conn
+            .handle_message(&request(
+                cmd::CREATE,
+                session_id,
+                tree_id,
+                &create_body_for("docs\\readme.txt"),
+            ))
+            .expect("answered");
+        assert_eq!(parse_response(&resp).status, status::SUCCESS);
+
+        // A fresh message whose first request carries the placeholder inherits
+        // nothing — there is no previous request in *this* chain.
+        let msg = compound(
+            session_id,
+            tree_id,
+            &[(cmd::CLOSE, close_body_for(u64::MAX), true)],
+        );
+        let resp = conn.handle_message(&msg).expect("answered");
+        assert_ne!(
+            parse_response(&resp).status,
+            status::SUCCESS,
+            "a chain cannot reach back into the one before it"
+        );
+        assert_eq!(conn.handles.len(), 1, "the handle must still be open");
+    }
+
     #[test]
     fn a_compound_chain_pointing_out_of_bounds_drops_the_connection() {
         let (mut conn, session_id) = connected();
@@ -1798,6 +2313,49 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(parse_response(&resp).status, status::NETWORK_NAME_DELETED);
+    }
+
+    /// macOS connects the share again while the mount is still live, then drops
+    /// the extra tree. Remembering a single disk tree id per session meant the
+    /// second connect retired the first, so everything the mount did afterwards
+    /// answered NETWORK_NAME_DELETED — Finder and `ls` reported an empty share
+    /// over a mount that was otherwise fine. Measured against macOS 26.6 smbfs,
+    /// which opened and dropped five trees over one mount.
+    #[test]
+    fn a_later_connect_to_the_same_share_leaves_the_earlier_tree_usable() {
+        let (mut conn, session_id) = connected();
+        let first = connect_tree(&mut conn, session_id);
+        let second = connect_tree(&mut conn, session_id);
+        assert_ne!(first, second, "each connect gets its own id");
+
+        let opens = |conn: &mut Conn, tree: u32| {
+            let resp = conn
+                .handle_message(&request(cmd::CREATE, session_id, tree, &create_body_for("docs")))
+                .expect("answered");
+            parse_response(&resp).status
+        };
+
+        assert_eq!(
+            opens(&mut conn, first),
+            status::SUCCESS,
+            "the earlier tree must survive a later connect to the same share"
+        );
+
+        let resp = conn
+            .handle_message(&request(
+                cmd::TREE_DISCONNECT,
+                session_id,
+                second,
+                &[4, 0, 0, 0],
+            ))
+            .expect("answered");
+        assert_eq!(parse_response(&resp).status, status::SUCCESS);
+
+        assert_eq!(
+            opens(&mut conn, first),
+            status::SUCCESS,
+            "disconnecting one tree must not take another one down with it"
+        );
     }
 
     #[test]
