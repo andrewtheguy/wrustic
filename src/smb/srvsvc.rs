@@ -6,6 +6,14 @@
 // long wait; in Finder it is connecting to `smb://host` and being shown no
 // share to pick, leaving the user to navigate to the mount point by hand.
 //
+// Explorer is answered by this module. Finder is answered only when the share
+// is served on port 445, and nothing here can widen that: macOS makes the
+// srvsvc call on a *second* connection, to port 445 and then 139, dropping the
+// port its URL was reached on. On any other port the client tree-connects to
+// IPC$, fails to reach those two ports, and disconnects without ever opening
+// the pipe — a trace that looks like a server giving up half way through and
+// is not. See docs/smb.md, "macOS only ever enumerates the standard port".
+//
 // Both go through the same mechanism: the client connects to the IPC$ tree,
 // opens the well-known `srvsvc` named pipe, and makes a DCE/RPC call to
 // NetrShareEnum. wrustic previously accepted the IPC$ tree (macOS connects to
