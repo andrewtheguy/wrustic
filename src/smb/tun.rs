@@ -22,11 +22,16 @@
 // to 445, so there is nothing for srvnet to arbitrate, and host file sharing is
 // untouched for the whole lifetime of the share.
 //
-// The routing trick that makes it work: the adapter itself is given
-// `ADAPTER_IP`, and we answer for `VIRTUAL_IP` — a second address in the same
-// /24 that is assigned to *nothing*. Windows sees an on-link route for the
-// subnet and pushes packets for VIRTUAL_IP out through the tun ring. Assign
-// VIRTUAL_IP to the adapter instead and Windows treats it as a local address,
+// The routing trick that makes it work: the adapter itself is given the
+// adapter address as a /32, and we answer for the virtual address — assigned
+// to *nothing* — which an explicit on-link /32 host route points at the tun
+// interface (the same shape WireGuard and Tailscale use). Windows pushes
+// packets for it out through the tun ring; no subnet is claimed, and the two
+// host routes are the transport's entire routing footprint. Being /32s they
+// also win longest-prefix match over anything broader — including the
+// 169.254.0.0/16 on-link route Windows adds for any APIPA interface, which
+// matters because the default addresses are link-local. Assign the virtual
+// address to the adapter instead and Windows treats it as a local address,
 // loops the traffic back internally, and the port reservation applies again —
 // which is the whole failure mode this module exists to avoid.
 //
@@ -52,7 +57,7 @@ use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
 
-use crate::cli::TunSubnet;
+use crate::cli::TunAddrs;
 
 const ADAPTER_NAME: &str = "wrustic";
 const TUNNEL_TYPE: &str = "wrustic snapshot share";
@@ -106,7 +111,7 @@ const WINTUN_DLL_SHA256: [u8; 32] = [
 /// A running tun-backed front end for a loopback SMB listener.
 ///
 /// Dropping it stops the poll thread and removes the adapter, which takes the
-/// address and the on-link route with it — nothing persists across a run.
+/// address and both host routes with it — nothing persists across a run.
 pub(crate) struct TunShare {
     virtual_ip: Ipv4Addr,
     shutdown: Arc<AtomicBool>,
@@ -130,37 +135,37 @@ impl TunShare {
         dll_dir: &Path,
         port: u16,
         forward_to: SocketAddr,
-        subnet: TunSubnet,
+        addrs: TunAddrs,
     ) -> Result<Self> {
-        let virtual_ip = subnet.virtual_ip();
-        let adapter_ip = subnet.adapter_ip();
-        let prefix_len = subnet.prefix_len();
+        let virtual_ip = addrs.virtual_ip();
+        let adapter_ip = addrs.adapter_ip();
 
-        // Refused before anything is created: claiming a subnet the machine
-        // already routes would black-hole real traffic for as long as the share
-        // is open, and the symptom (some unrelated host stops responding) would
-        // be almost impossible to connect back to a snapshot browser.
-        reject_subnet_in_use(&subnet)?;
+        // Refused before anything is created: claiming an address something on
+        // this machine already owns would divert its traffic for as long as
+        // the share is open, and the symptom (that one host stops responding)
+        // would be almost impossible to connect back to a snapshot browser.
+        reject_addresses_in_use(&addrs)?;
 
         let dll = materialise_dll(dll_dir)?;
         // SAFETY: loading a known-good signed DLL from a path we just wrote
         // ourselves inside the user's own config directory.
         let wintun = unsafe { wintun::load_from_path(&dll) }
-            .map_err(|e| adapter_hint(anyhow!("loading {}: {e}", dll.display()), &subnet))?;
+            .map_err(|e| adapter_hint(anyhow!("loading {}: {e}", dll.display()), &addrs))?;
 
         let adapter = wintun::Adapter::create(&wintun, ADAPTER_NAME, TUNNEL_TYPE, Some(ADAPTER_GUID))
             .map_err(|e| {
                 adapter_hint(
                     anyhow!("creating the `{ADAPTER_NAME}` tun adapter: {e}"),
-                    &subnet,
+                    &addrs,
                 )
             })?;
 
         // windows-sys here vs the wintun crate's older one: structurally the
         // same LUID union, different nominal type, so go through the u64.
         let luid: u64 = unsafe { adapter.get_luid().Value };
-        assign_address(luid, adapter_ip, prefix_len, &subnet)?;
-        smb_log!("tun: adapter up, {adapter_ip}/{prefix_len}, serving {virtual_ip}:{port}");
+        assign_address(luid, adapter_ip, &addrs)?;
+        add_virtual_route(luid, virtual_ip, &addrs)?;
+        smb_log!("tun: adapter up, {adapter_ip}/32, serving {virtual_ip}:{port}");
 
         let session = adapter
             .start_session(wintun::MAX_RING_CAPACITY)
@@ -172,9 +177,7 @@ impl TunShare {
             let shutdown = shutdown.clone();
             std::thread::Builder::new()
                 .name(format!("wrustic-tun-{port}"))
-                .spawn(move || {
-                    poll_loop(session, virtual_ip, prefix_len, port, forward_to, shutdown)
-                })
+                .spawn(move || poll_loop(session, virtual_ip, port, forward_to, shutdown))
                 .map_err(|e| anyhow!("spawning the tun thread: {e}"))?
         };
 
@@ -186,7 +189,7 @@ impl TunShare {
         })
     }
 
-    /// The UNC host clients should mount, e.g. `10.99.0.1`.
+    /// The UNC host clients should mount, e.g. `169.254.255.1`.
     pub(crate) fn virtual_ip(&self) -> Ipv4Addr {
         self.virtual_ip
     }
@@ -202,7 +205,7 @@ impl Drop for TunShare {
             let _ = join.join();
         }
         // Dropping the last reference removes the interface, and with it the
-        // address and the on-link route.
+        // address and both host routes.
         self.adapter = None;
         smb_log!("tun: adapter removed");
     }
@@ -269,82 +272,79 @@ refusing to load it",
 
 /// Adapter creation fails with a bare Win32 code when not elevated, which says
 /// nothing about the cause.
-fn adapter_hint(e: anyhow::Error, subnet: &TunSubnet) -> anyhow::Error {
+fn adapter_hint(e: anyhow::Error, addrs: &TunAddrs) -> anyhow::Error {
     anyhow!(
         "{e}\n\nCreating a network adapter requires administrator rights. Run \
 wrustic elevated to serve on port 445, or drop --smb-tun and mount the ordinary \
 loopback share instead.\n\
-While the share is up, {} is routed to the tun adapter (change it with \
---smb-tun-subnet).",
-        subnet.cidr()
+While the share is up, {addrs} route to the tun adapter (change the address \
+with --smb-tun-ip)."
     )
 }
 
-/// Refuse a subnet the machine already has a specific route for.
+/// Refuse an address something on this machine already owns or host-routes.
 ///
-/// Every address is "routable" on a machine with a default gateway, so the
-/// question is not whether a route exists but whether a *more specific* one
-/// does: `GetBestRoute2` returning a prefix length of 0 means the default route
-/// matched and the range is free, while anything longer means some real
-/// interface already owns it and adding ours would hijack that traffic.
-fn reject_subnet_in_use(subnet: &TunSubnet) -> Result<()> {
+/// Only an exact /32 match counts as taken. Broader matches must NOT trip
+/// this: the transport's own routes are /32s, which win longest-prefix match
+/// over anything wider, so a covering route (a machine's real /24, or the
+/// 169.254.0.0/16 on-link route Windows adds for every APIPA interface — the
+/// common case now that the default addresses are link-local) loses exactly
+/// two addresses while the share is open and keeps the rest of its range. A
+/// /32 match, though, means a local address or host route genuinely owns the
+/// address, and claiming it would divert that traffic.
+fn reject_addresses_in_use(addrs: &TunAddrs) -> Result<()> {
     use windows_sys::Win32::NetworkManagement::IpHelper::{GetBestRoute2, MIB_IPFORWARD_ROW2};
     use windows_sys::Win32::Networking::WinSock::{AF_INET, SOCKADDR_INET};
 
-    let virtual_ip = subnet.virtual_ip();
-    // SAFETY: both structures are zeroed, and only the destination address is
-    // read by the call; the outputs are written entirely by the API.
-    let (rc, prefix_len) = unsafe {
-        let mut dest: SOCKADDR_INET = std::mem::zeroed();
-        dest.si_family = AF_INET;
-        dest.Ipv4.sin_family = AF_INET;
-        dest.Ipv4.sin_addr.S_un.S_addr = u32::from_ne_bytes(virtual_ip.octets());
+    for addr in [addrs.virtual_ip(), addrs.adapter_ip()] {
+        // SAFETY: both structures are zeroed, and only the destination address
+        // is read by the call; the outputs are written entirely by the API.
+        let (rc, prefix_len) = unsafe {
+            let mut dest: SOCKADDR_INET = std::mem::zeroed();
+            dest.si_family = AF_INET;
+            dest.Ipv4.sin_family = AF_INET;
+            dest.Ipv4.sin_addr.S_un.S_addr = u32::from_ne_bytes(addr.octets());
 
-        let mut row: MIB_IPFORWARD_ROW2 = std::mem::zeroed();
-        let mut best_source: SOCKADDR_INET = std::mem::zeroed();
-        let rc = GetBestRoute2(
-            std::ptr::null(),
-            0,
-            std::ptr::null(),
-            &dest,
-            0,
-            &mut row,
-            &mut best_source,
-        );
-        (rc, row.DestinationPrefix.PrefixLength)
-    };
+            let mut row: MIB_IPFORWARD_ROW2 = std::mem::zeroed();
+            let mut best_source: SOCKADDR_INET = std::mem::zeroed();
+            let rc = GetBestRoute2(
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                &dest,
+                0,
+                &mut row,
+                &mut best_source,
+            );
+            (rc, row.DestinationPrefix.PrefixLength)
+        };
 
-    // A failure here means Windows has no route at all, which is exactly the
-    // free case; only a successful lookup can tell us the range is taken.
-    if rc == 0 && prefix_len > 0 {
-        return Err(anyhow!(
-            "{} is already routed by this machine (a /{prefix_len} route matches {virtual_ip}). \
+        // A failure here means Windows has no route at all, which is exactly
+        // the free case; only a successful lookup can tell us it is taken.
+        if rc == 0 && prefix_len == 32 {
+            return Err(anyhow!(
+                "{addr} is already owned by this machine (a /32 route matches it). \
 Serving the share there would divert that traffic for as long as it is open. \
-Pick a free range with --smb-tun-subnet.",
-            subnet.cidr()
-        ));
+Pick a free address with --smb-tun-ip."
+            ));
+        }
     }
     Ok(())
 }
 
-/// Add a unicast address to the interface through iphlpapi.
+/// ERROR_OBJECT_ALREADY_EXISTS — a previous adapter with this GUID left the
+/// address or route behind, which is exactly the state we want anyway.
+const ALREADY_EXISTS: u32 = 5010;
+
+/// Add a unicast /32 to the interface through iphlpapi.
 ///
 /// Not `netsh`: the wintun crate's own address setters shell out to it, which
 /// means parsing localised output to tell success from failure.
-fn assign_address(
-    luid_value: u64,
-    addr: Ipv4Addr,
-    prefix_len: u8,
-    subnet: &TunSubnet,
-) -> Result<()> {
+fn assign_address(luid_value: u64, addr: Ipv4Addr, addrs: &TunAddrs) -> Result<()> {
     use windows_sys::Win32::NetworkManagement::IpHelper::{
         CreateUnicastIpAddressEntry, InitializeUnicastIpAddressEntry, MIB_UNICASTIPADDRESS_ROW,
     };
     use windows_sys::Win32::Networking::WinSock::{AF_INET, IpDadStatePreferred};
-
-    /// ERROR_OBJECT_ALREADY_EXISTS — a previous adapter with this GUID left the
-    /// address behind, which is exactly the state we want anyway.
-    const ALREADY_EXISTS: u32 = 5010;
 
     // SAFETY: `row` is zeroed and then initialised by the API itself before we
     // fill in the fields it documents as caller-supplied.
@@ -355,7 +355,7 @@ fn assign_address(
         row.Address.si_family = AF_INET;
         row.Address.Ipv4.sin_family = AF_INET;
         row.Address.Ipv4.sin_addr.S_un.S_addr = u32::from_ne_bytes(addr.octets());
-        row.OnLinkPrefixLength = prefix_len;
+        row.OnLinkPrefixLength = 32;
         // Otherwise the address stays tentative pending duplicate-address
         // detection, which on a tun with no peer never completes.
         row.DadState = IpDadStatePreferred;
@@ -363,8 +363,43 @@ fn assign_address(
     };
     if rc != 0 && rc != ALREADY_EXISTS {
         return Err(adapter_hint(
-            anyhow!("assigning {addr}/{prefix_len} to the tun adapter failed with Win32 error {rc}"),
-            subnet,
+            anyhow!("assigning {addr}/32 to the tun adapter failed with Win32 error {rc}"),
+            addrs,
+        ));
+    }
+    Ok(())
+}
+
+/// Route the virtual address at the tun with an explicit on-link /32.
+///
+/// A /32 address assignment produces no subnet route as a side effect, so the
+/// virtual address needs a route of its own — the same shape WireGuard and
+/// Tailscale install: `CreateIpForwardEntry2` against the interface LUID with
+/// the next hop left unspecified, which makes it on-link. The route is owned
+/// by the interface, so it disappears with the adapter on every exit path,
+/// clean or killed, exactly like the address does.
+fn add_virtual_route(luid_value: u64, addr: Ipv4Addr, addrs: &TunAddrs) -> Result<()> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        CreateIpForwardEntry2, InitializeIpForwardEntry, MIB_IPFORWARD_ROW2,
+    };
+    use windows_sys::Win32::Networking::WinSock::AF_INET;
+
+    // SAFETY: `row` is zeroed and then initialised by the API itself before we
+    // fill in the fields it documents as caller-supplied.
+    let rc = unsafe {
+        let mut row: MIB_IPFORWARD_ROW2 = std::mem::zeroed();
+        InitializeIpForwardEntry(&mut row);
+        row.InterfaceLuid.Value = luid_value;
+        row.DestinationPrefix.PrefixLength = 32;
+        row.DestinationPrefix.Prefix.Ipv4.sin_family = AF_INET;
+        row.DestinationPrefix.Prefix.Ipv4.sin_addr.S_un.S_addr = u32::from_ne_bytes(addr.octets());
+        row.NextHop.Ipv4.sin_family = AF_INET;
+        CreateIpForwardEntry2(&row)
+    };
+    if rc != 0 && rc != ALREADY_EXISTS {
+        return Err(adapter_hint(
+            anyhow!("routing {addr}/32 at the tun adapter failed with Win32 error {rc}"),
+            addrs,
         ));
     }
     Ok(())
@@ -507,7 +542,6 @@ fn recycle(bridge: &mut Bridge, sock: &mut tcp::Socket, port: u16) {
 fn poll_loop(
     session: Arc<wintun::Session>,
     virtual_ip: Ipv4Addr,
-    prefix_len: u8,
     port: u16,
     forward_to: SocketAddr,
     shutdown: Arc<AtomicBool>,
@@ -521,7 +555,7 @@ fn poll_loop(
     iface.update_ip_addrs(|addrs| {
         // `unwrap` on a single push into an empty, statically sized list.
         addrs
-            .push(IpCidr::new(IpAddress::Ipv4(virtual_ip), prefix_len))
+            .push(IpCidr::new(IpAddress::Ipv4(virtual_ip), 32))
             .expect("one address fits");
     });
 
@@ -725,26 +759,9 @@ mod tests {
     /// failure this design exists to avoid.
     #[test]
     fn virtual_address_is_not_the_adapter_address() {
-        for cidr in ["10.99.0.0/24", "192.168.77.0/30", "172.20.0.0/16"] {
-            let subnet = crate::cli::tests_support::subnet(cidr);
-            assert_ne!(subnet.adapter_ip(), subnet.virtual_ip(), "{cidr}");
-        }
-    }
-
-    /// Both have to sit inside the subnet whose on-link route carries them, or
-    /// Windows has no route to the virtual address at all. A /30 is the tight
-    /// case: exactly two usable addresses, and these must be them.
-    #[test]
-    fn both_addresses_share_the_subnet_that_routes_them() {
-        for cidr in ["10.99.0.0/24", "192.168.77.0/30", "172.20.0.0/16"] {
-            let subnet = crate::cli::tests_support::subnet(cidr);
-            let mask = u32::MAX << (32 - subnet.prefix_len());
-            let net = |ip: Ipv4Addr| u32::from(ip) & mask;
-            assert_eq!(
-                net(subnet.adapter_ip()),
-                net(subnet.virtual_ip()),
-                "{cidr}: addresses fell outside one subnet"
-            );
+        for ip in ["169.254.255.1", "10.99.0.1", "192.168.77.5"] {
+            let addrs = crate::cli::tests_support::addrs(ip);
+            assert_ne!(addrs.adapter_ip(), addrs.virtual_ip(), "{ip}");
         }
     }
 

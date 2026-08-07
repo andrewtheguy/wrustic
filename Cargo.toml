@@ -1,6 +1,6 @@
 [package]
 name = "wrustic"
-version = "0.0.48"
+version = "0.0.49"
 edition = "2024"
 
 [dependencies]
@@ -85,7 +85,7 @@ smoltcp = { version = "0.13", default-features = false, optional = true, feature
     "proto-ipv4",
     "socket-tcp",
     # Not optional in practice: without it smoltcp silently drops echo requests
-    # (the `_ => None` arm in process_icmpv4), so `ping 10.99.0.1` fails while
+    # (the `_ => None` arm in process_icmpv4), so `ping 169.254.255.1` fails while
     # the share works perfectly. Pinging the address is the first thing anyone
     # does when a mount misbehaves, and a share that cannot be pinged looks
     # broken when it is not. It is in smoltcp's own default feature set; turning

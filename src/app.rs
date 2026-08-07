@@ -252,7 +252,7 @@ pub(crate) struct App {
     pub(crate) cipher: Option<Cipher>,
     pub(crate) server_port: u16,
     /// How the snapshot SMB share is exposed (`--smb-port`, `--smb-tun`,
-    /// `--smb-tun-subnet`).
+    /// `--smb-tun-ip`).
     ///
     /// The tun fields are carried on every platform so `boot` has one signature
     /// everywhere; only a Windows build with the `smb-tun` feature has anything
@@ -1382,7 +1382,7 @@ impl App {
             smb::Bind::Tun(smb::TunConfig {
                 state_dir: self.paths.dir.clone(),
                 port: smb::STANDARD_SMB_PORT,
-                subnet: self.smb.tun_subnet,
+                addrs: self.smb.tun_addrs,
             })
         } else {
             smb::Bind::Loopback
