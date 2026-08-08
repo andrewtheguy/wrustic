@@ -78,6 +78,13 @@ impl TestRepo {
         self.root.join("repo")
     }
 
+    /// The tree [`TestRepo::backup`] snapshots. Exposed so a test can *remove*
+    /// a file between backups, which is how a partly-used pack — and so a
+    /// prune that must repack rather than drop whole packs — is arranged.
+    pub(crate) fn source_path(&self) -> PathBuf {
+        self.root.join("source")
+    }
+
     /// Writes `files` into the fixture's source tree and backs it up, returning
     /// the new snapshot's full hex id. Later calls overwrite earlier files, so
     /// passing different content produces snapshots that share some packs and

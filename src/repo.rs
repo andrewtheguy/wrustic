@@ -442,95 +442,216 @@ fn retag_snapshot_json(raw: &[u8], old_id: &str, new_tags: &[String]) -> Result<
 /// Progress lines are written into `progress` for the TUI to render; the
 /// returned report summarizes the executed plan.
 ///
-/// Restic's refreshability-abort rule (`RepoLock::poisoned()`, the
-/// 22.5-minute cutoff) is enforced *throughout*: rustic_core takes no
-/// cancellation token, but it ticks the progress adapter continuously —
-/// per file during deletions, per blob batch during repack — so the
-/// adapter probes the lock on phase starts and on its ~10 Hz render ticks
-/// and panics with [`POISON_ABORT`] when the lock can no longer be
-/// trusted. [`abort_if_lock_poisoned`] catches that unwind and turns it
-/// into an ordinary error, stopping the prune before further writes or
-/// deletions. An abort mid-run is safe for the same reason a crash is:
-/// everything new is written before anything old is deleted.
+/// The prune stops early for either reason in [`AbortReason`], and both are
+/// enforced *throughout*: rustic_core takes no cancellation token, but it
+/// ticks the progress adapter continuously — per file during deletions, per
+/// blob batch during repack — so the adapter consults `abort` on every phase
+/// start and every ~10 Hz render tick and panics out of the executor when it
+/// says stop. [`abort_if_signalled`] catches that unwind and turns it into an
+/// ordinary error, so a cancelled prune returns to the TUI like any other
+/// failure rather than needing the process to die. `abort` is also checked at
+/// each phase boundary, which covers a signal landing between ticks.
+///
+/// An abort mid-run is safe for the same reason a crash is: everything new is
+/// written before anything old is deleted. It is *better* than a crash in one
+/// respect — the lock guard still drops, so no stale lock is left behind.
 pub(crate) fn prune(
     profile: &Profile,
     progress: std::sync::Arc<std::sync::Mutex<String>>,
+    abort: std::sync::Arc<AbortSignal>,
 ) -> Result<String> {
     let backends = build_backends(profile)?;
     let progress_bars = TuiProgressBars {
         buf: progress,
-        poison: std::sync::Arc::new(std::sync::OnceLock::new()),
+        abort: std::sync::Arc::clone(&abort),
     };
-    let poison = std::sync::Arc::clone(&progress_bars.poison);
-    let repo = Repository::new_with_progress(
-        &RepositoryOptions::default(),
-        &backends,
-        progress_bars,
-    )?
-    .open(&Credentials::password(profile.password()))?;
+    // Opening reads the key and config and takes no lock, but on a slow
+    // remote it is not instant, so it is cancellable too — hence the wrap.
+    let repo = abort_if_signalled(
+        &abort,
+        std::panic::AssertUnwindSafe(|| {
+            Repository::new_with_progress(&RepositoryOptions::default(), &backends, progress_bars)?
+                .open(&Credentials::password(profile.password()))
+        }),
+    )??;
+    // Cancelled while opening: stop before taking a lock at all.
+    if let Some(reason) = abort.reason() {
+        return Err(abort_error(reason));
+    }
+
     let crypto = lock::RepoCrypto::from_repo(&repo)?;
     let repo_lock = std::sync::Arc::new(lock::RepoLock::acquire_exclusive(
         lock::backend_for_profile(profile)?,
         crypto,
     )?);
-    // Arm the progress adapter's poison probe now that the lock exists; the
-    // probe stays a no-op for the open above, which needs no lock.
-    {
-        let repo_lock = std::sync::Arc::clone(&repo_lock);
-        let _ = poison.set(std::sync::Arc::new(move || repo_lock.poisoned()));
+    // Start honouring the refreshability rule now that there is a lock to
+    // watch; until here the signal only carried a cancellation.
+    abort.watch(std::sync::Arc::clone(&repo_lock));
+    // A cancellation that landed while acquisition waited out its 200 ms
+    // grace window: release the lock again and stop before planning.
+    if let Some(reason) = abort.reason() {
+        return Err(abort_error(reason));
     }
 
     let opts = PruneOptions::default()
         .instant_delete(true)
         .max_repack(LimitOption::Unlimited);
-    let plan =
-        abort_if_lock_poisoned(std::panic::AssertUnwindSafe(|| repo.prune_plan(&opts)))??;
+    let plan = abort_if_signalled(&abort, std::panic::AssertUnwindSafe(|| repo.prune_plan(&opts)))??;
     let report = prune_report(&plan.stats);
     // Planning walks every snapshot tree and can take a long time on a big
-    // repo. The progress probe covers it too, but a poison that lands
-    // between ticks is still caught here, at the last gate before anything
-    // destructive.
-    if repo_lock.poisoned() {
-        bail!(
-            "the repository lock could not be refreshed while the prune was being planned; \
-             aborting before deleting anything (the repository is unchanged)"
-        );
+    // repo. The adapter covers it too, but a signal that lands between ticks
+    // is still caught here, at the last gate before anything destructive.
+    if let Some(reason) = abort.reason() {
+        return Err(abort_error(reason));
     }
-    abort_if_lock_poisoned(std::panic::AssertUnwindSafe(|| repo.prune(&opts, plan)))??;
+    abort_if_signalled(&abort, std::panic::AssertUnwindSafe(|| repo.prune(&opts, plan)))??;
     Ok(report)
 }
 
-/// Panic payload marker the progress adapter raises when the poison probe
-/// trips mid-prune — the only way to stop rustic_core's executor, which
-/// takes no cancellation token. Matched by [`abort_if_lock_poisoned`].
-const POISON_ABORT: &str = "wrustic-prune-lock-poisoned";
+/// Why a native operation stopped itself before finishing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AbortReason {
+    /// The repository lock could no longer be refreshed inside restic's
+    /// 22.5-minute refreshability window — other processes are entitled to
+    /// treat it as stale and remove it, so writing on is unsafe.
+    LockPoisoned,
+    /// The user asked the operation to stop.
+    Cancelled,
+}
 
-/// Runs one rustic_core prune stage, converting the [`POISON_ABORT`] panic
-/// the progress adapter raises into an ordinary error. Any other panic is
-/// resumed unchanged.
-fn abort_if_lock_poisoned<T, F: FnOnce() -> T>(
+/// Payload of the panic the progress adapter raises to unwind out of
+/// rustic_core. Deliberately *not* what [`abort_if_signalled`] matches on
+/// (see [`AbortSignal`]) — it exists so an escaped panic reads sensibly.
+const ABORT_PANIC: &str = "wrustic: operation aborted (repository lock lost, or cancelled)";
+
+/// Abort channel between a running rustic_core operation and its caller.
+///
+/// rustic_core takes no cancellation token, so the only way to stop its
+/// executor is to panic out of one of the progress callbacks it ticks
+/// continuously and catch that panic at the call site.
+///
+/// [`AbortSignal::raise`] records the reason *before* throwing, and
+/// [`abort_if_signalled`] reads that record rather than inspecting the panic
+/// payload. That matters: prune's repack runs under rayon, which resumes the
+/// original payload, but rustic_core's other parallelism is `pariter`, whose
+/// worker-panic path discards the payload and raises a message of its own
+/// ("parallel_map worker thread panicked", `pariter/src/parallel_map.rs`).
+/// Payload matching is therefore correct for only some of rustic_core; a flag
+/// set on our side is correct for all of it, and for whatever a future
+/// version does.
+#[derive(Default)]
+pub(crate) struct AbortSignal {
+    cancel: std::sync::atomic::AtomicBool,
+    lock: std::sync::OnceLock<std::sync::Arc<lock::RepoLock>>,
+    raised: std::sync::Mutex<Option<AbortReason>>,
+    /// Test-only: an extra predicate consulted on every progress-adapter
+    /// probe. Lets a test land the abort at a chosen point inside
+    /// rustic_core's own call stack — the unwind path the caller-side checks
+    /// cannot reach by construction, and the part of this mechanism a unit
+    /// test of the adapter alone cannot cover. Keyed off the progress buffer
+    /// in practice, so a test can name the phase it wants to abort in.
+    #[cfg(test)]
+    trip: std::sync::OnceLock<Box<dyn Fn() -> bool + Send + Sync>>,
+}
+
+impl AbortSignal {
+    /// Asks the running operation to stop at its next progress tick. Safe to
+    /// call from another thread, and idempotent.
+    pub(crate) fn cancel(&self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Starts honouring restic's refreshability rule for `lock`. Called once
+    /// the operation owns one; until then the signal only watches for a
+    /// cancellation, so a lock-free phase (opening the repository) is still
+    /// interruptible.
+    fn watch(&self, lock: std::sync::Arc<lock::RepoLock>) {
+        let _ = self.lock.set(lock);
+    }
+
+    /// The reason to stop right now, if any. A poisoned lock outranks a
+    /// cancellation: both stop the run, but only one leaves a lock other
+    /// processes may remove, and the message has to say so.
+    fn reason(&self) -> Option<AbortReason> {
+        if self.lock.get().is_some_and(|l| l.poisoned()) {
+            return Some(AbortReason::LockPoisoned);
+        }
+        if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Some(AbortReason::Cancelled);
+        }
+        None
+    }
+
+    /// [`AbortSignal::reason`] as the progress adapter asks it — on every
+    /// phase start and every throttled render tick.
+    fn probe(&self) -> Option<AbortReason> {
+        #[cfg(test)]
+        if self.trip.get().is_some_and(|f| f()) {
+            self.cancel();
+        }
+        self.reason()
+    }
+
+    /// Records `reason` and panics out of rustic_core's executor.
+    fn raise(&self, reason: AbortReason) -> ! {
+        use std::sync::PoisonError;
+        *self.raised.lock().unwrap_or_else(PoisonError::into_inner) = Some(reason);
+        panic!("{ABORT_PANIC}");
+    }
+
+    /// The reason we raised, cleared as it is read.
+    fn take_raised(&self) -> Option<AbortReason> {
+        use std::sync::PoisonError;
+        self.raised
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
+    /// Cancels at the first progress-adapter probe where `f` holds.
+    #[cfg(test)]
+    pub(crate) fn trip_when(&self, f: impl Fn() -> bool + Send + Sync + 'static) {
+        let _ = self.trip.set(Box::new(f));
+    }
+}
+
+/// Runs one rustic_core stage, converting an abort the progress adapter
+/// raised into an ordinary error. Any other panic is resumed unchanged.
+fn abort_if_signalled<T, F: FnOnce() -> T>(
+    abort: &AbortSignal,
     f: std::panic::AssertUnwindSafe<F>,
 ) -> Result<T> {
     match std::panic::catch_unwind(f) {
-        Ok(value) => Ok(value),
-        Err(payload) => {
-            let is_poison = payload
-                .downcast_ref::<&str>()
-                .is_some_and(|s| s.contains(POISON_ABORT))
-                || payload
-                    .downcast_ref::<String>()
-                    .is_some_and(|s| s.contains(POISON_ABORT));
-            if is_poison {
-                Err(anyhow!(
-                    "the repository lock could not be refreshed for 22.5 minutes while the \
-                     prune was running — other processes may treat it as stale and remove it, \
-                     so the prune was aborted before deleting anything further. The repository \
-                     stays valid; the next prune finishes the remaining work"
-                ))
-            } else {
-                std::panic::resume_unwind(payload)
-            }
+        Ok(value) => {
+            // A raise that somehow did not unwind to here would otherwise be
+            // attributed to whatever the *next* stage panics for.
+            let _ = abort.take_raised();
+            Ok(value)
         }
+        Err(payload) => match abort.take_raised() {
+            Some(reason) => Err(abort_error(reason)),
+            None => std::panic::resume_unwind(payload),
+        },
+    }
+}
+
+/// What the user is told when a prune stops early. Both outcomes leave a
+/// valid repository — an interrupted prune is safe for the same reason a
+/// crashed one is: everything new is written before anything old is deleted.
+fn abort_error(reason: AbortReason) -> anyhow::Error {
+    match reason {
+        AbortReason::LockPoisoned => anyhow!(
+            "the repository lock could not be refreshed for 22.5 minutes while the prune was \
+             running — other processes may treat it as stale and remove it, so the prune was \
+             aborted before deleting anything further. The repository stays valid; the next \
+             prune finishes the remaining work"
+        ),
+        AbortReason::Cancelled => anyhow!(
+            "the prune was cancelled. The repository stays valid and the lock was released; \
+             any work already done is work the next prune does not have to redo, and anything \
+             left half-finished it collects"
+        ),
     }
 }
 
@@ -637,16 +758,14 @@ pub(crate) fn human_bytes(n: u64) -> String {
 /// Probe the progress adapter consults to learn whether the operation's
 /// repository lock is still trustworthy; `true` aborts the run via
 /// [`POISON_ABORT`]. Unset (empty `OnceLock`) means no lock to watch yet.
-type PoisonProbe = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
-
 /// Adapter feeding rustic_core's per-phase progress into the shared text
 /// buffer the prune screen renders. Each phase gets one line in the buffer,
 /// updated in place as the phase advances, so the screen shows the newest
 /// state of every phase rather than a scrolling log. Doubles as the abort
-/// channel: see [`prune`] and [`POISON_ABORT`].
+/// channel: see [`prune`] and [`AbortSignal`].
 struct TuiProgressBars {
     buf: std::sync::Arc<std::sync::Mutex<String>>,
-    poison: std::sync::Arc<std::sync::OnceLock<PoisonProbe>>,
+    abort: std::sync::Arc<AbortSignal>,
 }
 
 impl std::fmt::Debug for TuiProgressBars {
@@ -668,7 +787,7 @@ impl ProgressBars for TuiProgressBars {
         };
         Progress::new(TuiProgress {
             buf: std::sync::Arc::clone(&self.buf),
-            poison: std::sync::Arc::clone(&self.poison),
+            abort: std::sync::Arc::clone(&self.abort),
             line,
             title: std::sync::Mutex::new(prefix.to_string()),
             kind: progress_type,
@@ -685,7 +804,7 @@ impl ProgressBars for TuiProgressBars {
 /// similar rate anyway.
 struct TuiProgress {
     buf: std::sync::Arc<std::sync::Mutex<String>>,
-    poison: std::sync::Arc<std::sync::OnceLock<PoisonProbe>>,
+    abort: std::sync::Arc<AbortSignal>,
     line: usize,
     title: std::sync::Mutex<String>,
     kind: ProgressType,
@@ -704,16 +823,14 @@ impl std::fmt::Debug for TuiProgress {
 }
 
 impl TuiProgress {
-    /// Aborts the owning operation when the poison probe trips — the panic
+    /// Aborts the owning operation when the signal says stop — the panic
     /// unwinds out of rustic_core (which takes no cancellation token) and is
-    /// mapped back to an error by [`abort_if_lock_poisoned`]. Called on
-    /// phase starts and on the throttled render ticks, so an untrusted lock
-    /// stops the run within ~100 ms / one progress tick.
-    fn check_poison(&self) {
-        if let Some(probe) = self.poison.get()
-            && probe()
-        {
-            panic!("{POISON_ABORT}");
+    /// mapped back to an error by [`abort_if_signalled`]. Called on phase
+    /// starts and on the throttled render ticks, so a cancellation or an
+    /// untrusted lock stops the run within ~100 ms / one progress tick.
+    fn check_abort(&self) {
+        if let Some(reason) = self.abort.probe() {
+            self.abort.raise(reason);
         }
     }
 
@@ -764,7 +881,7 @@ impl RusticProgress for TuiProgress {
     }
 
     fn set_length(&self, len: u64) {
-        self.check_poison();
+        self.check_abort();
         self.len.store(len, Ordering::Relaxed);
         self.render(false);
     }
@@ -785,7 +902,7 @@ impl RusticProgress for TuiProgress {
                 .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
         {
-            self.check_poison();
+            self.check_abort();
             self.render(false);
         }
     }
@@ -1321,43 +1438,101 @@ mod tests {
         assert!(retag_snapshot_json(bad_tags.as_bytes(), OLD_ID, &tags(&["x"])).is_err());
     }
 
-    // Failure injection for the mid-prune lock-loss abort: a tripped poison
-    // probe must panic the progress adapter out of the (simulated) executor,
-    // and `abort_if_lock_poisoned` must turn exactly that panic into an
-    // error while resuming every other panic unchanged.
+    // Failure injection for the abort path: a signalled stop must panic the
+    // progress adapter out of the (simulated) executor, and
+    // `abort_if_signalled` must turn exactly that panic into an error while
+    // resuming every other panic unchanged.
     #[test]
-    fn poisoned_lock_aborts_through_the_progress_adapter() {
+    fn a_signalled_abort_unwinds_through_the_progress_adapter() {
         use std::panic::AssertUnwindSafe;
 
+        let abort = std::sync::Arc::new(AbortSignal::default());
         let bars = TuiProgressBars {
             buf: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
-            poison: std::sync::Arc::new(std::sync::OnceLock::new()),
+            abort: std::sync::Arc::clone(&abort),
         };
 
-        // Probe unset (before the lock exists): progress must not abort.
+        // Nothing signalled: progress must not abort.
         let p = bars.progress(ProgressType::Counter, "phase");
         p.set_length(3);
 
-        // Probe tripped: the next phase start aborts, and the mapper turns
-        // the unwind into an error naming the lock.
-        let _ = bars.poison.set(std::sync::Arc::new(|| true) as PoisonProbe);
-        let err = abort_if_lock_poisoned(AssertUnwindSafe(|| p.set_length(4)))
-            .expect_err("a tripped probe must abort the stage");
+        // Cancelled: the next phase start aborts, and the mapper turns the
+        // unwind into the cancellation error.
+        abort.cancel();
+        let err = abort_if_signalled(&abort, AssertUnwindSafe(|| p.set_length(4)))
+            .expect_err("a signalled abort must stop the stage");
         assert!(
-            format!("{err:#}").contains("lock could not be refreshed"),
+            format!("{err:#}").contains("prune was cancelled"),
             "unexpected error: {err:#}"
         );
 
         // A stage that panics for any other reason is not swallowed — the
         // panic resumes past the mapper.
         let other = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            abort_if_lock_poisoned(AssertUnwindSafe(|| panic!("boom")))
+            abort_if_signalled(&abort, AssertUnwindSafe(|| panic!("boom")))
         }));
         assert!(other.is_err(), "unrelated panics must resume, not map");
 
         // And a healthy stage's value passes through.
-        let ok = abort_if_lock_poisoned(AssertUnwindSafe(|| 7)).expect("healthy stage");
+        let ok = abort_if_signalled(&abort, AssertUnwindSafe(|| 7)).expect("healthy stage");
         assert_eq!(ok, 7);
+    }
+
+    // The reason the abort is flagged rather than recognised by its panic
+    // payload. rustic_core's `pariter` parallelism does not resume a worker's
+    // payload — it raises a message of its own — so a mapper that matched on
+    // the payload would fail to recognise its own abort and would let the
+    // panic escape. Simulate exactly that rewrite.
+    #[test]
+    fn an_abort_is_recognised_even_when_the_payload_is_rewritten() {
+        use std::panic::AssertUnwindSafe;
+
+        let abort = std::sync::Arc::new(AbortSignal::default());
+        let bars = TuiProgressBars {
+            buf: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
+            abort: std::sync::Arc::clone(&abort),
+        };
+        let p = bars.progress(ProgressType::Counter, "phase");
+        abort.cancel();
+
+        let err = abort_if_signalled(
+            &abort,
+            AssertUnwindSafe(|| {
+                // A worker panics; the pool swallows the payload and raises
+                // its own, exactly as pariter's consumer does.
+                let inner = std::panic::catch_unwind(AssertUnwindSafe(|| p.set_length(1)));
+                if inner.is_err() {
+                    panic!("parallel_map worker thread panicked: panic indicator set");
+                }
+            }),
+        )
+        .expect_err("the abort must be recognised through a rewritten payload");
+        assert!(
+            format!("{err:#}").contains("prune was cancelled"),
+            "unexpected error: {err:#}"
+        );
+
+        // The record is consumed, so an unrelated panic afterwards still
+        // resumes rather than being misreported as an abort.
+        let other = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            abort_if_signalled(&abort, AssertUnwindSafe(|| panic!("boom")))
+        }));
+        assert!(other.is_err(), "a stale record must not swallow a later panic");
+    }
+
+    // A poisoned lock outranks a cancellation: both stop the run, but only
+    // one leaves a lock other processes may remove, so the message must say
+    // so even when the user also pressed cancel.
+    #[test]
+    fn a_poisoned_lock_outranks_a_cancellation_in_the_reported_reason() {
+        let abort = AbortSignal::default();
+        assert_eq!(abort.reason(), None);
+        abort.cancel();
+        assert_eq!(abort.reason(), Some(AbortReason::Cancelled));
+        assert!(
+            format!("{:#}", abort_error(AbortReason::LockPoisoned))
+                .contains("could not be refreshed")
+        );
     }
 
     // ---- Lock coverage of the native writes -------------------------------
@@ -1386,6 +1561,18 @@ mod tests {
         assert!(
             lock::is_lock_error(&format!("{err:#}")),
             "expected a lock conflict, got: {err:#}"
+        );
+    }
+
+    /// An abort signal that never trips, for the tests not about cancelling.
+    fn no_abort() -> std::sync::Arc<AbortSignal> {
+        std::sync::Arc::new(AbortSignal::default())
+    }
+
+    fn assert_cancelled(err: &anyhow::Error) {
+        assert!(
+            format!("{err:#}").contains("prune was cancelled"),
+            "expected the cancellation error, got: {err:#}"
         );
     }
 
@@ -1487,7 +1674,7 @@ mod tests {
 
         let held = plant_shared_lock(&fixture);
         let progress = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        let err = prune(fixture.profile(), progress)
+        let err = prune(fixture.profile(), progress, no_abort())
             .expect_err("a prune must not run while another process holds a lock");
         assert_lock_conflict(&err);
         assert_eq!(
@@ -1499,7 +1686,7 @@ mod tests {
 
         drop(held);
         let progress = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        prune(fixture.profile(), progress).expect("prune once unlocked");
+        prune(fixture.profile(), progress, no_abort()).expect("prune once unlocked");
         assert_ne!(
             fixture.fingerprint().expect("fingerprint the repository"),
             before,
@@ -1515,6 +1702,167 @@ mod tests {
             load_snapshots(fixture.profile()).expect("list snapshots").len(),
             1
         );
+    }
+
+    // ---- Cancelling a running prune ---------------------------------------
+    //
+    // These are the tests the abort mechanism never had: until now it was
+    // only exercised against the progress adapter in isolation, never
+    // through rustic_core's own call stack, so "a prune can be stopped
+    // without killing the process" was an argument rather than a fact.
+
+    /// A repository with genuine prune work: two snapshots with disjoint
+    /// content, the first dropped, so packs become unused and the plan is
+    /// non-trivial. Returns the fixture and the surviving snapshot id.
+    fn fixture_with_prunable_garbage(name: &str) -> (TestRepo, String) {
+        let fixture = TestRepo::init(name);
+        let first = fixture.backup(&[("a.txt", b"first content\n")], &[]);
+        let keep = fixture.backup(&[("a.txt", b"second content\n"), ("b.txt", b"more\n")], &[]);
+        delete_snapshot(fixture.profile(), &first).expect("drop the first snapshot");
+        (fixture, keep)
+    }
+
+    // Cancelled before it starts: the prune must refuse before it ever takes
+    // the exclusive lock, so a user who changes their mind never blocks a
+    // concurrent restic even briefly.
+    #[test]
+    fn a_prune_cancelled_before_it_starts_never_takes_the_lock() {
+        let _guard = lock::test_acquire_guard();
+        let (fixture, keep) = fixture_with_prunable_garbage("cancel-early");
+        let before = fixture.fingerprint().expect("fingerprint the repository");
+
+        let abort = std::sync::Arc::new(AbortSignal::default());
+        abort.cancel();
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let err = prune(fixture.profile(), progress, abort)
+            .expect_err("a cancelled prune must not run");
+        assert_cancelled(&err);
+        assert_eq!(
+            fixture.fingerprint().expect("fingerprint the repository"),
+            before,
+            "a cancelled prune must not have touched the repository"
+        );
+        assert_eq!(fixture.lock_count(), 0, "no lock may be left behind");
+
+        // And the profile is still perfectly prunable afterwards.
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        prune(fixture.profile(), progress, no_abort()).expect("prune after the cancellation");
+        assert_eq!(
+            load_snapshots(fixture.profile()).expect("list snapshots")[0].id,
+            keep
+        );
+    }
+
+    /// Runs a prune that cancels itself at the first progress tick whose
+    /// buffer contains `phase`, and asserts the whole outcome: an ordinary
+    /// error rather than a dead process, the lock released, the surviving
+    /// snapshot intact, and the repository still prunable afterwards.
+    ///
+    /// The trip fires only from the progress adapter, which nothing but
+    /// rustic_core drives — so reaching it means the abort really did unwind
+    /// out of rustic_core's own call stack, which is the claim that was never
+    /// tested before.
+    fn assert_prune_cancels_cleanly_during(fixture_name: &str, phase: &'static str, fixture: TestRepo, keep: &str) {
+        let abort = std::sync::Arc::new(AbortSignal::default());
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        {
+            let buf = std::sync::Arc::clone(&progress);
+            abort.trip_when(move || {
+                buf.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .contains(phase)
+            });
+        }
+
+        let err = prune(fixture.profile(), std::sync::Arc::clone(&progress), abort)
+            .expect_err("the prune must abort when the signal trips");
+        assert_cancelled(&err);
+        // The phase really was reached — otherwise the test silently proves
+        // nothing, e.g. after a rustic_core phase rename.
+        let seen = progress.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert!(
+            seen.contains(phase),
+            "{fixture_name}: the prune never reached `{phase}`; progress was:\n{seen}"
+        );
+        assert_eq!(
+            fixture.lock_count(),
+            0,
+            "{fixture_name}: unwinding must still drop the lock guard — unlike a force-quit, \
+             an abort leaves no stale lock"
+        );
+
+        // The repository survived the unwind: still readable, the surviving
+        // snapshot intact, and still prunable.
+        let snapshots = load_snapshots(fixture.profile()).expect("list snapshots");
+        assert_eq!(snapshots.len(), 1, "{fixture_name}");
+        assert_eq!(snapshots[0].id, keep, "{fixture_name}");
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        prune(fixture.profile(), progress, no_abort()).expect("prune after the abort");
+        assert_eq!(
+            load_snapshots(fixture.profile()).expect("list snapshots").len(),
+            1,
+            "{fixture_name}: the follow-up prune must keep the surviving snapshot"
+        );
+    }
+
+    // Cancelled while planning, inside `prune_plan`. Nothing destructive has
+    // happened yet, so this is the cheapest abort — but it still has to
+    // unwind out of rustic_core rather than kill the process.
+    #[test]
+    fn cancelling_during_planning_unwinds_to_an_error() {
+        let _guard = lock::test_acquire_guard();
+        let (fixture, keep) = fixture_with_prunable_garbage("cancel-planning");
+        assert_prune_cancels_cleanly_during("planning", "reading index", fixture, &keep);
+    }
+
+    // Cancelled during execution, once the new index is being written — past
+    // the point where the prune has started changing the repository.
+    #[test]
+    fn cancelling_while_rebuilding_the_index_unwinds_to_an_error() {
+        let _guard = lock::test_acquire_guard();
+        let (fixture, keep) = fixture_with_prunable_garbage("cancel-reindex");
+        assert_prune_cancels_cleanly_during("rebuilding index", "rebuilding index", fixture, &keep);
+    }
+
+    // The riskiest phase, and the one that matters most for anything built on
+    // this mechanism later: repacking is prune's only *parallel* stage
+    // (`into_par_iter`), so the abort is raised on a rayon worker thread and
+    // has to reach the caller from there. The fixture forces a repack — two
+    // files in one pack, one of them dropped — rather than a whole-pack
+    // delete, which is the path the plain fixture takes.
+    #[test]
+    fn cancelling_inside_the_parallel_repack_unwinds_to_an_error() {
+        let _guard = lock::test_acquire_guard();
+        let fixture = TestRepo::init("cancel-repack");
+        // Incompressible, or zstd shrinks the blobs until the leftover waste
+        // falls under rustic's `max_unused` threshold and it declines to
+        // repack at all — which is what a uniform-byte fixture does.
+        let keep = pseudo_random(2 << 20, 0x5eed_1234);
+        let drop = pseudo_random(2 << 20, 0xd0d0_beef);
+        let drop_id = fixture.backup(&[("keep.bin", &keep), ("drop.bin", &drop)], &[]);
+        // Second snapshot without drop.txt, so the shared pack ends up partly
+        // used once the first snapshot goes.
+        std::fs::remove_file(fixture.source_path().join("drop.bin"))
+            .expect("remove the dropped source file");
+        let keep_id = fixture.backup(&[], &[]);
+        delete_snapshot(fixture.profile(), &drop_id).expect("drop the first snapshot");
+
+        assert_prune_cancels_cleanly_during("repack", "repacking", fixture, &keep_id);
+    }
+
+    /// Deterministic incompressible bytes (xorshift64*). Seeded per call so
+    /// two buffers differ, and reproducible so a failure is reproducible.
+    fn pseudo_random(len: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed | 1;
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            out.extend_from_slice(&state.to_le_bytes());
+        }
+        out.truncate(len);
+        out
     }
 
     // The other direction: the shared lock long-running reads take. Unlike
@@ -1832,7 +2180,7 @@ mod tests {
             )
             .expect("shared lock");
             let progress = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-            let err = prune(&profile, progress).expect_err("prune must be blocked");
+            let err = prune(&profile, progress, no_abort()).expect_err("prune must be blocked");
             assert!(
                 lock::is_lock_error(&format!("{err:#}")),
                 "expected a lock error, got: {err:#}"
@@ -1842,7 +2190,7 @@ mod tests {
 
         // The native prune under the exclusive lock.
         let progress = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        let report = prune(&profile, progress.clone()).expect("native prune");
+        let report = prune(&profile, progress.clone(), no_abort()).expect("native prune");
         assert!(report.contains("total space reclaimed"), "{report}");
         assert!(
             !progress.lock().unwrap().is_empty(),
