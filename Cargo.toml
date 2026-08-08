@@ -32,7 +32,7 @@ rustic_backend = { version = "0.6.2", default-features = false, features = ["res
 rustic_core = { version = "0.12.0", default-features = false }
 scrypt = { version = "0.12", default-features = false }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.11"
 # Constant-time byte comparison for the NTLMv2 proof check. A hand-written
 # `diff |= a ^ b` loop is one the optimiser is free to turn into an early exit;

@@ -62,6 +62,7 @@ pub(crate) fn help_rows(screen: &Screen) -> Option<&'static [(&'static str, &'st
             ("c", "compare this snapshot against another"),
             ("f", "filter the list by host, tag or path"),
             ("d", "delete this snapshot (no prune)"),
+            ("t", "edit this snapshot's tags"),
             ("p", "prune the repository"),
             ("r", "reload the snapshot list"),
             ("q / Esc", "back to the profile list"),
@@ -287,7 +288,7 @@ fn footer_text(screen: &Screen, keychain_enabled: bool) -> &'static str {
         // past the width of a terminal again.
         Screen::Home => "Enter open  n new  e edit  d delete  ? keys  q quit",
         Screen::Snapshots => {
-            "Enter browse  i info  s share  c compare  f filter  d delete  p prune  r reload  ? keys  q/Esc back"
+            "Enter browse  i info  s share  c compare  f filter  d delete  t tags  p prune  r reload  ? keys  q/Esc back"
         }
         Screen::SnapshotFilterDim => "Up/Dn move  PgUp/PgDn page  Enter pick  Esc back",
         Screen::SnapshotFilterValue => {
@@ -297,6 +298,14 @@ fn footer_text(screen: &Screen, keychain_enabled: bool) -> &'static str {
             "y confirm delete  Up/Dn scroll  PgUp/PgDn page  r raw JSON  n/Esc cancel"
         }
         Screen::SnapshotDeleteError(msg) => {
+            if crate::lock::is_lock_error(msg) {
+                "u remove stale locks and retry  any other key to continue"
+            } else {
+                "any key to continue"
+            }
+        }
+        Screen::SnapshotTagEdit => "type  Enter save  Esc cancel",
+        Screen::SnapshotTagError(msg) => {
             if crate::lock::is_lock_error(msg) {
                 "u remove stale locks and retry  any other key to continue"
             } else {
@@ -336,6 +345,7 @@ fn footer_text(screen: &Screen, keychain_enabled: bool) -> &'static str {
         | Screen::Verifying
         | Screen::SnapshotDeleting
         | Screen::SnapshotDeleteLoading
+        | Screen::SnapshotTagSaving
         | Screen::Unlocking
         | Screen::SnapshotCompareLoading => "working…",
         Screen::PruneConfirm => "y start prune  n/Esc cancel",
@@ -456,6 +466,41 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
                 .style(Style::new().fg(Color::Red))
                 .wrap(Wrap { trim: false })
                 .block(Block::bordered().title("Delete unavailable"));
+            frame.render_widget(para, area);
+        }
+        Screen::SnapshotTagEdit => {
+            let short = app
+                .tag_edit_target
+                .as_deref()
+                .map(|id| &id[..id.len().min(8)])
+                .unwrap_or("?");
+            render_input(
+                frame,
+                area,
+                &format!("Edit tags — snapshot {short}"),
+                &app.tag_edit_input,
+                false,
+                "Comma-separated tags; leave empty to clear all tags",
+            );
+        }
+        Screen::SnapshotTagSaving => {
+            let para = Paragraph::new("Rewriting snapshot tags under an exclusive repository lock…")
+                .block(Block::bordered().title("Saving tags"));
+            frame.render_widget(para, area);
+        }
+        Screen::SnapshotTagError(msg) => {
+            let body = if crate::lock::is_lock_error(msg) {
+                format!(
+                    "{msg}\n\nPress u to remove stale repository locks (live locks are \
+                     kept) and retry, or any other key to return to the snapshot list."
+                )
+            } else {
+                format!("{msg}\n\nPress any key to return to the snapshot list.")
+            };
+            let para = Paragraph::new(body)
+                .style(Style::new().fg(Color::Red))
+                .wrap(Wrap { trim: false })
+                .block(Block::bordered().title("Tag edit failed"));
             frame.render_widget(para, area);
         }
         Screen::Unlocking => {
@@ -1725,6 +1770,8 @@ mod tests {
             Screen::SnapshotFilterDim,
             Screen::SnapshotFilterValue,
             Screen::SnapshotDeleteConfirm,
+            Screen::SnapshotTagEdit,
+            Screen::SnapshotTagError(String::new()),
             Screen::SnapshotCompareSecond,
             Screen::SnapshotCompareResults,
             Screen::PruneConfirm,

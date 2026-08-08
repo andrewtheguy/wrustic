@@ -35,6 +35,9 @@ pub(crate) enum Screen {
     SnapshotDeleteConfirm,
     SnapshotDeleting,
     SnapshotDeleteError(String),
+    SnapshotTagEdit,
+    SnapshotTagSaving,
+    SnapshotTagError(String),
     Unlocking,
     OpeningSnapshot,
     SnapshotContents,
@@ -73,6 +76,7 @@ pub(crate) enum UnlockReturn {
     Delete,
     Smb,
     Prune,
+    TagEdit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -353,6 +357,14 @@ pub(crate) struct App {
     pub(crate) post_delete_select: Option<usize>,
     pub(crate) delete_root_listing: Option<ContentsPreview>,
 
+    // Native tag edit (repo::edit_snapshot_tags): the target snapshot id,
+    // the text field the comma-separated tag list is typed into, and the
+    // parsed list the worker consumes — target and list are kept while the
+    // error screen is up so an unlock-and-retry redoes the same edit.
+    pub(crate) tag_edit_target: Option<String>,
+    pub(crate) tag_edit_input: Input,
+    pub(crate) tag_edit_pending: Option<Vec<String>>,
+
     pub(crate) compare_first_id: Option<String>,
     pub(crate) compare_first_row_idx: Option<usize>,
     pub(crate) compare_second_id: Option<String>,
@@ -497,6 +509,9 @@ impl App {
             snapshot_info_overlay: false,
             error_is_fatal: false,
             quit: false,
+            tag_edit_target: None,
+            tag_edit_input: Input::default(),
+            tag_edit_pending: None,
             delete_target: None,
             delete_info: None,
             delete_show_json: false,
@@ -1001,6 +1016,12 @@ impl App {
         self.delete_preview_state = TableState::default();
         self.delete_preview_limit = 50;
         self.delete_root_listing = None;
+    }
+
+    pub(crate) fn clear_tag_edit_scratch(&mut self) {
+        self.tag_edit_target = None;
+        self.tag_edit_pending = None;
+        self.tag_edit_input = Input::default();
     }
 
     pub(crate) fn clear_compare_scratch(&mut self) {
@@ -1661,6 +1682,17 @@ impl App {
                 KeyCode::Char('p') => {
                     self.screen = Screen::PruneConfirm;
                 }
+                KeyCode::Char('t') => {
+                    if let Some((id, tags)) = self
+                        .selected_snapshot()
+                        .map(|s| (s.id.clone(), s.tags.join(",")))
+                    {
+                        self.tag_edit_target = Some(id);
+                        self.tag_edit_pending = None;
+                        self.tag_edit_input = Input::new(tags);
+                        self.screen = Screen::SnapshotTagEdit;
+                    }
+                }
                 KeyCode::Char('i') => {
                     if self.selected_snapshot().is_some() {
                         self.snapshot_info_overlay = true;
@@ -1940,6 +1972,33 @@ impl App {
                 }
             }
 
+            Screen::SnapshotTagEdit => match key.code {
+                KeyCode::Enter => {
+                    self.tag_edit_pending = Some(parse_tag_list(self.tag_edit_input.value()));
+                    self.screen = Screen::SnapshotTagSaving;
+                }
+                KeyCode::Esc => {
+                    self.clear_tag_edit_scratch();
+                    self.screen = Screen::Snapshots;
+                }
+                _ => {
+                    self.tag_edit_input.handle_event(&Event::Key(key));
+                }
+            },
+
+            Screen::SnapshotTagError(msg) => {
+                // Mirrors SnapshotDeleteError: `u` is only wired up for lock
+                // failures; anything else just dismisses.
+                let offer_unlock = crate::lock::is_lock_error(msg);
+                if offer_unlock && matches!(key.code, KeyCode::Char('u') | KeyCode::Char('U')) {
+                    self.unlock_return = UnlockReturn::TagEdit;
+                    self.screen = Screen::Unlocking;
+                } else {
+                    self.clear_tag_edit_scratch();
+                    self.screen = Screen::Snapshots;
+                }
+            }
+
             Screen::SnapshotContents => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
                     self.repo_session = None;
@@ -2008,6 +2067,7 @@ impl App {
             | Screen::LoadingFileDetails
             | Screen::SnapshotDeleting
             | Screen::SnapshotDeleteLoading
+            | Screen::SnapshotTagSaving
             | Screen::Unlocking
             | Screen::SnapshotCompareLoading => {}
 
@@ -2541,6 +2601,19 @@ impl FilterDimEntry {
     }
 }
 
+/// Comma-separated tag input → the tag list to store: entries trimmed,
+/// empties dropped, duplicates removed keeping the first occurrence.
+pub(crate) fn parse_tag_list(input: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for tag in input.split(',') {
+        let tag = tag.trim();
+        if !tag.is_empty() && !out.iter().any(|t| t == tag) {
+            out.push(tag.to_string());
+        }
+    }
+    out
+}
+
 pub(crate) fn filter_dim_entries(has_active: bool) -> Vec<FilterDimEntry> {
     let mut v = vec![
         FilterDimEntry::Kind(FilterKind::Host),
@@ -2820,6 +2893,118 @@ mod tests {
             Some("aaa"),
             "the retry after unlocking needs its target"
         );
+    }
+
+    #[test]
+    fn t_opens_the_tag_editor_prefilled_with_current_tags() {
+        let mut app = boot_app_with_snapshots(vec![
+            {
+                let mut r = row("laptop", &["old", "keep"], &["/home"]);
+                r.id = "aaa".into();
+                r
+            },
+            row_with_id("bbb"),
+        ]);
+        app.screen = Screen::Snapshots;
+        app.list_state.select(Some(0));
+
+        press(&mut app, KeyCode::Char('t'));
+
+        // The key handler only captures the target and seeds the input; the
+        // main loop does the rewrite, so the repository is never touched here.
+        assert!(matches!(app.screen, Screen::SnapshotTagEdit));
+        assert_eq!(app.tag_edit_target.as_deref(), Some("aaa"));
+        assert_eq!(app.tag_edit_input.value(), "old,keep");
+        assert!(app.tag_edit_pending.is_none());
+    }
+
+    #[test]
+    fn t_with_nothing_selected_does_nothing() {
+        let mut app = boot_app_with_snapshots(vec![]);
+        app.screen = Screen::Snapshots;
+        app.list_state.select(None);
+
+        press(&mut app, KeyCode::Char('t'));
+
+        assert!(matches!(app.screen, Screen::Snapshots));
+        assert!(app.tag_edit_target.is_none());
+    }
+
+    #[test]
+    fn tag_editor_enter_parses_the_input_and_hands_off_to_the_saver() {
+        let mut app = boot_app_with_snapshots(vec![row_with_id("aaa")]);
+        app.screen = Screen::SnapshotTagEdit;
+        app.tag_edit_target = Some("aaa".into());
+        app.tag_edit_input = Input::new(" new , keep ,, new ".into());
+
+        press(&mut app, KeyCode::Enter);
+
+        assert!(matches!(app.screen, Screen::SnapshotTagSaving));
+        assert_eq!(
+            app.tag_edit_pending.as_deref(),
+            Some(&["new".to_string(), "keep".to_string()][..]),
+            "trimmed, empties dropped, duplicates removed"
+        );
+    }
+
+    #[test]
+    fn tag_editor_esc_cancels_and_clears_the_scratch() {
+        let mut app = boot_app_with_snapshots(vec![row_with_id("aaa")]);
+        app.screen = Screen::SnapshotTagEdit;
+        app.tag_edit_target = Some("aaa".into());
+        app.tag_edit_input = Input::new("typed".into());
+
+        press(&mut app, KeyCode::Esc);
+
+        assert!(matches!(app.screen, Screen::Snapshots));
+        assert!(app.tag_edit_target.is_none());
+        assert!(app.tag_edit_pending.is_none());
+        assert_eq!(app.tag_edit_input.value(), "");
+    }
+
+    #[test]
+    fn u_on_a_tag_lock_error_retries_the_same_edit_after_unlocking() {
+        let mut app = boot_app_with_snapshots(vec![row_with_id("aaa")]);
+        app.screen = Screen::SnapshotTagError(
+            "unable to create lock in backend: repository is already locked \
+             exclusively by PID 1 on host by someone"
+                .into(),
+        );
+        app.tag_edit_target = Some("aaa".into());
+        app.tag_edit_pending = Some(vec!["new".into()]);
+
+        press(&mut app, KeyCode::Char('u'));
+
+        assert!(matches!(app.screen, Screen::Unlocking));
+        assert_eq!(
+            app.unlock_return,
+            UnlockReturn::TagEdit,
+            "the main loop must retry the tag edit after unlocking"
+        );
+        assert_eq!(app.tag_edit_target.as_deref(), Some("aaa"));
+        assert_eq!(app.tag_edit_pending.as_deref(), Some(&["new".to_string()][..]));
+    }
+
+    #[test]
+    fn non_lock_tag_error_dismisses_without_offering_unlock() {
+        let mut app = boot_app_with_snapshots(vec![row_with_id("aaa")]);
+        app.screen = Screen::SnapshotTagError("snapshot vanished".into());
+        app.tag_edit_target = Some("aaa".into());
+        app.tag_edit_pending = Some(vec!["new".into()]);
+
+        press(&mut app, KeyCode::Char('u'));
+
+        assert!(matches!(app.screen, Screen::Snapshots), "u must not unlock here");
+        assert!(app.tag_edit_target.is_none());
+        assert!(app.tag_edit_pending.is_none());
+    }
+
+    #[test]
+    fn parse_tag_list_normalizes() {
+        assert_eq!(parse_tag_list(""), Vec::<String>::new());
+        assert_eq!(parse_tag_list(" , ,"), Vec::<String>::new());
+        assert_eq!(parse_tag_list("a"), vec!["a"]);
+        assert_eq!(parse_tag_list(" a , b ,, a ,c "), vec!["a", "b", "c"]);
     }
 
     #[test]
