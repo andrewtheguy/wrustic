@@ -146,11 +146,13 @@ const MAX_WITHHELD_PANICS: usize = 4;
 /// explicit `restore()` before chaining is kept anyway, so handing the
 /// terminal back does not silently hinge on what ratatui's hook happens to do.
 fn install_panic_hook() {
+    // Installed from `main`, so this is the main thread's id — unlike the
+    // thread *name*, which any `thread::Builder` in any dependency can also
+    // claim, an id compares equal only to the thread itself.
+    let main_thread = std::thread::current().id();
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        // Rust names the process's main thread "main" and leaves every
-        // `thread::spawn` unnamed, ours and rustic_core's alike.
-        let on_main = std::thread::current().name() == Some("main");
+        let on_main = std::thread::current().id() == main_thread;
         match panic_disposition(info.payload(), on_main, repo::abort_unwinding()) {
             PanicDisposition::Drop => {}
             PanicDisposition::Withhold => withhold_panic(info.to_string()),
