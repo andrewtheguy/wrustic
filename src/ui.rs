@@ -349,9 +349,7 @@ fn footer_text(screen: &Screen, keychain_enabled: bool) -> &'static str {
         | Screen::Unlocking
         | Screen::SnapshotCompareLoading => "working…",
         Screen::PruneConfirm => "y start prune  n/Esc cancel",
-        Screen::PruneRunning => {
-            "pruning natively — Esc/Ctrl+C cancels (Ctrl+C again force-quits)"
-        }
+        Screen::PruneRunning => "Esc/Ctrl+C cancel (Ctrl+C again force-quits)",
         Screen::PruneDone(_) => "Up/Dn scroll  PgUp/PgDn page  g/G top/bottom  q/Esc back",
         Screen::PruneError(msg) => {
             if crate::lock::is_lock_error(msg) {
@@ -1023,7 +1021,7 @@ fn render_prune_confirm(frame: &mut Frame, app: &App, area: Rect) {
     let profile = app.active_profile_name.as_deref().unwrap_or("?");
     let body = format!(
         "Prune repository of profile `{profile}`?\n\n\
-         This prunes natively, rewriting and deleting pack files to reclaim\n\
+         This rewrites and deletes pack files to reclaim\n\
          the space left behind by deleted snapshots. It takes an exclusive\n\
          repository lock — concurrent backups are blocked while it runs —\n\
          and can take a long time on a large or remote repository.\n\
