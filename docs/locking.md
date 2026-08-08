@@ -247,8 +247,10 @@ both tools:
   (`preserve_order` keeps the layout), sealed and written through
   wrustic's own unpacked-file envelope (`RepoCrypto` + the lock module's
   backends pointed at `snapshots/`). Every field wrustic doesn't touch —
-  `excludes` included, unknown future fields too — survives
-  byte-for-byte. Verified live end to end:
+  `excludes` included, unknown future fields too — keeps its value and
+  position (reserializing may normalize JSON formatting details, such as
+  Go's `\u003c` HTML escaping of `<`, but drops and reorders nothing).
+  Verified live end to end:
   `live_native_tag_edit_interop_with_restic` (restic sees the new tags,
   `excludes` intact, `original` set; `restic check --read-data` passes;
   restic can itself retag the rewritten snapshot).

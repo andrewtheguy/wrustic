@@ -2725,11 +2725,16 @@ mod tests {
     }
 
     fn boot_app_with_snapshots(snaps: Vec<SnapshotRow>) -> App {
-        let tmp = std::env::temp_dir().join(format!(
-            "wrustic-app-test-{}-{}",
-            std::process::id(),
-            uniq()
-        ));
+        // Test workspaces live under the project's tmp/, not the system temp
+        // dir (project convention — avoids permission surprises).
+        let tmp = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tmp")
+            .join(format!(
+                "wrustic-app-test-{}-{}",
+                std::process::id(),
+                uniq()
+            ));
+        std::fs::create_dir_all(&tmp).expect("create test config dir");
         let paths = config::paths(Some(tmp)).expect("paths");
         let lock = config::acquire_lock(&paths).expect("lock fresh test config dir");
         let mut app =

@@ -322,7 +322,9 @@ pub(crate) fn delete_snapshot(profile: &Profile, snapshot_id: &str) -> Result<()
 /// The rewrite edits the raw snapshot JSON instead of round-tripping
 /// rustic_core's typed `SnapshotFile`, which silently drops restic fields it
 /// doesn't model (`excludes`) — this way every field wrustic doesn't touch
-/// survives byte-for-byte (serde_json's `preserve_order` keeps the layout).
+/// keeps its value and position (serde_json's `preserve_order` keeps the
+/// layout; reserializing may still normalize JSON formatting details, such
+/// as Go's `\u003c` HTML escaping of `<`, but drops and reorders nothing).
 ///
 /// Returns the rewritten snapshot's id (a retag changes the id), or `None`
 /// when the snapshot already carried exactly the requested tags — restic's
