@@ -460,6 +460,10 @@ pub(crate) fn prune(
     progress: std::sync::Arc<std::sync::Mutex<String>>,
     abort: std::sync::Arc<AbortSignal>,
 ) -> Result<String> {
+    // Fresh run, so any fallout still owed from a previous abort has landed:
+    // stop excusing background panics until this one raises its own.
+    ABORT_UNWINDING.store(false, std::sync::atomic::Ordering::Relaxed);
+
     let backends = build_backends(profile)?;
     let progress_bars = TuiProgressBars {
         buf: progress,
@@ -538,6 +542,43 @@ pub(crate) fn is_abort_panic(payload: &(dyn std::any::Any + Send)) -> bool {
         .map(String::as_str)
         .or_else(|| payload.downcast_ref::<&str>().copied())
         .is_some_and(|m| m == ABORT_PANIC)
+}
+
+/// Set while an abort is unwinding out of rustic_core, because the abort
+/// panic is not the only one it produces.
+///
+/// `TreeStreamerOnce::new` spawns **detached** loader threads that
+/// `out_tx.send(..).unwrap()` (`rustic_core-0.12.0/src/blob/tree.rs:683`).
+/// Unwinding drops the streamer and with it the receiving end, so every one
+/// of those threads panics on the resulting `SendError` — a different
+/// payload, on a thread [`is_abort_panic`] never sees. Those are collateral
+/// damage from a stop the user asked for, not a fault to report, and the
+/// panic hook needs to know that to keep them off the screen.
+///
+/// Latching rather than scoped: the loader threads panic concurrently with
+/// the unwind and can land after the catch has already mapped the abort to
+/// an error, so a flag cleared at the catch would race them. It is cleared
+/// when an operation that can raise one *starts* instead.
+static ABORT_UNWINDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a background-thread panic right now is fallout from an abort.
+pub(crate) fn abort_unwinding() -> bool {
+    ABORT_UNWINDING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The real payload [`AbortSignal::raise`] throws, for the panic-hook tests
+/// in main.rs — so they classify what the mechanism actually produces rather
+/// than a hand-written copy of it that could drift.
+#[cfg(test)]
+pub(crate) fn test_abort_payload() -> Box<dyn std::any::Any + Send> {
+    // No hook swapping to quieten the report: the hook is process-wide and
+    // the suite is threaded, so two tests trading it can leave the wrong one
+    // installed for everything after. A stray line in the test log is the
+    // cheaper problem, and the other panicking tests already print theirs.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        AbortSignal::default().raise(AbortReason::Cancelled)
+    }))
+    .expect_err("raise must panic")
 }
 
 /// Abort channel between a running rustic_core operation and its caller.
@@ -625,6 +666,7 @@ impl AbortSignal {
     fn raise(&self, reason: AbortReason) -> ! {
         use std::sync::PoisonError;
         *self.raised.lock().unwrap_or_else(PoisonError::into_inner) = Some(reason);
+        ABORT_UNWINDING.store(true, std::sync::atomic::Ordering::Relaxed);
         panic!("{ABORT_PANIC}");
     }
 
@@ -1864,6 +1906,14 @@ mod tests {
         let err = prune(fixture.profile(), std::sync::Arc::clone(&progress), abort)
             .expect_err("the prune must abort when the signal trips");
         assert_cancelled(&err);
+        // The panic hook has no access to the signal, so this flag is all it
+        // has to tell a background thread dying *because of* the abort from
+        // one dying of a bug. Only a `prune` starting clears it, and
+        // `test_acquire_guard` keeps another from running alongside this.
+        assert!(
+            abort_unwinding(),
+            "{label}: the hook would treat the unwind's fallout as a fault"
+        );
         // The phase really was reached — otherwise the test silently proves
         // nothing, e.g. after a rustic_core phase rename.
         let seen = progress.lock().unwrap_or_else(|p| p.into_inner()).clone();
@@ -1935,6 +1985,39 @@ mod tests {
         delete_snapshot(fixture.profile(), &drop_id).expect("drop the first snapshot");
 
         assert_prune_cancels_cleanly_during("repack", "repacking", fixture, &keep_id);
+    }
+
+    // The phase that was running when this failed in the field. `prune_plan`
+    // walks trees on `TreeStreamerOnce`, which spawns four **detached** loader
+    // threads that `out_tx.send(..).unwrap()`
+    // (`rustic_core-0.12.0/src/blob/tree.rs:683`); unwinding drops the
+    // streamer and the receiving end with it, so any loader still holding a
+    // queued tree panics on the resulting `SendError` — a second, unrelated
+    // payload, on threads the abort never touched. That is what
+    // `abort_unwinding` exists to excuse, and what the hook must not print.
+    //
+    // The fixture is wide (a tree blob per directory) to give the walk real
+    // work, but it does not force that loader race: the counter here counts
+    // *snapshots*, so with one survivor it ticks once and the abort lands at
+    // a phase boundary rather than with the queue full. Reproducing the race
+    // needs many snapshots of disjoint trees; the hook's own handling of it
+    // is covered directly by the disposition tests in main.rs instead.
+    #[test]
+    fn cancelling_during_the_tree_walk_unwinds_to_an_error() {
+        let _guard = lock::test_acquire_guard();
+        let fixture = TestRepo::init("cancel-treewalk");
+        let files: Vec<(String, Vec<u8>)> = (0..64)
+            .map(|i| (format!("dir{i:03}/f.bin"), pseudo_random(4096, 0x7ea1 + i)))
+            .collect();
+        let borrowed: Vec<(&str, &[u8])> = files
+            .iter()
+            .map(|(name, content)| (name.as_str(), content.as_slice()))
+            .collect();
+        let drop_id = fixture.backup(&borrowed, &[]);
+        let keep_id = fixture.backup(&[("extra.bin", &pseudo_random(4096, 0xfeed))], &[]);
+        delete_snapshot(fixture.profile(), &drop_id).expect("drop the first snapshot");
+
+        assert_prune_cancels_cleanly_during("tree walk", "finding used blobs", fixture, &keep_id);
     }
 
     /// Deterministic incompressible bytes (Marsaglia xorshift64 — the plain

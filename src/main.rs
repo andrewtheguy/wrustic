@@ -81,9 +81,14 @@ fn main() -> Result<()> {
         }
     };
 
-    install_panic_hook();
-
     let mut terminal = ratatui::init();
+    // `ratatui::init` installed its own panic hook just now — one that calls
+    // `ratatui::restore()` unconditionally, any panic, any thread, before
+    // chaining to whatever hook it found. Ours must go on *after* it, so ours
+    // runs first and that restore happens only when we chain to it. Installed
+    // the other way round, every cancelled prune's abort panic switched the
+    // shell back to its own screen underneath the live TUI.
+    install_panic_hook();
     // Enable mouse reporting after entering raw mode. With capture on,
     // terminals route clicks/scroll to us instead of doing native text
     // selection; users can hold Shift to bypass and select text.
@@ -101,36 +106,114 @@ fn main() -> Result<()> {
         let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     }
     ratatui::restore();
+    report_withheld_panics();
     result
 }
 
+/// Panic reports withheld from a live TUI, printed once the terminal is the
+/// shell's again. Bounded because a pool that dies thread by thread produces
+/// one apiece and they all say the same thing.
+static WITHHELD_PANICS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+const MAX_WITHHELD_PANICS: usize = 4;
+
 /// Keeps panics from writing over the alternate screen.
 ///
-/// Two cases, and they want opposite things:
+/// Nothing may be printed while the TUI owns the terminal: stderr goes to the
+/// alternate screen in raw mode, where `\n` moves down a line without
+/// returning to column 0, and the diff-based renderer only repaints cells
+/// that changed — so a panic report staircases across the frame and stays
+/// there. Whether the report is *wanted* is a separate question from whether
+/// it can be shown, and the split is by thread:
 ///
-/// * Cancelling a prune. rustic_core takes no cancellation token, so the
-///   progress adapter unwinds out of it by panicking and `repo::prune` maps
-///   that back to an ordinary error. The hook runs before the `catch_unwind`
-///   does, though, so the default one prints a panic report the user has no
-///   reason to see — and prints it in raw mode, where `\n` moves down without
-///   returning to column 0 and the diff-based renderer leaves whatever it
-///   does not repaint. That is the inconsistent terminal. Swallow it: the
-///   error is already on its way to the prune screen.
-/// * An actual bug. The default report is worth having, but it is unreadable
-///   while the terminal is in raw mode and on the alternate screen — and a
-///   panic on the main thread unwinds straight past the `ratatui::restore()`
-///   at the end of `main`, leaving the shell wedged afterwards. Restore
-///   first, then report.
+/// * **The main thread.** The panic unwinds out of `main`, past the
+///   `ratatui::restore()` at the end of it, so the terminal has to be handed
+///   back here or the shell is left raw and on the alternate screen. The
+///   process is going down; restore, then report as usual.
+/// * **Any other thread.** The app survives, so the terminal must not be
+///   touched — restoring it out from under a running TUI is precisely the
+///   corruption this exists to prevent. Withhold the report until exit.
+///
+/// Cancelling a prune produces both kinds of panic and neither is worth
+/// reporting: the abort itself (`repo::is_abort_panic` — rustic_core takes no
+/// cancellation token, so the progress adapter unwinds out of it by panicking
+/// and `repo::prune` maps that straight back to an error the prune screen
+/// shows), and the fallout in rustic_core's own detached threads that
+/// `repo::abort_unwinding` accounts for.
+///
+/// Must be installed after `ratatui::init()`: the hook taken here is then
+/// ratatui's own — restore-then-report — and reaching it becomes this hook's
+/// decision instead of the first thing that happens on every panic. The
+/// explicit `restore()` before chaining is kept anyway, so handing the
+/// terminal back does not silently hinge on what ratatui's hook happens to do.
 fn install_panic_hook() {
+    // Installed from `main`, so this is the main thread's id — unlike the
+    // thread *name*, which any `thread::Builder` in any dependency can also
+    // claim, an id compares equal only to the thread itself.
+    let main_thread = std::thread::current().id();
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if repo::is_abort_panic(info.payload()) {
-            return;
+        let on_main = std::thread::current().id() == main_thread;
+        match panic_disposition(info.payload(), on_main, repo::abort_unwinding()) {
+            PanicDisposition::Drop => {}
+            PanicDisposition::Withhold => withhold_panic(info.to_string()),
+            PanicDisposition::RestoreAndReport => {
+                let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+                ratatui::restore();
+                default_hook(info);
+            }
         }
-        let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
-        ratatui::restore();
-        default_hook(info);
     }));
+}
+
+/// What the hook does with one panic.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PanicDisposition {
+    /// Expected, and says nothing the user needs: forget it.
+    Drop,
+    /// Worth reporting, but not while the TUI owns the terminal.
+    Withhold,
+    /// The process is going down. Hand the terminal back, then report.
+    RestoreAndReport,
+}
+
+fn panic_disposition(
+    payload: &(dyn std::any::Any + Send),
+    on_main_thread: bool,
+    abort_unwinding: bool,
+) -> PanicDisposition {
+    if repo::is_abort_panic(payload) {
+        return PanicDisposition::Drop;
+    }
+    if on_main_thread {
+        return PanicDisposition::RestoreAndReport;
+    }
+    if abort_unwinding {
+        return PanicDisposition::Drop;
+    }
+    PanicDisposition::Withhold
+}
+
+fn withhold_panic(report: String) {
+    let mut withheld = WITHHELD_PANICS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if withheld.len() < MAX_WITHHELD_PANICS {
+        withheld.push(report);
+    }
+}
+
+/// Reports what the hook could not print while the TUI was up. Called after
+/// the terminal is restored, so a background thread's panic is still
+/// diagnosable rather than merely silent.
+fn report_withheld_panics() {
+    let withheld = std::mem::take(
+        &mut *WITHHELD_PANICS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    for report in withheld {
+        eprintln!("{report}");
+    }
 }
 
 fn run(
@@ -668,4 +751,89 @@ fn with_parent(items: Vec<ContentRow>) -> (Vec<ContentRow>, TableState) {
     let initial = if out.len() > 1 { 1 } else { 0 };
     table_state.select(Some(initial));
     (out, table_state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A panic payload as the hook receives one.
+    fn payload_of(f: impl FnOnce() + std::panic::UnwindSafe) -> Box<dyn std::any::Any + Send> {
+        std::panic::catch_unwind(f).expect_err("must panic")
+    }
+
+    // The whole of the terminal-corruption fix is in this table, so it is
+    // worth stating outright. Two versions shipped with a corrupted TUI after
+    // a cancelled prune: the first printed the abort panic, the second caught
+    // that one but still restored the terminal — out from under a *running*
+    // app — for the `SendError` panics rustic_core's detached tree loaders
+    // raise as fallout from the same unwind.
+    #[test]
+    fn only_a_dying_process_may_take_the_terminal_back() {
+        let abort = repo::test_abort_payload();
+        let fault = payload_of(|| panic!("some bug"));
+
+        // The abort is an ordinary outcome wherever it surfaces: the caller
+        // has already turned it into the error the prune screen shows.
+        for on_main in [true, false] {
+            for unwinding in [true, false] {
+                assert_eq!(
+                    panic_disposition(abort.as_ref(), on_main, unwinding),
+                    PanicDisposition::Drop,
+                    "abort panic, on_main={on_main} unwinding={unwinding}"
+                );
+            }
+        }
+
+        // A background thread's panic never touches the terminal — the app is
+        // still drawing to it. Only whether the report is worth keeping
+        // depends on the abort being in flight.
+        assert_eq!(
+            panic_disposition(fault.as_ref(), false, true),
+            PanicDisposition::Drop,
+            "fallout from an abort the user asked for is not a fault"
+        );
+        assert_eq!(
+            panic_disposition(fault.as_ref(), false, false),
+            PanicDisposition::Withhold,
+            "a real background fault must survive to be printed at exit"
+        );
+
+        // The main thread is the only case that ends the process, so it is
+        // the only one allowed to restore the terminal.
+        assert_eq!(
+            panic_disposition(fault.as_ref(), true, false),
+            PanicDisposition::RestoreAndReport
+        );
+    }
+
+    // A dying thread pool withholds one report per worker and they all say
+    // the same thing, so the buffer is capped rather than unbounded.
+    #[test]
+    fn withheld_reports_are_capped_and_drained_once() {
+        WITHHELD_PANICS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+
+        for i in 0..MAX_WITHHELD_PANICS * 3 {
+            withhold_panic(format!("report {i}"));
+        }
+        assert_eq!(
+            WITHHELD_PANICS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            MAX_WITHHELD_PANICS
+        );
+
+        report_withheld_panics();
+        assert!(
+            WITHHELD_PANICS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "draining must empty the buffer, or a later call reprints it"
+        );
+    }
 }

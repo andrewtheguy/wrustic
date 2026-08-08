@@ -225,29 +225,70 @@ whole approach viable: rustic_core defines **no `Drop` impls** at all, so
 no destructor can panic during the unwind and turn it into a process
 `abort()`; and wrustic sets no `panic = "abort"`.)
 
-The panic must also stay *invisible*. Rust's hook runs before the
-`catch_unwind` does, so the default one prints a panic report to stderr —
-over the alternate screen, in raw mode, where `\n` drops a line without
-returning to column 0 and the diff-based renderer never repaints what it
-did not change. `main::install_panic_hook` swallows exactly this panic
-(matched on `repo::ABORT_PANIC` by
-`repo::is_abort_panic`, pinned to what `raise` throws by
-`the_panic_hook_recognises_the_abort_it_must_not_print`) and restores the
-terminal before reporting any *other* panic — which also covers a real
-panic on the main thread, since that unwinds straight past the
-`ratatui::restore()` at the end of `main`.
+The panic must also stay *invisible*, and a cancellation raises more than
+one. Rust's hook runs before the `catch_unwind` does, so the default hook
+prints a report to stderr — over the alternate screen, in raw mode, where
+`\n` drops a line without returning to column 0 and the diff-based renderer
+never repaints what it did not change. That is one way a cancel corrupted
+the screen; the other was worse. `ratatui::init` installs a panic hook of
+its own that calls `ratatui::restore()` *unconditionally* — any panic, any
+thread — before chaining to whatever hook it found installed. With
+wrustic's hook installed first, ratatui's wrapper sat outermost and
+switched the shell back to its own screen (raw mode off, alternate screen
+left, mouse capture still on) on the abort panic of every single cancel,
+before wrustic's hook even ran. So `install_panic_hook` must run *after*
+`ratatui::init()`: wrustic's hook then decides, and ratatui's
+restore-then-report wrapper is the `default_hook` it chains to only when
+the process is going down. Two different panics reach the hook:
+
+- **The abort itself**, matched by `repo::is_abort_panic` and pinned to what
+  `raise` throws by `the_panic_hook_recognises_the_abort_it_must_not_print`.
+- **Its fallout inside rustic_core.** `TreeStreamerOnce::new` spawns four
+  *detached* loader threads that `out_tx.send(..).unwrap()`
+  (`rustic_core-0.12.0/src/blob/tree.rs:683`). Unwinding drops the streamer
+  and the receiving end with it, so every loader still holding a queued tree
+  panics on the resulting `SendError` — a different payload, on threads the
+  abort never touched. `repo::ABORT_UNWINDING`, set by `raise` and cleared
+  when a `prune` starts, is how the hook tells that fallout from a fault. It
+  latches rather than clearing at the catch because those threads panic
+  *concurrently* with the unwind and can land after it.
+
+So `main::install_panic_hook` splits by thread, not by payload
+(`main::panic_disposition`, covered exhaustively by
+`only_a_dying_process_may_take_the_terminal_back`):
+
+| | abort panic | fallout during an abort | anything else |
+|---|---|---|---|
+| main thread | dropped | restore + report | restore + report |
+| any other thread | dropped | dropped | withheld until exit |
+
+Only a panic on the main thread ends the process, and only it may restore
+the terminal — it unwinds straight past the `ratatui::restore()` at the end
+of `main`, so the shell would be left raw otherwise. A background thread's
+panic leaves the app running, so the terminal must not be touched at all:
+restoring it out from under a live TUI is the corruption, not the cure. Its
+report goes to `WITHHELD_PANICS` (capped — a dying pool produces one per
+worker, all saying the same thing) and is printed by
+`report_withheld_panics` once `main` has the terminal back.
 
 Tested end to end, not just in the adapter: `a_signalled_abort_unwinds_
 through_the_progress_adapter` and `an_abort_is_recognised_even_when_the_
 payload_is_rewritten` cover the mapper (including the pariter-style
-rewrite, and that unrelated panics still resume), and three tests cancel
+rewrite, and that unrelated panics still resume), and four tests cancel
 a *real* prune from inside rustic_core's own call stack — during planning,
-during index rebuild, and inside the parallel repack
-(`cancelling_inside_the_parallel_repack_unwinds_to_an_error`, whose
-fixture uses incompressible data so rustic actually repacks instead of
-dropping whole packs). Each asserts the phase was really reached, the
-error came back as an error, the lock was released, the surviving
+during the used-blob tree walk, during index rebuild, and inside the
+parallel repack (`cancelling_inside_the_parallel_repack_unwinds_to_an_
+error`, whose fixture uses incompressible data so rustic actually repacks
+instead of dropping whole packs). Each asserts the phase was really
+reached, the error came back as an error, `ABORT_UNWINDING` is set so the
+hook will excuse the fallout, the lock was released, the surviving
 snapshot is intact, and the repository is still prunable afterwards.
+
+What none of them reproduces is the loader race itself: the used-blob
+counter counts *snapshots*, so with one survivor it ticks once and the
+abort lands at a phase boundary rather than with the queue full. Forcing
+it would need many snapshots of disjoint trees; the hook's handling of it
+is covered directly by `panic_disposition` instead.
 
 **Native tag edits (implemented — phase 5, `repo::edit_snapshot_tags`,
 the TUI's `t` on the snapshot list):** what `restic tag` does, verified
