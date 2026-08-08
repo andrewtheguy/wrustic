@@ -524,6 +524,22 @@ pub(crate) enum AbortReason {
 /// (see [`AbortSignal`]) — it exists so an escaped panic reads sensibly.
 const ABORT_PANIC: &str = "wrustic: operation aborted (repository lock lost, or cancelled)";
 
+/// Whether a panic payload is the one [`AbortSignal::raise`] throws.
+///
+/// The process-wide panic hook runs *before* [`abort_if_signalled`] catches
+/// anything, so without this the default hook would print "thread panicked at
+/// ..." to stderr — on top of the TUI, in raw mode, where the newlines
+/// staircase and the alternate screen only repaints the cells that changed.
+/// A cancellation is a normal outcome here, not a crash, so the hook stays
+/// quiet for it (see the hook installed in `main`).
+pub(crate) fn is_abort_panic(payload: &(dyn std::any::Any + Send)) -> bool {
+    payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .is_some_and(|m| m == ABORT_PANIC)
+}
+
 /// Abort channel between a running rustic_core operation and its caller.
 ///
 /// rustic_core takes no cancellation token, so the only way to stop its
@@ -1488,6 +1504,30 @@ mod tests {
         // And a healthy stage's value passes through.
         let ok = abort_if_signalled(&abort, AssertUnwindSafe(|| 7)).expect("healthy stage");
         assert_eq!(ok, 7);
+    }
+
+    // The panic hook has to recognise our own abort by its payload alone —
+    // it runs before `abort_if_signalled` catches anything and has no access
+    // to the signal. If `raise` ever throws something else, the hook goes
+    // back to printing a panic report over the TUI, which is exactly the
+    // corrupted terminal it exists to prevent.
+    #[test]
+    fn the_panic_hook_recognises_the_abort_it_must_not_print() {
+        let abort = AbortSignal::default();
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            abort.raise(AbortReason::Cancelled)
+        }))
+        .expect_err("raise must panic");
+        assert!(
+            is_abort_panic(payload.as_ref()),
+            "the hook would print this one"
+        );
+
+        // Anything else still reaches the default hook.
+        let other = std::panic::catch_unwind(|| panic!("boom")).expect_err("must panic");
+        assert!(!is_abort_panic(other.as_ref()));
+        let literal = std::panic::catch_unwind(|| std::panic::panic_any("boom")).expect_err("!");
+        assert!(!is_abort_panic(literal.as_ref()));
     }
 
     // The reason the abort is flagged rather than recognised by its panic

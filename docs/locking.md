@@ -225,6 +225,18 @@ whole approach viable: rustic_core defines **no `Drop` impls** at all, so
 no destructor can panic during the unwind and turn it into a process
 `abort()`; and wrustic sets no `panic = "abort"`.)
 
+The panic must also stay *invisible*. Rust's hook runs before the
+`catch_unwind` does, so the default one prints a panic report to stderr —
+over the alternate screen, in raw mode, where `\n` drops a line without
+returning to column 0 and the diff-based renderer never repaints what it
+did not change. `main::install_panic_hook` swallows exactly this panic
+(matched on `repo::ABORT_PANIC` by
+`repo::is_abort_panic`, pinned to what `raise` throws by
+`the_panic_hook_recognises_the_abort_it_must_not_print`) and restores the
+terminal before reporting any *other* panic — which also covers a real
+panic on the main thread, since that unwinds straight past the
+`ratatui::restore()` at the end of `main`.
+
 Tested end to end, not just in the adapter: `a_signalled_abort_unwinds_
 through_the_progress_adapter` and `an_abort_is_recognised_even_when_the_
 payload_is_rewritten` cover the mapper (including the pariter-style

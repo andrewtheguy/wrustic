@@ -81,6 +81,8 @@ fn main() -> Result<()> {
         }
     };
 
+    install_panic_hook();
+
     let mut terminal = ratatui::init();
     // Enable mouse reporting after entering raw mode. With capture on,
     // terminals route clicks/scroll to us instead of doing native text
@@ -100,6 +102,35 @@ fn main() -> Result<()> {
     }
     ratatui::restore();
     result
+}
+
+/// Keeps panics from writing over the alternate screen.
+///
+/// Two cases, and they want opposite things:
+///
+/// * Cancelling a prune. rustic_core takes no cancellation token, so the
+///   progress adapter unwinds out of it by panicking and `repo::prune` maps
+///   that back to an ordinary error. The hook runs before the `catch_unwind`
+///   does, though, so the default one prints a panic report the user has no
+///   reason to see — and prints it in raw mode, where `\n` moves down without
+///   returning to column 0 and the diff-based renderer leaves whatever it
+///   does not repaint. That is the inconsistent terminal. Swallow it: the
+///   error is already on its way to the prune screen.
+/// * An actual bug. The default report is worth having, but it is unreadable
+///   while the terminal is in raw mode and on the alternate screen — and a
+///   panic on the main thread unwinds straight past the `ratatui::restore()`
+///   at the end of `main`, leaving the shell wedged afterwards. Restore
+///   first, then report.
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if repo::is_abort_panic(info.payload()) {
+            return;
+        }
+        let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+        ratatui::restore();
+        default_hook(info);
+    }));
 }
 
 fn run(
