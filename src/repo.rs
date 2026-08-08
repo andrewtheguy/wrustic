@@ -1396,14 +1396,14 @@ mod tests {
         let _guard = lock::test_acquire_guard();
         let fixture = TestRepo::init("delete");
         let snap_id = fixture.backup(&[("a.txt", b"hello\n")], &["keep"]);
-        let before = fixture.fingerprint();
+        let before = fixture.fingerprint().expect("fingerprint the repository");
 
         let held = plant_shared_lock(&fixture);
         let err = delete_snapshot(fixture.profile(), &snap_id)
             .expect_err("a delete must not run while another process holds a lock");
         assert_lock_conflict(&err);
         assert_eq!(
-            fixture.fingerprint(),
+            fixture.fingerprint().expect("fingerprint the repository"),
             before,
             "a blocked delete must not have written or removed anything"
         );
@@ -1438,14 +1438,14 @@ mod tests {
         let _guard = lock::test_acquire_guard();
         let fixture = TestRepo::init("tag");
         let snap_id = fixture.backup(&[("a.txt", b"hello\n")], &["old"]);
-        let before = fixture.fingerprint();
+        let before = fixture.fingerprint().expect("fingerprint the repository");
 
         let held = plant_shared_lock(&fixture);
         let err = edit_snapshot_tags(fixture.profile(), &snap_id, &["blocked".into()])
             .expect_err("a tag edit must not run while another process holds a lock");
         assert_lock_conflict(&err);
         assert_eq!(
-            fixture.fingerprint(),
+            fixture.fingerprint().expect("fingerprint the repository"),
             before,
             "a blocked tag edit must not have written the rewritten snapshot"
         );
@@ -1483,7 +1483,7 @@ mod tests {
         let first = fixture.backup(&[("a.txt", b"first content\n")], &[]);
         fixture.backup(&[("a.txt", b"second content\n"), ("b.txt", b"more\n")], &[]);
         delete_snapshot(fixture.profile(), &first).expect("drop the first snapshot");
-        let before = fixture.fingerprint();
+        let before = fixture.fingerprint().expect("fingerprint the repository");
 
         let held = plant_shared_lock(&fixture);
         let progress = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
@@ -1491,7 +1491,7 @@ mod tests {
             .expect_err("a prune must not run while another process holds a lock");
         assert_lock_conflict(&err);
         assert_eq!(
-            fixture.fingerprint(),
+            fixture.fingerprint().expect("fingerprint the repository"),
             before,
             "a blocked prune must not have deleted a pack or rewritten an index"
         );
@@ -1501,7 +1501,7 @@ mod tests {
         let progress = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         prune(fixture.profile(), progress).expect("prune once unlocked");
         assert_ne!(
-            fixture.fingerprint(),
+            fixture.fingerprint().expect("fingerprint the repository"),
             before,
             "the unblocked prune should have collected the dropped snapshot's blobs"
         );

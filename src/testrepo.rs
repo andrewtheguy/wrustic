@@ -17,10 +17,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use anyhow::{Context, Result};
 use rustic_core::{
     BackupOptions, ConfigOptions, Credentials, KeyOptions, PathList, Repository,
     RepositoryOptions, SnapshotOptions,
 };
+use sha2::{Digest, Sha256};
 
 use crate::config::Profile;
 use crate::lock::{LockBackend, RepoCrypto};
@@ -127,22 +129,30 @@ impl TestRepo {
         self.lock_backend().list().expect("list locks").len()
     }
 
-    /// Every repository file except `locks/`, as sorted `(relative path, size)`
-    /// pairs. Comparing two of these proves a blocked operation wrote, deleted
-    /// and rewrote nothing — the point of taking the lock before the first
-    /// write, not somewhere in the middle.
-    pub(crate) fn fingerprint(&self) -> Vec<(String, u64)> {
+    /// Every repository file except `locks/`, as sorted
+    /// `(relative path, SHA-256 of the content)` pairs. Comparing two of these
+    /// proves a blocked operation wrote, deleted and rewrote nothing — the
+    /// point of taking the lock before the first write, not somewhere in the
+    /// middle. Hashing rather than sizing matters for the repository files
+    /// that are *not* content-addressed — `config`, `keys/<id>` — where a
+    /// rewrite keeps both its name and, plausibly, its length.
+    ///
+    /// Every I/O failure propagates instead of being skipped: a fingerprint
+    /// that silently came back short would make `assert_eq!(after, before)`
+    /// pass while comparing two equally incomplete pictures.
+    pub(crate) fn fingerprint(&self) -> Result<Vec<(String, String)>> {
         let repo = self.repo_path();
         let mut out = Vec::new();
-        walk(&repo, &repo, &mut out);
+        walk(&repo, &repo, &mut out)?;
         out.sort();
-        return out;
+        return Ok(out);
 
-        fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, u64)>) {
-            let Ok(entries) = std::fs::read_dir(dir) else {
-                return;
-            };
-            for entry in entries.flatten() {
+        fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, String)>) -> Result<()> {
+            let entries = std::fs::read_dir(dir)
+                .with_context(|| format!("listing {}", dir.display()))?;
+            for entry in entries {
+                let entry =
+                    entry.with_context(|| format!("reading an entry of {}", dir.display()))?;
                 let path = entry.path();
                 let rel = path
                     .strip_prefix(root)
@@ -152,15 +162,18 @@ impl TestRepo {
                 if rel == "locks" {
                     continue;
                 }
-                match entry.file_type() {
-                    Ok(t) if t.is_dir() => walk(root, &path, out),
-                    Ok(_) => {
-                        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                        out.push((rel, size));
-                    }
-                    Err(_) => {}
+                let file_type = entry
+                    .file_type()
+                    .with_context(|| format!("stat {}", path.display()))?;
+                if file_type.is_dir() {
+                    walk(root, &path, out)?;
+                } else {
+                    let content = std::fs::read(&path)
+                        .with_context(|| format!("reading {}", path.display()))?;
+                    out.push((rel, crate::lock::hex(&Sha256::digest(&content))));
                 }
             }
+            Ok(())
         }
     }
 }
