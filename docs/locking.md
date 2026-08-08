@@ -109,12 +109,14 @@ Restic's own table above *is* the safety map. Tiered by lock type, with
 each operation's implementation status (see Phases below for the history).
 Implemented today: **forget / delete snapshots** (`repo::delete_snapshot`,
 the TUI delete flow), **prune** (`repo::prune`, the TUI's `p` action —
-see "Native prune" below), the **snapshot SMB share** (a long-running
-*read* under the same non-exclusive lock `restic mount` takes — see
-"Long-running reads" below), and — outside these tables because it takes
-no lock — **unlock** (`repo::unlock`, native stale-lock removal behind
-the TUI's `u` shortcut, plus the pre-spawn unstick in
-`restic::run_unsticking_locks`, nowadays test-only).
+see "Native prune" below), **tag edits** (`repo::edit_snapshot_tags`,
+the TUI's `t` action — see "Native tag edits" below), the **snapshot SMB
+share** (a long-running *read* under the same non-exclusive lock
+`restic mount` takes — see "Long-running reads" below), and — outside
+these tables because it takes no lock — **unlock** (`repo::unlock`,
+native stale-lock removal behind the TUI's `u` shortcut, plus the
+pre-spawn unstick in `restic::run_unsticking_locks`, nowadays
+test-only).
 
 **Tier 1 — non-exclusive lock (coexists with running restic backups):**
 
@@ -130,7 +132,7 @@ the TUI's `u` shortcut, plus the pre-spawn unstick in
 |---|---|---|
 | forget / delete snapshots | `delete_snapshots` | **implemented** — `repo::delete_snapshot` (phase 2) |
 | prune | `prune_plan` + `prune` | **implemented** — `repo::prune` (phase 4) |
-| tag edits | `save_snapshots` + `delete_snapshots` | planned — phase 5, next up |
+| tag edits | raw JSON via `cat_file` + own envelope (see below) | **implemented** — `repo::edit_snapshot_tags` (phase 5) |
 | description edits | `save_snapshots` + `delete_snapshots` | not planned — `description` is rustic-only; restic silently drops it on any rewrite, so wrustic only implements what both tools share |
 | key remove | `delete_key` | not planned |
 
@@ -199,30 +201,36 @@ rustic_core 0.12.0 source.
   run — Ctrl+C twice force-quits the app instead (safe, leaves a stale
   lock).
 
-**Native tag edits (planned — phase 5):** what `restic tag` does,
-verified against restic 0.19.1 (`cmd/restic/cmd_tag.go`), and what
-wrustic must mimic. Tags only — description edits are out of scope
-because `description` is a rustic-only field restic cannot preserve
-(see the round-trip bullet below); wrustic implements only features
-common to both tools:
+**Native tag edits (implemented — phase 5, `repo::edit_snapshot_tags`,
+the TUI's `t` on the snapshot list):** what `restic tag` does, verified
+against restic 0.19.1 (`cmd/restic/cmd_tag.go`), and what wrustic
+mimics. Tags only — description edits are out of scope because
+`description` is a rustic-only field restic cannot preserve (see the
+round-trip bullet below); wrustic implements only features common to
+both tools:
 
 - restic takes the **exclusive** lock (`openWithExclusiveLock`) even
   though the edit only touches snapshot files, and resolves the target
-  snapshots *under* the lock. wrustic must do the same — re-read the
-  snapshot after acquiring the lock, exactly like `repo::delete_snapshot`
+  snapshots *under* the lock. wrustic does the same — the snapshot is
+  re-read after acquiring the lock, exactly like `repo::delete_snapshot`
   does, because the row the TUI shows was read lock-free and may have
   been retagged or deleted in the meantime (a retag changes the snapshot
   id, so a stale id fails cleanly instead of editing the wrong file).
 - Edit semantics: `time` is preserved; `original` is set to the pre-edit
   id if not already set ("retain the original snapshot id over all tag
-  changes"); the **new snapshot file is saved first, then the old one
-  deleted** (`SaveSnapshot` → `RemoveUnpacked`), so there is never a
-  moment where the snapshot doesn't exist. rustic_core supports exactly
-  this order: its loader already does `original.get_or_insert(id)`
-  (`snapshotfile.rs` `set_id`), `save_snapshots` clears `id` and writes a
-  new file, then `delete_snapshots` removes the old id. Snapshot files
-  are not indexed, so nothing else needs rebuilding; the critical section
-  is sub-second.
+  changes"); the **new snapshot file is written first, then the old one
+  deleted** (restic's `SaveSnapshot` → `RemoveUnpacked` order), so there
+  is never a moment where the snapshot doesn't exist. Between those two
+  steps wrustic re-reads the new file through rustic_core's decrypt path
+  and compares it byte-for-byte — an envelope bug aborts before anything
+  is deleted. Snapshot files are not indexed, so nothing else needs
+  rebuilding; the critical section is sub-second. An unchanged tag set
+  is a no-op (no rewrite, id kept) — compared as a *set*, because restic
+  attaches no meaning to tag order and rustic_core models tags as a
+  `BTreeSet`, so wrustic's display (and editor prefill) is always
+  sorted; an order-sensitive check would rewrite untouched snapshots.
+  (restic's own `tag --set` rewrites unconditionally; wrustic is
+  deliberately stricter.)
 - Cross-tool field round-trip (restic 0.19.1 `internal/data/snapshot.go`
   vs rustic_core 0.12.0 `SnapshotFile`): `description` (and `label`,
   `delete`) are rustic-only — restic ignores them on read and silently
@@ -230,18 +238,22 @@ common to both tools:
   round-trip through Go structs that don't have the fields). This is why
   description edits are out of scope: the field cannot survive a mixed
   restic/wrustic workflow. Mirror image: rustic_core's `SnapshotFile`
-  has no `excludes` field, so a typed round-trip of a
-  `restic backup --exclude` snapshot silently drops `excludes` (cosmetic
-  metadata; data is unaffected). If losslessness is wanted, the
-  implementation can instead edit the raw snapshot JSON
-  (`serde_json::Value`) and write it through wrustic's own unpacked-file
-  envelope (`RepoCrypto`, already proven for lock files) — decide at
-  implementation time. rustic-only fields are all skipped-when-unset, so
-  editing a restic-created snapshot injects no rustic-only keys, and
-  rustic's `summary` struct is a superset of restic's, so summaries
-  survive. Cosmetic delta: rustic serializes
-  `uid`/`gid`/`hostname`/`username` even when zero/empty where restic
-  omits them — harmless, the rewritten file gets a new id regardless.
+  has no `excludes` field, so a round-trip through the typed
+  `save_snapshots` API would silently drop `excludes` from a
+  `restic backup --exclude` snapshot. That is why the implementation
+  does **not** use the typed API: it edits the raw snapshot JSON —
+  `Repository::cat_file(FileType::Snapshot, …)` under the lock, a
+  `serde_json::Value` mutation touching only `tags`/`original`
+  (`preserve_order` keeps the layout), sealed and written through
+  wrustic's own unpacked-file envelope (`RepoCrypto` + the lock module's
+  backends pointed at `snapshots/`). Every field wrustic doesn't touch —
+  `excludes` included, unknown future fields too — keeps its value and
+  position (reserializing may normalize JSON formatting details, such as
+  Go's `\u003c` HTML escaping of `<`, but drops and reorders nothing).
+  Verified live end to end:
+  `live_native_tag_edit_interop_with_restic` (restic sees the new tags,
+  `excludes` intact, `original` set; `restic check --read-data` passes;
+  restic can itself retag the rewritten snapshot).
 
 **Long-running reads — non-exclusive lock (implemented):** the snapshot
 SMB share (`smb::start_snapshot_share`). Reads take no lock in wrustic's
@@ -408,13 +420,16 @@ A `RepoLock` guard type that mirrors restic exactly:
    repack, then passes `restic check --read-data` with zero errors and
    zero orphans, restores the surviving snapshot through restic, and a
    follow-up `restic prune` runs clean.
-5. **Native tag edits** under the exclusive lock — next up; see "Native
-   tag edits" above for the verified restic semantics (lock kind,
-   resolve-under-lock, `original`, save-new-then-delete-old) the
-   implementation must follow. Description edits are out of scope
-   (rustic-only field, not restic-preservable). Native backup / copy /
-   key management, formerly this phase, were dropped from the plan — the
-   restic CLI keeps them.
+5. **Native tag edits** — DONE (`repo::edit_snapshot_tags`, the TUI's
+   `t` on the snapshot list; see "Native tag edits" above for the full
+   design). The exclusive lock, resolve-under-lock, `original`
+   retention, and write-verify-then-delete ordering all mirror restic;
+   the rewrite goes through raw JSON so restic-only fields like
+   `excludes` survive. A lock conflict offers `u` (native stale-lock
+   removal) and retries the same edit, like the delete flow. Description
+   edits are out of scope (rustic-only field, not restic-preservable).
+   Native backup / copy / key management, formerly this phase, were
+   dropped from the plan — the restic CLI keeps them.
 
 Non-goals: native backup, copy, and key management (the restic CLI
 keeps them; the Tier 1 rows above remain as the safety map should that

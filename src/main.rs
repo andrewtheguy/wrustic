@@ -35,7 +35,8 @@ use crate::app::{App, BrowseFrame, Screen, UnlockReturn};
 use crate::cli::{USAGE, parse_cli};
 use crate::config::{ConfigLock, Paths};
 use crate::repo::{
-    ContentRow, delete_snapshot, diff_snapshots, get_file_details, list_tree, load_snapshots,
+    ContentRow, delete_snapshot, diff_snapshots, edit_snapshot_tags, get_file_details, list_tree,
+    load_snapshots,
     open_indexed, preview_snapshot_contents, snapshot_delete_info, snapshot_root_tree,
     unlock, verify_profile,
 };
@@ -265,6 +266,42 @@ fn run(
             continue;
         }
 
+        if matches!(app.screen, Screen::SnapshotTagSaving) {
+            let (Some(snapshot_id), Some(tags)) =
+                (app.tag_edit_target.clone(), app.tag_edit_pending.clone())
+            else {
+                app.screen =
+                    Screen::SnapshotTagError("No snapshot selected for tag editing.".into());
+                continue;
+            };
+            let idx = app.loading_index;
+            let Some((_, profile)) = app.config.profile_at(idx) else {
+                app.screen = Screen::SnapshotTagError("Selected profile no longer exists.".into());
+                continue;
+            };
+            match edit_snapshot_tags(profile, &snapshot_id, &tags) {
+                // Unchanged: nothing was written, the list is still accurate.
+                Ok(None) => {
+                    app.clear_tag_edit_scratch();
+                    app.screen = Screen::Snapshots;
+                }
+                // The retag minted a new snapshot id — reload the list, keeping
+                // the cursor where it was (same mechanism as after a delete).
+                Ok(Some(_new_id)) => {
+                    app.clear_tag_edit_scratch();
+                    app.post_delete_select = app.list_state.selected();
+                    app.snapshots.clear();
+                    app.screen = Screen::Loading;
+                }
+                // Keep target and tags so an `unlock`-and-retry from the error
+                // screen redoes the same edit.
+                Err(e) => {
+                    app.screen = Screen::SnapshotTagError(format!("{e:#}"));
+                }
+            }
+            continue;
+        }
+
         if matches!(app.screen, Screen::Unlocking) {
             // Which flow asked for the unlock decides where its outcome goes:
             // the SMB share and the prune retry their operation (a lock
@@ -281,6 +318,7 @@ fn run(
                     }
                     UnlockReturn::Prune => Screen::PruneError(msg),
                     UnlockReturn::Delete => Screen::SnapshotDeleteError(msg),
+                    UnlockReturn::TagEdit => Screen::SnapshotTagError(msg),
                 };
                 continue;
             };
@@ -289,6 +327,9 @@ fn run(
                     app.screen = match return_to {
                         UnlockReturn::Smb => Screen::SnapshotSmbStarting,
                         UnlockReturn::Prune => Screen::PruneRunning,
+                        // Redo the same edit; target and tags survived the
+                        // error screen.
+                        UnlockReturn::TagEdit => Screen::SnapshotTagSaving,
                         // Re-enter the delete flow so details/preview are
                         // rebuilt and the confirmation is asked again; without
                         // a pending target there is nothing to retry, so just
@@ -312,6 +353,7 @@ fn run(
                         }
                         UnlockReturn::Prune => Screen::PruneError(msg),
                         UnlockReturn::Delete => Screen::SnapshotDeleteError(msg),
+                        UnlockReturn::TagEdit => Screen::SnapshotTagError(msg),
                     };
                 }
             }

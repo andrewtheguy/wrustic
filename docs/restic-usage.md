@@ -16,6 +16,7 @@ Everything wrustic does at runtime is native:
 | All reads (snapshot list, tree browsing, diff, file view/share, filters) | `rustic_core` |
 | Snapshot delete | native, under the restic-compatible repo lock (`repo::delete_snapshot`) |
 | Prune | native, under the same exclusive lock (`repo::prune`, instant delete) |
+| Tag edits (`t` on the snapshot list) | native, under the same exclusive lock (`repo::edit_snapshot_tags`, lossless raw-JSON rewrite) |
 | Unlock / stale-lock removal (`u` shortcut) | native (`repo::unlock`) |
 
 The prune flow (`p` on the Snapshots screen) runs rustic_core's prune
@@ -38,13 +39,11 @@ itself will never run them:
 - `restic backup` — creating snapshots
 - maintenance beyond prune: `repair`, `migrate`, key management
 
-Planned native: **tag edits**, under the same exclusive
-restic-compatible lock as delete and prune (locking.md Tier 2, "Native
-tag edits"). Description edits are not planned — `description` is a
-rustic-only snapshot field that restic silently drops on any rewrite,
-and wrustic only implements features common to both tools. Native
-backup, copy, and key management were considered (locking.md Tier 1)
-and dropped from the plan — they stay on the restic CLI indefinitely.
+Description edits are not planned — `description` is a rustic-only
+snapshot field that restic silently drops on any rewrite, and wrustic
+only implements features common to both tools. Native backup, copy, and
+key management were considered (locking.md Tier 1) and dropped from the
+plan — they stay on the restic CLI indefinitely.
 
 ## Tests only
 
@@ -56,8 +55,9 @@ real restic against throwaway repos:
 
 - The live interop tests in `src/repo.rs` use `restic::run` for `init`,
   `backup`, `forget`, `unlock`, `snapshots --json`,
-  `check --read-data --json`, `restore`, and `prune` to prove the native
-  lock, delete, and prune paths are compatible with real restic.
+  `check --read-data --json`, `restore`, `tag`, and `prune` to prove the
+  native lock, delete, tag-edit, and prune paths are compatible with
+  real restic.
 - The live test in `src/restic.rs` exercises the harness itself end to
   end (stdin password channel, plus `restic::run_unsticking_locks` — the
   native pre-spawn lock check that unlocks stale locks before running a

@@ -7,9 +7,9 @@ use bytes::Bytes;
 use rustic_backend::BackendOptions;
 use rustic_core::repofile::{Node, NodeType};
 use rustic_core::{
-    Credentials, IndexedFull, IndexedFullStatus, IndexedIdsStatus, LimitOption, Progress,
-    ProgressBars, ProgressType, PruneOptions, PruneStats, Repository, RepositoryOptions,
-    RepositoryBackends, RusticProgress, TreeId,
+    Credentials, FileType, IndexedFull, IndexedFullStatus, IndexedIdsStatus, LimitOption,
+    Progress, ProgressBars, ProgressType, PruneOptions, PruneStats, Repository,
+    RepositoryOptions, RepositoryBackends, RusticProgress, TreeId,
 };
 use tokio::sync::mpsc;
 
@@ -308,6 +308,110 @@ pub(crate) fn delete_snapshot(profile: &Profile, snapshot_id: &str) -> Result<()
     let snap = repo.get_snapshot_from_str(snapshot_id, |_| true)?;
     repo.delete_snapshots(&[snap.id])?;
     Ok(())
+}
+
+/// Replaces one snapshot's tag list natively, under the exclusive
+/// restic-compatible lock `restic tag` takes (docs/locking.md, "Native tag
+/// edits"). Mirrors restic's semantics: the snapshot is re-read *under* the
+/// lock (a concurrent retag changes the id, so a stale id fails cleanly
+/// instead of editing the wrong file), `original` is set to the pre-edit id
+/// if unset, and the new snapshot file is written — and verified readable —
+/// before the old one is deleted, so there is never a moment where the
+/// snapshot doesn't exist.
+///
+/// The rewrite edits the raw snapshot JSON instead of round-tripping
+/// rustic_core's typed `SnapshotFile`, which silently drops restic fields it
+/// doesn't model (`excludes`) — this way every field wrustic doesn't touch
+/// keeps its value and position (serde_json's `preserve_order` keeps the
+/// layout; reserializing may still normalize JSON formatting details, such
+/// as Go's `\u003c` HTML escaping of `<`, but drops and reorders nothing).
+///
+/// Returns the rewritten snapshot's id (a retag changes the id), or `None`
+/// when the snapshot already carried exactly the requested tags — restic's
+/// `changed == false` no-op, which avoids minting a new id for an identical
+/// snapshot.
+pub(crate) fn edit_snapshot_tags(
+    profile: &Profile,
+    snapshot_id: &str,
+    new_tags: &[String],
+) -> Result<Option<String>> {
+    ensure_full_snapshot_id(snapshot_id)?;
+    let backends = build_backends(profile)?;
+    let repo = Repository::new(&RepositoryOptions::default(), &backends)?
+        .open(&Credentials::password(profile.password()))?;
+    if repo.config().append_only == Some(true) {
+        bail!("the repository is append-only; snapshots cannot be rewritten");
+    }
+    let crypto = lock::RepoCrypto::from_repo(&repo)?;
+    let _lock =
+        lock::RepoLock::acquire_exclusive(lock::backend_for_profile(profile)?, crypto.clone())?;
+
+    let raw = repo.cat_file(FileType::Snapshot, snapshot_id).map_err(|e| {
+        anyhow!("reading snapshot {snapshot_id}: {e} (deleted or retagged concurrently?)")
+    })?;
+    let Some(new_json) = retag_snapshot_json(&raw, snapshot_id, new_tags)? else {
+        return Ok(None);
+    };
+
+    let snapshots = lock::snapshot_backend_for_profile(profile)?;
+    let new_id = lock::write_unpacked(snapshots.as_ref(), &crypto, &new_json)?;
+    // Read the new file back through rustic_core's own decrypt path before
+    // deleting anything: proves an independent reader decodes our envelope to
+    // exactly the JSON we meant to store.
+    let readback = repo
+        .cat_file(FileType::Snapshot, &new_id)
+        .map_err(|e| anyhow!("verifying rewritten snapshot {new_id}: {e}"))?;
+    if readback.as_ref() != new_json.as_slice() {
+        let _ = snapshots.remove(&new_id);
+        bail!("rewritten snapshot {new_id} did not read back as written; old snapshot kept");
+    }
+    snapshots.remove(snapshot_id)?;
+    Ok(Some(new_id))
+}
+
+/// The tag edit as a pure JSON transformation. Returns `None` when the
+/// snapshot already carries `new_tags`. The comparison is *set*-based, not
+/// list-based: restic attaches no meaning to tag order (its filters treat
+/// tags as a set), and rustic_core models them as a `BTreeSet` outright, so
+/// wrustic always displays them sorted — an order-sensitive check would make
+/// "open the editor, press Enter" rewrite a snapshot whose stored order
+/// merely differs from the sorted display. (restic's own `tag --set` is
+/// blunter still and rewrites unconditionally, identical tags or not.)
+///
+/// Only the `tags` and `original` keys are touched: `tags` is replaced — or
+/// removed when the new set is empty, matching restic's `omitempty` — and
+/// `original` is set to `old_id` unless the snapshot, itself the product of
+/// an earlier edit, already has one ("retain the original snapshot id over
+/// all tag changes", cmd_tag.go).
+fn retag_snapshot_json(raw: &[u8], old_id: &str, new_tags: &[String]) -> Result<Option<Vec<u8>>> {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(raw).context("parsing snapshot JSON")?;
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("snapshot JSON is not an object"))?;
+    let current: Vec<&str> = match obj.get("tags") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .map(|v| v.as_str().ok_or_else(|| anyhow!("snapshot tag is not a string: {v}")))
+            .collect::<Result<_>>()?,
+        Some(other) => bail!("snapshot `tags` is not an array: {other}"),
+    };
+    let current_set: std::collections::BTreeSet<&str> = current.iter().copied().collect();
+    let new_set: std::collections::BTreeSet<&str> =
+        new_tags.iter().map(String::as_str).collect();
+    if current_set == new_set {
+        return Ok(None);
+    }
+    if new_tags.is_empty() {
+        let _ = obj.remove("tags");
+    } else {
+        let _ = obj.insert("tags".into(), serde_json::json!(new_tags));
+    }
+    if !matches!(obj.get("original"), Some(serde_json::Value::String(_))) {
+        let _ = obj.insert("original".into(), serde_json::Value::String(old_id.to_string()));
+    }
+    Ok(Some(serde_json::to_vec(&value).context("serializing snapshot JSON")?))
 }
 
 /// Prunes the repository natively, under an exclusive restic-compatible lock —
@@ -1128,6 +1232,94 @@ mod tests {
         assert!(ensure_full_snapshot_id(&bad).is_err());
     }
 
+    fn tags(v: &[&str]) -> Vec<String> {
+        v.iter().map(ToString::to_string).collect()
+    }
+
+    const OLD_ID: &str = "ceedd62f4a63412571eac929f67931fb9702f31b681387e446e61cae3e039e73";
+
+    // The shape restic 0.19 writes for a `backup --exclude` snapshot —
+    // `excludes` has no counterpart in rustic_core's SnapshotFile, and the
+    // raw-JSON rewrite exists precisely so it survives a tag edit.
+    const RESTIC_SNAPSHOT: &str = r#"{"time":"2026-08-05T12:00:31.123456789+02:00","parent":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","tree":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","paths":["/home/it3"],"hostname":"it3s-MBP-4","username":"it3","uid":501,"gid":20,"excludes":["*.o","target/"],"tags":["old","keep"],"program_version":"restic 0.19.1","summary":{"backup_start":"2026-08-05T12:00:31.1+02:00","backup_end":"2026-08-05T12:00:32.2+02:00","files_new":3,"files_changed":0,"files_unmodified":0,"dirs_new":1,"dirs_changed":0,"dirs_unmodified":0,"data_blobs":3,"tree_blobs":2,"data_added":1000,"data_added_packed":900,"total_files_processed":3,"total_bytes_processed":1000}}"#;
+
+    #[test]
+    fn retag_replaces_tags_and_touches_nothing_else() {
+        let out = retag_snapshot_json(RESTIC_SNAPSHOT.as_bytes(), OLD_ID, &tags(&["new"]))
+            .unwrap()
+            .expect("tags differ, must rewrite");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["tags"], serde_json::json!(["new"]));
+        assert_eq!(v["original"], serde_json::json!(OLD_ID));
+        // Everything wrustic doesn't model must survive byte-identically —
+        // strip the two edited keys and the rest equals the input.
+        let mut expect: serde_json::Value = serde_json::from_str(RESTIC_SNAPSHOT).unwrap();
+        let mut got = v.clone();
+        for doc in [&mut expect, &mut got] {
+            let o = doc.as_object_mut().unwrap();
+            o.remove("tags");
+            o.remove("original");
+        }
+        assert_eq!(got, expect, "only tags/original may change");
+        // With preserve_order the untouched prefix keeps restic's layout.
+        let out_str = String::from_utf8(out).unwrap();
+        assert!(out_str.starts_with(r#"{"time":"2026-08-05T12:00:31.123456789+02:00","parent""#));
+    }
+
+    #[test]
+    fn retag_to_empty_removes_the_tags_key_like_restic_omitempty() {
+        let out = retag_snapshot_json(RESTIC_SNAPSHOT.as_bytes(), OLD_ID, &[])
+            .unwrap()
+            .expect("clearing tags is a change");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(v.get("tags").is_none());
+        assert_eq!(v["excludes"], serde_json::json!(["*.o", "target/"]));
+    }
+
+    #[test]
+    fn retag_is_a_noop_when_tags_already_match() {
+        assert!(
+            retag_snapshot_json(RESTIC_SNAPSHOT.as_bytes(), OLD_ID, &tags(&["old", "keep"]))
+                .unwrap()
+                .is_none()
+        );
+        // Also for the no-tags ↔ empty-request pair (key absent entirely).
+        let untagged = r#"{"time":"2026-08-05T12:00:31Z","tree":"cc","paths":["/x"]}"#;
+        assert!(retag_snapshot_json(untagged.as_bytes(), OLD_ID, &[]).unwrap().is_none());
+        // The comparison is set-based: the same tags in another order are a
+        // no-op, because rustic sorts tags for display (BTreeSet) and a
+        // reordered prefill must not rewrite an untouched snapshot.
+        assert!(
+            retag_snapshot_json(RESTIC_SNAPSHOT.as_bytes(), OLD_ID, &tags(&["keep", "old"]))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn retag_keeps_an_existing_original_id() {
+        // A snapshot that is itself the product of an earlier edit: restic
+        // retains the *first* original over all tag changes.
+        let first = "1111111111111111111111111111111111111111111111111111111111111111";
+        let edited = RESTIC_SNAPSHOT.replace(
+            r#""program_version""#,
+            &format!(r#""original":"{first}","program_version""#),
+        );
+        let out = retag_snapshot_json(edited.as_bytes(), OLD_ID, &tags(&["x"]))
+            .unwrap()
+            .expect("rewrite");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["original"], serde_json::json!(first));
+    }
+
+    #[test]
+    fn retag_rejects_malformed_snapshots() {
+        assert!(retag_snapshot_json(b"[]", OLD_ID, &[]).is_err());
+        assert!(retag_snapshot_json(b"not json", OLD_ID, &[]).is_err());
+        let bad_tags = r#"{"time":"2026-08-05T12:00:31Z","tags":"oops"}"#;
+        assert!(retag_snapshot_json(bad_tags.as_bytes(), OLD_ID, &tags(&["x"])).is_err());
+    }
+
     // Failure injection for the mid-prune lock-loss abort: a tripped poison
     // probe must panic the progress adapter out of the (simulated) executor,
     // and `abort_if_lock_poisoned` must turn exactly that panic into an
@@ -1252,6 +1444,124 @@ mod tests {
         let listed: serde_json::Value =
             serde_json::from_slice(&restic_list).expect("restic snapshots json");
         assert_eq!(listed, serde_json::json!([]));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // End-to-end interop for the native tag edit. restic creates a snapshot
+    // with tags and an --exclude (the `excludes` field has no counterpart in
+    // rustic_core's SnapshotFile — the raw-JSON rewrite exists precisely so
+    // it survives an edit), wrustic retags natively under the exclusive
+    // lock, and restic must afterwards see the new tags with everything else
+    // intact and the repository healthy. Marked #[ignore]; run with
+    // `cargo test -- --ignored` (needs restic on PATH).
+    #[test]
+    #[ignore]
+    fn live_native_tag_edit_interop_with_restic() {
+        // Acquires RepoLocks — serialize with other acquiring tests (SIGHUP
+        // disposition is process-global).
+        let _guard = lock::test_acquire_guard();
+
+        let root =
+            std::path::PathBuf::from("tmp").join(format!("tag-it-{}", std::process::id()));
+        let repo_path = root.join("repo");
+        let source = root.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("keep.txt"), b"hello").unwrap();
+        std::fs::write(source.join("skip.o"), b"object file").unwrap();
+
+        let profile = Profile::Local {
+            password: "pw".into(),
+            local_path: repo_path.to_string_lossy().into_owned(),
+        };
+        crate::restic::run(&profile, &["init", "--json"]).expect("restic init");
+        crate::restic::run(
+            &profile,
+            &[
+                "backup",
+                source.to_str().unwrap(),
+                "--tag",
+                "old,keep",
+                "--exclude",
+                "*.o",
+                "--json",
+            ],
+        )
+        .expect("restic backup");
+
+        let snapshots = load_snapshots(&profile).expect("list snapshots");
+        assert_eq!(snapshots.len(), 1);
+        let snap_id = snapshots[0].id.clone();
+        // rustic models tags as a BTreeSet, so wrustic's view is sorted even
+        // though restic stored ["old", "keep"] in typed order.
+        assert_eq!(snapshots[0].tags, vec!["keep", "old"]);
+
+        // A concurrent holder (a shared lock, as a running backup would
+        // take) must block the exclusive tag edit — restic's rule for `tag`.
+        {
+            let backends = build_backends(&profile).unwrap();
+            let repo = Repository::new(&RepositoryOptions::default(), &backends)
+                .unwrap()
+                .open(&Credentials::password(profile.password()))
+                .unwrap();
+            let crypto = lock::RepoCrypto::from_repo(&repo).unwrap();
+            let live = lock::RepoLock::acquire_shared(
+                lock::backend_for_profile(&profile).unwrap(),
+                crypto,
+            )
+            .expect("shared lock");
+            let err = edit_snapshot_tags(&profile, &snap_id, &["blocked".into()])
+                .expect_err("tag edit must be blocked by a live shared lock");
+            assert!(
+                lock::is_lock_error(&format!("{err:#}")),
+                "expected a lock conflict, got: {err:#}"
+            );
+            drop(live);
+        }
+
+        // Same tags → restic's `changed == false` no-op: nothing written.
+        let unchanged =
+            edit_snapshot_tags(&profile, &snap_id, &["old".into(), "keep".into()])
+                .expect("no-op edit");
+        assert!(unchanged.is_none());
+        assert_eq!(load_snapshots(&profile).unwrap()[0].id, snap_id);
+
+        // The real edit.
+        let new_id = edit_snapshot_tags(&profile, &snap_id, &["new".into(), "keep".into()])
+            .expect("native tag edit")
+            .expect("tags differ, must rewrite");
+        assert_ne!(new_id, snap_id);
+
+        // restic's view: one snapshot under the new id, retagged, with
+        // `excludes` intact and `original` pointing at the pre-edit id.
+        let listed = crate::restic::run(&profile, &["snapshots", "--json"])
+            .expect("restic snapshots");
+        let listed: serde_json::Value =
+            serde_json::from_slice(&listed).expect("restic snapshots json");
+        let arr = listed.as_array().expect("snapshot array");
+        assert_eq!(arr.len(), 1);
+        let snap = &arr[0];
+        assert_eq!(snap["id"], serde_json::json!(new_id));
+        assert_eq!(snap["tags"], serde_json::json!(["new", "keep"]));
+        assert_eq!(
+            snap["excludes"],
+            serde_json::json!(["*.o"]),
+            "the raw-JSON rewrite must preserve restic's excludes field"
+        );
+        assert_eq!(snap["original"], serde_json::json!(snap_id));
+
+        // wrustic's native reader agrees (sorted view of the same set).
+        let after = load_snapshots(&profile).expect("list after edit");
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].id, new_id);
+        assert_eq!(after[0].tags, vec!["keep", "new"]);
+
+        // The repository is healthy from restic's side, and restic can
+        // itself retag the rewritten snapshot (full round-trip of our file).
+        crate::restic::run(&profile, &["check", "--read-data", "--json"])
+            .expect("restic check");
+        crate::restic::run(&profile, &["tag", "--add", "more", &new_id, "--json"])
+            .expect("restic tag on our rewritten snapshot");
 
         std::fs::remove_dir_all(&root).ok();
     }

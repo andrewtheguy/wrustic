@@ -9,7 +9,9 @@
 //!
 //! [`S3LockBackend`] serves the lock module: lock files are outside
 //! rustic_core's `FileType`-addressed world entirely (its enum has no `Lock`
-//! variant), so it reaches the `locks/` prefix directly. See docs/locking.md.
+//! variant), so it reaches the `locks/` prefix directly. The prefix is a
+//! constructor parameter, so the same backend also serves `snapshots/` for
+//! the native tag edit's raw-JSON rewrite. See docs/locking.md.
 
 use std::sync::OnceLock;
 
@@ -63,6 +65,7 @@ fn build_operator(
 
 pub(crate) struct S3LockBackend {
     operator: Operator,
+    dir: String,
 }
 
 impl S3LockBackend {
@@ -73,11 +76,17 @@ impl S3LockBackend {
         root: &str,
         access_key: &str,
         secret_key: &str,
+        dir: &str,
     ) -> Result<Self> {
         Ok(Self {
             operator: build_operator(endpoint, bucket, region, root, access_key, secret_key)
-                .context("creating the S3 lock backend")?,
+                .with_context(|| format!("creating the S3 {dir} backend"))?,
+            dir: dir.to_string(),
         })
+    }
+
+    fn key(&self, name: &str) -> String {
+        format!("{}/{name}", self.dir)
     }
 }
 
@@ -89,11 +98,11 @@ impl LockBackend for S3LockBackend {
         };
         let entries = self
             .operator
-            .lister_options("locks/", options)
-            .map_err(|err| anyhow!("listing S3 locks: {err}"))?;
+            .lister_options(&format!("{}/", self.dir), options)
+            .map_err(|err| anyhow!("listing S3 {}: {err}", self.dir))?;
         let mut out = Vec::new();
         for result in entries {
-            let entry = result.map_err(|err| anyhow!("reading S3 lock listing: {err}"))?;
+            let entry = result.map_err(|err| anyhow!("reading S3 {} listing: {err}", self.dir))?;
             if entry.metadata().is_file() {
                 out.push((entry.name().to_string(), entry.metadata().content_length()));
             }
@@ -102,25 +111,25 @@ impl LockBackend for S3LockBackend {
     }
 
     fn read(&self, name: &str) -> Result<Option<Vec<u8>>> {
-        match self.operator.read(&format!("locks/{name}")) {
+        match self.operator.read(&self.key(name)) {
             Ok(buf) => Ok(Some(buf.to_bytes().to_vec())),
             Err(err) if err.kind() == opendal::ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(anyhow!("reading S3 lock {name}: {err}")),
+            Err(err) => Err(anyhow!("reading S3 {}: {err}", self.key(name))),
         }
     }
 
     fn write(&self, name: &str, data: &[u8]) -> Result<()> {
         self.operator
-            .write(&format!("locks/{name}"), data.to_vec())
-            .map_err(|err| anyhow!("writing S3 lock {name}: {err}"))?;
+            .write(&self.key(name), data.to_vec())
+            .map_err(|err| anyhow!("writing S3 {}: {err}", self.key(name)))?;
         Ok(())
     }
 
     fn remove(&self, name: &str) -> Result<()> {
-        match self.operator.delete(&format!("locks/{name}")) {
+        match self.operator.delete(&self.key(name)) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == opendal::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(anyhow!("removing S3 lock {name}: {err}")),
+            Err(err) => Err(anyhow!("removing S3 {}: {err}", self.key(name))),
         }
     }
 }

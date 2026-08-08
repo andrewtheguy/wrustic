@@ -251,9 +251,13 @@ impl RepoCrypto {
 // Backend access to the repo's `locks/` directory.
 // ---------------------------------------------------------------------------
 
-/// Raw file operations on `locks/`. Lock names are the hex storage ids.
+/// Raw file operations on one unpacked-file directory of the repo. Built for
+/// `locks/` (which rustic_core cannot address at all), but the operations are
+/// directory-agnostic, so the same backends also serve `snapshots/` for the
+/// native tag edit's lossless raw-JSON rewrite (`repo::edit_snapshot_tags`).
+/// File names are the hex storage ids.
 pub(crate) trait LockBackend: Send + Sync {
-    /// All lock files as `(name, size)`. Zero-size entries are interrupted
+    /// All files as `(name, size)`. Zero-size entries are interrupted
     /// uploads and get skipped by callers (as restic does).
     fn list(&self) -> Result<Vec<(String, u64)>>;
     /// `None` when the lock vanished between list and read — a lock that is
@@ -269,8 +273,8 @@ pub(crate) struct LocalLockBackend {
 }
 
 impl LocalLockBackend {
-    pub(crate) fn new(repo_path: &str) -> Self {
-        Self { dir: std::path::Path::new(repo_path).join("locks") }
+    pub(crate) fn new(repo_path: &str, dir: &str) -> Self {
+        Self { dir: std::path::Path::new(repo_path).join(dir) }
     }
 }
 
@@ -279,12 +283,12 @@ impl LockBackend for LocalLockBackend {
         let entries = match std::fs::read_dir(&self.dir) {
             Ok(e) => e,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(e).context("listing locks/"),
+            Err(e) => return Err(e).with_context(|| format!("listing {}", self.dir.display())),
         };
         let mut out = Vec::new();
         for entry in entries {
-            let entry = entry.context("reading locks/ entry")?;
-            let meta = entry.metadata().context("reading locks/ entry metadata")?;
+            let entry = entry.context("reading dir entry")?;
+            let meta = entry.metadata().context("reading dir entry metadata")?;
             if meta.is_file() {
                 out.push((entry.file_name().to_string_lossy().into_owned(), meta.len()));
             }
@@ -296,55 +300,56 @@ impl LockBackend for LocalLockBackend {
         match std::fs::read(self.dir.join(name)) {
             Ok(data) => Ok(Some(data)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e).with_context(|| format!("reading lock {name}")),
+            Err(e) => Err(e).with_context(|| format!("reading {name}")),
         }
     }
 
     fn write(&self, name: &str, data: &[u8]) -> Result<()> {
-        std::fs::create_dir_all(&self.dir).context("creating locks/")?;
-        // Write-then-rename so other processes never see a partial lock file.
+        std::fs::create_dir_all(&self.dir)
+            .with_context(|| format!("creating {}", self.dir.display()))?;
+        // Write-then-rename so other processes never see a partial file.
         let tmp = self.dir.join(format!(".tmp-{name}"));
         {
             use std::io::Write;
-            let mut f = std::fs::File::create(&tmp).context("creating lock temp file")?;
-            f.write_all(data).context("writing lock temp file")?;
-            f.sync_all().context("syncing lock temp file")?;
+            let mut f = std::fs::File::create(&tmp).context("creating temp file")?;
+            f.write_all(data).context("writing temp file")?;
+            f.sync_all().context("syncing temp file")?;
         }
-        std::fs::rename(&tmp, self.dir.join(name)).context("renaming lock into place")
+        std::fs::rename(&tmp, self.dir.join(name)).context("renaming into place")
     }
 
     fn remove(&self, name: &str) -> Result<()> {
         match std::fs::remove_file(self.dir.join(name)) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e).with_context(|| format!("removing lock {name}")),
+            Err(e) => Err(e).with_context(|| format!("removing {name}")),
         }
     }
 }
 
 pub(crate) struct RestLockBackend {
-    locks_url: url::Url,
+    dir_url: url::Url,
     user: String,
     password: String,
     client: reqwest::blocking::Client,
 }
 
 impl RestLockBackend {
-    pub(crate) fn new(rest_url: &str, user: &str, password: &str) -> Result<Self> {
+    pub(crate) fn new(rest_url: &str, user: &str, password: &str, dir: &str) -> Result<Self> {
         let mut base = rest_url.to_string();
         if !base.ends_with('/') {
             base.push('/');
         }
-        let locks_url = url::Url::parse(&base)
+        let dir_url = url::Url::parse(&base)
             .with_context(|| format!("parsing REST URL `{rest_url}`"))?
-            .join("locks/")
-            .context("building locks/ URL")?;
+            .join(&format!("{dir}/"))
+            .with_context(|| format!("building {dir}/ URL"))?;
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .context("building HTTP client")?;
         Ok(Self {
-            locks_url,
+            dir_url,
             user: user.to_string(),
             password: password.to_string(),
             client,
@@ -361,7 +366,7 @@ impl RestLockBackend {
     }
 
     fn item_url(&self, name: &str) -> Result<url::Url> {
-        self.locks_url.join(name).with_context(|| format!("building URL for lock {name}"))
+        self.dir_url.join(name).with_context(|| format!("building URL for {name}"))
     }
 }
 
@@ -371,7 +376,7 @@ impl LockBackend for RestLockBackend {
         // server replies with a plain array of names (size unknown — report
         // it as nonzero so the entry is still read rather than skipped).
         let resp = self
-            .request(reqwest::Method::GET, self.locks_url.clone())
+            .request(reqwest::Method::GET, self.dir_url.clone())
             .header("Accept", "application/vnd.x.restic.rest.v2")
             .send()
             .context("listing locks via REST")?;
@@ -442,11 +447,28 @@ impl LockBackend for RestLockBackend {
 /// rustic_core backend an open `Repository` uses — rustic_core's `FileType`
 /// enum cannot address `locks/` at all.
 pub(crate) fn backend_for_profile(profile: &crate::config::Profile) -> Result<Arc<dyn LockBackend>> {
+    dir_backend_for_profile(profile, "locks")
+}
+
+/// Raw access to the repo's `snapshots/` directory, for the native tag
+/// edit's lossless rewrite (unlike locks, rustic_core *can* address
+/// snapshots — but only through its typed `SnapshotFile`, which drops
+/// restic fields it doesn't model, e.g. `excludes`).
+pub(crate) fn snapshot_backend_for_profile(
+    profile: &crate::config::Profile,
+) -> Result<Arc<dyn LockBackend>> {
+    dir_backend_for_profile(profile, "snapshots")
+}
+
+fn dir_backend_for_profile(
+    profile: &crate::config::Profile,
+    dir: &str,
+) -> Result<Arc<dyn LockBackend>> {
     use crate::config::Profile;
     Ok(match profile {
-        Profile::Local { local_path, .. } => Arc::new(LocalLockBackend::new(local_path)),
+        Profile::Local { local_path, .. } => Arc::new(LocalLockBackend::new(local_path, dir)),
         Profile::Rest { rest_url, rest_user, rest_password, .. } => {
-            Arc::new(RestLockBackend::new(rest_url, rest_user, rest_password)?)
+            Arc::new(RestLockBackend::new(rest_url, rest_user, rest_password, dir)?)
         }
         Profile::S3 {
             s3_endpoint,
@@ -463,6 +485,7 @@ pub(crate) fn backend_for_profile(profile: &crate::config::Profile) -> Result<Ar
             s3_root,
             s3_access_key,
             s3_secret_key,
+            dir,
         )?),
     })
 }
@@ -671,7 +694,18 @@ fn refresh_loop(
 
 fn write_lock(backend: &dyn LockBackend, crypto: &RepoCrypto, data: &LockData) -> Result<String> {
     let json = serde_json::to_vec(data).context("serializing lock file")?;
-    let sealed = crypto.seal(&json)?;
+    write_unpacked(backend, crypto, &json)
+}
+
+/// Seals a payload as an unpacked repo file (the encoding restic uses for
+/// locks, snapshots, index, …) and writes it under its content-addressed
+/// name — the SHA-256 hex of the ciphertext. Returns the name.
+pub(crate) fn write_unpacked(
+    backend: &dyn LockBackend,
+    crypto: &RepoCrypto,
+    plain: &[u8],
+) -> Result<String> {
+    let sealed = crypto.seal(plain)?;
     let name = hex(&Sha256::digest(&sealed));
     backend.write(&name, &sealed)?;
     Ok(name)
@@ -1482,7 +1516,7 @@ mod tests {
     #[test]
     fn rest_backend_v2_full_cycle_with_basic_auth() {
         let mock = RestMock::start(false);
-        let backend = RestLockBackend::new(&mock.base_url, "andrew", "hunter2").unwrap();
+        let backend = RestLockBackend::new(&mock.base_url, "andrew", "hunter2", "locks").unwrap();
 
         assert!(backend.list().unwrap().is_empty());
         backend.write("aaaa", b"data-1").unwrap();
@@ -1519,7 +1553,7 @@ mod tests {
     #[test]
     fn rest_backend_v1_list_fallback_and_no_auth_without_user() {
         let mock = RestMock::start(true);
-        let backend = RestLockBackend::new(&mock.base_url, "", "").unwrap();
+        let backend = RestLockBackend::new(&mock.base_url, "", "", "locks").unwrap();
 
         backend.write("cccc", b"x").unwrap();
         // v1 answers with names only — size is unknown, reported as u64::MAX
@@ -1536,7 +1570,7 @@ mod tests {
         // mock 404s everything outside /repo/.
         let mock = RestMock::start(false);
         let url = mock.base_url.replace("/repo/", "/uninitialized/");
-        let backend = RestLockBackend::new(&url, "", "").unwrap();
+        let backend = RestLockBackend::new(&url, "", "", "locks").unwrap();
         assert!(backend.list().unwrap().is_empty());
         // Writes must NOT swallow errors the same way.
         assert!(backend.write("aaaa", b"x").is_err());
@@ -1559,6 +1593,7 @@ mod tests {
                 &format!("lock-backend-it-{}", std::process::id()),
                 "GK22222222222222222222222222222222",
                 "3333333333333333333333333333333333333333333333333333333333333333",
+                "locks",
             )
             .unwrap(),
         );
