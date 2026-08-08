@@ -229,8 +229,17 @@ The panic must also stay *invisible*, and a cancellation raises more than
 one. Rust's hook runs before the `catch_unwind` does, so the default hook
 prints a report to stderr — over the alternate screen, in raw mode, where
 `\n` drops a line without returning to column 0 and the diff-based renderer
-never repaints what it did not change. That is what a corrupted prune
-screen was. Two different panics reach the hook:
+never repaints what it did not change. That is one way a cancel corrupted
+the screen; the other was worse. `ratatui::init` installs a panic hook of
+its own that calls `ratatui::restore()` *unconditionally* — any panic, any
+thread — before chaining to whatever hook it found installed. With
+wrustic's hook installed first, ratatui's wrapper sat outermost and
+switched the shell back to its own screen (raw mode off, alternate screen
+left, mouse capture still on) on the abort panic of every single cancel,
+before wrustic's hook even ran. So `install_panic_hook` must run *after*
+`ratatui::init()`: wrustic's hook then decides, and ratatui's
+restore-then-report wrapper is the `default_hook` it chains to only when
+the process is going down. Two different panics reach the hook:
 
 - **The abort itself**, matched by `repo::is_abort_panic` and pinned to what
   `raise` throws by `the_panic_hook_recognises_the_abort_it_must_not_print`.

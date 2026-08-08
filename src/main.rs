@@ -81,9 +81,14 @@ fn main() -> Result<()> {
         }
     };
 
-    install_panic_hook();
-
     let mut terminal = ratatui::init();
+    // `ratatui::init` installed its own panic hook just now — one that calls
+    // `ratatui::restore()` unconditionally, any panic, any thread, before
+    // chaining to whatever hook it found. Ours must go on *after* it, so ours
+    // runs first and that restore happens only when we chain to it. Installed
+    // the other way round, every cancelled prune's abort panic switched the
+    // shell back to its own screen underneath the live TUI.
+    install_panic_hook();
     // Enable mouse reporting after entering raw mode. With capture on,
     // terminals route clicks/scroll to us instead of doing native text
     // selection; users can hold Shift to bypass and select text.
@@ -134,6 +139,12 @@ const MAX_WITHHELD_PANICS: usize = 4;
 /// and `repo::prune` maps that straight back to an error the prune screen
 /// shows), and the fallout in rustic_core's own detached threads that
 /// `repo::abort_unwinding` accounts for.
+///
+/// Must be installed after `ratatui::init()`: the hook taken here is then
+/// ratatui's own — restore-then-report — and reaching it becomes this hook's
+/// decision instead of the first thing that happens on every panic. The
+/// explicit `restore()` before chaining is kept anyway, so handing the
+/// terminal back does not silently hinge on what ratatui's hook happens to do.
 fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
