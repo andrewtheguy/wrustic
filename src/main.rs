@@ -469,7 +469,7 @@ fn run(
                 app.prune_rx = Some(rx);
                 app.prune_progress = Some(progress);
                 app.prune_abort = Some(abort);
-                app.prune_cancelling = None;
+                app.prune_cancelling = false;
                 app.prune_started = Some(std::time::Instant::now());
             }
             let rx = app.prune_rx.as_ref().expect("receiver set above");
@@ -478,7 +478,7 @@ fn run(
                     app.prune_rx = None;
                     app.prune_progress = None;
                     app.prune_abort = None;
-                    app.prune_cancelling = None;
+                    app.prune_cancelling = false;
                     app.prune_started = None;
                     app.prune_scroll = 0;
                     app.screen = match outcome {
@@ -491,32 +491,38 @@ fn run(
                     // progress without spinning (a swallowed resize is
                     // repainted at the next tick).
                     //
-                    // Ctrl+C asks the worker to stop: rustic_core takes no
-                    // cancellation token, so the progress adapter unwinds out
-                    // of it at the next tick and `repo::prune` returns an
+                    // Esc or Ctrl+C asks the worker to stop: rustic_core takes
+                    // no cancellation token, so the progress adapter unwinds
+                    // out of it at the next tick and `repo::prune` returns an
                     // ordinary error (docs/locking.md, "Cancelling a native
                     // prune"). The app stays up and the lock guard still
                     // drops, so — unlike the force-quit this replaced — no
                     // stale lock is left behind.
                     //
-                    // A second Ctrl+C after that still force-quits, as the
+                    // Only Ctrl+C escalates: a second press force-quits, the
                     // fallback for a run that has somehow stopped ticking.
                     // Killing the process is safe for the repository (all new
                     // data and the new index are written before anything old
-                    // is deleted) but skips the lock cleanup.
+                    // is deleted) but skips the lock cleanup. Esc therefore
+                    // never quits, however often it is pressed — it is the
+                    // "I changed my mind" key everywhere else in the app, and
+                    // must not become a way to lose the lock by accident.
+                    //
+                    // Every other key stays swallowed until the worker reports.
                     if event::poll(std::time::Duration::from_millis(150))?
                         && let Event::Key(key) = event::read()?
                         && key.kind == KeyEventKind::Press
-                        && key.modifiers.contains(KeyModifiers::CONTROL)
-                        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
                     {
-                        if app.prune_cancelling.is_some() {
+                        let ctrl_c = key.modifiers.contains(KeyModifiers::CONTROL)
+                            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'));
+                        let cancel = ctrl_c || key.code == KeyCode::Esc;
+                        if ctrl_c && app.prune_cancelling {
                             app.quit = true;
-                        } else {
+                        } else if cancel {
                             if let Some(abort) = &app.prune_abort {
                                 abort.cancel();
                             }
-                            app.prune_cancelling = Some(std::time::Instant::now());
+                            app.prune_cancelling = true;
                         }
                     }
                 }
@@ -524,7 +530,7 @@ fn run(
                     app.prune_rx = None;
                     app.prune_progress = None;
                     app.prune_abort = None;
-                    app.prune_cancelling = None;
+                    app.prune_cancelling = false;
                     app.prune_started = None;
                     app.screen =
                         Screen::PruneError("prune worker exited without reporting".into());

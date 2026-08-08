@@ -90,7 +90,7 @@ impl TestRepo {
     /// passing different content produces snapshots that share some packs and
     /// not others — the shape prune needs to have real work to do.
     pub(crate) fn backup(&self, files: &[(&str, &[u8])], tags: &[&str]) -> String {
-        let source = self.root.join("source");
+        let source = self.source_path();
         for (name, content) in files {
             std::fs::write(source.join(name), content).expect("write fixture source file");
         }

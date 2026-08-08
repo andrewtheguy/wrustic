@@ -486,7 +486,7 @@ pub(crate) fn prune(
     )?);
     // Start honouring the refreshability rule now that there is a lock to
     // watch; until here the signal only carried a cancellation.
-    abort.watch(std::sync::Arc::clone(&repo_lock));
+    abort.watch(&repo_lock);
     // A cancellation that landed while acquisition waited out its 200 ms
     // grace window: release the lock again and stop before planning.
     if let Some(reason) = abort.reason() {
@@ -542,7 +542,12 @@ const ABORT_PANIC: &str = "wrustic: operation aborted (repository lock lost, or 
 #[derive(Default)]
 pub(crate) struct AbortSignal {
     cancel: std::sync::atomic::AtomicBool,
-    lock: std::sync::OnceLock<std::sync::Arc<lock::RepoLock>>,
+    /// Weak on purpose: the signal outlives the operation (the TUI keeps a
+    /// handle so it can cancel), and a strong reference here would keep the
+    /// repository lock — and its refresh thread — alive past the point where
+    /// `prune` returned and dropped its own. Ownership stays solely with the
+    /// operation; this only observes.
+    lock: std::sync::OnceLock<std::sync::Weak<lock::RepoLock>>,
     raised: std::sync::Mutex<Option<AbortReason>>,
     /// Test-only: an extra predicate consulted on every progress-adapter
     /// probe. Lets a test land the abort at a chosen point inside
@@ -566,15 +571,22 @@ impl AbortSignal {
     /// the operation owns one; until then the signal only watches for a
     /// cancellation, so a lock-free phase (opening the repository) is still
     /// interruptible.
-    fn watch(&self, lock: std::sync::Arc<lock::RepoLock>) {
-        let _ = self.lock.set(lock);
+    fn watch(&self, lock: &std::sync::Arc<lock::RepoLock>) {
+        let _ = self.lock.set(std::sync::Arc::downgrade(lock));
     }
 
     /// The reason to stop right now, if any. A poisoned lock outranks a
     /// cancellation: both stop the run, but only one leaves a lock other
     /// processes may remove, and the message has to say so.
     fn reason(&self) -> Option<AbortReason> {
-        if self.lock.get().is_some_and(|l| l.poisoned()) {
+        // A dead weak reference means the operation already released the
+        // lock, so there is nothing left to protect.
+        if self
+            .lock
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|l| l.poisoned())
+        {
             return Some(AbortReason::LockPoisoned);
         }
         if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1753,6 +1765,36 @@ mod tests {
         );
     }
 
+    // The TUI keeps its own handle on the signal for as long as the prune
+    // screen is up, so the signal outlives the call — which is exactly the
+    // ownership the other tests do *not* reproduce, because they move theirs
+    // into `prune`. A strong reference to the lock inside the signal would
+    // therefore keep the lock file, and its refresh thread, alive after the
+    // prune returned; the lock must belong to the operation alone.
+    #[test]
+    fn a_surviving_abort_signal_does_not_keep_the_repository_lock_alive() {
+        let _guard = lock::test_acquire_guard();
+        let (fixture, _keep) = fixture_with_prunable_garbage("signal-outlives");
+
+        let abort = std::sync::Arc::new(AbortSignal::default());
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        prune(
+            fixture.profile(),
+            progress,
+            std::sync::Arc::clone(&abort),
+        )
+        .expect("prune");
+
+        assert_eq!(
+            fixture.lock_count(),
+            0,
+            "the lock must be gone the moment prune returns, even though the \
+             abort signal is still held"
+        );
+        // And the still-live signal has nothing left to observe.
+        assert_eq!(abort.reason(), None);
+    }
+
     /// Runs a prune that cancels itself at the first progress tick whose
     /// buffer contains `phase`, and asserts the whole outcome: an ordinary
     /// error rather than a dead process, the lock released, the surviving
@@ -1762,7 +1804,12 @@ mod tests {
     /// rustic_core drives — so reaching it means the abort really did unwind
     /// out of rustic_core's own call stack, which is the claim that was never
     /// tested before.
-    fn assert_prune_cancels_cleanly_during(fixture_name: &str, phase: &'static str, fixture: TestRepo, keep: &str) {
+    fn assert_prune_cancels_cleanly_during(
+        label: &str,
+        phase: &'static str,
+        fixture: TestRepo,
+        keep: &str,
+    ) {
         let abort = std::sync::Arc::new(AbortSignal::default());
         let progress = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         {
@@ -1782,26 +1829,26 @@ mod tests {
         let seen = progress.lock().unwrap_or_else(|p| p.into_inner()).clone();
         assert!(
             seen.contains(phase),
-            "{fixture_name}: the prune never reached `{phase}`; progress was:\n{seen}"
+            "{label}: the prune never reached `{phase}`; progress was:\n{seen}"
         );
         assert_eq!(
             fixture.lock_count(),
             0,
-            "{fixture_name}: unwinding must still drop the lock guard — unlike a force-quit, \
+            "{label}: unwinding must still drop the lock guard — unlike a force-quit, \
              an abort leaves no stale lock"
         );
 
         // The repository survived the unwind: still readable, the surviving
         // snapshot intact, and still prunable.
         let snapshots = load_snapshots(fixture.profile()).expect("list snapshots");
-        assert_eq!(snapshots.len(), 1, "{fixture_name}");
-        assert_eq!(snapshots[0].id, keep, "{fixture_name}");
+        assert_eq!(snapshots.len(), 1, "{label}");
+        assert_eq!(snapshots[0].id, keep, "{label}");
         let progress = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         prune(fixture.profile(), progress, no_abort()).expect("prune after the abort");
         assert_eq!(
             load_snapshots(fixture.profile()).expect("list snapshots").len(),
             1,
-            "{fixture_name}: the follow-up prune must keep the surviving snapshot"
+            "{label}: the follow-up prune must keep the surviving snapshot"
         );
     }
 
@@ -1850,8 +1897,10 @@ mod tests {
         assert_prune_cancels_cleanly_during("repack", "repacking", fixture, &keep_id);
     }
 
-    /// Deterministic incompressible bytes (xorshift64*). Seeded per call so
-    /// two buffers differ, and reproducible so a failure is reproducible.
+    /// Deterministic incompressible bytes (Marsaglia xorshift64 — the plain
+    /// shift-only variant, no output multiplier; only its lack of structure
+    /// matters here, not its statistical quality). Seeded per call so two
+    /// buffers differ, and reproducible so a failure is reproducible.
     fn pseudo_random(len: usize, seed: u64) -> Vec<u8> {
         let mut state = seed | 1;
         let mut out = Vec::with_capacity(len);

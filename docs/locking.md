@@ -201,10 +201,13 @@ Two things can raise it, and the distinction is only in the message:
 - **the lock became untrustworthy** — `RepoLock::poisoned()`, restic's
   22.5-minute cutoff. Aborts planning *and* execution within roughly one
   progress tick, before further writes or deletions.
-- **the user asked to stop** — Ctrl+C on the prune screen. The TUI stays
-  up and the prune returns like any other failure. This replaced the old
-  double-Ctrl+C force-quit, which is now only the fallback for a run that
-  has somehow stopped ticking; the second press still force-quits.
+- **the user asked to stop** — Esc or Ctrl+C on the prune screen. The TUI
+  stays up and the prune returns like any other failure. This replaced the
+  old double-Ctrl+C force-quit, which survives only as the fallback for a
+  run that has somehow stopped ticking: a *second Ctrl+C* still force-quits.
+  Esc never escalates however often it is pressed — it is the "I changed my
+  mind" key everywhere else in the app, and must not become a way to lose
+  the lock by accident.
 
 An abort mid-run is safe for the same reason a crash is (see *Crash
 safety*), and *better* than the force-quit in one respect: the lock guard

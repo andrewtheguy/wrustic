@@ -383,15 +383,15 @@ pub(crate) struct App {
     pub(crate) prune_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     pub(crate) prune_started: Option<Instant>,
     pub(crate) prune_scroll: u16,
-    // `prune_abort` is the worker's cancellation handle: Ctrl+C on the
+    // `prune_abort` is the worker's cancellation handle: Esc or Ctrl+C on the
     // running screen sets it, and the worker stops at its next progress tick
     // and returns an ordinary error (repo::AbortSignal). `prune_cancelling`
-    // records when that was asked for, so the screen can say so and a second
+    // records that this was asked for, so the screen can say so and a second
     // Ctrl+C can still force-quit if a run somehow stops ticking. The
     // progress buffer holds one line per prune phase, rewritten in place by
     // the worker's progress adapter.
     pub(crate) prune_abort: Option<std::sync::Arc<crate::repo::AbortSignal>>,
-    pub(crate) prune_cancelling: Option<Instant>,
+    pub(crate) prune_cancelling: bool,
     pub(crate) prune_progress: Option<std::sync::Arc<std::sync::Mutex<String>>>,
 
     // Outer rect of the currently-rendered list/paragraph (bordered area).
@@ -532,7 +532,7 @@ impl App {
             prune_started: None,
             prune_scroll: 0,
             prune_abort: None,
-            prune_cancelling: None,
+            prune_cancelling: false,
             prune_progress: None,
             list_area: None,
             list_header_rows: 0,
@@ -1820,8 +1820,8 @@ impl App {
             },
 
             // Keys on the running screen are handled by the main loop's event
-            // drain, not here: Ctrl+C asks the worker to stop (a second press
-            // force-quits, as a fallback if it has stopped ticking);
+            // drain, not here: Esc or Ctrl+C asks the worker to stop (a second
+            // Ctrl+C force-quits, as a fallback if it has stopped ticking);
             // everything else is swallowed until the worker reports.
             Screen::PruneRunning => {}
 
