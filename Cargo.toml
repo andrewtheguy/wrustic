@@ -1,6 +1,6 @@
 [package]
 name = "wrustic"
-version = "0.0.50"
+version = "0.0.51"
 edition = "2024"
 
 [dependencies]
@@ -114,3 +114,19 @@ keychain = [
     "dep:dbus-secret-service-keyring-store",
     "dep:windows-native-keyring-store",
 ]
+
+# restic's key file is scrypt-derived, so every repository open pays a full
+# KDF. Unoptimised, that costs ~10 s per open and made each test that touches
+# a repository run for minutes. Optimising only the KDF crates keeps wrustic's
+# own code unoptimised and fully debuggable.
+[profile.dev.package.scrypt]
+opt-level = 3
+
+[profile.dev.package.salsa20]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.pbkdf2]
+opt-level = 3

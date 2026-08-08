@@ -98,7 +98,7 @@ pub(crate) struct FileDetails {
 // All backends are write-capable; keeping write operations safe against
 // concurrent restic processes is the lock module's job (docs/locking.md),
 // not the backend's.
-fn build_backends(profile: &Profile) -> Result<RepositoryBackends> {
+pub(crate) fn build_backends(profile: &Profile) -> Result<RepositoryBackends> {
     let mut opts = BackendOptions::default();
     match profile {
         Profile::Local { local_path, .. } => {
@@ -1210,6 +1210,7 @@ fn collect_all_as(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testrepo::TestRepo;
 
     #[test]
     fn full_snapshot_id_accepts_64_hex() {
@@ -1357,6 +1358,209 @@ mod tests {
         // And a healthy stage's value passes through.
         let ok = abort_if_lock_poisoned(AssertUnwindSafe(|| 7)).expect("healthy stage");
         assert_eq!(ok, 7);
+    }
+
+    // ---- Lock coverage of the native writes -------------------------------
+    //
+    // Every native write must take the *exclusive* lock before it touches
+    // anything (docs/locking.md, Tier 2). The tests below plant a live
+    // *shared* lock first — the lock a concurrent `restic backup` or a
+    // running SMB share holds. A shared lock never blocks another shared
+    // acquisition (proven by lock::tests::
+    // exclusive_conflicts_with_any_lock_shared_only_with_exclusive), so an
+    // operation that fails against one can only have asked for an exclusive
+    // lock: this catches both a dropped acquisition and one downgraded to
+    // shared. Comparing the repository fingerprint either side of the blocked
+    // attempt then proves the refusal landed before the first write rather
+    // than midway through.
+    //
+    // Unlike the live_* tests these need no restic binary — the fixture repo
+    // is built in-process (src/testrepo.rs) — so removing an
+    // `acquire_exclusive` fails a plain `cargo test`.
+    fn plant_shared_lock(fixture: &TestRepo) -> lock::RepoLock {
+        lock::RepoLock::acquire_shared(fixture.lock_backend(), fixture.crypto())
+            .expect("plant a shared lock")
+    }
+
+    fn assert_lock_conflict(err: &anyhow::Error) {
+        assert!(
+            lock::is_lock_error(&format!("{err:#}")),
+            "expected a lock conflict, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn delete_snapshot_takes_the_exclusive_lock() {
+        // Acquires RepoLocks — serialize with other acquiring tests (SIGHUP
+        // disposition is process-global).
+        let _guard = lock::test_acquire_guard();
+        let fixture = TestRepo::init("delete");
+        let snap_id = fixture.backup(&[("a.txt", b"hello\n")], &["keep"]);
+        let before = fixture.fingerprint().expect("fingerprint the repository");
+
+        let held = plant_shared_lock(&fixture);
+        let err = delete_snapshot(fixture.profile(), &snap_id)
+            .expect_err("a delete must not run while another process holds a lock");
+        assert_lock_conflict(&err);
+        assert_eq!(
+            fixture.fingerprint().expect("fingerprint the repository"),
+            before,
+            "a blocked delete must not have written or removed anything"
+        );
+        assert_eq!(
+            fixture.lock_count(),
+            1,
+            "the failed acquisition must clean up after itself, leaving only the planted lock"
+        );
+        assert_eq!(
+            load_snapshots(fixture.profile()).expect("list snapshots").len(),
+            1,
+            "the snapshot must survive the blocked delete"
+        );
+
+        // Released: the very same delete now goes through, and leaves no lock.
+        drop(held);
+        delete_snapshot(fixture.profile(), &snap_id).expect("delete once unlocked");
+        assert!(
+            load_snapshots(fixture.profile())
+                .expect("list snapshots")
+                .is_empty()
+        );
+        assert_eq!(
+            fixture.lock_count(),
+            0,
+            "the delete must release its lock when it returns"
+        );
+    }
+
+    #[test]
+    fn edit_snapshot_tags_takes_the_exclusive_lock() {
+        let _guard = lock::test_acquire_guard();
+        let fixture = TestRepo::init("tag");
+        let snap_id = fixture.backup(&[("a.txt", b"hello\n")], &["old"]);
+        let before = fixture.fingerprint().expect("fingerprint the repository");
+
+        let held = plant_shared_lock(&fixture);
+        let err = edit_snapshot_tags(fixture.profile(), &snap_id, &["blocked".into()])
+            .expect_err("a tag edit must not run while another process holds a lock");
+        assert_lock_conflict(&err);
+        assert_eq!(
+            fixture.fingerprint().expect("fingerprint the repository"),
+            before,
+            "a blocked tag edit must not have written the rewritten snapshot"
+        );
+        assert_eq!(fixture.lock_count(), 1, "only the planted lock may remain");
+        let snapshots = load_snapshots(fixture.profile()).expect("list snapshots");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(
+            snapshots[0].tags,
+            vec!["old".to_string()],
+            "the tags must survive the blocked edit"
+        );
+
+        drop(held);
+        let new_id = edit_snapshot_tags(fixture.profile(), &snap_id, &["fresh".into()])
+            .expect("tag edit once unlocked")
+            .expect("tags changed, so the snapshot is rewritten");
+        let snapshots = load_snapshots(fixture.profile()).expect("list snapshots");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].id, new_id);
+        assert_eq!(snapshots[0].tags, vec!["fresh".to_string()]);
+        assert_eq!(
+            fixture.lock_count(),
+            0,
+            "the tag edit must release its lock when it returns"
+        );
+    }
+
+    #[test]
+    fn prune_takes_the_exclusive_lock() {
+        let _guard = lock::test_acquire_guard();
+        let fixture = TestRepo::init("prune");
+        // Two snapshots with disjoint content, then drop the first: its blobs
+        // become unused, so the prune has real work and its refusal or its
+        // success is visible in the fingerprint.
+        let first = fixture.backup(&[("a.txt", b"first content\n")], &[]);
+        fixture.backup(&[("a.txt", b"second content\n"), ("b.txt", b"more\n")], &[]);
+        delete_snapshot(fixture.profile(), &first).expect("drop the first snapshot");
+        let before = fixture.fingerprint().expect("fingerprint the repository");
+
+        let held = plant_shared_lock(&fixture);
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let err = prune(fixture.profile(), progress)
+            .expect_err("a prune must not run while another process holds a lock");
+        assert_lock_conflict(&err);
+        assert_eq!(
+            fixture.fingerprint().expect("fingerprint the repository"),
+            before,
+            "a blocked prune must not have deleted a pack or rewritten an index"
+        );
+        assert_eq!(fixture.lock_count(), 1, "only the planted lock may remain");
+
+        drop(held);
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        prune(fixture.profile(), progress).expect("prune once unlocked");
+        assert_ne!(
+            fixture.fingerprint().expect("fingerprint the repository"),
+            before,
+            "the unblocked prune should have collected the dropped snapshot's blobs"
+        );
+        assert_eq!(
+            fixture.lock_count(),
+            0,
+            "the prune must release its lock when it returns"
+        );
+        // Whatever it collected, the surviving snapshot must still be readable.
+        assert_eq!(
+            load_snapshots(fixture.profile()).expect("list snapshots").len(),
+            1
+        );
+    }
+
+    // The other direction: the shared lock long-running reads take. Unlike
+    // the writes above, the guard is handed to the caller, so this can assert
+    // the lock is *held for the whole time the repository handle is alive* —
+    // present on the backend, tolerant of a concurrent backup's append lock,
+    // and blocking every native write until it drops.
+    #[test]
+    fn shared_open_holds_the_append_lock_for_the_handle_lifetime() {
+        let _guard = lock::test_acquire_guard();
+        let fixture = TestRepo::init("shared");
+        let snap_id = fixture.backup(&[("a.txt", b"hello\n")], &[]);
+        let backend = fixture.lock_backend();
+        let crypto = fixture.crypto();
+
+        let (repo, held) =
+            open_indexed_full_shared_lock(fixture.profile()).expect("open under a shared lock");
+        assert_eq!(fixture.lock_count(), 1, "the open must have left one lock");
+        assert!(!held.poisoned(), "a fresh lock must not be poisoned");
+        // The handle works, so the lock is genuinely being held alongside it
+        // rather than acquired and released inside the open.
+        assert_eq!(repo.get_all_snapshots().expect("snapshots").len(), 1);
+
+        // A concurrent backup or a second share takes an append lock: allowed.
+        assert!(
+            lock::check_blocking_locks(backend.as_ref(), &crypto, false).is_ok(),
+            "an append lock must coexist with the share's lock"
+        );
+        // Anything exclusive is refused for as long as the handle lives.
+        assert_lock_conflict(
+            &lock::check_blocking_locks(backend.as_ref(), &crypto, true)
+                .expect_err("an exclusive acquisition must be blocked"),
+        );
+        assert_lock_conflict(
+            &delete_snapshot(fixture.profile(), &snap_id)
+                .expect_err("a native delete must be blocked"),
+        );
+
+        drop(repo);
+        drop(held);
+        assert_eq!(
+            fixture.lock_count(),
+            0,
+            "dropping the guard must remove the lock file"
+        );
+        delete_snapshot(fixture.profile(), &snap_id).expect("delete once the share released");
     }
 
     // End-to-end interop with the restic CLI against a fresh local repo:

@@ -711,7 +711,7 @@ pub(crate) fn write_unpacked(
     Ok(name)
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
         use std::fmt::Write;
         let _ = write!(s, "{b:02x}");
