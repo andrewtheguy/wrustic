@@ -2739,22 +2739,15 @@ mod tests {
     /// The snapshot share holds restic's non-exclusive lock for its lifetime:
     /// while it runs, an exclusive acquisition is blocked but a concurrent
     /// append lock (a backup) is not; stopping releases the lock; and an
-    /// existing exclusive lock stops the share from starting at all. Uses the
-    /// tmp/share-test fixture (seeding: see the share.rs e2e test).
+    /// existing exclusive lock stops the share from starting at all. The
+    /// repository is built in-process (src/testrepo.rs), so this needs no
+    /// restic binary and no hand-seeded fixture directory.
     #[test]
-    #[ignore]
     fn snapshot_share_holds_restics_append_lock() {
         let _guard = crate::lock::test_acquire_guard();
-        let profile = Profile::Local {
-            password: "sandbox".into(),
-            local_path: "tmp/share-test/restic-repo".into(),
-        };
-        let snap_id = {
-            let repo = crate::repo::open_indexed(&profile).expect("open fixture repo");
-            let snaps = repo.get_all_snapshots().expect("list snapshots");
-            let snap = snaps.last().expect("at least one snapshot");
-            snap.id.to_hex().as_str().to_string()
-        };
+        let fixture = crate::testrepo::TestRepo::init("share-lock");
+        let snap_id = fixture.backup(&[("readme.txt", b"shared\n")], &[]);
+        let profile = fixture.profile().clone();
         let (lock_backend, crypto) =
             crate::repo::lock_context(&profile).expect("lock context");
         assert!(

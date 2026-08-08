@@ -15,6 +15,10 @@ mod restic;
 mod s3_backend;
 mod share;
 mod smb;
+// In-process repository fixtures for the tests that must not depend on a
+// restic binary being installed.
+#[cfg(test)]
+mod testrepo;
 mod ui;
 
 use anyhow::Result;

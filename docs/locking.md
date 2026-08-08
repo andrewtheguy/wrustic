@@ -349,6 +349,40 @@ A `RepoLock` guard type that mirrors restic exactly:
 5. native unlock = remove stale locks only (mirrors `restic unlock`
    without `--remove-all`)
 
+### Test coverage of the "writes are locked" rule
+
+The per-operation live tests below prove interop with restic, but they need
+a restic binary and are `#[ignore]`d, so on their own they let a dropped
+`acquire_exclusive` through a plain `cargo test`. That rule is therefore also
+enforced by tests with no external dependency:
+`delete_snapshot_takes_the_exclusive_lock`,
+`edit_snapshot_tags_takes_the_exclusive_lock` and
+`prune_takes_the_exclusive_lock` each plant a live **non-exclusive** lock —
+the one a concurrent `restic backup` or a running share holds — and assert
+the operation fails with restic's lock error. Since a non-exclusive lock
+never blocks another non-exclusive acquisition, only an *exclusive*
+acquisition can fail against it, so a lock that was dropped **or merely
+downgraded** fails the test. Comparing every repository file except `locks/`
+either side of the blocked attempt proves the refusal landed before the first
+write rather than midway through, and the lock count afterwards proves both
+that a failed acquisition cleans up after itself and that a successful
+operation releases on return.
+
+`shared_open_holds_the_append_lock_for_the_handle_lifetime` covers the other
+direction: the guard `open_indexed_full_shared_lock` hands back is held for
+as long as the repository handle lives, tolerates a second append lock, and
+blocks native writes until it drops —
+`smb::tests::snapshot_share_holds_restics_append_lock` checks the same
+properties through the share itself.
+
+These fixtures are built in-process with rustic_core's `init`/`backup`
+(`src/testrepo.rs`, `#[cfg(test)]`), which is what frees them from the restic
+binary; `init`/`backup` remain non-features of wrustic itself (Tier 1 above),
+exactly as `src/restic.rs` is test-only. Because restic's key file is
+scrypt-derived, every repository open runs a full KDF — unoptimised that is
+~10 s per open, so `Cargo.toml` raises `opt-level` for the scrypt crates in
+the dev profile only.
+
 ## Phases
 
 1. **Lock module** — DONE (`src/lock.rs` + `LockBackend` impls in
