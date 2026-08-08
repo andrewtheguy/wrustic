@@ -92,7 +92,13 @@ impl TestRepo {
     pub(crate) fn backup(&self, files: &[(&str, &[u8])], tags: &[&str]) -> String {
         let source = self.source_path();
         for (name, content) in files {
-            std::fs::write(source.join(name), content).expect("write fixture source file");
+            // `name` may address a subdirectory: a fixture needs one tree blob
+            // per directory to give rustic's tree streamer real work to do.
+            let path = source.join(name);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("create fixture source subdir");
+            }
+            std::fs::write(path, content).expect("write fixture source file");
         }
 
         let backends = build_backends(&self.profile).expect("fixture backends");
