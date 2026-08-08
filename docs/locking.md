@@ -183,23 +183,59 @@ rustic_core 0.12.0 source.
   not just execution. rustic_core's executor never re-validates the plan
   (no re-read of snapshots), so the snapshot set enumerated at plan time
   must stay frozen throughout. `RepoLock::poisoned()` (the 22.5-minute
-  refreshability rule) is enforced for the whole run: rustic_core takes
-  no cancellation token, but it ticks its progress callbacks
-  continuously — per file during deletions, per blob batch during
-  repack — so `repo::prune`'s progress adapter probes the lock on every
-  phase start and on its ~10 Hz render ticks and, when poisoned, panics
-  with a marker that `abort_if_lock_poisoned` catches and maps to an
-  ordinary error. A lock that can no longer be trusted therefore aborts
-  planning *and* execution within roughly one progress tick, before
-  further writes or deletions; an explicit post-planning check covers a
-  poison landing between ticks. An abort mid-run is safe for the same
-  reason a crash is (see *Crash safety*). The mechanism is
-  failure-injection tested
-  (`poisoned_lock_aborts_through_the_progress_adapter`): a tripped probe
-  aborts a stage and maps to the lock error, unrelated panics resume
-  unchanged. What remains impossible is *user* cancellation of a healthy
-  run — Ctrl+C twice force-quits the app instead (safe, leaves a stale
-  lock).
+  refreshability rule) is enforced for the whole run, through the abort
+  mechanism described next.
+
+**Cancelling a native prune (`repo::AbortSignal`):** rustic_core 0.12.0
+has no cancellation API of any kind — no token, no callback that can say
+"stop". The one thing it does offer is progress callbacks, ticked
+continuously: per file during deletions, per blob batch during repack. So
+`repo::prune`'s progress adapter consults an `AbortSignal` on every phase
+start and every ~10 Hz render tick, and panics out of rustic_core's
+executor when it says stop; `abort_if_signalled` catches that unwind at
+the call site and returns an ordinary error. `abort` is checked at each
+phase boundary too, covering a signal that lands between ticks.
+
+Two things can raise it, and the distinction is only in the message:
+
+- **the lock became untrustworthy** — `RepoLock::poisoned()`, restic's
+  22.5-minute cutoff. Aborts planning *and* execution within roughly one
+  progress tick, before further writes or deletions.
+- **the user asked to stop** — Esc or Ctrl+C on the prune screen. The TUI
+  stays up and the prune returns like any other failure. This replaced the
+  old double-Ctrl+C force-quit, which survives only as the fallback for a
+  run that has somehow stopped ticking: a *second Ctrl+C* still force-quits.
+  Esc never escalates however often it is pressed — it is the "I changed my
+  mind" key everywhere else in the app, and must not become a way to lose
+  the lock by accident.
+
+An abort mid-run is safe for the same reason a crash is (see *Crash
+safety*), and *better* than the force-quit in one respect: the lock guard
+still drops, so no stale lock is left behind.
+
+Why a flag rather than a distinctive panic payload: prune's repack is
+rayon (`into_par_iter`), which resumes a worker's original payload, but
+rustic_core's other parallelism is `pariter`, whose worker-panic path
+discards the payload and raises a message of its own
+(`pariter/src/parallel_map.rs`). Matching on the payload is therefore
+correct for only part of rustic_core. `AbortSignal` records the reason
+before throwing and the catch reads that record, which is correct for all
+of it — and for whatever a future version does. (Two facts that make the
+whole approach viable: rustic_core defines **no `Drop` impls** at all, so
+no destructor can panic during the unwind and turn it into a process
+`abort()`; and wrustic sets no `panic = "abort"`.)
+
+Tested end to end, not just in the adapter: `a_signalled_abort_unwinds_
+through_the_progress_adapter` and `an_abort_is_recognised_even_when_the_
+payload_is_rewritten` cover the mapper (including the pariter-style
+rewrite, and that unrelated panics still resume), and three tests cancel
+a *real* prune from inside rustic_core's own call stack — during planning,
+during index rebuild, and inside the parallel repack
+(`cancelling_inside_the_parallel_repack_unwinds_to_an_error`, whose
+fixture uses incompressible data so rustic actually repacks instead of
+dropping whole packs). Each asserts the phase was really reached, the
+error came back as an error, the lock was released, the surviving
+snapshot is intact, and the repository is still prunable afterwards.
 
 **Native tag edits (implemented — phase 5, `repo::edit_snapshot_tags`,
 the TUI's `t` on the snapshot list):** what `restic tag` does, verified

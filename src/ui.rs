@@ -349,7 +349,9 @@ fn footer_text(screen: &Screen, keychain_enabled: bool) -> &'static str {
         | Screen::Unlocking
         | Screen::SnapshotCompareLoading => "working…",
         Screen::PruneConfirm => "y start prune  n/Esc cancel",
-        Screen::PruneRunning => "pruning natively — Ctrl+C twice force-quits, other keys disabled",
+        Screen::PruneRunning => {
+            "pruning natively — Esc/Ctrl+C cancels (Ctrl+C again force-quits)"
+        }
         Screen::PruneDone(_) => "Up/Dn scroll  PgUp/PgDn page  g/G top/bottom  q/Esc back",
         Screen::PruneError(msg) => {
             if crate::lock::is_lock_error(msg) {
@@ -1025,10 +1027,10 @@ fn render_prune_confirm(frame: &mut Frame, app: &App, area: Rect) {
          the space left behind by deleted snapshots. It takes an exclusive\n\
          repository lock — concurrent backups are blocked while it runs —\n\
          and can take a long time on a large or remote repository.\n\
-         Progress is shown live. A running prune cannot be cancelled;\n\
-         pressing Ctrl+C twice force-quits wrustic instead, which is safe\n\
-         for the repository (nothing old is deleted before everything new\n\
-         is written) but leaves a stale lock for a later unlock.\n\n\
+         Progress is shown live, and Esc or Ctrl+C cancels a run:\n\
+         it stops at the next progress tick and releases the lock. That is\n\
+         safe at any point — nothing old is deleted before everything new\n\
+         is written — and the next prune finishes the work.\n\n\
          y/Enter start   n/Esc cancel"
     );
     let para = Paragraph::new(body)
@@ -1050,17 +1052,18 @@ fn render_prune_running(frame: &mut Frame, app: &App, area: Rect) {
         secs / 60,
         secs % 60
     );
-    if app.prune_quit_armed.is_some() {
+    if app.prune_cancelling {
         body.push_str(
-            "Ctrl+C again within a few seconds force-quits wrustic. The\n\
-             repository stays valid — the interrupted work is redone by the\n\
-             next prune — but the leftover lock must be removed later\n\
-             (u on the lock error).\n\n",
+            "Cancelling — the prune stops at its next progress tick and\n\
+             releases the lock. The repository stays valid; the next prune\n\
+             finishes the work. Ctrl+C again force-quits wrustic instead,\n\
+             which leaves a stale lock for a later unlock.\n\n",
         );
     } else {
         body.push_str(
-            "A native prune cannot be cancelled. Ctrl+C twice force-quits\n\
-             wrustic; the repository stays valid either way.\n\n",
+            "Esc or Ctrl+C cancels this prune. It stops at the next progress\n\
+             tick and releases the lock; the repository stays valid either\n\
+             way.\n\n",
         );
     }
     // One line per prune phase, rewritten in place as the phase advances

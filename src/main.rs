@@ -102,11 +102,6 @@ fn main() -> Result<()> {
     result
 }
 
-// How long an armed prune force-quit stays live before it disarms itself —
-// long enough for a deliberate double Ctrl+C, short enough that a stray
-// press is forgotten.
-const PRUNE_QUIT_ARM_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
-
 fn run(
     terminal: &mut DefaultTerminal,
     paths: Paths,
@@ -462,15 +457,19 @@ fn run(
                 let (tx, rx) = std::sync::mpsc::channel();
                 let progress = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
                 let worker_progress = progress.clone();
+                let abort = std::sync::Arc::new(repo::AbortSignal::default());
+                let worker_abort = abort.clone();
                 std::thread::spawn(move || {
                     // The receiver is gone only if the app quit; nothing to do.
                     let _ = tx.send(
-                        repo::prune(&profile, worker_progress).map_err(|e| format!("{e:#}")),
+                        repo::prune(&profile, worker_progress, worker_abort)
+                            .map_err(|e| format!("{e:#}")),
                     );
                 });
                 app.prune_rx = Some(rx);
                 app.prune_progress = Some(progress);
-                app.prune_quit_armed = None;
+                app.prune_abort = Some(abort);
+                app.prune_cancelling = false;
                 app.prune_started = Some(std::time::Instant::now());
             }
             let rx = app.prune_rx.as_ref().expect("receiver set above");
@@ -478,7 +477,8 @@ fn run(
                 Ok(outcome) => {
                     app.prune_rx = None;
                     app.prune_progress = None;
-                    app.prune_quit_armed = None;
+                    app.prune_abort = None;
+                    app.prune_cancelling = false;
                     app.prune_started = None;
                     app.prune_scroll = 0;
                     app.screen = match outcome {
@@ -489,39 +489,48 @@ fn run(
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
                     // Wait briefly so the loop redraws the elapsed clock and
                     // progress without spinning (a swallowed resize is
-                    // repainted at the next tick). A native prune cannot be
-                    // cancelled mid-flight by the user (rustic_core takes no
-                    // cancellation token), so Ctrl+C arms a force-quit and a
-                    // second Ctrl+C exits the app, killing the worker with
-                    // the process. That is safe for the repository — prune
-                    // writes all new data and the new index before deleting
-                    // anything old — but skips the lock guard's cleanup, so
-                    // a stale lock file stays behind until an unlock removes
-                    // it. The arm expires after a few seconds, so a stray
-                    // Ctrl+C from earlier can never pair with a later one
-                    // into an accidental quit.
-                    if app
-                        .prune_quit_armed
-                        .is_some_and(|t| t.elapsed() > PRUNE_QUIT_ARM_WINDOW)
-                    {
-                        app.prune_quit_armed = None;
-                    }
+                    // repainted at the next tick).
+                    //
+                    // Esc or Ctrl+C asks the worker to stop: rustic_core takes
+                    // no cancellation token, so the progress adapter unwinds
+                    // out of it at the next tick and `repo::prune` returns an
+                    // ordinary error (docs/locking.md, "Cancelling a native
+                    // prune"). The app stays up and the lock guard still
+                    // drops, so — unlike the force-quit this replaced — no
+                    // stale lock is left behind.
+                    //
+                    // Only Ctrl+C escalates: a second press force-quits, the
+                    // fallback for a run that has somehow stopped ticking.
+                    // Killing the process is safe for the repository (all new
+                    // data and the new index are written before anything old
+                    // is deleted) but skips the lock cleanup. Esc therefore
+                    // never quits, however often it is pressed — it is the
+                    // "I changed my mind" key everywhere else in the app, and
+                    // must not become a way to lose the lock by accident.
+                    //
+                    // Every other key stays swallowed until the worker reports.
                     if event::poll(std::time::Duration::from_millis(150))?
                         && let Event::Key(key) = event::read()?
                         && key.kind == KeyEventKind::Press
-                        && key.modifiers.contains(KeyModifiers::CONTROL)
-                        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
                     {
-                        if app.prune_quit_armed.is_some() {
+                        let ctrl_c = key.modifiers.contains(KeyModifiers::CONTROL)
+                            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'));
+                        let cancel = ctrl_c || key.code == KeyCode::Esc;
+                        if ctrl_c && app.prune_cancelling {
                             app.quit = true;
-                        } else {
-                            app.prune_quit_armed = Some(std::time::Instant::now());
+                        } else if cancel {
+                            if let Some(abort) = &app.prune_abort {
+                                abort.cancel();
+                            }
+                            app.prune_cancelling = true;
                         }
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     app.prune_rx = None;
                     app.prune_progress = None;
+                    app.prune_abort = None;
+                    app.prune_cancelling = false;
                     app.prune_started = None;
                     app.screen =
                         Screen::PruneError("prune worker exited without reporting".into());

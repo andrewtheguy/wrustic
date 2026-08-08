@@ -383,13 +383,15 @@ pub(crate) struct App {
     pub(crate) prune_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     pub(crate) prune_started: Option<Instant>,
     pub(crate) prune_scroll: u16,
-    // A native prune cannot be cancelled mid-flight by the user, so Ctrl+C
-    // on the running screen arms a force-quit instead; Some(when) while the
-    // arm is live (a second Ctrl+C within the arm window quits the app, and
-    // the main loop disarms it after the window passes). The progress buffer
-    // holds one line per prune phase, rewritten in place by the worker's
-    // progress adapter.
-    pub(crate) prune_quit_armed: Option<Instant>,
+    // `prune_abort` is the worker's cancellation handle: Esc or Ctrl+C on the
+    // running screen sets it, and the worker stops at its next progress tick
+    // and returns an ordinary error (repo::AbortSignal). `prune_cancelling`
+    // records that this was asked for, so the screen can say so and a second
+    // Ctrl+C can still force-quit if a run somehow stops ticking. The
+    // progress buffer holds one line per prune phase, rewritten in place by
+    // the worker's progress adapter.
+    pub(crate) prune_abort: Option<std::sync::Arc<crate::repo::AbortSignal>>,
+    pub(crate) prune_cancelling: bool,
     pub(crate) prune_progress: Option<std::sync::Arc<std::sync::Mutex<String>>>,
 
     // Outer rect of the currently-rendered list/paragraph (bordered area).
@@ -529,7 +531,8 @@ impl App {
             prune_rx: None,
             prune_started: None,
             prune_scroll: 0,
-            prune_quit_armed: None,
+            prune_abort: None,
+            prune_cancelling: false,
             prune_progress: None,
             list_area: None,
             list_header_rows: 0,
@@ -1817,10 +1820,9 @@ impl App {
             },
 
             // Keys on the running screen are handled by the main loop's event
-            // drain, not here: a native prune cannot be cancelled, so Ctrl+C
-            // arms a force-quit of the whole app (second press quits — safe
-            // for the repository, see the main loop); everything else is
-            // swallowed until the worker reports.
+            // drain, not here: Esc or Ctrl+C asks the worker to stop (a second
+            // Ctrl+C force-quits, as a fallback if it has stopped ticking);
+            // everything else is swallowed until the worker reports.
             Screen::PruneRunning => {}
 
             Screen::PruneDone(report) => match key.code {
