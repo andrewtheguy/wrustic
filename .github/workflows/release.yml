@@ -137,11 +137,15 @@ jobs:
           cp vendor/wintun/wintun-amd64.dll stage/
           # Absolute Windows-style paths: relative Source/Output paths in an
           # .iss resolve against the script's directory, not this shell's CWD.
-          "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" \
+          # MSYS2_ARG_CONV_EXCL disables Git Bash's argument path-mangling,
+          # which otherwise rewrites the /D switches into filesystem paths
+          # (ISCC then reads them as extra script filenames); with conversion
+          # off, the .iss path is handed over in Windows form too.
+          MSYS2_ARG_CONV_EXCL="*" "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" \
             "/DAppVersion=${version}" \
             "/DStageDir=$(cygpath -w "$PWD/stage")" \
             "/DOutDir=$(cygpath -w "$PWD/dist")" \
-            ci/windows/installer.iss
+            "$(cygpath -w "$PWD/ci/windows/installer.iss")"
 
       # bash is present on the Windows runners too, so one step works
       # everywhere instead of a pwsh variant. Windows releases the installer;
