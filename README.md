@@ -126,7 +126,7 @@ cargo run
 ### CLI flags
 
 ```text
-wrustic [-c|--config-dir <PATH>] [-p|--port <N>] [--smb-port <N>] [--no-keychain] [-h|--help]
+wrustic [-c|--config-dir <PATH>] [-p|--port <N>] [--smb-port <N>] [--no-restic-cache] [--no-keychain] [-h|--help]
 ```
 
 `--config-dir <PATH>` overrides the default config location —

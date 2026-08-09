@@ -24,10 +24,12 @@ flat `App` struct.
 
 It is intentionally **not** a restic replacement:
 - Reads go through `rustic_core` directly (no subprocess).
-- The native write operations wrustic exposes (snapshot delete, tag
-  edits, and stale-lock removal today) are guarded by restic-compatible
-  repository locks (docs/locking.md) so they coexist safely with
-  concurrent restic processes. Prune runs the restic CLI through a
+- The native write operations wrustic exposes (snapshot delete and tag
+  edits) are guarded by restic-compatible repository locks
+  (docs/locking.md) so they coexist safely with concurrent restic
+  processes; stale-lock removal (`repo::unlock`) is native too but
+  deliberately takes no lock — like `restic unlock`, it only removes
+  locks that are provably stale. Prune runs the restic CLI through a
   secure spawn harness. Anything else (backup, init, key add) is out of
   scope — use the `restic` CLI for those.
 

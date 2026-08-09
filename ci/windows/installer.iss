@@ -34,8 +34,12 @@ DisableProgramGroupPage=yes
 DisableReadyPage=yes
 OutputDir={#OutDir}
 OutputBaseFilename=wrustic-windows-amd64-setup
-ArchitecturesAllowed=x64compatible
-ArchitecturesInstallIn64BitMode=x64compatible
+; x64os, not x64compatible: the payload includes the amd64 wintun kernel
+; driver, which an Arm64 Windows running wrustic under x64 emulation could
+; never load — this stays AMD64-only, matching the documented release
+; support. (x64os is Inno Setup 6.3's name for what was previously `x64`.)
+ArchitecturesAllowed=x64os
+ArchitecturesInstallIn64BitMode=x64os
 ChangesEnvironment=yes
 Compression=lzma2
 SolidCompression=yes

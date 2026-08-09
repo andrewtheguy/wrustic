@@ -276,43 +276,83 @@ pub(crate) fn run_unsticking_locks(profile: &Profile, args: &[&str]) -> Result<V
     run(profile, args)
 }
 
-/// Tracks the PID of the restic child currently running through this harness
-/// so another thread can interrupt it (the TUI's Ctrl+C on the prune screen).
-/// 0 means no child is running.
+/// Tracks the restic child currently running through this harness so another
+/// thread can interrupt it (the TUI's Ctrl+C on the prune screen).
 #[derive(Debug, Default)]
 pub(crate) struct ChildTracker {
-    pid: std::sync::atomic::AtomicU32,
+    /// PID of the live child, 0 when none. A mutex rather than an atomic so
+    /// [`ChildTracker::signal`] sends its signal *while holding the lock*,
+    /// and the streaming runner clears the slot under the same lock before
+    /// reaping the child — a signal can therefore only ever target a PID
+    /// that has not been reaped yet, closing the kill-by-PID reuse race by
+    /// ordering instead of merely narrowing the window.
+    pid: std::sync::Mutex<u32>,
+    /// Latched by [`ChildTracker::interrupt`]. A Ctrl+C that lands while no
+    /// child is registered (version detection, the unstick pre-check, the
+    /// spawn itself) must still cancel: the streaming runner refuses to
+    /// spawn restic once this is set, and re-checks right after registering.
+    cancel_requested: AtomicBool,
 }
 
 impl ChildTracker {
-    /// Ask the tracked restic (if any) to stop. Interrupting restic is safe
-    /// by design: it never removes data still in use — new packs and indexes
-    /// are written before old ones are deleted — so a killed prune only
-    /// leaves the remaining work for the next run.
+    /// Ask the run to stop. Interrupting restic is safe by design: it never
+    /// removes data still in use — new packs and indexes are written before
+    /// old ones are deleted — so a killed prune only leaves the remaining
+    /// work for the next run.
+    ///
+    /// The request is latched before any signal is sent, so a press that
+    /// lands before restic is spawned still cancels — the runner checks the
+    /// latch rather than letting a prune start after the user said stop.
     ///
     /// Unix sends SIGINT, the same signal a terminal Ctrl+C delivers, which
     /// restic catches to clean up and remove its repository lock. Windows has
     /// no cross-process Ctrl+C for a piped child, so the process is
     /// terminated; the lock it leaves behind names a dead PID, which the next
     /// spawn's unstick pre-check removes as stale.
-    ///
-    /// PID-reuse race: the child can exit between the load and the signal
-    /// below. The window is a main-loop tick against the OS not recycling
-    /// the PID in that instant — the same exposure every kill-by-PID has.
     pub(crate) fn interrupt(&self) {
-        let pid = self.pid.load(Ordering::Relaxed);
-        if pid == 0 {
+        self.cancel_requested.store(true, Ordering::SeqCst);
+        self.signal();
+    }
+
+    /// Whether a cancel has been requested for this run.
+    fn cancel_requested(&self) -> bool {
+        self.cancel_requested.load(Ordering::SeqCst)
+    }
+
+    fn register(&self, pid: u32) {
+        *self
+            .pid
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = pid;
+    }
+
+    /// Forget the child. Must run *before* the child is reaped (see the
+    /// `pid` field docs); clearing an already-empty slot is fine.
+    fn clear(&self) {
+        *self
+            .pid
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = 0;
+    }
+
+    /// Signal the registered child, if any, under the pid lock.
+    fn signal(&self) {
+        let pid = self
+            .pid
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *pid == 0 {
             return;
         }
         #[cfg(unix)]
         unsafe {
-            libc::kill(pid as i32, libc::SIGINT);
+            libc::kill(*pid as i32, libc::SIGINT);
         }
         #[cfg(windows)]
         unsafe {
             use windows_sys::Win32::Foundation::CloseHandle;
             use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
-            let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            let handle = OpenProcess(PROCESS_TERMINATE, 0, *pid);
             if !handle.is_null() {
                 TerminateProcess(handle, 1);
                 CloseHandle(handle);
@@ -332,6 +372,12 @@ pub(crate) fn run_unsticking_locks_streaming(
     tracker: &ChildTracker,
     progress: &std::sync::Mutex<String>,
 ) -> Result<Vec<u8>> {
+    // Refuse before the unstick pre-check too: it opens the repository and
+    // can spawn `restic unlock`, none of which should happen after the user
+    // said stop.
+    if tracker.cancel_requested() {
+        return Err(anyhow!("cancelled before restic was spawned"));
+    }
     unstick_if_blocked(profile, args)?;
     run_streaming(profile, args, tracker, progress)
 }
@@ -365,23 +411,38 @@ fn run_streaming(
 ) -> Result<Vec<u8>> {
     use std::io::{BufRead, BufReader, Read};
 
+    // A cancel that arrived while there was no child to signal (version
+    // detection, the unstick pre-check) must stop the run here, not let a
+    // prune start after the user said stop.
+    if tracker.cancel_requested() {
+        return Err(anyhow!("cancelled before restic was spawned"));
+    }
     let mut cmd = command(profile, args)?;
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd
         .spawn()
         .map_err(|e| anyhow!("failed to spawn `restic`: {e}"))?;
-    tracker.pid.store(child.id(), Ordering::Relaxed);
+    tracker.register(child.id());
+    // A cancel that landed between the check above and the registration saw
+    // no PID to signal; deliver it now that there is one.
+    if tracker.cancel_requested() {
+        tracker.signal();
+    }
+    // Every fallible path below must not leave a live (or zombie) child
+    // behind. The tracker is cleared *before* the reap so interrupt() can
+    // never signal a reaped — hence reusable — PID.
+    let reap = |child: &mut std::process::Child| {
+        tracker.clear();
+        let _ = child.kill();
+        let _ = child.wait();
+    };
     let result = (|| {
         if let Err(e) = write_password(&mut child, profile) {
-            let _ = child.kill();
-            let _ = child.wait();
+            reap(&mut child);
             return Err(e);
         }
-        // Every fallible path below must not leave a live (or zombie) child
-        // behind — same kill-and-reap discipline as the password path above.
         let Some(stderr) = child.stderr.take() else {
-            let _ = child.kill();
-            let _ = child.wait();
+            reap(&mut child);
             return Err(anyhow!("restic stderr not piped"));
         };
         let stderr_thread = std::thread::spawn(move || {
@@ -391,21 +452,34 @@ fn run_streaming(
             buf
         });
         let Some(stdout) = child.stdout.take() else {
-            let _ = child.kill();
-            let _ = child.wait();
+            reap(&mut child);
             let _ = stderr_thread.join();
             return Err(anyhow!("restic stdout not piped"));
         };
+        // stdout is collected byte-for-byte — line endings and an
+        // unterminated final line included — because the report is shown
+        // verbatim. Only the progress display converts, lossily; chunks
+        // split at newlines, so a multi-byte character never straddles two
+        // conversions.
         let mut collected = Vec::new();
-        for line in BufReader::new(stdout).lines() {
-            let Ok(line) = line else { break };
-            collected.extend_from_slice(line.as_bytes());
-            collected.push(b'\n');
-            if let Ok(mut p) = progress.lock() {
-                p.push_str(&line);
-                p.push('\n');
+        let mut reader = BufReader::new(stdout);
+        let mut chunk = Vec::new();
+        loop {
+            chunk.clear();
+            match reader.read_until(b'\n', &mut chunk) {
+                Ok(0) => break,
+                Ok(_) => {
+                    collected.extend_from_slice(&chunk);
+                    if let Ok(mut p) = progress.lock() {
+                        p.push_str(&String::from_utf8_lossy(&chunk));
+                    }
+                }
+                Err(_) => break,
             }
         }
+        // stdout is closed, so restic is exiting: stop tracking before the
+        // wait reaps it (see ChildTracker::clear).
+        tracker.clear();
         let status = match child.wait() {
             Ok(status) => status,
             Err(e) => {
@@ -426,7 +500,7 @@ fn run_streaming(
         }
         Ok(collected)
     })();
-    tracker.pid.store(0, Ordering::Relaxed);
+    tracker.clear();
     result
 }
 
@@ -657,21 +731,41 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn child_tracker_interrupt_stops_a_running_child() {
-        use std::sync::atomic::Ordering;
-
         let mut child = Command::new("sleep")
             .arg("30")
             .spawn()
             .expect("spawn sleep");
         let tracker = ChildTracker::default();
-        tracker.pid.store(child.id(), Ordering::Relaxed);
+        tracker.register(child.id());
         tracker.interrupt();
         let status = child.wait().expect("wait for interrupted child");
         assert!(!status.success(), "SIGINT should have stopped the child");
 
-        // With no tracked PID, interrupt must be a no-op (not signal PID 0 —
-        // which would hit our own process group).
-        ChildTracker::default().interrupt();
+        // With no tracked PID, interrupt must not signal anyone (signalling
+        // PID 0 would hit our own process group) — but it must still latch
+        // the cancel request for the runner to act on.
+        let idle = ChildTracker::default();
+        idle.interrupt();
+        assert!(idle.cancel_requested());
+    }
+
+    // A Ctrl+C that lands before restic is spawned (during version detection
+    // or the unstick pre-check) has no child to signal, but must still
+    // cancel: the streaming runner refuses to start at all. The check comes
+    // before any repository access, which is why a bogus profile suffices.
+    #[test]
+    fn a_cancel_before_the_spawn_refuses_to_start_restic() {
+        let tracker = ChildTracker::default();
+        tracker.interrupt();
+        let progress = std::sync::Mutex::new(String::new());
+        let err =
+            run_unsticking_locks_streaming(&test_profile(), &["prune"], &tracker, &progress)
+                .expect_err("a latched cancel must refuse to spawn restic");
+        assert!(format!("{err:#}").contains("cancelled"), "{err:#}");
+        assert!(
+            progress.into_inner().expect("progress mutex").is_empty(),
+            "nothing ran, so nothing may have streamed"
+        );
     }
 
     fn test_profile() -> Profile {

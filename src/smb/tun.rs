@@ -796,7 +796,7 @@ on wintun.net and its Authenticode signature before changing the constant.",
     /// have accepted. A missing file must name what to do about it.
     #[test]
     fn verify_dll_refuses_impostors_and_absence() {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tmp").join(format!(
             "wrustic-tun-dll-{}-{:?}",
             std::process::id(),
             std::thread::current().id()

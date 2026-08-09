@@ -589,11 +589,10 @@ fn run(
                     // streamed progress without spinning. Ctrl+C interrupts
                     // the restic child (safe: restic never removes data still
                     // in use); every other event is swallowed, with resize
-                    // picked up by the redraw. Every Ctrl+C re-sends the
-                    // interrupt: a press that lands before the child is
-                    // tracked (detect / the unstick pre-check) is a no-op on
-                    // the tracker, so a repeat must still be able to reach
-                    // the child once it exists.
+                    // picked up by the redraw. A press that lands before the
+                    // child exists (detect / the unstick pre-check) is
+                    // latched by the tracker, and the runner refuses to
+                    // spawn restic after it — the cancel lands either way.
                     if event::poll(std::time::Duration::from_millis(150))?
                         && let Event::Key(key) = event::read()?
                         && key.kind == KeyEventKind::Press
