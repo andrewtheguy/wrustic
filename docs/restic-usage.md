@@ -1,34 +1,48 @@
 # Where restic is used
 
-wrustic never invokes the `restic` binary — restic is used only by the
-test suite (through a secure spawn harness) and by the user, manually,
-outside the app. This page is the single overview of both. The safety
-rationale behind the native/CLI split (lock tiers, why prune could go
-native) lives in [locking.md](locking.md) under "What writes wrustic can
-safely support".
+wrustic runs without the `restic` binary for everything except prune.
+This page is the single overview of every workflow that uses the restic
+CLI — today or by plan. The safety rationale behind the native/CLI split
+(lock tiers) lives in [locking.md](locking.md) under "What writes wrustic
+can safely support".
 
 ## Inside the app
 
-Everything wrustic does at runtime is native:
+One TUI flow shells out to restic: **prune** (`p` on the Snapshots
+screen). Everything else wrustic does at runtime is native:
 
 | Workflow | Implementation |
 |---|---|
 | All reads (snapshot list, tree browsing, diff, file view/share, filters) | `rustic_core` |
 | Snapshot delete | native, under the restic-compatible repo lock (`repo::delete_snapshot`) |
-| Prune | native, under the same exclusive lock (`repo::prune`, instant delete) |
 | Tag edits (`t` on the snapshot list) | native, under the same exclusive lock (`repo::edit_snapshot_tags`, lossless raw-JSON rewrite) |
 | Unlock / stale-lock removal (`u` shortcut) | native (`repo::unlock`) |
+| Prune | **restic CLI**, via the spawn harness in `src/restic.rs` |
 
-The prune flow (`p` on the Snapshots screen) runs rustic_core's prune
-under wrustic's exclusive restic-compatible lock, always with instant
-delete so the repository state it leaves is indistinguishable from a
-`restic prune` (locking.md has the full rationale). Progress renders
-live, one line per prune phase. A lock conflict — stale locks included,
-restic's rule — offers `u` for native stale-lock removal and a retry. A
-running native prune cannot be cancelled; Ctrl+C twice force-quits
-wrustic instead, which is safe for the repository (prune deletes nothing
-before all new data and the new index are written) but leaves a stale
-lock for a later unlock.
+The prune flow runs `restic prune` through the secure spawn harness
+(`restic::run_unsticking_locks_streaming`: password piped over stdin,
+credentials over env vars, secrets never on argv, `--cache-dir <per-user
+path private to wrustic> --cleanup-cache` unless the user passed
+`--no-restic-cache`, which switches it to `--no-cache`). Before spawning,
+the harness evaluates the repo's lock files natively and runs
+`restic unlock` if a stale lock would block the exclusive acquisition.
+restic ≥ 0.19 must be available for this one action — a `restic(.exe)`
+sitting next to the wrustic executable wins (the Windows installer ships
+a pinned one there), otherwise PATH is searched; every other feature
+works without it. restic 0.19 has no JSON output for prune, so the report
+is shown verbatim, never parsed; restic's stdout is streamed into the
+running screen live (on a pipe restic reports progress roughly every
+10 s). Ctrl+C interrupts the run safely — restic never removes data still
+in use, so a cancelled prune just leaves the remaining work for the next
+one (SIGINT on Unix, which restic catches and removes its lock; process
+termination on Windows, whose leftover lock is stale and removed by the
+next run's unstick pre-check).
+
+## Expected to use restic from the app (planned, not wired yet)
+
+**repair index** and **migrate** (locking.md Tier 3) would go through the
+same harness if the TUI grows actions for them
+(`restic::run_unsticking_locks`).
 
 ## Outside the app (run manually by the user)
 
@@ -45,22 +59,15 @@ only implements features common to both tools. Native backup, copy, and
 key management were considered (locking.md Tier 1) and dropped from the
 plan — they stay on the restic CLI indefinitely.
 
-## Tests only
-
-`src/restic.rs` is a **test-only** module (`#[cfg(test)]`): a secure spawn
-harness (password piped over stdin, credentials over env vars, secrets
-never on argv, restic's cache pointed at a `--cache-dir` private to
-wrustic with `--cleanup-cache`) that the live interop tests use to drive
-real restic against throwaway repos:
+## Development and tests
 
 - The live interop tests in `src/repo.rs` use `restic::run` for `init`,
   `backup`, `forget`, `unlock`, `snapshots --json`,
-  `check --read-data --json`, `restore`, `tag`, and `prune` to prove the
-  native lock, delete, tag-edit, and prune paths are compatible with
-  real restic.
+  `check --read-data --json`, and `tag` to prove the native lock, delete,
+  and tag-edit paths are compatible with real restic.
 - The live test in `src/restic.rs` exercises the harness itself end to
-  end (stdin password channel, plus `restic::run_unsticking_locks` — the
-  native pre-spawn lock check that unlocks stale locks before running a
-  restic command).
+  end (stdin password channel, the native pre-spawn lock check that
+  unlocks stale locks before running a restic command, and the streaming
+  prune runner the TUI uses).
 - `scripts/garage-e2e.sh seed` initializes and seeds the Garage S3 test
   repository with restic (requires restic >= 0.19.1).

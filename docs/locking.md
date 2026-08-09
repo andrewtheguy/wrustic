@@ -108,15 +108,15 @@ safety rationale behind that split.)
 Restic's own table above *is* the safety map. Tiered by lock type, with
 each operation's implementation status (see Phases below for the history).
 Implemented today: **forget / delete snapshots** (`repo::delete_snapshot`,
-the TUI delete flow), **prune** (`repo::prune`, the TUI's `p` action —
-see "Native prune" below), **tag edits** (`repo::edit_snapshot_tags`,
+the TUI delete flow), **tag edits** (`repo::edit_snapshot_tags`,
 the TUI's `t` action — see "Native tag edits" below), the **snapshot SMB
 share** (a long-running *read* under the same non-exclusive lock
 `restic mount` takes — see "Long-running reads" below), and — outside
 these tables because it takes no lock — **unlock** (`repo::unlock`,
 native stale-lock removal behind the TUI's `u` shortcut, plus the
-pre-spawn unstick in `restic::run_unsticking_locks`, nowadays
-test-only).
+pre-spawn unstick in `restic::run_unsticking_locks`). Prune is *not*
+native: the TUI's `p` action shells out to `restic prune` through the
+spawn harness (Tier 3 below).
 
 **Tier 1 — non-exclusive lock (coexists with running restic backups):**
 
@@ -131,164 +131,13 @@ test-only).
 | Operation | rustic_core API | Status |
 |---|---|---|
 | forget / delete snapshots | `delete_snapshots` | **implemented** — `repo::delete_snapshot` (phase 2) |
-| prune | `prune_plan` + `prune` | **implemented** — `repo::prune` (phase 4) |
 | tag edits | raw JSON via `cat_file` + own envelope (see below) | **implemented** — `repo::edit_snapshot_tags` (phase 5) |
 | description edits | `save_snapshots` + `delete_snapshots` | not planned — `description` is rustic-only; restic silently drops it on any rewrite, so wrustic only implements what both tools share |
 | key remove | `delete_key` | not planned |
 
-Apart from prune these have tiny critical sections (seconds); a
-concurrent restic command gets the ordinary "repository is already
-locked" error it is designed to handle. Prune holds the lock for its
-whole run — exactly like `restic prune` does.
-
-**Native prune (implemented):** `repo::prune` was originally Tier 3
-("stays on the restic CLI"), on two stated grounds: rustic_core's
-two-phase delete bookkeeping and its `keep_pack = 0` default. Both
-concerns predate the lock module and dissolve under a real exclusive
-lock; the facts below were verified against restic 0.19.1 and
-rustic_core 0.12.0 source.
-
-- *Grace periods*: restic itself has **no** time-based grace anywhere —
-  its prune never reads a pack mtime (`internal/repository/prune.go`
-  enumerates packs as `(id, size)` only); safety comes purely from the
-  exclusive lock (`cmd_prune.go` refuses `--no-lock`). Under wrustic's
-  lock there is no concurrent writer to protect, which is the same
-  argument restic relies on. (`keep_pack` could not protect
-  restic-written packs anyway: it compares the index entry's `time`
-  field, which restic's index format doesn't have.)
-- *Two-phase delete*: opt-out. `repo::prune` always sets
-  `instant_delete`, and rustic_core then never writes its rustic-only
-  `packs_to_delete` index extension (every `add_remove` call site in
-  `commands/prune.rs` is behind `!instant_delete`) — which matters
-  because restic 0.19 decodes only the `packs` key (unknown JSON keys are
-  silently ignored), treats marked packs as orphans, deletes them on its
-  next prune, and drops the extension when it rewrites an index. Instant
-  delete *is* restic's own semantic, and needs no grace period under the
-  lock (see above). `max_repack` is lifted to unlimited to match restic;
-  `early_delete_index` stays off (it inverts the crash-safe ordering).
-- *Resulting state*: new index files covering exactly the surviving
-  packs (`supersedes` unset — restic 0.17 dropped the field), old
-  indexes and unused packs deleted. restic keeps no provenance and
-  re-derives everything from listing `index/` and `data/`, so this is
-  indistinguishable from a restic prune. Verified live:
-  `live_native_prune_interop_with_restic` (repack-forcing shape) passes
-  `restic check --read-data` with zero errors and zero orphaned packs,
-  restores the surviving snapshot, and a follow-up `restic prune` runs
-  clean.
-- *Crash safety*: rustic_core's execution order matches restic's
-  spec-mandated one — write repacked packs → write new index → delete
-  old indexes → delete packs — so an interruption leaves a valid repo
-  plus garbage the next prune collects.
-- *Lock coverage*: the exclusive lock is acquired **before planning**,
-  not just execution. rustic_core's executor never re-validates the plan
-  (no re-read of snapshots), so the snapshot set enumerated at plan time
-  must stay frozen throughout. `RepoLock::poisoned()` (the 22.5-minute
-  refreshability rule) is enforced for the whole run, through the abort
-  mechanism described next.
-
-**Cancelling a native prune (`repo::AbortSignal`):** rustic_core 0.12.0
-has no cancellation API of any kind — no token, no callback that can say
-"stop". The one thing it does offer is progress callbacks, ticked
-continuously: per file during deletions, per blob batch during repack. So
-`repo::prune`'s progress adapter consults an `AbortSignal` on every phase
-start and every ~10 Hz render tick, and panics out of rustic_core's
-executor when it says stop; `abort_if_signalled` catches that unwind at
-the call site and returns an ordinary error. `abort` is checked at each
-phase boundary too, covering a signal that lands between ticks.
-
-Two things can raise it, and the distinction is only in the message:
-
-- **the lock became untrustworthy** — `RepoLock::poisoned()`, restic's
-  22.5-minute cutoff. Aborts planning *and* execution within roughly one
-  progress tick, before further writes or deletions.
-- **the user asked to stop** — Esc or Ctrl+C on the prune screen. The TUI
-  stays up and the prune returns like any other failure. This replaced the
-  old double-Ctrl+C force-quit, which survives only as the fallback for a
-  run that has somehow stopped ticking: a *second Ctrl+C* still force-quits.
-  Esc never escalates however often it is pressed — it is the "I changed my
-  mind" key everywhere else in the app, and must not become a way to lose
-  the lock by accident.
-
-An abort mid-run is safe for the same reason a crash is (see *Crash
-safety*), and *better* than the force-quit in one respect: the lock guard
-still drops, so no stale lock is left behind.
-
-Why a flag rather than a distinctive panic payload: prune's repack is
-rayon (`into_par_iter`), which resumes a worker's original payload, but
-rustic_core's other parallelism is `pariter`, whose worker-panic path
-discards the payload and raises a message of its own
-(`pariter/src/parallel_map.rs`). Matching on the payload is therefore
-correct for only part of rustic_core. `AbortSignal` records the reason
-before throwing and the catch reads that record, which is correct for all
-of it — and for whatever a future version does. (Two facts that make the
-whole approach viable: rustic_core defines **no `Drop` impls** at all, so
-no destructor can panic during the unwind and turn it into a process
-`abort()`; and wrustic sets no `panic = "abort"`.)
-
-The panic must also stay *invisible*, and a cancellation raises more than
-one. Rust's hook runs before the `catch_unwind` does, so the default hook
-prints a report to stderr — over the alternate screen, in raw mode, where
-`\n` drops a line without returning to column 0 and the diff-based renderer
-never repaints what it did not change. That is one way a cancel corrupted
-the screen; the other was worse. `ratatui::init` installs a panic hook of
-its own that calls `ratatui::restore()` *unconditionally* — any panic, any
-thread — before chaining to whatever hook it found installed. With
-wrustic's hook installed first, ratatui's wrapper sat outermost and
-switched the shell back to its own screen (raw mode off, alternate screen
-left, mouse capture still on) on the abort panic of every single cancel,
-before wrustic's hook even ran. So `install_panic_hook` must run *after*
-`ratatui::init()`: wrustic's hook then decides, and ratatui's
-restore-then-report wrapper is the `default_hook` it chains to only when
-the process is going down. Two different panics reach the hook:
-
-- **The abort itself**, matched by `repo::is_abort_panic` and pinned to what
-  `raise` throws by `the_panic_hook_recognises_the_abort_it_must_not_print`.
-- **Its fallout inside rustic_core.** `TreeStreamerOnce::new` spawns four
-  *detached* loader threads that `out_tx.send(..).unwrap()`
-  (`rustic_core-0.12.0/src/blob/tree.rs:683`). Unwinding drops the streamer
-  and the receiving end with it, so every loader still holding a queued tree
-  panics on the resulting `SendError` — a different payload, on threads the
-  abort never touched. `repo::ABORT_UNWINDING`, set by `raise` and cleared
-  when a `prune` starts, is how the hook tells that fallout from a fault. It
-  latches rather than clearing at the catch because those threads panic
-  *concurrently* with the unwind and can land after it.
-
-So `main::install_panic_hook` splits by thread, not by payload
-(`main::panic_disposition`, covered exhaustively by
-`only_a_dying_process_may_take_the_terminal_back`):
-
-| | abort panic | fallout during an abort | anything else |
-|---|---|---|---|
-| main thread | dropped | restore + report | restore + report |
-| any other thread | dropped | dropped | withheld until exit |
-
-Only a panic on the main thread ends the process, and only it may restore
-the terminal — it unwinds straight past the `ratatui::restore()` at the end
-of `main`, so the shell would be left raw otherwise. A background thread's
-panic leaves the app running, so the terminal must not be touched at all:
-restoring it out from under a live TUI is the corruption, not the cure. Its
-report goes to `WITHHELD_PANICS` (capped — a dying pool produces one per
-worker, all saying the same thing) and is printed by
-`report_withheld_panics` once `main` has the terminal back.
-
-Tested end to end, not just in the adapter: `a_signalled_abort_unwinds_
-through_the_progress_adapter` and `an_abort_is_recognised_even_when_the_
-payload_is_rewritten` cover the mapper (including the pariter-style
-rewrite, and that unrelated panics still resume), and four tests cancel
-a *real* prune from inside rustic_core's own call stack — during planning,
-during the used-blob tree walk, during index rebuild, and inside the
-parallel repack (`cancelling_inside_the_parallel_repack_unwinds_to_an_
-error`, whose fixture uses incompressible data so rustic actually repacks
-instead of dropping whole packs). Each asserts the phase was really
-reached, the error came back as an error, `ABORT_UNWINDING` is set so the
-hook will excuse the fallout, the lock was released, the surviving
-snapshot is intact, and the repository is still prunable afterwards.
-
-What none of them reproduces is the loader race itself: the used-blob
-counter counts *snapshots*, so with one survivor it ticks once and the
-abort lands at a phase boundary rather than with the queue full. Forcing
-it would need many snapshots of disjoint trees; the hook's handling of it
-is covered directly by `panic_disposition` instead.
+These have tiny critical sections (seconds); a concurrent restic command
+gets the ordinary "repository is already locked" error it is designed to
+handle.
 
 **Native tag edits (implemented — phase 5, `repo::edit_snapshot_tags`,
 the TUI's `t` on the snapshot list):** what `restic tag` does, verified
@@ -370,12 +219,17 @@ unlocked. Poisoning is a latch: a refresh that succeeds after the timeout
 was observed does not resurrect trust, since an unlock + prune may have
 happened in the gap.
 
-**Tier 3 — stays on a user-run restic CLI indefinitely:** repair index,
-migrate. Rare, hand-run recovery/upgrade operations with no TUI action —
-the user runs them with restic outside the app; wrustic itself never
-spawns restic (the harness in `src/restic.rs` is test-only). (Prune sat
-here until the exclusive lock landed; see "Native prune" above for why
-its original rationale no longer applied.)
+**Tier 3 — stays on the restic CLI indefinitely:** prune, repair index,
+migrate. Prune is technically possible under an exclusive lock, but
+rustic_core's prune semantics differ from restic's (two-phase delete with
+23 h `keep_delete` and a rustic-only `packs_to_delete` index extension
+restic cannot see; `keep_pack` defaults to 0 so concurrently-written
+packs get no grace period), and mixing two prune implementations on one
+repo is where the real blast radius lives — so the TUI's `p` action runs
+`restic prune` through the spawn harness in `src/restic.rs` instead
+(`restic::run_unsticking_locks_streaming`). Repair index and migrate are
+rare, hand-run recovery/upgrade operations with no TUI action; the user
+runs them with restic outside the app.
 
 ## wrustic lock module design
 
@@ -444,9 +298,8 @@ The per-operation live tests below prove interop with restic, but they need
 a restic binary and are `#[ignore]`d, so on their own they let a dropped
 `acquire_exclusive` through a plain `cargo test`. That rule is therefore also
 enforced by tests with no external dependency:
-`delete_snapshot_takes_the_exclusive_lock`,
-`edit_snapshot_tags_takes_the_exclusive_lock` and
-`prune_takes_the_exclusive_lock` each plant a live **non-exclusive** lock —
+`delete_snapshot_takes_the_exclusive_lock` and
+`edit_snapshot_tags_takes_the_exclusive_lock` each plant a live **non-exclusive** lock —
 the one a concurrent `restic backup` or a running share holds — and assert
 the operation fails with restic's lock error. Since a non-exclusive lock
 never blocks another non-exclusive acquisition, only an *exclusive*
@@ -466,8 +319,8 @@ properties through the share itself.
 
 These fixtures are built in-process with rustic_core's `init`/`backup`
 (`src/testrepo.rs`, `#[cfg(test)]`), which is what frees them from the restic
-binary; `init`/`backup` remain non-features of wrustic itself (Tier 1 above),
-exactly as `src/restic.rs` is test-only. Because restic's key file is
+binary; `init`/`backup` remain non-features of wrustic itself (Tier 1 above).
+Because restic's key file is
 scrypt-derived, every repository open runs a full KDF — unoptimised that is
 ~10 s per open, so `Cargo.toml` raises `opt-level` for the scrypt crates in
 the dev profile only.
@@ -500,15 +353,12 @@ the dev profile only.
    exclusive lock (`repo::delete_snapshot`), and the `u` shortcut's
    `restic unlock` became native stale-lock removal (`repo::unlock`).
    The restic/rustic metadata cross-check and `restic snapshots --json`
-   fetch went away with it; from then until phase 4 the only feature that
-   needed the restic binary was the TUI's prune action (`p` on the
-   Snapshots screen).
+   fetch went away with it; the only feature that still needs the restic
+   binary is the TUI's prune action (`p` on the Snapshots screen).
    `src/restic.rs` is the secure spawn harness (stdin-piped
    password, env-var credentials, resterm's launch semantics including
-   its private cache directory) the live tests use to drive restic —
-   dev-flow repo setup plus restic-side observations; since phase 4 it
-   is a `#[cfg(test)]`-only module, as wrustic itself never spawns
-   restic. Before spawning a lock-taking command,
+   its private cache directory) that the prune flow and the live tests
+   use to drive restic. Before spawning a lock-taking command,
    `restic::run_unsticking_locks` performs restic's acquisition conflict
    check natively: the subcommand maps to the lock restic takes for it
    (the per-command table above) and `lock::check_blocking_locks`
@@ -530,19 +380,18 @@ the dev profile only.
    in place (and its SIGHUP probe doesn't kill the process). On a lock
    conflict at share start, the share screen offers `u` — native
    stale-lock removal, then retry.
-4. **Native prune** — DONE. The TUI's last restic shell-out became
-   `repo::prune`: rustic_core's `prune_plan` + `prune` with instant
-   delete under the native exclusive lock, acquired before planning and
-   poison-checked after it (see "Native prune" above for the full safety
-   argument). The old prune-specific machinery in `src/restic.rs`
-   (version detection, the streaming runner, the child tracker) went
-   away with it, and the harness itself became test-only — wrustic never
-   spawns restic; the restic CLI is for the user (Tier 3, init, backup)
-   and for the live tests.
-   Verified live: `live_native_prune_interop_with_restic` forces a
-   repack, then passes `restic check --read-data` with zero errors and
-   zero orphans, restores the surviving snapshot through restic, and a
-   follow-up `restic prune` runs clean.
+4. **Prune through the harness** — DONE. The TUI's prune action runs
+   `restic prune` via `restic::run_unsticking_locks_streaming`: version
+   detection first (restic ≥ 0.19, a `restic(.exe)` next to the wrustic
+   executable preferred over PATH), then the native unstick pre-check
+   from phase 2, then a streaming spawn whose stdout lines feed the
+   running screen live and whose PID a `ChildTracker` records so Ctrl+C
+   can interrupt it (SIGINT on Unix — restic catches it and removes its
+   lock; termination on Windows, whose leftover lock names a dead PID
+   and is removed as stale by the next run's pre-check). A native prune
+   via rustic_core was tried and reverted — mixing rustic's prune
+   semantics with restic's on one repository is the blast radius Tier 3
+   exists to avoid, so prune stays a shell-out.
 5. **Native tag edits** — DONE (`repo::edit_snapshot_tags`, the TUI's
    `t` on the snapshot list; see "Native tag edits" above for the full
    design). The exclusive lock, resolve-under-lock, `original`
@@ -556,6 +405,6 @@ the dev profile only.
 
 Non-goals: native backup, copy, and key management (the restic CLI
 keeps them; the Tier 1 rows above remain as the safety map should that
-ever change), native repair/migrate (Tier 3), multi-host clock-skew
-mitigation beyond what restic itself does, and any restic < 0.19
-compatibility.
+ever change), native prune/repair/migrate (Tier 3), multi-host
+clock-skew mitigation beyond what restic itself does, and any
+restic < 0.19 compatibility.

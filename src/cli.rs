@@ -145,17 +145,40 @@ Options:
                               get one. It is also the only way in from Windows
                               builds before 11 24H2, which speak to no port but
                               445. Needs administrator rights to create the
-                              adapter; the host's own file sharing is left
-                              untouched. While a share is open, two /32 host
-                              routes point at the tun — no subnet is claimed.
-                              Windows only, and only in builds compiled with
-                              --features smb-tun.
+                              adapter, and the wintun driver (wintun-amd64.dll)
+                              next to the wrustic executable — the Windows
+                              installer ships it there. The host's own file
+                              sharing is left untouched. While a share is open,
+                              two /32 host routes point at the tun — no subnet
+                              is claimed. Windows only, and only in builds
+                              compiled with --features smb-tun.
       --smb-tun-ip <IPv4>     Mount address for --smb-tun. Default 169.254.255.1
                               — link-local, in the block RFC 3927 keeps clear of
                               APIPA autoconfiguration, so it collides with
                               nothing. The address is deliberately assigned to
                               nothing; the next one up (.2) goes on the adapter,
                               and only those two /32s are claimed.
+      --no-restic-cache       Turn off restic's on-disk cache: every restic call
+                              runs --no-cache. On by default, restic keeps its
+                              cache in a 'wrustic' directory under your
+                              platform's per-user cache root, private to your
+                              account: $XDG_CACHE_HOME or ~/.cache on Linux,
+                              ~/Library/Caches on macOS, %LOCALAPPDATA% on
+                              Windows. On a machine where no such root can be
+                              determined, --no-cache is passed anyway rather
+                              than falling back to restic's shared default
+                              cache. Only affects the restic CLI commands
+                              wrustic shells out for (prune-class); native
+                              reads/writes never use a restic cache. The cache
+                              speeds up repeated restic work against a remote
+                              repository at the cost of disk space — it can
+                              reach hundreds of megabytes for a large
+                              repository. Cached calls also pass
+                              --cleanup-cache, so restic itself drops the
+                              per-repository subdirectories there that go 30
+                              days unused. To clean it out by hand, point restic
+                              at the same directory:
+                              'restic --cache-dir <that path> cache --cleanup'.
       --no-mouse              Disable mouse reporting (useful for QA / copy-paste).
       --no-keychain           Disable keychain integration even when the binary
                               was built with the 'keychain' feature.
@@ -167,6 +190,7 @@ pub(crate) struct Cli {
     pub(crate) config_dir: Option<PathBuf>,
     pub(crate) port: u16,
     pub(crate) smb: SmbOptions,
+    pub(crate) restic_cache: bool,
     pub(crate) no_mouse: bool,
     pub(crate) no_keychain: bool,
     pub(crate) show_version: bool,
@@ -179,6 +203,7 @@ impl Default for Cli {
             config_dir: None,
             port: DEFAULT_SERVER_PORT,
             smb: SmbOptions::default(),
+            restic_cache: true,
             no_mouse: false,
             no_keychain: false,
             show_version: false,
@@ -216,6 +241,7 @@ requires compiling with `--features smb-tun`"
                 let value = &other["--smb-tun-ip=".len()..];
                 cli.smb.tun_addrs = parse_tun_ip(value, "--smb-tun-ip=")?;
             }
+            "--no-restic-cache" => cli.restic_cache = false,
             "--no-mouse" => cli.no_mouse = true,
             "--no-keychain" => cli.no_keychain = true,
             "-c" | "--config-dir" => {

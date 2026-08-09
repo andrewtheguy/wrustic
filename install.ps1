@@ -1,7 +1,10 @@
 #!/usr/bin/env pwsh
 
 # wrustic installer for Windows
-# Downloads latest binary from: https://github.com/andrewtheguy/wrustic/releases
+# Downloads the latest installer (wrustic-windows-amd64-setup.exe) from
+# https://github.com/andrewtheguy/wrustic/releases and runs it silently.
+# The installer lays down wrustic.exe, wintun-amd64.dll, and a pinned
+# restic.exe together in $env:LOCALAPPDATA\Programs\wrustic.
 #
 # Adapted from the beam-rs installer. Flags are read from $args or
 # $env:WRUSTIC_INSTALL_ARGS; there is no param() block, so the script behaves
@@ -200,11 +203,7 @@ function Get-BinaryName {
         exit 1
     }
 
-    return "wrustic-windows-amd64.exe"
-}
-
-function Get-InstallName {
-    return "wrustic.exe"
+    return "wrustic-windows-amd64-setup.exe"
 }
 
 # Parse an argument string (e.g. from an environment variable) with PowerShell's
@@ -301,10 +300,10 @@ function Download-Binary {
 
 # `wrustic --version` prints and exits without touching config or repos, so
 # this smoke test is safe on any machine.
-function Test-Binary {
+function Test-InstalledBinary {
     param([string]$Path)
 
-    Print-Info "Testing downloaded binary..."
+    Print-Info "Testing installed binary..."
     try {
         $versionInfo = & $Path --version 2>&1
         if ($LASTEXITCODE -ne 0) {
@@ -313,14 +312,13 @@ function Test-Binary {
         Print-Info "Binary test successful: $versionInfo"
     }
     catch {
-        Print-Error "Binary test failed. The downloaded file may be corrupted or incompatible."
+        Print-Error "Installed binary failed to run."
         Print-Error "Output: $_"
-        Remove-Item -Path $Path -Force -ErrorAction SilentlyContinue
         exit 1
     }
 }
 
-# Download only - save to the current directory
+# Download only - save the installer to the current directory
 function Download-Only {
     param(
         [string]$BaseUrl,
@@ -331,10 +329,10 @@ function Download-Only {
     $url = "$BaseUrl/$BinaryName"
     $outputFile = Join-Path (Get-Location) $BinaryName
     # Stage in a temp directory rather than writing straight to $outputFile. A
-    # failed transfer would otherwise leave a truncated binary sitting at the
-    # advertised name, and a checksum mismatch would delete whatever file the
-    # user already had there. Nothing touches $outputFile until the download is
-    # verified and the binary has run.
+    # failed transfer would otherwise leave a truncated installer sitting at
+    # the advertised name, and a checksum mismatch would delete whatever file
+    # the user already had there. Nothing touches $outputFile until the
+    # download is verified.
     $tempDir = Join-Path $env:TEMP "wrustic-download-$(Get-Random)"
     $tempBinary = Join-Path $tempDir $BinaryName
 
@@ -342,7 +340,6 @@ function Download-Only {
         New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
 
         Download-Binary -Url $url -OutputPath $tempBinary -ExpectedChecksum $ExpectedChecksum
-        Test-Binary -Path $tempBinary
 
         try {
             Move-Item -Path $tempBinary -Destination $outputFile -Force
@@ -352,17 +349,18 @@ function Download-Only {
             exit 1
         }
 
-        Print-Info "Binary saved to: $outputFile"
+        Print-Info "Installer saved to: $outputFile"
     }
     finally {
-        # Runs even on the `exit 1` paths inside Download-Binary/Test-Binary.
+        # Runs even on the `exit 1` paths inside Download-Binary.
         if (Test-Path $tempDir) {
             Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
 }
 
-# Download to a temporary location, test it, then install
+# Download the installer to a temporary location, run it silently, then smoke
+# test what it installed.
 function Install-Binary {
     param(
         [string]$BaseUrl,
@@ -374,55 +372,28 @@ function Install-Binary {
     $tempDir = Join-Path $env:TEMP "wrustic-install-$(Get-Random)"
     $tempBinary = Join-Path $tempDir $BinaryName
     $installDir = Join-Path $env:LOCALAPPDATA "Programs\wrustic"
-    $installName = Get-InstallName
-    $finalPath = Join-Path $installDir $installName
 
     try {
         New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
 
         Download-Binary -Url $url -OutputPath $tempBinary -ExpectedChecksum $ExpectedChecksum
-        Test-Binary -Path $tempBinary
 
-        if (-not (Test-Path $installDir)) {
-            New-Item -ItemType Directory -Path $installDir -Force | Out-Null
-        }
-
-        try {
-            Move-Item -Path $tempBinary -Destination $finalPath -Force
-        }
-        catch {
-            Print-Error "Failed to move binary to final location: $_"
+        # The Inno Setup installer places wrustic.exe, wintun-amd64.dll, and
+        # the pinned restic.exe in $installDir and appends it to the user
+        # PATH. /VERYSILENT keeps it non-interactive.
+        Print-Info "Running installer..."
+        $setup = Start-Process -FilePath $tempBinary `
+            -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' `
+            -Wait -PassThru
+        if ($setup.ExitCode -ne 0) {
+            Print-Error "Installer exited with code $($setup.ExitCode)."
             Print-Error "If wrustic is currently running, close it and try again."
             exit 1
         }
 
-        Print-Info "Binary installed successfully to $finalPath"
-
-        # Add to PATH if not already there. Compare whole entries, not
-        # substrings — a sibling like ...\Programs\wrustic-old must not count
-        # as this directory being present.
-        $userPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
-        $pathEntries = if ($userPath) { $userPath -split ';' } else { @() }
-        $alreadyPresent = $pathEntries |
-            Where-Object { $_.TrimEnd('\') -eq $installDir.TrimEnd('\') } |
-            Select-Object -First 1
-        if (-not $alreadyPresent) {
-            Print-Warn "$installDir is not in your PATH"
-            Print-Warn "Adding to user PATH..."
-
-            try {
-                $newPath = if ($userPath) { "$userPath;$installDir" } else { $installDir }
-                [System.Environment]::SetEnvironmentVariable("Path", $newPath, "User")
-                Print-Info "Added to PATH. You may need to restart your terminal for changes to take effect."
-            }
-            catch {
-                Print-Warn "Failed to add to PATH automatically. Please add manually:"
-                Print-Warn "$installDir"
-            }
-        }
-        else {
-            Print-Info "$installDir is already in your PATH"
-        }
+        Print-Info "Installed to $installDir"
+        Test-InstalledBinary -Path (Join-Path $installDir "wrustic.exe")
+        Test-BundledRestic -InstallDir $installDir
     }
     finally {
         if (Test-Path $tempDir) {
@@ -431,41 +402,32 @@ function Install-Binary {
     }
 }
 
-# wrustic runs without restic (reads and its write operations — snapshot
-# delete, prune, stale-lock removal — are native), but the commands it
-# deliberately leaves to the restic CLI (init, backup, repair and friends)
-# need restic >= 0.19 on PATH — so mention it.
-function Test-ResticPresent {
-    $restic = Get-Command restic -ErrorAction SilentlyContinue
-    if (-not $restic) {
-        Print-Warn "restic was not found on your PATH."
-        Print-Warn "wrustic runs without it, but restic >= 0.19 is needed for the"
-        Print-Warn "operations wrustic leaves to it (init, backup, repair). Install it with:"
-        Print-Warn "  winget install restic.restic"
-        Print-Warn "or grab a binary from https://github.com/restic/restic/releases"
+# The installer ships a pinned restic.exe next to wrustic.exe — wrustic
+# prefers it over PATH for the prune flow — so report what landed.
+function Test-BundledRestic {
+    param([string]$InstallDir)
+
+    $restic = Join-Path $InstallDir "restic.exe"
+    if (-not (Test-Path $restic)) {
+        Print-Warn "restic.exe was not found in $InstallDir."
+        Print-Warn "The prune flow will fall back to a restic >= 0.19 on PATH."
         return
     }
 
-    $versionLine = (& $restic.Source version 2>&1 | Select-Object -First 1)
-    Print-Info "Found restic: $versionLine"
-    if ($versionLine -match 'restic\s+(\d+)\.(\d+)\.(\d+)') {
-        $found = [version]::new([int]$matches[1], [int]$matches[2], [int]$matches[3])
-        if ($found -lt [version]::new(0, 19, 0)) {
-            Print-Warn "wrustic expects restic >= 0.19 for maintenance commands; run 'restic self-update' to upgrade."
-        }
-    }
+    $versionLine = (& $restic version 2>&1 | Select-Object -First 1)
+    Print-Info "Bundled restic: $versionLine"
 }
 
 function Show-Usage {
     Write-Host @"
 Usage: .\install.ps1 [OPTIONS] [RELEASE_TAG]
 
-Download and install the wrustic binary
+Download and run the wrustic installer (wrustic-windows-amd64-setup.exe)
 
 Options:
-  -DownloadOnly  Download binary to current directory without installing
+  -DownloadOnly  Download the installer to the current directory without running it
   -PreRelease    Use latest prerelease tag instead of latest stable release
-  -Admin         Allow installation with administrator privileges (not recommended)
+  -Admin         Allow running with administrator privileges (not recommended)
   -h, --help     Show this help message
 
 Arguments:
@@ -478,21 +440,19 @@ Environment variables:
 Examples:
   .\install.ps1                              # Install latest wrustic
   .\install.ps1 <release-tag>                # Install specific stable release
-  .\install.ps1 -DownloadOnly                # Download latest to current directory
-  .\install.ps1 -DownloadOnly <release-tag>  # Download specific stable release
+  .\install.ps1 -DownloadOnly                # Download latest installer to current directory
+  .\install.ps1 -DownloadOnly <release-tag>  # Download specific installer
   .\install.ps1 -Admin                       # Allow admin installation (not recommended)
   `$env:RELEASE_TAG='<release-tag>'; .\install.ps1  # Use environment variable
 
-Installs to: `$env:LOCALAPPDATA\Programs\wrustic (added to the user PATH)
+Installs to: `$env:LOCALAPPDATA\Programs\wrustic (added to the user PATH),
+containing wrustic.exe, wintun-amd64.dll (the driver --smb-tun loads), and a
+pinned restic.exe that wrustic's prune flow uses.
 
 Supported platforms: Windows (amd64). The Windows build ships with the
 'keychain' feature enabled, so passphrases can be saved to Windows Credential
 Manager.
 
-Note: wrustic runs without restic (snapshot delete, prune, and stale-lock
-removal are native), but the operations it leaves to the restic CLI (init,
-backup, repair) need restic >= 0.19 on PATH — recommended
-('winget install restic.restic').
 Note: Installation as administrator is not recommended. Use -Admin to override.
 "@
 }
@@ -567,9 +527,7 @@ function Start-Installation {
     else {
         Install-Binary -BaseUrl $baseUrl -BinaryName $binaryName -ExpectedChecksum $expectedChecksum
         Print-Info "Installation completed successfully!"
-        $installName = Get-InstallName
-        Print-Info "You can now run '$installName' from your terminal."
-        Test-ResticPresent
+        Print-Info "You can now run 'wrustic' from your terminal (restart it to pick up PATH)."
     }
 }
 

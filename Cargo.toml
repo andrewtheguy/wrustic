@@ -1,6 +1,6 @@
 [package]
 name = "wrustic"
-version = "0.0.55"
+version = "0.0.56"
 edition = "2024"
 
 [dependencies]
@@ -76,8 +76,9 @@ windows-sys = { version = "0.61", features = [
 # claimed in a stack Windows does not arbitrate — the same reason a VM guest or
 # a WireGuard peer can hold 445 without disturbing the host. See docs/smb-tun.md.
 #
-# Off by default: it embeds a 427 KB signed driver in the binary and only earns
-# its keep if you actually want UNC paths. Enable with `--features smb-tun`.
+# Off by default: it needs the signed wintun driver DLL (vendor/wintun) shipped
+# next to the executable and only earns its keep if you actually want UNC
+# paths. Enable with `--features smb-tun`.
 wintun = { version = "0.5", optional = true }
 smoltcp = { version = "0.13", default-features = false, optional = true, features = [
     "std",
