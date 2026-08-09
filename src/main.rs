@@ -8,9 +8,6 @@ mod local_server;
 mod lock;
 mod passphrase;
 mod repo;
-// restic is never invoked at runtime — the harness exists for the live
-// interop tests only (dev-flow repo setup, restic-side observations).
-#[cfg(test)]
 mod restic;
 mod s3_backend;
 mod share;
@@ -64,6 +61,8 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    restic::set_cache_enabled(cli.restic_cache);
+
     #[cfg(feature = "keychain")]
     let no_keychain = cli.no_keychain || !keychain::init_store();
     #[cfg(not(feature = "keychain"))]
@@ -86,7 +85,7 @@ fn main() -> Result<()> {
     // `ratatui::restore()` unconditionally, any panic, any thread, before
     // chaining to whatever hook it found. Ours must go on *after* it, so ours
     // runs first and that restore happens only when we chain to it. Installed
-    // the other way round, every cancelled prune's abort panic switched the
+    // the other way round, any background thread's panic would switch the
     // shell back to its own screen underneath the live TUI.
     install_panic_hook();
     // Enable mouse reporting after entering raw mode. With capture on,
@@ -133,13 +132,6 @@ const MAX_WITHHELD_PANICS: usize = 4;
 ///   touched — restoring it out from under a running TUI is precisely the
 ///   corruption this exists to prevent. Withhold the report until exit.
 ///
-/// Cancelling a prune produces both kinds of panic and neither is worth
-/// reporting: the abort itself (`repo::is_abort_panic` — rustic_core takes no
-/// cancellation token, so the progress adapter unwinds out of it by panicking
-/// and `repo::prune` maps that straight back to an error the prune screen
-/// shows), and the fallout in rustic_core's own detached threads that
-/// `repo::abort_unwinding` accounts for.
-///
 /// Must be installed after `ratatui::init()`: the hook taken here is then
 /// ratatui's own — restore-then-report — and reaching it becomes this hook's
 /// decision instead of the first thing that happens on every panic. The
@@ -152,45 +144,14 @@ fn install_panic_hook() {
     let main_thread = std::thread::current().id();
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let on_main = std::thread::current().id() == main_thread;
-        match panic_disposition(info.payload(), on_main, repo::abort_unwinding()) {
-            PanicDisposition::Drop => {}
-            PanicDisposition::Withhold => withhold_panic(info.to_string()),
-            PanicDisposition::RestoreAndReport => {
-                let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
-                ratatui::restore();
-                default_hook(info);
-            }
+        if std::thread::current().id() == main_thread {
+            let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+            ratatui::restore();
+            default_hook(info);
+        } else {
+            withhold_panic(info.to_string());
         }
     }));
-}
-
-/// What the hook does with one panic.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum PanicDisposition {
-    /// Expected, and says nothing the user needs: forget it.
-    Drop,
-    /// Worth reporting, but not while the TUI owns the terminal.
-    Withhold,
-    /// The process is going down. Hand the terminal back, then report.
-    RestoreAndReport,
-}
-
-fn panic_disposition(
-    payload: &(dyn std::any::Any + Send),
-    on_main_thread: bool,
-    abort_unwinding: bool,
-) -> PanicDisposition {
-    if repo::is_abort_panic(payload) {
-        return PanicDisposition::Drop;
-    }
-    if on_main_thread {
-        return PanicDisposition::RestoreAndReport;
-    }
-    if abort_unwinding {
-        return PanicDisposition::Drop;
-    }
-    PanicDisposition::Withhold
 }
 
 fn withhold_panic(report: String) {
@@ -417,9 +378,8 @@ fn run(
 
         if matches!(app.screen, Screen::Unlocking) {
             // Which flow asked for the unlock decides where its outcome goes:
-            // the SMB share and the prune retry their operation (a lock
-            // conflict is why `u` was offered), the delete flow re-enters its
-            // confirmation.
+            // the SMB share retries its operation (a lock conflict is why `u`
+            // was offered), the delete flow re-enters its confirmation.
             let return_to = std::mem::take(&mut app.unlock_return);
             let idx = app.loading_index;
             let Some((_, profile)) = app.config.profile_at(idx) else {
@@ -429,7 +389,6 @@ fn run(
                         app.smb_error = Some(msg);
                         Screen::SnapshotSmb
                     }
-                    UnlockReturn::Prune => Screen::PruneError(msg),
                     UnlockReturn::Delete => Screen::SnapshotDeleteError(msg),
                     UnlockReturn::TagEdit => Screen::SnapshotTagError(msg),
                 };
@@ -439,7 +398,6 @@ fn run(
                 Ok(_removed) => {
                     app.screen = match return_to {
                         UnlockReturn::Smb => Screen::SnapshotSmbStarting,
-                        UnlockReturn::Prune => Screen::PruneRunning,
                         // Redo the same edit; target and tags survived the
                         // error screen.
                         UnlockReturn::TagEdit => Screen::SnapshotTagSaving,
@@ -464,7 +422,6 @@ fn run(
                             app.smb_error = Some(msg);
                             Screen::SnapshotSmb
                         }
-                        UnlockReturn::Prune => Screen::PruneError(msg),
                         UnlockReturn::Delete => Screen::SnapshotDeleteError(msg),
                         UnlockReturn::TagEdit => Screen::SnapshotTagError(msg),
                     };
@@ -569,82 +526,89 @@ fn run(
                 };
                 let profile = profile.clone();
                 let (tx, rx) = std::sync::mpsc::channel();
+                let tracker = std::sync::Arc::new(restic::ChildTracker::default());
                 let progress = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+                let worker_tracker = tracker.clone();
                 let worker_progress = progress.clone();
-                let abort = std::sync::Arc::new(repo::AbortSignal::default());
-                let worker_abort = abort.clone();
                 std::thread::spawn(move || {
+                    let result = (|| -> Result<Vec<u8>> {
+                        if let Err(e) = restic::detect() {
+                            return Err(anyhow::anyhow!(e.user_message()));
+                        }
+                        // No `--json`: restic 0.19 has no JSON output for
+                        // prune (the flag is accepted and ignored). The
+                        // report is displayed verbatim, never parsed.
+                        restic::run_unsticking_locks_streaming(
+                            &profile,
+                            &["prune"],
+                            &worker_tracker,
+                            &worker_progress,
+                        )
+                    })();
                     // The receiver is gone only if the app quit; nothing to do.
-                    let _ = tx.send(
-                        repo::prune(&profile, worker_progress, worker_abort)
-                            .map_err(|e| format!("{e:#}")),
-                    );
+                    let _ = tx.send(result.map_err(|e| format!("{e:#}")));
                 });
                 app.prune_rx = Some(rx);
+                app.prune_tracker = Some(tracker);
                 app.prune_progress = Some(progress);
-                app.prune_abort = Some(abort);
-                app.prune_cancelling = false;
+                app.prune_cancel_requested = false;
                 app.prune_started = Some(std::time::Instant::now());
             }
             let rx = app.prune_rx.as_ref().expect("receiver set above");
             match rx.try_recv() {
                 Ok(outcome) => {
+                    let cancelled = app.prune_cancel_requested;
                     app.prune_rx = None;
+                    app.prune_tracker = None;
                     app.prune_progress = None;
-                    app.prune_abort = None;
-                    app.prune_cancelling = false;
+                    app.prune_cancel_requested = false;
                     app.prune_started = None;
                     app.prune_scroll = 0;
                     app.screen = match outcome {
-                        Ok(report) => Screen::PruneDone(report),
+                        // A cancel that raced restic's own finish is still a
+                        // finish — the report is real either way.
+                        Ok(stdout) => {
+                            let report = String::from_utf8_lossy(&stdout).into_owned();
+                            Screen::PruneDone(if report.trim().is_empty() {
+                                "prune finished (restic produced no output)".into()
+                            } else {
+                                report
+                            })
+                        }
+                        Err(msg) if cancelled => Screen::PruneError(format!(
+                            "Prune cancelled — restic was interrupted before finishing.\n\n\
+                             The repository stays valid: restic never removes data still \
+                             in use, and the next prune redoes the remaining work.\n\n\
+                             restic said: {msg}"
+                        )),
                         Err(msg) => Screen::PruneError(msg),
                     };
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
                     // Wait briefly so the loop redraws the elapsed clock and
-                    // progress without spinning (a swallowed resize is
-                    // repainted at the next tick).
-                    //
-                    // Esc or Ctrl+C asks the worker to stop: rustic_core takes
-                    // no cancellation token, so the progress adapter unwinds
-                    // out of it at the next tick and `repo::prune` returns an
-                    // ordinary error (docs/locking.md, "Cancelling a native
-                    // prune"). The app stays up and the lock guard still
-                    // drops, so — unlike the force-quit this replaced — no
-                    // stale lock is left behind.
-                    //
-                    // Only Ctrl+C escalates: a second press force-quits, the
-                    // fallback for a run that has somehow stopped ticking.
-                    // Killing the process is safe for the repository (all new
-                    // data and the new index are written before anything old
-                    // is deleted) but skips the lock cleanup. Esc therefore
-                    // never quits, however often it is pressed — it is the
-                    // "I changed my mind" key everywhere else in the app, and
-                    // must not become a way to lose the lock by accident.
-                    //
-                    // Every other key stays swallowed until the worker reports.
+                    // streamed progress without spinning. Ctrl+C interrupts
+                    // the restic child (safe: restic never removes data still
+                    // in use); every other event is swallowed, with resize
+                    // picked up by the redraw. Every Ctrl+C re-sends the
+                    // interrupt: a press that lands before the child is
+                    // tracked (detect / the unstick pre-check) is a no-op on
+                    // the tracker, so a repeat must still be able to reach
+                    // the child once it exists.
                     if event::poll(std::time::Duration::from_millis(150))?
                         && let Event::Key(key) = event::read()?
                         && key.kind == KeyEventKind::Press
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+                        && let Some(tracker) = &app.prune_tracker
                     {
-                        let ctrl_c = key.modifiers.contains(KeyModifiers::CONTROL)
-                            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'));
-                        let cancel = ctrl_c || key.code == KeyCode::Esc;
-                        if ctrl_c && app.prune_cancelling {
-                            app.quit = true;
-                        } else if cancel {
-                            if let Some(abort) = &app.prune_abort {
-                                abort.cancel();
-                            }
-                            app.prune_cancelling = true;
-                        }
+                        tracker.interrupt();
+                        app.prune_cancel_requested = true;
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     app.prune_rx = None;
+                    app.prune_tracker = None;
                     app.prune_progress = None;
-                    app.prune_abort = None;
-                    app.prune_cancelling = false;
                     app.prune_started = None;
                     app.screen =
                         Screen::PruneError("prune worker exited without reporting".into());
@@ -756,56 +720,6 @@ fn with_parent(items: Vec<ContentRow>) -> (Vec<ContentRow>, TableState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A panic payload as the hook receives one.
-    fn payload_of(f: impl FnOnce() + std::panic::UnwindSafe) -> Box<dyn std::any::Any + Send> {
-        std::panic::catch_unwind(f).expect_err("must panic")
-    }
-
-    // The whole of the terminal-corruption fix is in this table, so it is
-    // worth stating outright. Two versions shipped with a corrupted TUI after
-    // a cancelled prune: the first printed the abort panic, the second caught
-    // that one but still restored the terminal — out from under a *running*
-    // app — for the `SendError` panics rustic_core's detached tree loaders
-    // raise as fallout from the same unwind.
-    #[test]
-    fn only_a_dying_process_may_take_the_terminal_back() {
-        let abort = repo::test_abort_payload();
-        let fault = payload_of(|| panic!("some bug"));
-
-        // The abort is an ordinary outcome wherever it surfaces: the caller
-        // has already turned it into the error the prune screen shows.
-        for on_main in [true, false] {
-            for unwinding in [true, false] {
-                assert_eq!(
-                    panic_disposition(abort.as_ref(), on_main, unwinding),
-                    PanicDisposition::Drop,
-                    "abort panic, on_main={on_main} unwinding={unwinding}"
-                );
-            }
-        }
-
-        // A background thread's panic never touches the terminal — the app is
-        // still drawing to it. Only whether the report is worth keeping
-        // depends on the abort being in flight.
-        assert_eq!(
-            panic_disposition(fault.as_ref(), false, true),
-            PanicDisposition::Drop,
-            "fallout from an abort the user asked for is not a fault"
-        );
-        assert_eq!(
-            panic_disposition(fault.as_ref(), false, false),
-            PanicDisposition::Withhold,
-            "a real background fault must survive to be printed at exit"
-        );
-
-        // The main thread is the only case that ends the process, so it is
-        // the only one allowed to restore the terminal.
-        assert_eq!(
-            panic_disposition(fault.as_ref(), true, false),
-            PanicDisposition::RestoreAndReport
-        );
-    }
 
     // A dying thread pool withholds one report per worker and they all say
     // the same thing, so the buffer is capped rather than unbounded.

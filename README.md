@@ -5,12 +5,13 @@ repositories, built on [`rustic_core`](https://crates.io/crates/rustic_core)
 and [`ratatui`](https://crates.io/crates/ratatui).
 
 `wrustic` is read-mostly by design: reads are native via `rustic_core`, and
-the write operations it exposes (snapshot delete, prune) are native too,
+the write operations it exposes (snapshot delete, tag edits) are native too,
 guarded by restic-compatible repository locks (docs/locking.md). Stale-lock
 removal is also native, but takes no lock itself — like `restic unlock`, it
-only deletes lock files that are provably stale. Everything else that writes
-stays on the `restic` CLI — docs/restic-usage.md is the overview of exactly
-which workflows that means.
+only deletes lock files that are provably stale. Prune shells out to
+`restic prune` through a secure spawn harness, and everything else that
+writes stays on the `restic` CLI — docs/restic-usage.md is the overview of
+exactly which workflows that means.
 
 ## Features
 
@@ -25,9 +26,10 @@ which workflows that means.
   repository lock; when the repo is locked, `u` on the error screen removes
   stale locks (live ones are kept) and retries
 - **Prune** (`p` on the snapshot list): reclaim the space deleted snapshots
-  left behind — native, under the same exclusive repository lock restic's
-  own prune takes, with live progress; on a lock conflict, `u` removes
-  stale locks and retries
+  left behind — runs `restic prune` (restic >= 0.19, bundled next to the
+  executable or on PATH) with live progress and safe Ctrl+C cancellation;
+  stale locks are removed automatically before the run via restic's own
+  `unlock`
 - **File sharing**: one-time signed download URLs served from localhost
 - **Snapshot sharing over SMB** (`s` on the snapshot list): mount a whole
   snapshot read-only from Linux, macOS, or Windows 11 24H2+, served by a
@@ -76,11 +78,21 @@ shell profile.
 
 ### Windows
 
-`install.ps1` is the PowerShell equivalent (adapted from the beam-rs
-installer). It installs `wrustic.exe` to
-`%LOCALAPPDATA%\Programs\wrustic` and adds that directory to the **user**
-PATH — no admin rights, and the script refuses to run elevated unless you pass
-`-Admin`. Target: `windows-amd64`.
+Windows releases as an installer, `wrustic-windows-amd64-setup.exe` (built
+with Inno Setup from `ci/windows/installer.iss`). It installs three files
+side by side into `%LOCALAPPDATA%\Programs\wrustic` and adds that directory
+to the **user** PATH — per-user, no admin rights:
+
+- `wrustic.exe`
+- `wintun-amd64.dll` — the signed wintun driver `--smb-tun` loads from next
+  to the executable
+- `restic.exe` — a pinned restic the prune flow uses (a sibling restic wins
+  over PATH)
+
+You can download and run the installer from the releases page, or use
+`install.ps1`, which fetches the installer, verifies its SHA-256 against the
+digest GitHub publishes in the release metadata, and runs it silently. The
+script refuses to run elevated unless you pass `-Admin`.
 
 ```powershell
 irm https://raw.githubusercontent.com/andrewtheguy/wrustic/main/install.ps1 | iex
@@ -90,7 +102,7 @@ Or clone the repo and run `.\install.ps1` directly. Useful flags:
 
 - `.\install.ps1 <release-tag>` — install a specific release tag
 - `.\install.ps1 -PreRelease` — grab the latest prerelease
-- `.\install.ps1 -DownloadOnly` — drop the binary in the current directory
+- `.\install.ps1 -DownloadOnly` — drop the installer in the current directory
 - `$env:RELEASE_TAG='<release-tag>'; .\install.ps1` — same as passing the tag
 
 A piped `iex` one-liner cannot take arguments, so set
@@ -99,12 +111,6 @@ A piped `iex` one-liner cannot take arguments, so set
 ```powershell
 $env:WRUSTIC_INSTALL_ARGS='-PreRelease'; irm https://raw.githubusercontent.com/andrewtheguy/wrustic/main/install.ps1 | iex
 ```
-
-Like the shell script it verifies the SHA-256 against the digest GitHub
-publishes in the release metadata, then runs the binary once before installing
-it. It also checks for restic on `PATH` afterwards — wrustic runs without it,
-but the maintenance commands it leaves to the restic CLI need it — and points
-at `winget install restic.restic` if it's missing.
 
 ## Build & run
 
@@ -177,16 +183,18 @@ by serving the standard port; see [`docs/smb-tun.md`](docs/smb-tun.md) and
 private tun adapter. Two independent reasons to want it: it is the only way to
 get a real UNC path — `\\169.254.255.1\snap`, usable in Explorer's address bar
 and in any program that takes one — and the only way in from Windows builds
-before 11 24H2. It needs administrator rights to create the adapter, leaves the
-host's own file sharing untouched, and while a share is open two link-local
-`/32` host routes point at the tun — no subnet is claimed. `--smb-tun-ip <IPv4>`
-moves them.
+before 11 24H2. It needs administrator rights to create the adapter and the
+wintun driver (`wintun-amd64.dll`) next to the wrustic executable — the
+Windows installer ships it there; a source build copies it from
+`vendor/wintun/`. It leaves the host's own file sharing untouched, and while
+a share is open two link-local `/32` host routes point at the tun — no subnet
+is claimed. `--smb-tun-ip <IPv4>` moves them.
 
-wrustic never invokes restic at runtime, so there is nothing restic-related
-to configure here — the test suite's restic invocations keep their cache in
-a `wrustic` directory under the platform's per-user cache root, private to
-this tool and garbage-collected by restic itself (`--cleanup-cache`); see
-docs/restic-usage.md.
+`--no-restic-cache` turns off restic's on-disk cache for the restic
+commands wrustic shells out for (prune-class). By default those calls
+keep their cache in a `wrustic` directory under the platform's per-user
+cache root, private to this tool and garbage-collected by restic itself
+(`--cleanup-cache`); see docs/restic-usage.md.
 
 `--no-keychain` disables keychain integration at runtime, even when the
 binary was built with the `keychain` feature. See
@@ -222,23 +230,23 @@ Then in the TUI:
 
 ## Relationship to the `restic` binary
 
-`wrustic` never invokes the `restic` executable — every feature is native,
-and the only code that spawns restic is the test suite (via a secure
-harness, to prove interop from restic's side). `rustic_core` reads the
-on-disk repository format, and the write operations wrustic exposes
-(snapshot delete, prune) hold restic-compatible repository locks, so they
-coexist safely with concurrent restic processes; stale-lock removal takes
-no lock — like `restic unlock`, it only deletes lock files that are
-provably stale. The prune always uses instant delete, so the repository
-state it leaves is indistinguishable from `restic prune` (docs/locking.md
-has the full safety argument).
+`wrustic` invokes the `restic` executable for exactly one feature: prune,
+through a secure spawn harness (password piped over stdin, credentials
+over env vars, secrets never on argv). A `restic(.exe)` sitting next to
+the wrustic executable is preferred — that is how the Windows installer's
+pinned restic is found — with PATH lookup as the fallback. Everything else
+is native: `rustic_core` reads the on-disk repository format, and the
+native write operations wrustic exposes (snapshot delete, tag edits) hold
+restic-compatible repository locks, so they coexist safely with
+concurrent restic processes; stale-lock removal takes no lock — like
+`restic unlock`, it only deletes lock files that are provably stale.
 [`docs/restic-usage.md`](docs/restic-usage.md) is the per-workflow overview
-of where the restic CLI still appears (manual use and tests).
+of where the restic CLI appears (the prune flow, manual use, and tests).
 
 You *will* want `restic` (>= 0.19.0 — the release whose locking protocol and
-JSON output wrustic is built against) on your `$PATH` for development. Use it
-for:
+JSON output wrustic is built against) on your `$PATH`. Use it for:
 
+- **The prune flow** (`p` in the TUI shells out to it).
 - **Write operations wrustic doesn't expose** (init, backup, copy, key
   management, …).
 - Any read operation not yet wired up in the TUI.

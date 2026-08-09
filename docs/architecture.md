@@ -9,8 +9,9 @@ update this file.
 A read-oriented terminal UI for restic backup repositories. It opens a
 repo, lists snapshots, lets you walk the file tree, inspect file details,
 diff two snapshots, and download a single file via a localhost signed URL.
-Its write surface is deliberately small and fully native: snapshot
-deletion, prune, and stale-lock removal (details below).
+Its write surface is deliberately small: snapshot deletion, tag edits,
+and stale-lock removal are native; prune shells out to `restic prune`
+(details below).
 
 **Scope: single-user, single-device.** wrustic is a personal tool — one
 person, one machine (or one account on a shared box that they fully own).
@@ -23,12 +24,12 @@ flat `App` struct.
 
 It is intentionally **not** a restic replacement:
 - Reads go through `rustic_core` directly (no subprocess).
-- The write operations wrustic exposes (snapshot delete, prune, and
-  stale-lock removal today) are native too, guarded by restic-compatible
+- The native write operations wrustic exposes (snapshot delete, tag
+  edits, and stale-lock removal today) are guarded by restic-compatible
   repository locks (docs/locking.md) so they coexist safely with
-  concurrent restic processes. Anything without a native + locked
-  implementation (backup, init, key add) is out of scope — use the
-  `restic` CLI for those.
+  concurrent restic processes. Prune runs the restic CLI through a
+  secure spawn harness. Anything else (backup, init, key add) is out of
+  scope — use the `restic` CLI for those.
 
 ## Runtime shape
 
@@ -200,19 +201,20 @@ docs/locking.md for the full design. rustic_core itself is lock-oblivious,
 so every native write MUST hold a `lock::RepoLock` — that discipline lives
 in `repo.rs`, not in rustic_core.
 
-wrustic never shells out to restic — prune (`p` on the Snapshots screen)
-is native too: `repo::prune` runs rustic_core's prune with instant
-delete under the exclusive lock, on a worker thread so the TUI stays
-responsive (docs/restic-usage.md is the per-workflow overview, and
-docs/locking.md "Native prune" has the safety argument). Write
-operations without a native + locked implementation (init, backup, key
-management, repair, migrate) are for the user to run with the restic CLI
-outside the app.
+One TUI flow shells out to restic: prune (`p` on the Snapshots screen)
+runs `restic prune` on a worker thread through the secure spawn harness
+in `src/restic.rs`, streaming restic's stdout into the running screen
+(docs/restic-usage.md is the per-workflow overview, and docs/locking.md
+Tier 3 has the rationale for keeping prune on restic). The binary is a
+`restic(.exe)` next to the wrustic executable when present (the Windows
+installer ships a pinned one), otherwise `restic` from PATH. Write
+operations without an implementation (init, backup, key management,
+repair, migrate) are for the user to run with the restic CLI outside
+the app.
 
-The only code that spawns restic is the test suite, through the secure
-harness in `src/restic.rs` (a `#[cfg(test)]`-only module) — the live
-interop tests use it for dev-flow repo setup and for observing lock/prune
-behavior from restic's side. Its launch semantics mirror resterm's:
+The same harness serves the live interop tests for dev-flow repo setup
+and for observing lock behavior from restic's side. Its launch semantics
+mirror resterm's:
 - `restic::run(profile, args)` pipes the master password via the child's
   stdin (`--password-file /dev/stdin`) and passes the repo URL and cloud
   credentials via env vars, so secrets never appear on argv; inherited
@@ -221,12 +223,13 @@ behavior from restic's side. Its launch semantics mirror resterm's:
   the platform's own per-user cache root (`dirs::cache_dir()`) together
   with `--cleanup-cache`, so restic garbage collects the per-repository
   subdirectories it keeps there once they go 30 days unused — restic's
-  default shared cache is never used.
-- `restic::run_unsticking_locks(profile, args)` additionally performs
-  restic's acquisition-time lock check natively *before* spawning (via
-  `restic::lock_requirement` and `lock::check_blocking_locks`, both
-  test-only now) and runs restic's own `unlock` when a stale lock would
-  block the command.
+  default shared cache is never used. `--no-restic-cache` switches every
+  call to `--no-cache` instead.
+- `restic::run_unsticking_locks(profile, args)` (and the streaming
+  variant the prune flow uses) additionally performs restic's
+  acquisition-time lock check natively *before* spawning (via
+  `restic::lock_requirement` and `lock::check_blocking_locks`) and runs
+  restic's own `unlock` when a stale lock would block the command.
 
 ## Verification and dev flow
 

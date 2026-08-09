@@ -85,14 +85,17 @@ const SOCKET_BUF: usize = 256 * 1024;
 /// without bound.
 const PROXY_HIGH_WATER: usize = 512 * 1024;
 
-/// The wintun DLL, embedded so wrustic stays a single binary.
+/// The wintun driver DLL's filename, expected next to the wrustic
+/// executable. The Windows installer ships the vendored
+/// `vendor/wintun/wintun-amd64.dll` into the install directory; a source
+/// build copies it there by hand.
 ///
-/// Redistributing it this way is what the Wintun "Prebuilt Binaries License"
-/// §3(d) permits: alongside other software that uses it only through the
-/// documented API, which is all this module does.
-const WINTUN_DLL: &[u8] = include_bytes!("../../vendor/wintun/wintun-amd64.dll");
+/// Redistributing the DLL alongside wrustic is what the Wintun "Prebuilt
+/// Binaries License" §3(d) permits: with other software that uses it only
+/// through the documented API, which is all this module does.
+const WINTUN_DLL_NAME: &str = "wintun-amd64.dll";
 
-/// SHA-256 of the embedded driver, pinned so it cannot be swapped unnoticed.
+/// SHA-256 of the driver, pinned so it cannot be swapped unnoticed.
 ///
 /// Provenance: `wintun-0.14.1.zip` from <https://www.wintun.net/builds/>, whose
 /// archive hash matched the SHA2-256 published on wintun.net
@@ -102,7 +105,7 @@ const WINTUN_DLL: &[u8] = include_bytes!("../../vendor/wintun/wintun-amd64.dll")
 ///
 /// Checked in two places, because a hash that is only verified at download time
 /// protects nothing later: a test asserts the vendored bytes still hash to this,
-/// and `materialise_dll` re-checks the file on disk before it is ever loaded.
+/// and `locate_dll` checks the file on disk before it is ever loaded.
 const WINTUN_DLL_SHA256: [u8; 32] = [
     0xe5, 0xda, 0x84, 0x47, 0xdc, 0x2c, 0x32, 0x0e, 0xdc, 0x0f, 0xc5, 0x2f, 0xa0, 0x18, 0x85, 0xc1,
     0x03, 0xde, 0x8c, 0x11, 0x84, 0x81, 0xf6, 0x83, 0x64, 0x3c, 0xac, 0xc3, 0x22, 0x0d, 0xaf, 0xce,
@@ -125,18 +128,13 @@ impl TunShare {
     /// Bring up the adapter and start proxying `VIRTUAL_IP:port` to
     /// `forward_to`.
     ///
-    /// `dll_dir` is where the embedded wintun DLL is materialised; it should be
-    /// a directory only this user can write, since it is then loaded as code.
+    /// The wintun driver is loaded from `wintun-amd64.dll` next to the
+    /// wrustic executable ([`locate_dll`]), after its hash is verified.
     ///
     /// Requires administrator rights: creating a network adapter always does.
     /// Nothing else about this needs elevation, and no existing service,
     /// binding or adapter is modified.
-    pub(crate) fn start(
-        dll_dir: &Path,
-        port: u16,
-        forward_to: SocketAddr,
-        addrs: TunAddrs,
-    ) -> Result<Self> {
+    pub(crate) fn start(port: u16, forward_to: SocketAddr, addrs: TunAddrs) -> Result<Self> {
         let virtual_ip = addrs.virtual_ip();
         let adapter_ip = addrs.adapter_ip();
 
@@ -146,9 +144,9 @@ impl TunShare {
         // would be almost impossible to connect back to a snapshot browser.
         reject_addresses_in_use(&addrs)?;
 
-        let dll = materialise_dll(dll_dir)?;
-        // SAFETY: loading a known-good signed DLL from a path we just wrote
-        // ourselves inside the user's own config directory.
+        let dll = locate_dll()?;
+        // SAFETY: loading the known-good signed DLL whose hash was just
+        // verified against the pinned constant.
         let wintun = unsafe { wintun::load_from_path(&dll) }
             .map_err(|e| adapter_hint(anyhow!("loading {}: {e}", dll.display()), &addrs))?;
 
@@ -227,44 +225,43 @@ fn file_sha256(path: &Path) -> Option<[u8; 32]> {
     std::fs::read(path).ok().map(|bytes| sha256(&bytes))
 }
 
-/// Write the embedded DLL out if what is on disk is not byte-for-byte the
-/// driver we shipped, and return its path.
+/// The wintun driver next to the wrustic executable, verified before it is
+/// handed to `LoadLibrary`.
 ///
-/// The file is about to be handed to `LoadLibrary`, so "close enough" is not
-/// good enough: a stale or tampered DLL of the same length would previously
-/// have been loaded as code. Nothing is loaded unless its SHA-256 matches
-/// [`WINTUN_DLL_SHA256`].
-///
-/// This narrows the window rather than closing it — between the hash check and
-/// the load, a writer could still swap the file. `dir` is the user's own config
-/// directory, so anything able to win that race can already replace the wrustic
-/// binary itself; this defends against a stale or corrupted copy, not against
-/// an attacker who already has that much.
-fn materialise_dll(dir: &Path) -> Result<PathBuf> {
-    let path = dir.join("wintun.dll");
-    // Already exactly right: leave it alone. This is also what makes a second
-    // share in the same process work, since Windows will not let us overwrite a
-    // DLL this process already has loaded.
-    if file_sha256(&path).is_some_and(|found| found == WINTUN_DLL_SHA256) {
-        return Ok(path);
-    }
-    std::fs::create_dir_all(dir)
-        .map_err(|e| anyhow!("creating {} for the tun driver: {e}", dir.display()))?;
-    std::fs::write(&path, WINTUN_DLL)
-        .map_err(|e| anyhow!("writing {}: {e}", path.display()))?;
+/// The file is about to be loaded as code, so "close enough" is not good
+/// enough: nothing is loaded unless its SHA-256 matches
+/// [`WINTUN_DLL_SHA256`]. This narrows the window rather than closing it —
+/// between the hash check and the load, a writer could still swap the file.
+/// Anything able to write the install directory can already replace the
+/// wrustic binary itself; this defends against a stale or corrupted copy,
+/// not against an attacker who already has that much.
+fn locate_dll() -> Result<PathBuf> {
+    let exe = std::env::current_exe()
+        .map_err(|e| anyhow!("resolving the wrustic executable path: {e}"))?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent directory", exe.display()))?;
+    let path = dir.join(WINTUN_DLL_NAME);
+    verify_dll(&path)?;
+    Ok(path)
+}
 
-    // Verify what actually landed on disk, not what we meant to put there.
-    match file_sha256(&path) {
-        Some(found) if found == WINTUN_DLL_SHA256 => Ok(path),
+/// Refuse anything that is not byte-for-byte the driver wrustic ships.
+fn verify_dll(path: &Path) -> Result<()> {
+    match file_sha256(path) {
+        Some(found) if found == WINTUN_DLL_SHA256 => Ok(()),
         Some(found) => Err(anyhow!(
-            "{} does not match the driver wrustic shipped (found sha256 {}, expected {}); \
-refusing to load it",
+            "{} does not match the driver wrustic ships (found sha256 {}, expected {}); \
+refusing to load it. Reinstall wrustic, or copy vendor/wintun/{WINTUN_DLL_NAME} from \
+the source tree next to the executable",
             path.display(),
             hex(&found),
             hex(&WINTUN_DLL_SHA256),
         )),
         None => Err(anyhow!(
-            "{} could not be read back after writing it",
+            "{} was not found; --smb-tun needs the wintun driver next to the wrustic \
+executable. The Windows installer ships it there; for a source build, copy \
+vendor/wintun/{WINTUN_DLL_NAME} from the source tree next to the executable",
             path.display()
         )),
     }
@@ -765,55 +762,55 @@ mod tests {
         }
     }
 
-    /// The embedded driver has to actually be embedded; an empty or truncated
-    /// include would only surface as a load failure at share time.
-    #[test]
-    fn wintun_dll_is_embedded() {
-        assert!(WINTUN_DLL.len() > 100_000, "len {}", WINTUN_DLL.len());
-        assert_eq!(&WINTUN_DLL[..2], b"MZ");
-    }
-
     /// The vendored driver is a committed binary that nothing else in the build
-    /// would notice changing, and it is loaded as code. Pinning its hash means
-    /// replacing it — by accident, by a bad merge, or otherwise — fails the
-    /// build instead of silently shipping a different driver.
+    /// would notice changing, and the release installer ships it to be loaded
+    /// as code. Pinning its hash means replacing it — by accident, by a bad
+    /// merge, or otherwise — fails the build instead of silently shipping a
+    /// different driver.
     #[test]
-    fn embedded_driver_matches_its_pinned_hash() {
-        let found = sha256(WINTUN_DLL);
+    fn vendored_driver_matches_its_pinned_hash() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("vendor")
+            .join("wintun")
+            .join(WINTUN_DLL_NAME);
+        let bytes = std::fs::read(&path).expect("read the vendored driver");
+        assert!(bytes.len() > 100_000, "len {}", bytes.len());
+        assert_eq!(&bytes[..2], b"MZ");
+        let found = sha256(&bytes);
         assert_eq!(
             found,
             WINTUN_DLL_SHA256,
-            "vendored wintun.dll hashes to {}, expected {}. If this was a \
+            "vendored {WINTUN_DLL_NAME} hashes to {}, expected {}. If this was a \
 deliberate driver update, verify the new archive against the SHA2-256 published \
 on wintun.net and its Authenticode signature before changing the constant.",
             hex(&found),
             hex(&WINTUN_DLL_SHA256),
         );
+        // And verify_dll accepts exactly this file — the load path and the
+        // vendored artifact cannot drift apart unnoticed.
+        verify_dll(&path).expect("the vendored driver must pass the load-time check");
     }
 
-    /// A file on disk that is not the driver we shipped must never be loaded,
-    /// and must be replaced rather than trusted — the case the old
-    /// length-only check got wrong.
+    /// A file that is not the driver we ship must never be loaded — same
+    /// length, different bytes is exactly what a length comparison would
+    /// have accepted. A missing file must name what to do about it.
     #[test]
-    fn materialise_replaces_a_file_that_does_not_match() {
+    fn verify_dll_refuses_impostors_and_absence() {
         let dir = std::env::temp_dir().join(format!(
             "wrustic-tun-dll-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
         std::fs::create_dir_all(&dir).expect("temp dir");
-        let path = dir.join("wintun.dll");
+        let path = dir.join(WINTUN_DLL_NAME);
 
-        // Same length as the real driver, entirely different bytes: exactly
-        // what a length comparison would have accepted.
-        std::fs::write(&path, vec![0x41u8; WINTUN_DLL.len()]).expect("write impostor");
-        let got = materialise_dll(&dir).expect("impostor is replaced, not trusted");
-        assert_eq!(got, path);
-        assert_eq!(file_sha256(&path), Some(WINTUN_DLL_SHA256));
+        std::fs::write(&path, vec![0x41u8; 427_552]).expect("write impostor");
+        let err = verify_dll(&path).expect_err("an impostor must be refused");
+        assert!(format!("{err:#}").contains("refusing to load"), "{err:#}");
 
-        // A second call is a no-op that still returns the verified path.
-        assert_eq!(materialise_dll(&dir).expect("idempotent"), path);
-        assert_eq!(file_sha256(&path), Some(WINTUN_DLL_SHA256));
+        std::fs::remove_file(&path).expect("remove impostor");
+        let err = verify_dll(&path).expect_err("a missing driver must be an error");
+        assert!(format!("{err:#}").contains("not found"), "{err:#}");
 
         std::fs::remove_dir_all(&dir).ok();
     }

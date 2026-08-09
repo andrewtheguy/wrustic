@@ -123,23 +123,25 @@ An adapter that does show up belongs to a *live* process — a hung or suspended
 wrustic still holds its handle. Stop that process and the adapter goes with it;
 there is nothing to remove by hand.
 
-The one thing that does persist is `wintun.dll` in the config directory. That is
-deliberate, so the driver is not rewritten on every run, and it is re-verified
-against `WINTUN_DLL_SHA256` before each load — a stale or altered copy is
-replaced rather than trusted. Deleting it is safe; it is written again on next
-use.
+The driver DLL itself is not written anywhere at runtime: it lives as
+`wintun-amd64.dll` next to `wrustic.exe` and is re-verified against
+`WINTUN_DLL_SHA256` before each load — a stale or altered copy is refused
+rather than trusted.
 
-## The embedded driver
+## The shipped driver
 
-`wintun.dll` (427 KB, signed by WireGuard LLC) is embedded with `include_bytes!`
-from `vendor/wintun/`, and written to the config directory on first use so
-wrustic stays a single binary — `install.ps1` delivers one `.exe` and no side
-files. The Wintun *Prebuilt Binaries License* §3(d) permits redistribution
-alongside software that uses it only through the documented API, which is all
-`src/smb/tun.rs` does. `vendor/wintun/LICENSE.txt` is the copy that governs it.
+`wintun-amd64.dll` (427 KB, signed by WireGuard LLC) is vendored in
+`vendor/wintun/` and shipped by the Windows installer into the install
+directory next to `wrustic.exe`; `src/smb/tun.rs` loads it from there. For a
+source build, copy `vendor/wintun/wintun-amd64.dll` next to the built
+executable. The Wintun *Prebuilt Binaries License* §3(d) permits
+redistribution alongside software that uses it only through the documented
+API, which is all `src/smb/tun.rs` does. `vendor/wintun/LICENSE.txt` is the
+copy that governs it.
 
-This is why the feature is off by default everywhere except the shipped Windows
-binary: it embeds a driver, and only earns its keep if you want UNC paths.
+The feature is off by default everywhere except the shipped Windows binary:
+it needs the driver DLL beside the executable, and only earns its keep if
+you want UNC paths.
 
 ### Provenance and integrity
 
@@ -153,21 +155,19 @@ binary: it embeds a driver, and only earns its keep if you want UNC paths.
 A checksum verified only at download time protects nothing afterwards, so the
 DLL hash is pinned as `WINTUN_DLL_SHA256` and checked twice:
 
-- `embedded_driver_matches_its_pinned_hash` fails the build if the vendored
+- `vendored_driver_matches_its_pinned_hash` fails the build if the vendored
   binary ever changes without the constant changing with it;
-- `materialise_dll` re-hashes the file in the config directory and rewrites it
-  unless it is byte-for-byte the shipped driver. Nothing is passed to
-  `LoadLibrary` that has not just been verified.
-
-That second check is the one that matters at runtime: the previous version
-compared only file *length*, which a same-length impostor would have passed —
-`materialise_replaces_a_file_that_does_not_match` pins that behaviour.
+- `locate_dll` hashes the file next to the executable and refuses it unless
+  it is byte-for-byte the shipped driver
+  (`verify_dll_refuses_impostors_and_absence` pins that behaviour, including
+  a same-length impostor that a length comparison would have passed). Nothing
+  is passed to `LoadLibrary` that has not just been verified.
 
 It narrows the window rather than closing it. Between the hash check and the
-load, a writer could still swap the file. The directory is the user's own config
-directory, so anything able to win that race can already replace the wrustic
-binary itself; this defends against a stale or corrupted copy, not against an
-attacker who is already inside that trust boundary.
+load, a writer could still swap the file. Anything able to write the install
+directory can already replace the wrustic binary itself; this defends against
+a stale or corrupted copy, not against an attacker who is already inside that
+trust boundary.
 
 **Updating the driver:** verify the new archive against the SHA2-256 published
 on wintun.net *and* its Authenticode signature, then update both
@@ -180,7 +180,10 @@ until they agree, which is the point.
 
 Mounts `\\169.254.255.1\snap` for real, reads a file, lists a directory, and asserts
 that the host's own `0.0.0.0:445` listener is still there afterwards. Ignored by
-default because it needs administrator rights and creates an adapter.
+default because it needs administrator rights and creates an adapter. Since the
+driver is loaded from next to the running executable, copy
+`vendor/wintun/wintun-amd64.dll` into the test binary's directory
+(`target/debug/deps/`) first — the error message names the path it looked at.
 
 `smb_manual_tun` holds a share open so an external client can be pointed at it:
 

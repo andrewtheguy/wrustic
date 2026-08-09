@@ -121,8 +121,8 @@ mod sign;
 mod srvsvc;
 // Windows-only and off by default. The tun transport exists solely to get
 // around srvnet.sys owning port 445, which is not a problem any other platform
-// has, and it costs an embedded driver in the binary — so it is gated on both
-// the target and the `smb-tun` feature.
+// has, and it needs the wintun driver DLL shipped next to the executable — so
+// it is gated on both the target and the `smb-tun` feature.
 #[cfg(all(windows, feature = "smb-tun"))]
 pub(crate) mod tun;
 mod wire;
@@ -400,13 +400,11 @@ sudo setcap cap_net_bind_service=+ep <path-to-wrustic>\n\
     )
 }
 
-/// Where the tun transport materialises its driver and which port it serves.
+/// Which port the tun transport serves and which addresses it claims. The
+/// driver itself is found next to the wrustic executable (`smb::tun`).
 #[cfg(all(windows, feature = "smb-tun"))]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TunConfig {
-    /// Directory the embedded wintun driver is written to before loading. Must
-    /// be one only this user can write, since it is then loaded as code.
-    pub(crate) state_dir: std::path::PathBuf,
     /// Port served on the tun address — 445 in normal use, which is the whole
     /// point of the transport.
     pub(crate) port: u16,
@@ -415,8 +413,6 @@ pub(crate) struct TunConfig {
 }
 
 /// Which interfaces to accept connections on.
-///
-/// No longer `Copy`: the tun variant carries the path its driver is unpacked to.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) enum Bind {
     /// 127.0.0.1 and ::1 only. The default, and the only one the shipped binary
@@ -487,7 +483,7 @@ pub(crate) fn start(
         Bind::Tun(cfg) => {
             let forward_to =
                 std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, bound_port));
-            let share = tun::TunShare::start(&cfg.state_dir, cfg.port, forward_to, cfg.addrs)?;
+            let share = tun::TunShare::start(cfg.port, forward_to, cfg.addrs)?;
             let host = share.virtual_ip().to_string();
             (Some(share), MountPoint { host, port: cfg.port })
         }
@@ -2454,13 +2450,11 @@ mod tests {
             }
         };
 
-        let state_dir = tempdir_path("smb-tun");
         let handle = start(
             0,
             DEFAULT_SHARE_NAME,
             test_backing(),
             Bind::Tun(TunConfig {
-                state_dir,
                 port: STANDARD_SMB_PORT,
                 addrs,
             }),
@@ -2523,13 +2517,11 @@ mod tests {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(180);
-        let state_dir = tempdir_path("smb-tun");
         let handle = start(
             0,
             DEFAULT_SHARE_NAME,
             test_backing(),
             Bind::Tun(TunConfig {
-                state_dir,
                 port: STANDARD_SMB_PORT,
                 addrs: crate::cli::DEFAULT_SMB_TUN_ADDRS,
             }),

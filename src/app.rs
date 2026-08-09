@@ -75,7 +75,6 @@ pub(crate) enum UnlockReturn {
     #[default]
     Delete,
     Smb,
-    Prune,
     TagEdit,
 }
 
@@ -335,9 +334,9 @@ pub(crate) struct App {
     pub(crate) smb_password: Option<String>,
     pub(crate) smb_error: Option<String>,
     // Which flow the Unlocking screen was entered from, so the main loop
-    // routes the outcome back there: the SMB share and the prune retry their
-    // operation on success, the delete flow re-enters its confirmation;
-    // failures render inline in the owning flow. Consumed by the main loop.
+    // routes the outcome back there: the SMB share retries its operation on
+    // success, the delete flow re-enters its confirmation; failures render
+    // inline in the owning flow. Consumed by the main loop.
     pub(crate) unlock_return: UnlockReturn,
 
     // Whether the `?` key overlay is showing. Screen-relative: it renders the
@@ -373,25 +372,22 @@ pub(crate) struct App {
     pub(crate) compare_results: Option<(DiffSummary, Vec<DiffChange>)>,
     pub(crate) compare_results_state: TableState,
 
-    // Prune runs natively (repo::prune) on a worker thread so the TUI stays
-    // alive (redraws, elapsed clock) during an operation that can take
-    // minutes. `prune_rx` is the completion channel: Some while a prune is in
-    // flight (the report text on success, rendered error text on failure),
-    // and the main loop spawns the worker exactly when it sees `PruneRunning`
-    // with no receiver yet. `prune_started` feeds the elapsed display;
+    // Prune runs `restic prune` on a worker thread so the TUI stays alive
+    // (redraws, elapsed clock) during an operation that can take minutes.
+    // `prune_rx` is the completion channel: Some while a prune is in flight
+    // (restic's stdout on success, rendered error text on failure), and the
+    // main loop spawns the worker exactly when it sees `PruneRunning` with
+    // no receiver yet. `prune_started` feeds the elapsed display;
     // `prune_scroll` is the PruneDone report scroll offset.
-    pub(crate) prune_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    pub(crate) prune_rx: Option<std::sync::mpsc::Receiver<Result<Vec<u8>, String>>>,
     pub(crate) prune_started: Option<Instant>,
     pub(crate) prune_scroll: u16,
-    // `prune_abort` is the worker's cancellation handle: Esc or Ctrl+C on the
-    // running screen sets it, and the worker stops at its next progress tick
-    // and returns an ordinary error (repo::AbortSignal). `prune_cancelling`
-    // records that this was asked for, so the screen can say so and a second
-    // Ctrl+C can still force-quit if a run somehow stops ticking. The
-    // progress buffer holds one line per prune phase, rewritten in place by
-    // the worker's progress adapter.
-    pub(crate) prune_abort: Option<std::sync::Arc<crate::repo::AbortSignal>>,
-    pub(crate) prune_cancelling: bool,
+    // Handle to the running restic child (Ctrl+C on the running screen calls
+    // `interrupt()`), the flag remembering that the user asked to cancel (so
+    // the resulting restic error renders as "cancelled", not a failure), and
+    // the live progress buffer the worker appends restic's stdout lines to.
+    pub(crate) prune_tracker: Option<std::sync::Arc<crate::restic::ChildTracker>>,
+    pub(crate) prune_cancel_requested: bool,
     pub(crate) prune_progress: Option<std::sync::Arc<std::sync::Mutex<String>>>,
 
     // Outer rect of the currently-rendered list/paragraph (bordered area).
@@ -531,8 +527,8 @@ impl App {
             prune_rx: None,
             prune_started: None,
             prune_scroll: 0,
-            prune_abort: None,
-            prune_cancelling: false,
+            prune_tracker: None,
+            prune_cancel_requested: false,
             prune_progress: None,
             list_area: None,
             list_header_rows: 0,
@@ -1404,7 +1400,6 @@ impl App {
         #[cfg(all(windows, feature = "smb-tun"))]
         let bind = if self.smb.tun {
             smb::Bind::Tun(smb::TunConfig {
-                state_dir: self.paths.dir.clone(),
                 port: smb::STANDARD_SMB_PORT,
                 addrs: self.smb.tun_addrs,
             })
@@ -1820,9 +1815,10 @@ impl App {
             },
 
             // Keys on the running screen are handled by the main loop's event
-            // drain, not here: Esc or Ctrl+C asks the worker to stop (a second
-            // Ctrl+C force-quits, as a fallback if it has stopped ticking);
-            // everything else is swallowed until the worker reports.
+            // drain, not here: Ctrl+C interrupts the restic child (safe —
+            // restic never removes data still in use, and an interrupted
+            // prune leaves the remaining work for the next run); everything
+            // else is swallowed until the worker reports.
             Screen::PruneRunning => {}
 
             Screen::PruneDone(report) => match key.code {
@@ -1847,19 +1843,12 @@ impl App {
                 _ => {}
             },
 
-            // Mirrors SnapshotDeleteError: the native lock acquisition fails
-            // on any existing lock, stale ones included (restic's rule), so
-            // on a lock conflict `u` offers native stale-lock removal and a
-            // retry. A live lock survives the removal and fails the retry
-            // with the holder's details.
-            Screen::PruneError(msg) => {
-                let offer_unlock = crate::lock::is_lock_error(msg);
-                if offer_unlock && matches!(key.code, KeyCode::Char('u') | KeyCode::Char('U')) {
-                    self.unlock_return = UnlockReturn::Prune;
-                    self.screen = Screen::Unlocking;
-                } else {
-                    self.screen = Screen::Snapshots;
-                }
+            // Unlike SnapshotDeleteError there is no `u` offer here: the
+            // prune flow already ran restic's own stale-lock removal before
+            // spawning (restic::run_unsticking_locks), so a surviving lock
+            // error means a *live* holder that unlocking must not touch.
+            Screen::PruneError(_) => {
+                self.screen = Screen::Snapshots;
             }
 
             Screen::SnapshotFilterDim => match key.code {
@@ -3159,27 +3148,17 @@ mod tests {
         assert!(matches!(app.screen, Screen::Snapshots));
         assert_eq!(app.prune_scroll, 0);
 
-        // A prune error dismisses on any key, back to the snapshot list.
+        // A prune error dismisses on any key, back to the snapshot list —
+        // including a lock conflict: the unstick pre-check already ran
+        // restic's own stale-lock removal, so there is no `u` retry here.
         app.screen = Screen::PruneError("boom".into());
         press(&mut app, KeyCode::Char('x'));
         assert!(matches!(app.screen, Screen::Snapshots));
-
-        // On a lock conflict, `u` enters the unlock flow with the outcome
-        // routed back into the prune for a retry; `u` on a non-lock error
-        // just dismisses like any other key.
         app.screen = Screen::PruneError(
             "unable to create lock in backend: repository is already locked \
              exclusively by PID 1 on host by someone"
                 .into(),
         );
-        press(&mut app, KeyCode::Char('u'));
-        assert!(matches!(app.screen, Screen::Unlocking));
-        assert_eq!(
-            app.unlock_return,
-            UnlockReturn::Prune,
-            "the main loop must retry the prune after unlocking"
-        );
-        app.screen = Screen::PruneError("boom".into());
         press(&mut app, KeyCode::Char('u'));
         assert!(matches!(app.screen, Screen::Snapshots));
     }

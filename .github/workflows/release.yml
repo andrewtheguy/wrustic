@@ -78,10 +78,10 @@ jobs:
           # dependency to install, so `keychain` ships enabled.
           #
           # `smb-tun` ships too, otherwise `--smb-tun` exists only for people who
-          # build from source: install.ps1 delivers this binary and nothing else,
-          # and the wintun driver rides inside it rather than being a separate
-          # asset. Costs ~564 KiB of embedded, signed driver (measured: 14,159,872
-          # -> 14,737,408 bytes); see docs/smb-tun.md.
+          # build from source. Windows releases as an installer
+          # (wrustic-windows-amd64-setup.exe) that lays down wrustic.exe, the
+          # signed wintun driver (wintun-amd64.dll), and a pinned restic.exe in
+          # one directory; see docs/smb-tun.md and ci/windows/installer.iss.
           - runner: windows-latest
             label: windows-amd64
             features: "--features keychain,smb-tun"
@@ -96,34 +96,72 @@ jobs:
       - name: Build
         run: cargo build --release ${{ matrix.features }}
 
-      # The vendored wintun driver is a committed binary loaded as code, and its
-      # hash is pinned in WINTUN_DLL_SHA256. Nothing else in the release path
-      # would notice the two drifting apart, so assert it here rather than ship
-      # a driver the constant no longer describes. A cargo test filter that
-      # matches nothing still exits 0, so a renamed or gated-out test would
-      # silently stop guarding anything — require the test to be discovered
-      # before trusting its run.
-      - name: Verify the embedded driver matches its pinned hash
+      # The vendored wintun driver is a committed binary the installer ships to
+      # be loaded as code, and its hash is pinned in WINTUN_DLL_SHA256. Nothing
+      # else in the release path would notice the two drifting apart, so assert
+      # it here rather than ship a driver the constant no longer describes. A
+      # cargo test filter that matches nothing still exits 0, so a renamed or
+      # gated-out test would silently stop guarding anything — require the test
+      # to be discovered before trusting its run.
+      - name: Verify the vendored driver matches its pinned hash
         if: matrix.label == 'windows-amd64'
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --release ${{ matrix.features }} embedded_driver_matches_its_pinned_hash -- --list \
-            | grep -q embedded_driver_matches_its_pinned_hash \
-            || { echo "::error::embedded_driver_matches_its_pinned_hash was not discovered; the driver hash is unverified"; exit 1; }
-          cargo test --release ${{ matrix.features }} embedded_driver_matches_its_pinned_hash
+          cargo test --release ${{ matrix.features }} vendored_driver_matches_its_pinned_hash -- --list \
+            | grep -q vendored_driver_matches_its_pinned_hash \
+            || { echo "::error::vendored_driver_matches_its_pinned_hash was not discovered; the driver hash is unverified"; exit 1; }
+          cargo test --release ${{ matrix.features }} vendored_driver_matches_its_pinned_hash
 
-      # bash is present on the Windows runners too, so one rename works
-      # everywhere instead of a pwsh variant.
-      - name: Rename binary
+      # The installer payload: wrustic.exe, the vendored wintun driver, and a
+      # pinned restic (verified against the SHA256SUMS restic publishes for the
+      # release before anything is extracted). wrustic prefers this sibling
+      # restic over PATH at runtime, so the pin here decides the restic every
+      # Windows install prunes with.
+      - name: Build Windows installer
+        if: matrix.label == 'windows-amd64'
         shell: bash
-        run: mv target/release/wrustic${{ matrix.ext }} target/release/wrustic-${{ matrix.label }}${{ matrix.ext }}
+        env:
+          RESTIC_VERSION: "0.19.1"
+          RESTIC_ZIP_SHA256: "da948ad707ed690426473aaba2046cd61f8f90f6f0e7dab6be0d5796531de67d"
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          mkdir -p stage dist
+          curl -fsSL -o restic.zip \
+            "https://github.com/restic/restic/releases/download/v${RESTIC_VERSION}/restic_${RESTIC_VERSION}_windows_amd64.zip"
+          echo "${RESTIC_ZIP_SHA256}  restic.zip" | sha256sum -c -
+          unzip -j restic.zip -d stage
+          mv "stage/restic_${RESTIC_VERSION}_windows_amd64.exe" stage/restic.exe
+          cp target/release/wrustic.exe stage/
+          cp vendor/wintun/wintun-amd64.dll stage/
+          # Absolute Windows-style paths: relative Source/Output paths in an
+          # .iss resolve against the script's directory, not this shell's CWD.
+          "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" \
+            "/DAppVersion=${version}" \
+            "/DStageDir=$(cygpath -w "$PWD/stage")" \
+            "/DOutDir=$(cygpath -w "$PWD/dist")" \
+            ci/windows/installer.iss
+
+      # bash is present on the Windows runners too, so one step works
+      # everywhere instead of a pwsh variant. Windows releases the installer;
+      # the other platforms release the bare binary.
+      - name: Prepare release asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          if [ "${{ matrix.label }}" = "windows-amd64" ]; then
+            mv dist/wrustic-windows-amd64-setup.exe out/
+          else
+            mv target/release/wrustic${{ matrix.ext }} out/wrustic-${{ matrix.label }}${{ matrix.ext }}
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: wrustic-${{ matrix.label }}
-          path: target/release/wrustic-${{ matrix.label }}${{ matrix.ext }}
+          path: out/*
           if-no-files-found: error
 
   create-release:

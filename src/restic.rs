@@ -1,21 +1,25 @@
-//! Secure harness for running restic CLI commands — **test-only**.
+//! Secure harness for running restic CLI commands.
 //!
-//! wrustic never invokes restic at runtime: every TUI flow is native
-//! (src/repo.rs + src/lock.rs: snapshot delete, unlock, the SMB share's
-//! lock, prune), and anything wrustic does not implement (init, backup,
-//! repair, migrate, key management) is for the user to run with the restic
-//! CLI outside the app. This module is compiled only for tests
-//! (`#[cfg(test)] mod restic` in main.rs) and is the one sanctioned way for
-//! the live interop tests to drive restic: dev-flow repo setup
-//! (init/backup) and restic-side observations (snapshots, check, restore,
-//! forget, unlock, prune).
+//! Snapshot delete, tag edits and unlock in the TUI are native (src/repo.rs +
+//! src/lock.rs); this module is the one sanctioned way to trigger the restic
+//! commands wrustic deliberately shells out for (prune, and future
+//! maintenance flows like repair or migrate), plus dev-flow repo setup and
+//! restic-side observations in the live tests. The TUI's prune flow (`p` on
+//! the Snapshots screen) is its main caller, via
+//! [`run_unsticking_locks_streaming`].
+//!
+//! The binary run is `restic(.exe)` sitting next to the wrustic executable
+//! when one is there — the Windows installer ships a pinned restic in the
+//! install directory — and otherwise `restic` from PATH.
+//!
 //! Launch semantics mirror resterm's: secrets never touch argv — the
 //! master password is piped through the child's stdin (`--password-file
 //! /dev/stdin` on Unix; on Windows restic reads its non-terminal stdin
 //! directly), the repo URL and any cloud credentials go through env vars —
 //! and restic's on-disk cache is pointed at a directory private to wrustic
 //! (`--cache-dir`, plus `--cleanup-cache` so restic garbage collects unused
-//! per-repository subdirectories there).
+//! per-repository subdirectories there) unless the user opts out with
+//! `--no-restic-cache`, which turns caching off entirely (`--no-cache`).
 //!
 //! Restic checks the repository lock before any of these commands run, so a
 //! leftover lock blocks them with "repository is already locked". wrustic
@@ -32,10 +36,35 @@
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Result, anyhow};
+use serde::Deserialize;
 
 use crate::config::Profile;
+
+// The floor is the 0.19 series — the release whose locking protocol and JSON
+// output shapes wrustic is built against (docs/locking.md targets restic
+// 0.19; restic < 0.19 compatibility is an explicit non-goal).
+const MIN_MAJOR: u32 = 0;
+const MIN_MINOR: u32 = 19;
+const MIN_PATCH: u32 = 0;
+
+/// The restic binary the harness spawns: a `restic(.exe)` sitting in the
+/// same directory as the wrustic executable wins over PATH lookup. That is
+/// how the Windows installer's pinned restic is found — it lives next to
+/// wrustic.exe in the install directory — while every other setup falls
+/// through to plain `restic` from PATH.
+fn restic_program() -> PathBuf {
+    let name = if cfg!(windows) { "restic.exe" } else { "restic" };
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            let candidate = exe.parent()?.join(name);
+            candidate.is_file().then_some(candidate)
+        })
+        .unwrap_or_else(|| PathBuf::from("restic"))
+}
 
 /// wrustic's own restic cache directory, or `None` when no per-user cache
 /// root can be determined.
@@ -50,12 +79,31 @@ fn cache_dir() -> Option<PathBuf> {
     Some(dirs::cache_dir()?.join("wrustic"))
 }
 
+/// Whether the restic cache is on. On by default: caching is what makes
+/// repeated restic work against a remote repository fast. `--no-restic-cache`
+/// turns it off for users who would rather not spend the disk space —
+/// hundreds of megabytes for a large repository.
+static CACHE_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Set once from the command line, before any restic call is made.
+pub(crate) fn set_cache_enabled(enabled: bool) {
+    CACHE_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether the restic cache is on — the prune confirmation screen tells the
+/// user which cache mode the run will carry, so this reports the mode
+/// [`apply_cache_flag`] will actually pass: a machine with no per-user cache
+/// root gets `--no-cache` even though the flag was never given.
+pub(crate) fn cache_enabled() -> bool {
+    CACHE_ENABLED.load(Ordering::Relaxed) && cache_dir().is_some()
+}
+
 /// Add the cache flags every restic invocation carries.
 ///
-/// Points restic at [`cache_dir`]. Caching stays off (`--no-cache`) when no
-/// per-user cache root can be named, rather than falling back to restic's
-/// own default, which wrustic must not share with other restic CLI
-/// instances.
+/// Default points restic at [`cache_dir`]; `--no-restic-cache` passes
+/// `--no-cache` instead. Caching also stays off when no per-user cache root
+/// can be named, rather than falling back to restic's own default, which
+/// wrustic must not share with other restic CLI instances.
 ///
 /// The cached path also carries `--cleanup-cache`, so restic itself garbage
 /// collects the per-repository subdirectories it keeps under that directory
@@ -72,7 +120,7 @@ fn cache_dir() -> Option<PathBuf> {
 /// modification time. Sweeping happens once, at repository open, not in the
 /// background.
 fn apply_cache_flag(cmd: &mut Command) {
-    match cache_dir() {
+    match cache_dir().filter(|_| CACHE_ENABLED.load(Ordering::Relaxed)) {
         Some(dir) => {
             cmd.arg("--cache-dir").arg(dir).arg("--cleanup-cache");
         }
@@ -80,6 +128,79 @@ fn apply_cache_flag(cmd: &mut Command) {
             cmd.arg("--no-cache");
         }
     }
+}
+
+pub(crate) struct ResticInfo;
+
+#[derive(Debug)]
+pub(crate) enum ResticError {
+    NotFound,
+    TooOld { found: String },
+    Unparseable { output: String },
+}
+
+impl ResticError {
+    pub(crate) fn user_message(&self) -> String {
+        let min = format!("{MIN_MAJOR}.{MIN_MINOR}.{MIN_PATCH}");
+        match self {
+            ResticError::NotFound => format!(
+                "restic not found on PATH. Install restic >= {min} to run restic commands."
+            ),
+            ResticError::TooOld { found } => format!(
+                "restic {found} found on PATH, but >= {min} is required to run restic commands."
+            ),
+            ResticError::Unparseable { output } => {
+                format!("Could not parse restic version output: {output}")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct VersionDocument {
+    version: String,
+}
+
+pub(crate) fn detect() -> Result<ResticInfo, ResticError> {
+    let mut cmd = Command::new(restic_program());
+    apply_cache_flag(&mut cmd);
+    let output = match cmd.arg("version").arg("--json").output() {
+        Ok(o) => o,
+        Err(_) => return Err(ResticError::NotFound),
+    };
+    if !output.status.success() {
+        return Err(ResticError::Unparseable {
+            output: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    // {"message_type":"version","version":"0.19.1","go_version":"go1.26.4",…}
+    // A restic old enough not to understand `--json` here lands in
+    // `Unparseable`, which is an acceptable message for something that far
+    // below the supported floor.
+    let parsed: VersionDocument = serde_json::from_str(stdout.trim())
+        .map_err(|_| ResticError::Unparseable { output: stdout.clone() })?;
+    let (major, minor, patch) = parse_version(&parsed.version)
+        .ok_or_else(|| ResticError::Unparseable { output: stdout.clone() })?;
+    if !meets_minimum((major, minor, patch)) {
+        return Err(ResticError::TooOld { found: parsed.version });
+    }
+    Ok(ResticInfo)
+}
+
+fn meets_minimum(found: (u32, u32, u32)) -> bool {
+    found >= (MIN_MAJOR, MIN_MINOR, MIN_PATCH)
+}
+
+fn parse_version(v: &str) -> Option<(u32, u32, u32)> {
+    let mut it = v.split('.');
+    let major: u32 = it.next()?.parse().ok()?;
+    let minor: u32 = it.next()?.parse().ok()?;
+    // Patch may carry a suffix like "1-dev"; take the leading digits.
+    let patch_raw = it.next()?;
+    let patch_digits: String = patch_raw.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let patch: u32 = patch_digits.parse().ok()?;
+    Some((major, minor, patch))
 }
 
 /// Remove stale repository locks via `restic unlock`. restic only deletes
@@ -149,12 +270,73 @@ fn lock_requirement(args: &[&str]) -> LockRequirement {
 /// details, returned for the caller to surface. restic re-runs the same
 /// check in-process at startup, so a lock appearing in the window between
 /// our re-check and the spawn still fails safely inside restic.
+#[allow(dead_code)] // the TUI's prune uses the streaming variant; kept for future non-interactive flows (repair, migrate) and exercised by the live test
 pub(crate) fn run_unsticking_locks(profile: &Profile, args: &[&str]) -> Result<Vec<u8>> {
     unstick_if_blocked(profile, args)?;
     run(profile, args)
 }
 
-/// The native pre-spawn lock check for the unsticking runner: apply
+/// Tracks the PID of the restic child currently running through this harness
+/// so another thread can interrupt it (the TUI's Ctrl+C on the prune screen).
+/// 0 means no child is running.
+#[derive(Debug, Default)]
+pub(crate) struct ChildTracker {
+    pid: std::sync::atomic::AtomicU32,
+}
+
+impl ChildTracker {
+    /// Ask the tracked restic (if any) to stop. Interrupting restic is safe
+    /// by design: it never removes data still in use — new packs and indexes
+    /// are written before old ones are deleted — so a killed prune only
+    /// leaves the remaining work for the next run.
+    ///
+    /// Unix sends SIGINT, the same signal a terminal Ctrl+C delivers, which
+    /// restic catches to clean up and remove its repository lock. Windows has
+    /// no cross-process Ctrl+C for a piped child, so the process is
+    /// terminated; the lock it leaves behind names a dead PID, which the next
+    /// spawn's unstick pre-check removes as stale.
+    ///
+    /// PID-reuse race: the child can exit between the load and the signal
+    /// below. The window is a main-loop tick against the OS not recycling
+    /// the PID in that instant — the same exposure every kill-by-PID has.
+    pub(crate) fn interrupt(&self) {
+        let pid = self.pid.load(Ordering::Relaxed);
+        if pid == 0 {
+            return;
+        }
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(pid as i32, libc::SIGINT);
+        }
+        #[cfg(windows)]
+        unsafe {
+            use windows_sys::Win32::Foundation::CloseHandle;
+            use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+            let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if !handle.is_null() {
+                TerminateProcess(handle, 1);
+                CloseHandle(handle);
+            }
+        }
+    }
+}
+
+/// [`run_unsticking_locks`] with live output: each stdout line restic prints
+/// is appended to `progress` as it arrives (restic reports progress on a
+/// pipe too, roughly every 10 s when stdout is not a terminal), the child's
+/// PID is registered on `tracker` so it can be interrupted, and the full
+/// stdout is still returned at the end.
+pub(crate) fn run_unsticking_locks_streaming(
+    profile: &Profile,
+    args: &[&str],
+    tracker: &ChildTracker,
+    progress: &std::sync::Mutex<String>,
+) -> Result<Vec<u8>> {
+    unstick_if_blocked(profile, args)?;
+    run_streaming(profile, args, tracker, progress)
+}
+
+/// The native pre-spawn lock check shared by both unsticking runners: apply
 /// restic's acquisition conflict rules for this subcommand's lock, and when
 /// blocked run restic's own `unlock` (stale locks only) and re-check.
 fn unstick_if_blocked(profile: &Profile, args: &[&str]) -> Result<()> {
@@ -171,6 +353,83 @@ fn unstick_if_blocked(profile: &Profile, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// [`run`], but streaming stdout line-by-line into `progress` and exposing
+/// the child on `tracker` for interruption. stderr is drained on a helper
+/// thread (so neither pipe can fill up and deadlock the child) and reported
+/// on failure exactly like [`run`].
+fn run_streaming(
+    profile: &Profile,
+    args: &[&str],
+    tracker: &ChildTracker,
+    progress: &std::sync::Mutex<String>,
+) -> Result<Vec<u8>> {
+    use std::io::{BufRead, BufReader, Read};
+
+    let mut cmd = command(profile, args)?;
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow!("failed to spawn `restic`: {e}"))?;
+    tracker.pid.store(child.id(), Ordering::Relaxed);
+    let result = (|| {
+        if let Err(e) = write_password(&mut child, profile) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+        // Every fallible path below must not leave a live (or zombie) child
+        // behind — same kill-and-reap discipline as the password path above.
+        let Some(stderr) = child.stderr.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow!("restic stderr not piped"));
+        };
+        let stderr_thread = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let mut stderr = stderr;
+            let _ = stderr.read_to_end(&mut buf);
+            buf
+        });
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stderr_thread.join();
+            return Err(anyhow!("restic stdout not piped"));
+        };
+        let mut collected = Vec::new();
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            collected.extend_from_slice(line.as_bytes());
+            collected.push(b'\n');
+            if let Ok(mut p) = progress.lock() {
+                p.push_str(&line);
+                p.push('\n');
+            }
+        }
+        let status = match child.wait() {
+            Ok(status) => status,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stderr_thread.join();
+                return Err(anyhow!("waiting on restic: {e}"));
+            }
+        };
+        let stderr_buf = stderr_thread.join().unwrap_or_default();
+        if !status.success() {
+            let stderr = String::from_utf8_lossy(&stderr_buf).trim().to_string();
+            return Err(anyhow!(
+                "restic exited with status {}: {}",
+                status,
+                if stderr.is_empty() { "(no stderr)" } else { &stderr }
+            ));
+        }
+        Ok(collected)
+    })();
+    tracker.pid.store(0, Ordering::Relaxed);
+    result
+}
+
 /// Build a `restic <args>` command for a profile with credentials passed by
 /// the safest mechanism each supports. Never put secrets in argv. Master
 /// password is piped through an anonymous pipe on the child's stdin; the repo
@@ -179,12 +438,12 @@ fn unstick_if_blocked(profile: &Profile, args: &[&str]) -> Result<()> {
 /// through).
 ///
 /// Every command built here also carries the cache flags from
-/// [`apply_cache_flag`]: `--cache-dir <per-user path> --cleanup-cache`, or
-/// `--no-cache` when no per-user cache root exists. Either way wrustic never
+/// [`apply_cache_flag`]: `--cache-dir <per-user path> --cleanup-cache` by
+/// default, or `--no-cache` under `--no-restic-cache`. Either way wrustic never
 /// lets restic use its default on-disk cache, which other restic CLI instances
 /// share.
 fn command(profile: &Profile, args: &[&str]) -> Result<Command> {
-    let mut cmd = Command::new("restic");
+    let mut cmd = Command::new(restic_program());
     apply_cache_flag(&mut cmd);
     // Windows has no `/dev/stdin` path for restic to open. It doesn't need
     // one: when stdin is not a terminal — which it never is here, since
@@ -324,6 +583,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn minimum_is_the_0_19_series() {
+        // The whole 0.19 line is accepted, starting at .0 — the release the
+        // locking protocol (docs/locking.md) is written against.
+        assert!(meets_minimum((0, 19, 0)));
+        assert!(meets_minimum((0, 19, 1)));
+        assert!(meets_minimum((0, 20, 0)));
+        assert!(meets_minimum((1, 0, 0)));
+        // Anything before it is refused.
+        assert!(!meets_minimum((0, 18, 9)));
+        assert!(!meets_minimum((0, 1, 0)));
+    }
+
+    #[test]
+    fn user_message_quotes_the_minimum() {
+        let msg = ResticError::TooOld { found: "0.18.1".into() }.user_message();
+        assert!(msg.contains("0.19.0"), "message should name the floor: {msg}");
+        assert!(msg.contains("0.18.1"), "message should name what was found: {msg}");
+    }
+
+    #[test]
+    fn parses_version_string() {
+        assert_eq!(parse_version("0.19.1"), Some((0, 19, 1)));
+        assert_eq!(parse_version("1.2.3"), Some((1, 2, 3)));
+        assert_eq!(parse_version("0.19.1-dev"), Some((0, 19, 1)));
+        assert_eq!(parse_version("not-a-version"), None);
+        assert_eq!(parse_version("0.19"), None);
+    }
+
+    // The test binary has no restic sibling in target/…/deps, so the sibling
+    // probe must fall through to PATH lookup rather than pointing at a file
+    // that is not there.
+    #[test]
+    fn restic_program_falls_back_to_path_lookup() {
+        let program = restic_program();
+        if program.as_os_str() != "restic" {
+            assert!(program.is_file(), "{program:?} must exist if preferred over PATH");
+            assert_eq!(
+                program.parent(),
+                std::env::current_exe().unwrap().parent(),
+                "a non-PATH restic must be the sibling of the running executable"
+            );
+        }
+    }
+
+    #[test]
     fn lock_requirement_matches_restics_per_command_table() {
         use LockRequirement::*;
         // Global flags before the subcommand don't confuse the mapping.
@@ -347,6 +651,29 @@ mod tests {
         assert_eq!(lock_requirement(&["--json"]), None);
     }
 
+    // Unix-only: the assertion needs a child that dies to SIGINT the way
+    // restic does; on Windows interrupt() terminates instead, which a live
+    // prune would be needed to observe.
+    #[cfg(unix)]
+    #[test]
+    fn child_tracker_interrupt_stops_a_running_child() {
+        use std::sync::atomic::Ordering;
+
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let tracker = ChildTracker::default();
+        tracker.pid.store(child.id(), Ordering::Relaxed);
+        tracker.interrupt();
+        let status = child.wait().expect("wait for interrupted child");
+        assert!(!status.success(), "SIGINT should have stopped the child");
+
+        // With no tracked PID, interrupt must be a no-op (not signal PID 0 —
+        // which would hit our own process group).
+        ChildTracker::default().interrupt();
+    }
+
     fn test_profile() -> Profile {
         Profile::Local {
             password: "pw".into(),
@@ -362,8 +689,11 @@ mod tests {
             .collect()
     }
 
+    // Both halves live in one test because the cache switch is process-wide,
+    // and Rust runs tests in the same process on parallel threads — as two
+    // tests they would race over it.
     #[test]
-    fn cache_is_a_private_per_user_directory_or_off() {
+    fn cache_defaults_to_a_private_per_user_directory_and_opts_out_to_no_cache() {
         // The tail of every command, whatever the cache mode prepends.
         #[cfg(unix)]
         let tail: &[&str] = &["--password-file", "/dev/stdin", "snapshots", "--json"];
@@ -377,6 +707,8 @@ mod tests {
             !args.iter().any(|arg| arg.contains("pw")),
             "the password must never reach argv: {args:?}"
         );
+        // What the prune screen reports must be the mode actually passed.
+        assert_eq!(cache_enabled(), cache_dir().is_some());
 
         match cache_dir() {
             // The default: restic caches into a directory private to wrustic,
@@ -406,6 +738,19 @@ mod tests {
                 assert_eq!(args, expected);
             }
         }
+
+        // `--no-restic-cache` turns caching off outright.
+        set_cache_enabled(false);
+        assert!(!cache_enabled());
+        let opted_out = command_args(&test_profile());
+        // Restored, so the default-path assertions above still hold for any
+        // test that runs after this one.
+        set_cache_enabled(true);
+
+        let mut expected = vec!["--no-cache".to_string()];
+        expected.extend(tail.iter().map(|s| s.to_string()));
+        assert_eq!(opted_out, expected);
+        assert_eq!(command_args(&test_profile()), args);
     }
 
     #[test]
@@ -571,10 +916,20 @@ mod tests {
             drop(live);
         }
 
-        // An exclusive maintenance command through the harness (the TUI's
-        // prune went native, but the unsticking runner stays for repair,
-        // migrate and friends — prune stands in for those here).
-        run_unsticking_locks(&profile, &["prune"]).expect("prune");
+        // Prune through the harness — the command this module is kept for.
+        // The streaming variant is what the TUI uses: restic's stdout must
+        // land in the progress buffer line-by-line and still come back whole.
+        let tracker = ChildTracker::default();
+        let progress = std::sync::Mutex::new(String::new());
+        let out = run_unsticking_locks_streaming(&profile, &["prune"], &tracker, &progress)
+            .expect("prune");
+        let streamed = progress.into_inner().expect("progress mutex");
+        assert!(!streamed.is_empty(), "prune should have streamed progress lines");
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            streamed,
+            "collected stdout and streamed progress must match"
+        );
 
         let after = run(&profile, &["snapshots", "--json"]).expect("after-list");
         let arr_after: serde_json::Value = serde_json::from_slice(&after).expect("parse after");
