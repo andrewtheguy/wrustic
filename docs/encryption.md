@@ -35,12 +35,17 @@ Which fields are encrypted, per backend (`src/config.rs`):
 | Backend | Encrypted | Plaintext |
 |---|---|---|
 | `Local` | `password` | `local_path` |
-| `Rest` | `password`, `rest_user`, `rest_password` | `rest_url` |
-| `S3` | `password`, `s3_access_key`, `s3_secret_key` | `s3_endpoint`, `s3_bucket`, `s3_region`, `s3_root` |
+| `Rest` | `password`, `rest_password` | `rest_url`, `rest_user` |
+| `S3` | `password`, `s3_secret_key` | `s3_endpoint`, `s3_bucket`, `s3_region`, `s3_root`, `s3_access_key` |
 
 Empty strings short-circuit: `encrypt_field` returns early on `""` so an
-unset `rest_user` stays as `rest_user = ""` in the TOML rather than being
-encrypted into noise.
+unset `rest_password` stays as `rest_password = ""` in the TOML rather than
+being encrypted into noise.
+
+REST authentication must be entered in the separate username and password
+fields. Do not put it in `rest_url` as `https://user:password@host/`: the URL is
+stored verbatim in plaintext, including any embedded user information, while
+the separate `rest_password` field is encrypted.
 
 ## On-disk schema
 
@@ -200,15 +205,16 @@ The TOML file always exposes, in plaintext:
 
 - The profile names (`[profiles.foo]`, `[profiles.bar]`, …).
 - The backend type per profile (`backend = "s3" | "rest" | "local"`).
-- All public backend fields: `local_path`, `rest_url`, `s3_endpoint`,
-  `s3_bucket`, `s3_region`, `s3_root`.
+- All public backend fields: `local_path`, `rest_url`, `rest_user`,
+  `s3_endpoint`, `s3_bucket`, `s3_region`, `s3_root`, `s3_access_key`. If
+  credentials were embedded in `rest_url`, they are exposed with the URL.
 - Schema metadata: `version`, `cipher` marker.
 - The `[passphrase]` block (`instance`, `instance_sig`,
   `salt`). The instance is a user-chosen label; the signature and salt are
   useless without the passphrase.
 
-Everything else (repo passwords, REST user/password, S3 access/secret
-keys) sits behind `$WR;1.0;AES-256-GCM;` and is unreadable without the passphrase.
+Repository passwords, the separate REST password, and S3 secret access keys
+sit behind `$WR;1.0;AES-256-GCM;` and are unreadable without the passphrase.
 
 The key is never on disk; the `[passphrase]` block is metadata, not
 material. An attacker with only `config.toml` would need to brute-force

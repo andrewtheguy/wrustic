@@ -16,9 +16,9 @@ exactly which workflows that means.
 ## Features
 
 - **Backends**: local filesystem, REST-server, and S3
-- **Profile management**: create, edit, and delete saved profiles; secrets
-  (repository password, S3 keys) are encrypted per-value with AES-256-GCM
-  under a passphrase-derived key
+- **Profile management**: create, edit, and delete saved profiles; repository
+  passwords, REST passwords, and S3 secret access keys are encrypted per-value
+  with AES-256-GCM under a passphrase-derived key
 - **Snapshot browsing**: list snapshots, navigate the file tree, view file
   details, and compare two snapshots side-by-side
 - **Snapshot filtering**: narrow by host, tag, or path
@@ -346,8 +346,10 @@ cargo run   # pick "REST server", enter http://localhost:8000/, then password
 ```
 
 Note: `--no-auth` is a local-only convenience. For anything outside a dev
-machine, use `--htpasswd-file` and TLS per the `rest-server` documentation;
-`wrustic` accepts credentials embedded in the URL (`https://user:pass@host/`).
+machine, use `--htpasswd-file` and TLS per the `rest-server` documentation.
+Enter authentication in wrustic's separate username and password fields. Do
+not embed credentials in the URL (`https://user:pass@host/`): `rest_url` is
+stored verbatim in plaintext, while the separate password field is encrypted.
 
 ### S3 dev workflow (via `rclone serve s3`)
 
@@ -402,8 +404,9 @@ Caveats:
   to exist on disk before `restic init`.
 - `--force-path-style=true` is required — rclone's S3 server doesn't speak
   virtual-hosted-style addressing.
-- Profiles are persisted in `~/.config/wrustic/config.toml`. Secret fields
-  such as the restic password and S3 keys are encrypted per value with
-  AES-256-GCM under a passphrase-derived key. The file itself is not a
+- Profiles are persisted in `~/.config/wrustic/config.toml`. Repository
+  passwords, REST passwords, and S3 secret access keys are encrypted per value
+  with AES-256-GCM under a passphrase-derived key. REST usernames and S3 access
+  key IDs remain plaintext metadata. The file itself is not a
   whole-file encrypted archive; see `docs/encryption.md` for the on-disk schema
   and threat model.
