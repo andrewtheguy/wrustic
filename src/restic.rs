@@ -272,7 +272,7 @@ fn lock_requirement(args: &[&str]) -> LockRequirement {
 /// our re-check and the spawn still fails safely inside restic.
 #[allow(dead_code)] // the TUI's prune uses the streaming variant; kept for future non-interactive flows (repair, migrate) and exercised by the live test
 pub(crate) fn run_unsticking_locks(profile: &Profile, args: &[&str]) -> Result<Vec<u8>> {
-    unstick_if_blocked(profile, args)?;
+    unstick_if_blocked(profile, args, None)?;
     run(profile, args)
 }
 
@@ -365,35 +365,49 @@ impl ChildTracker {
 /// is appended to `progress` as it arrives (restic reports progress on a
 /// pipe too, roughly every 10 s when stdout is not a terminal), the child's
 /// PID is registered on `tracker` so it can be interrupted, and the full
-/// stdout is still returned at the end.
+/// stdout is still returned at the end. The tracker covers the whole flow:
+/// the unstick pre-check refuses after a cancel, and a `restic unlock` it
+/// spawns is itself registered for interruption.
 pub(crate) fn run_unsticking_locks_streaming(
     profile: &Profile,
     args: &[&str],
     tracker: &ChildTracker,
     progress: &std::sync::Mutex<String>,
 ) -> Result<Vec<u8>> {
-    // Refuse before the unstick pre-check too: it opens the repository and
-    // can spawn `restic unlock`, none of which should happen after the user
-    // said stop.
-    if tracker.cancel_requested() {
-        return Err(anyhow!("cancelled before restic was spawned"));
-    }
-    unstick_if_blocked(profile, args)?;
+    unstick_if_blocked(profile, args, Some((tracker, progress)))?;
     run_streaming(profile, args, tracker, progress)
 }
 
 /// The native pre-spawn lock check shared by both unsticking runners: apply
 /// restic's acquisition conflict rules for this subcommand's lock, and when
 /// blocked run restic's own `unlock` (stale locks only) and re-check.
-fn unstick_if_blocked(profile: &Profile, args: &[&str]) -> Result<()> {
+///
+/// With `cancel` set (the streaming prune flow), cancellation stays live
+/// through the pre-check instead of only being honoured afterwards: a
+/// latched Ctrl+C refuses before the repository is opened, and the unlock
+/// child runs through the tracker-aware streaming runner — registered so an
+/// interrupt reaches it, and refused outright when the cancel landed first.
+fn unstick_if_blocked(
+    profile: &Profile,
+    args: &[&str],
+    cancel: Option<(&ChildTracker, &std::sync::Mutex<String>)>,
+) -> Result<()> {
     let exclusive = match lock_requirement(args) {
         LockRequirement::None => return Ok(()),
         LockRequirement::NonExclusive => false,
         LockRequirement::Exclusive => true,
     };
+    if cancel.is_some_and(|(tracker, _)| tracker.cancel_requested()) {
+        return Err(anyhow!("cancelled before restic was spawned"));
+    }
     let (backend, crypto) = crate::repo::lock_context(profile)?;
     if crate::lock::check_blocking_locks(backend.as_ref(), &crypto, exclusive).is_err() {
-        unlock(profile)?;
+        match cancel {
+            Some((tracker, progress)) => {
+                run_streaming(profile, &["unlock", "--json"], tracker, progress)?;
+            }
+            None => unlock(profile)?,
+        }
         crate::lock::check_blocking_locks(backend.as_ref(), &crypto, exclusive)?;
     }
     Ok(())
@@ -474,7 +488,15 @@ fn run_streaming(
                         p.push_str(&String::from_utf8_lossy(&chunk));
                     }
                 }
-                Err(_) => break,
+                // A real I/O failure, not EOF (an exiting child closes the
+                // pipe, which is Ok(0); Interrupted is retried inside
+                // read_until): breaking here would silently return a
+                // truncated report as if it were complete.
+                Err(e) => {
+                    reap(&mut child);
+                    let _ = stderr_thread.join();
+                    return Err(anyhow!("reading restic stdout: {e}"));
+                }
             }
         }
         // stdout is closed, so restic is exiting: stop tracking before the
@@ -765,6 +787,34 @@ mod tests {
         assert!(
             progress.into_inner().expect("progress mutex").is_empty(),
             "nothing ran, so nothing may have streamed"
+        );
+    }
+
+    // Cancellation stays live through the lock unsticking: with a blocking
+    // stale lock planted — the state that would otherwise make the pre-check
+    // spawn `restic unlock` — a latched cancel must refuse instead. The
+    // stale lock surviving untouched is the proof no unlock ran, which is
+    // also why this needs no restic binary.
+    #[test]
+    fn a_cancel_during_unsticking_spawns_no_unlock() {
+        let fixture = crate::testrepo::TestRepo::init("unstick-cancel");
+        crate::lock::write_stale_lock_for_tests(
+            fixture.lock_backend().as_ref(),
+            &fixture.crypto(),
+        );
+        assert_eq!(fixture.lock_count(), 1, "the stale lock must be planted");
+
+        let tracker = ChildTracker::default();
+        tracker.interrupt();
+        let progress = std::sync::Mutex::new(String::new());
+        let err =
+            run_unsticking_locks_streaming(fixture.profile(), &["prune"], &tracker, &progress)
+                .expect_err("a latched cancel must refuse during unsticking");
+        assert!(format!("{err:#}").contains("cancelled"), "{err:#}");
+        assert_eq!(
+            fixture.lock_count(),
+            1,
+            "no unlock may have run: the stale lock must survive"
         );
     }
 
