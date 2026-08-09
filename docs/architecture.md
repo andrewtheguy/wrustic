@@ -208,8 +208,9 @@ runs `restic prune` on a worker thread through the secure spawn harness
 in `src/restic.rs`, streaming restic's stdout into the running screen
 (docs/restic-usage.md is the per-workflow overview, and docs/locking.md
 Tier 3 has the rationale for keeping prune on restic). The binary is a
-`restic(.exe)` next to the wrustic executable when present (the Windows
-installer ships a pinned one), otherwise `restic` from PATH. Write
+bundled `restic/restic(.exe)` under the wrustic executable's directory
+when present (the installers ship a pinned one there, off the PATH they
+put wrustic on), otherwise `restic` from PATH. Write
 operations without an implementation (init, backup, key management,
 repair, migrate) are for the user to run with the restic CLI outside
 the app.

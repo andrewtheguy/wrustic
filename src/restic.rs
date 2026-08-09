@@ -8,9 +8,10 @@
 //! the Snapshots screen) is its main caller, via
 //! [`run_unsticking_locks_streaming`].
 //!
-//! The binary run is `restic(.exe)` sitting next to the wrustic executable
-//! when one is there — the Windows installer ships a pinned restic in the
-//! install directory — and otherwise `restic` from PATH.
+//! The binary run is a bundled `restic/restic(.exe)` under the wrustic
+//! executable's directory when one is there — the Windows installer ships a
+//! pinned restic in that subdirectory, off the PATH the install directory
+//! itself joins — and otherwise `restic` from PATH.
 //!
 //! Launch semantics mirror resterm's: secrets never touch argv — the
 //! master password is piped through the child's stdin (`--password-file
@@ -50,17 +51,28 @@ const MIN_MAJOR: u32 = 0;
 const MIN_MINOR: u32 = 19;
 const MIN_PATCH: u32 = 0;
 
-/// The restic binary the harness spawns: a `restic(.exe)` sitting in the
-/// same directory as the wrustic executable wins over PATH lookup. That is
-/// how the Windows installer's pinned restic is found — it lives next to
-/// wrustic.exe in the install directory — while every other setup falls
-/// through to plain `restic` from PATH.
+/// The restic binary the harness spawns: a bundled `restic/restic(.exe)`
+/// under the wrustic executable's directory wins over PATH lookup. That is
+/// how the installers' pinned restic is found — and the extra `restic`
+/// path component is deliberate: the installers put the *install
+/// directory* (or a symlink to the binary) on PATH so `wrustic` is
+/// typeable in a terminal, and a restic sitting directly next to wrustic
+/// would ride along onto PATH. In a subdirectory it stays private to
+/// wrustic. Every other setup falls through to plain `restic` from PATH.
 fn restic_program() -> PathBuf {
     let name = if cfg!(windows) { "restic.exe" } else { "restic" };
     std::env::current_exe()
         .ok()
         .and_then(|exe| {
-            let candidate = exe.parent()?.join(name);
+            // The .deb/.pkg installs launch wrustic through a symlink in
+            // /usr/bin or /usr/local/bin; macOS's current_exe() can return
+            // that symlink unresolved, which would miss the bundled restic
+            // sitting next to the real binary in /opt/wrustic. (Windows is
+            // left alone: canonicalize yields a verbatim \\?\ path there,
+            // and the installer creates no symlinks.)
+            #[cfg(unix)]
+            let exe = exe.canonicalize().unwrap_or(exe);
+            let candidate = exe.parent()?.join("restic").join(name);
             candidate.is_file().then_some(candidate)
         })
         .unwrap_or_else(|| PathBuf::from("restic"))
@@ -707,7 +719,7 @@ mod tests {
         assert_eq!(parse_version("0.19"), None);
     }
 
-    // The test binary has no restic sibling in target/…/deps, so the sibling
+    // The test binary has no bundled restic under target/…/deps, so the
     // probe must fall through to PATH lookup rather than pointing at a file
     // that is not there.
     #[test]
@@ -715,10 +727,12 @@ mod tests {
         let program = restic_program();
         if program.as_os_str() != "restic" {
             assert!(program.is_file(), "{program:?} must exist if preferred over PATH");
+            // Compare by directory name, not full path: restic_program
+            // canonicalizes the executable path, current_exe here may not be.
             assert_eq!(
-                program.parent(),
-                std::env::current_exe().unwrap().parent(),
-                "a non-PATH restic must be the sibling of the running executable"
+                program.parent().and_then(|dir| dir.file_name()),
+                Some(std::ffi::OsStr::new("restic")),
+                "a non-PATH restic must live in the executable's restic/ subdirectory"
             );
         }
     }
