@@ -3,9 +3,12 @@
 # wrustic installer for Windows
 # Downloads the latest installer (wrustic-windows-amd64-setup.exe) from
 # https://github.com/andrewtheguy/wrustic/releases and runs it silently.
-# The installer lays down wrustic.exe and wintun-amd64.dll in
-# $env:LOCALAPPDATA\Programs\wrustic, plus a pinned restic.exe in its
-# restic\ subdirectory (kept off the PATH the install directory joins).
+# The installer is machine-wide: it lays down wrustic.exe and
+# wintun-amd64.dll in $env:ProgramFiles\wrustic, plus a pinned restic.exe
+# in its restic\ subdirectory (kept off the PATH the install directory
+# joins), so installing needs an elevated PowerShell. Config, state, and
+# the restic cache stay per-user — wrustic derives them from the running
+# user's profile at runtime.
 #
 # Adapted from the beam-rs installer. Flags are read from $args or
 # $env:WRUSTIC_INSTALL_ARGS; there is no param() block, so the script behaves
@@ -13,7 +16,6 @@
 
 # Defaults (overwritten by the fallback arg parser)
 $ReleaseTag   = $null
-$Admin        = $false
 $PreRelease   = $false
 $DownloadOnly = $false
 
@@ -243,8 +245,6 @@ function Apply-FallbackArgs {
 
         $argLower = $arg.ToLowerInvariant()
         switch ($argLower) {
-            '-admin' { $script:Admin = $true; continue }
-            '/admin' { $script:Admin = $true; continue }
             '-prerelease' { $script:PreRelease = $true; continue }
             '/prerelease' { $script:PreRelease = $true; continue }
             '-downloadonly' { $script:DownloadOnly = $true; continue }
@@ -372,7 +372,7 @@ function Install-Binary {
     $url = "$BaseUrl/$BinaryName"
     $tempDir = Join-Path $env:TEMP "wrustic-install-$(Get-Random)"
     $tempBinary = Join-Path $tempDir $BinaryName
-    $installDir = Join-Path $env:LOCALAPPDATA "Programs\wrustic"
+    $installDir = Join-Path $env:ProgramFiles "wrustic"
 
     try {
         New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
@@ -380,7 +380,7 @@ function Install-Binary {
         Download-Binary -Url $url -OutputPath $tempBinary -ExpectedChecksum $ExpectedChecksum
 
         # The Inno Setup installer places wrustic.exe and wintun-amd64.dll
-        # in $installDir (appended to the user PATH) and the pinned
+        # in $installDir (appended to the system PATH) and the pinned
         # restic.exe in its restic\ subdirectory, off that PATH entry.
         # /VERYSILENT keeps it non-interactive.
         Print-Info "Running installer..."
@@ -406,7 +406,7 @@ function Install-Binary {
 
 # The installer ships a pinned restic.exe in the install directory's
 # restic\ subdirectory — wrustic prefers it over PATH for the prune flow,
-# and the subdirectory keeps it off the user PATH — so report what landed.
+# and the subdirectory keeps it off the system PATH — so report what landed.
 function Test-BundledRestic {
     param([string]$InstallDir)
 
@@ -430,7 +430,6 @@ Download and run the wrustic installer (wrustic-windows-amd64-setup.exe)
 Options:
   -DownloadOnly  Download the installer to the current directory without running it
   -PreRelease    Use latest prerelease tag instead of latest stable release
-  -Admin         Allow running with administrator privileges (not recommended)
   -h, --help     Show this help message
 
 Arguments:
@@ -445,43 +444,33 @@ Examples:
   .\install.ps1 <release-tag>                # Install specific stable release
   .\install.ps1 -DownloadOnly                # Download latest installer to current directory
   .\install.ps1 -DownloadOnly <release-tag>  # Download specific installer
-  .\install.ps1 -Admin                       # Allow admin installation (not recommended)
   `$env:RELEASE_TAG='<release-tag>'; .\install.ps1  # Use environment variable
 
-Installs to: `$env:LOCALAPPDATA\Programs\wrustic (added to the user PATH),
+Installs to: `$env:ProgramFiles\wrustic (added to the system PATH),
 containing wrustic.exe, wintun-amd64.dll (the driver --smb-tun loads), and a
 pinned restic.exe in the restic\ subdirectory that wrustic's prune flow uses
-(kept out of the PATH entry on purpose).
+(kept out of the PATH entry on purpose). The install is machine-wide, so
+running it requires an elevated PowerShell; config, state, and the restic
+cache stay per-user.
 
 Supported platforms: Windows (amd64). The Windows build ships with the
 'keychain' feature enabled, so passphrases can be saved to Windows Credential
 Manager.
-
-Note: Installation as administrator is not recommended. Use -Admin to override.
 "@
 }
 
+# The Inno Setup installer is machine-wide (PrivilegesRequired=admin), and
+# running it /VERYSILENT from a non-elevated shell would stall on a UAC
+# prompt or fail outright — so require the elevation up front.
 function Test-AdminPrivileges {
-    param([bool]$AllowAdmin)
-
     $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
     $isAdmin = $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
-    if ($isAdmin) {
-        if (-not $AllowAdmin) {
-            Print-Error "Installation as administrator is not allowed without explicit override."
-            Print-Error "Running as administrator can cause permission issues and is not recommended."
-            Print-Error ""
-            Print-Error "To proceed anyway, run with the -Admin flag:"
-            Print-Error "  .\install.ps1 -Admin"
-            Print-Error ""
-            Print-Error "Recommended: Run this installer as a regular user instead."
-            exit 1
-        }
-        else {
-            Print-Warn "Running as administrator with explicit override (-Admin flag)."
-            Print-Warn "This is not recommended and may cause permission issues."
-        }
+    if (-not $isAdmin) {
+        Print-Error "Installing wrustic is machine-wide and needs administrator rights."
+        Print-Error "Re-run this script from an elevated PowerShell (Run as administrator),"
+        Print-Error "or use -DownloadOnly to fetch the installer and run it yourself."
+        exit 1
     }
 }
 
@@ -552,7 +541,6 @@ function Main {
     if ($envArgs) {
         if (-not $script:PreRelease -and $envArgs -match '(?i)(^|\s)--?prerelease(\s|$)') { $script:PreRelease = $true }
         if (-not $script:DownloadOnly -and $envArgs -match '(?i)(^|\s)--?downloadonly(\s|$)') { $script:DownloadOnly = $true }
-        if (-not $script:Admin -and $envArgs -match '(?i)(^|\s)--?admin(\s|$)') { $script:Admin = $true }
         if (-not $script:ReleaseTag -and $envArgs -match '^(\s*[^-][^\s]+)') {
             $script:ReleaseTag = $matches[1].Trim()
         }
@@ -582,7 +570,7 @@ function Main {
     }
 
     if (-not $script:DownloadOnly) {
-        Test-AdminPrivileges -AllowAdmin:$script:Admin
+        Test-AdminPrivileges
     }
 
     Start-Installation -Tag $tag -DownloadOnly:$script:DownloadOnly

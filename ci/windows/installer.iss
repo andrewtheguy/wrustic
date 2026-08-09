@@ -3,8 +3,13 @@
 ; into its restic\ subdirectory. wrustic loads the driver from next to its
 ; executable (src/smb/tun.rs) and prefers the bundled restic\restic.exe
 ; over PATH (src/restic.rs). The subdirectory matters: the install
-; directory itself is appended to the user PATH so `wrustic` is typeable
+; directory itself is appended to the system PATH so `wrustic` is typeable
 ; in a terminal, and restic must not ride along onto PATH with it.
+;
+; The install is machine-wide (Program Files, elevated) — only the program
+; files. Config, state, and the restic cache stay per-user: wrustic derives
+; them from the running user's profile at runtime and the installer never
+; touches them.
 ;
 ; Built by .github/workflows/release.yml with Inno Setup 6:
 ;   ISCC.exe /DAppVersion=<version> /DStageDir=<dir> /DOutDir=<dir> ci\windows\installer.iss
@@ -28,10 +33,9 @@ AppName=wrustic
 AppVersion={#AppVersion}
 AppPublisher=andrewtheguy
 AppPublisherURL=https://github.com/andrewtheguy/wrustic
-; Per-user install, no elevation: same location install.ps1 used before.
-; (--smb-tun still needs an elevated *runtime*; installing does not.)
-DefaultDirName={localappdata}\Programs\wrustic
-PrivilegesRequired=lowest
+; Machine-wide install: {autopf} is C:\Program Files here (64-bit mode).
+DefaultDirName={autopf}\wrustic
+PrivilegesRequired=admin
 DisableProgramGroupPage=yes
 DisableReadyPage=yes
 OutputDir={#OutDir}
@@ -53,9 +57,9 @@ Source: "{#StageDir}\wintun-amd64.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StageDir}\restic.exe"; DestDir: "{app}\restic"; Flags: ignoreversion
 
 [Registry]
-; Append the install directory to the user PATH so `wrustic` works from any
-; terminal. Left in place on uninstall, matching what install.ps1 did.
-Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}"; Check: NeedsAddPath
+; Append the install directory to the system PATH so `wrustic` works from
+; any terminal, for every user. Left in place on uninstall.
+Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}"; Check: NeedsAddPath
 
 [Code]
 // Whole-entry comparison, not substring: a sibling like
@@ -67,7 +71,7 @@ var
   P: Integer;
 begin
   Result := True;
-  if not RegQueryStringValue(HKCU, 'Environment', 'Path', Path) then
+  if not RegQueryStringValue(HKLM, 'SYSTEM\CurrentControlSet\Control\Session Manager\Environment', 'Path', Path) then
     exit;
   App := Lowercase(RemoveBackslash(ExpandConstant('{app}')));
   Rest := Path;

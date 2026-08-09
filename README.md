@@ -27,7 +27,7 @@ exactly which workflows that means.
   stale locks (live ones are kept) and retries
 - **Prune** (`p` on the snapshot list): reclaim the space deleted snapshots
   left behind — runs `restic prune` (restic >= 0.19, bundled with the
-  Windows installer or found on PATH) with live progress and safe Ctrl+C
+  installers or found on PATH) with live progress and safe Ctrl+C
   cancellation;
   stale locks are removed automatically before the run via restic's own
   `unlock`
@@ -54,10 +54,43 @@ See [`docs/roadmap.md`](docs/roadmap.md) for planned features.
 
 ## Install (prebuilt binary)
 
-### Linux / macOS
+Every platform installer lays down the program files only — config, state,
+and the restic cache stay per-user, derived from the running user's profile
+at runtime.
 
-A convenience script downloads the latest release binary from GitHub and
-drops it at `$HOME/.local/bin/wrustic` — no `sudo`, no system-wide install.
+### Linux (.deb)
+
+Each release ships `wrustic-linux-amd64.deb` / `wrustic-linux-arm64.deb`. The
+package installs `/opt/wrustic/wrustic` and a pinned restic at
+`/opt/wrustic/restic/restic` (the prune flow prefers it over PATH; the
+subdirectory keeps it from ever being a terminal-visible `restic`), plus a
+`/usr/bin/wrustic` symlink:
+
+```sh
+sudo apt install ./wrustic-linux-amd64.deb   # or: sudo dpkg -i ...
+```
+
+### macOS (.pkg)
+
+Each release ships `wrustic-macos-arm64.pkg` with the same layout —
+`/opt/wrustic/wrustic`, the pinned `/opt/wrustic/restic/restic`, and a
+`/usr/local/bin/wrustic` symlink. The package is unsigned and not notarized,
+so Gatekeeper refuses a browser-downloaded copy; fetch it with `curl` (which
+sets no quarantine flag) and install from the terminal instead:
+
+```sh
+curl -fsSLO https://github.com/andrewtheguy/wrustic/releases/latest/download/wrustic-macos-arm64.pkg
+sudo installer -pkg wrustic-macos-arm64.pkg -target /
+```
+
+To remove it: `sudo rm -rf /opt/wrustic /usr/local/bin/wrustic` and
+`sudo pkgutil --forget com.andrewtheguy.wrustic`.
+
+### Linux / macOS (install script, per-user)
+
+Alternatively, a convenience script downloads the latest release binary from
+GitHub and drops it at `$HOME/.local/bin/wrustic` — no `sudo`, no system-wide
+install, no bundled restic (prune then needs a restic >= 0.19 on PATH).
 Supported targets: `linux-amd64`, `linux-arm64`, `macos-arm64`.
 
 ```sh
@@ -80,22 +113,22 @@ shell profile.
 ### Windows
 
 Windows releases as an installer, `wrustic-windows-amd64-setup.exe` (built
-with Inno Setup from `ci/windows/installer.iss`). It installs three files
-side by side into `%LOCALAPPDATA%\Programs\wrustic` and adds that directory
-to the **user** PATH — per-user, no admin rights:
+with Inno Setup from `ci/windows/installer.iss`). It installs machine-wide
+(elevated) into `%ProgramFiles%\wrustic` and adds that directory to the
+**system** PATH:
 
 - `wrustic.exe`
 - `wintun-amd64.dll` — the signed wintun driver `--smb-tun` loads from next
   to the executable
 - `restic\restic.exe` — a pinned restic the prune flow uses (the bundled
   copy wins over PATH). It sits in a subdirectory on purpose: only the
-  install directory itself joins the user PATH, so the bundled restic
+  install directory itself joins the system PATH, so the bundled restic
   never shadows or becomes a terminal-visible `restic`
 
 You can download and run the installer from the releases page, or use
-`install.ps1`, which fetches the installer, verifies its SHA-256 against the
-digest GitHub publishes in the release metadata, and runs it silently. The
-script refuses to run elevated unless you pass `-Admin`.
+`install.ps1` from an **elevated** PowerShell — it fetches the installer,
+verifies its SHA-256 against the digest GitHub publishes in the release
+metadata, and runs it silently.
 
 ```powershell
 irm https://raw.githubusercontent.com/andrewtheguy/wrustic/main/install.ps1 | iex
@@ -237,9 +270,8 @@ Then in the TUI:
 through a secure spawn harness (password piped over stdin, credentials
 over env vars, secrets never on argv). A bundled `restic/restic(.exe)`
 under the wrustic executable's directory is preferred — that is how the
-Windows installer's pinned restic is found, tucked into a subdirectory so
-it stays off the PATH entry the installer adds — with PATH lookup as the
-fallback. Everything else
+installers' pinned restic is found, tucked into a subdirectory so it
+never rides onto PATH — with PATH lookup as the fallback. Everything else
 is native: `rustic_core` reads the on-disk repository format, and the
 native write operations wrustic exposes (snapshot delete, tag edits) hold
 restic-compatible repository locks, so they coexist safely with

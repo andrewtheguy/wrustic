@@ -53,17 +53,25 @@ const MIN_PATCH: u32 = 0;
 
 /// The restic binary the harness spawns: a bundled `restic/restic(.exe)`
 /// under the wrustic executable's directory wins over PATH lookup. That is
-/// how the Windows installer's pinned restic is found — and the extra
-/// `restic` path component is deliberate: the installer puts the *install
-/// directory* on the user PATH so `wrustic` is typeable in a terminal, and
-/// a restic.exe sitting directly in it would ride along onto PATH. In a
-/// subdirectory it stays private to wrustic. Every other setup falls
-/// through to plain `restic` from PATH.
+/// how the installers' pinned restic is found — and the extra `restic`
+/// path component is deliberate: the installers put the *install
+/// directory* (or a symlink to the binary) on PATH so `wrustic` is
+/// typeable in a terminal, and a restic sitting directly next to wrustic
+/// would ride along onto PATH. In a subdirectory it stays private to
+/// wrustic. Every other setup falls through to plain `restic` from PATH.
 fn restic_program() -> PathBuf {
     let name = if cfg!(windows) { "restic.exe" } else { "restic" };
     std::env::current_exe()
         .ok()
         .and_then(|exe| {
+            // The .deb/.pkg installs launch wrustic through a symlink in
+            // /usr/bin or /usr/local/bin; macOS's current_exe() can return
+            // that symlink unresolved, which would miss the bundled restic
+            // sitting next to the real binary in /opt/wrustic. (Windows is
+            // left alone: canonicalize yields a verbatim \\?\ path there,
+            // and the installer creates no symlinks.)
+            #[cfg(unix)]
+            let exe = exe.canonicalize().unwrap_or(exe);
             let candidate = exe.parent()?.join("restic").join(name);
             candidate.is_file().then_some(candidate)
         })
@@ -719,14 +727,11 @@ mod tests {
         let program = restic_program();
         if program.as_os_str() != "restic" {
             assert!(program.is_file(), "{program:?} must exist if preferred over PATH");
-            let bundled_dir = std::env::current_exe()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .join("restic");
+            // Compare by directory name, not full path: restic_program
+            // canonicalizes the executable path, current_exe here may not be.
             assert_eq!(
-                program.parent(),
-                Some(bundled_dir.as_path()),
+                program.parent().and_then(|dir| dir.file_name()),
+                Some(std::ffi::OsStr::new("restic")),
                 "a non-PATH restic must live in the executable's restic/ subdirectory"
             );
         }

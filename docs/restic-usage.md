@@ -28,9 +28,9 @@ the harness evaluates the repo's lock files natively and runs
 `restic unlock` if a stale lock would block the exclusive acquisition.
 restic ≥ 0.19 must be available for this one action — a bundled
 `restic/restic(.exe)` under the wrustic executable's directory wins (the
-Windows installer ships a pinned one there, in a subdirectory so it stays
-off the PATH entry the installer adds), otherwise PATH is searched; every
-other feature works without it. restic 0.19 has no JSON output for prune, so the report
+installers on every platform ship a pinned one there, in a subdirectory
+so it stays off the PATH they put wrustic on), otherwise PATH is
+searched; every other feature works without it. restic 0.19 has no JSON output for prune, so the report
 is shown verbatim, never parsed; restic's stdout is streamed into the
 running screen live (on a pipe restic reports progress roughly every
 10 s). Ctrl+C interrupts the run safely — restic never removes data still

@@ -62,18 +62,28 @@ jobs:
           # Linux ships without `keychain`: the D-Bus secret-service store needs
           # libdbus at build time and a running keyring daemon at runtime, which
           # a headless host has neither of. See docs/keychain.md.
+          #
+          # restic_build/restic_sha256 pin the restic each platform's package
+          # bundles (checksums from the SHA256SUMS restic publishes for the
+          # release). Windows pins its zip in the installer step instead.
           - runner: ubuntu-latest
             label: linux-amd64
             features: ""
             ext: ""
+            restic_build: linux_amd64
+            restic_sha256: f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c
           - runner: ubuntu-24.04-arm
             label: linux-arm64
             features: ""
             ext: ""
+            restic_build: linux_arm64
+            restic_sha256: a5f64aaab53d51e311fa3829124c5b703f2d14cf187d8640b6be3b2b49376465
           - runner: macos-latest
             label: macos-arm64
             features: "--features keychain"
             ext: ""
+            restic_build: darwin_arm64
+            restic_sha256: 7be0a144ccc377880f294204aa271d76e4b79554b42a751151d425ce6ebac143
           # Windows Credential Manager is part of the OS — no build or runtime
           # dependency to install, so `keychain` ships enabled.
           #
@@ -148,9 +158,63 @@ jobs:
             "/DOutDir=$(cygpath -w "$PWD/dist")" \
             "$(cygpath -w "$PWD/ci/windows/installer.iss")"
 
+      # The unix counterpart of the Windows installer: a .deb (Linux) / .pkg
+      # (macOS) that installs /opt/wrustic/wrustic, the pinned restic at
+      # /opt/wrustic/restic/restic (same subdirectory contract as Windows —
+      # wrustic prefers it over PATH, and it stays off PATH itself), and a
+      # wrustic symlink in the standard bin directory. Program files only:
+      # config, state, and the restic cache stay per-user at runtime.
+      - name: Build the Linux .deb / macOS .pkg
+        if: matrix.restic_build != ''
+        shell: bash
+        env:
+          RESTIC_VERSION: "0.19.1"
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          curl -fsSL -o restic.bz2 \
+            "https://github.com/restic/restic/releases/download/v${RESTIC_VERSION}/restic_${RESTIC_VERSION}_${{ matrix.restic_build }}.bz2"
+          # shasum, not sha256sum: present on both the Ubuntu and macOS runners.
+          echo "${{ matrix.restic_sha256 }}  restic.bz2" | shasum -a 256 -c -
+          bunzip2 restic.bz2
+          mkdir -p pkgroot/opt/wrustic/restic dist
+          install -m 0755 target/release/wrustic pkgroot/opt/wrustic/wrustic
+          install -m 0755 restic pkgroot/opt/wrustic/restic/restic
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            # /usr/local/bin is on the default PATH (/etc/paths) even on
+            # arm64. The pkg is unsigned/un-notarized: a browser download
+            # gets quarantined and refused by Gatekeeper, but fetching with
+            # curl and running `sudo installer -pkg` works — see README.
+            mkdir -p pkgroot/usr/local/bin
+            ln -s /opt/wrustic/wrustic pkgroot/usr/local/bin/wrustic
+            pkgbuild --root pkgroot \
+              --identifier com.andrewtheguy.wrustic \
+              --version "${version}" \
+              --install-location / \
+              "dist/wrustic-${{ matrix.label }}.pkg"
+          else
+            arch="${{ matrix.label }}"
+            arch="${arch#linux-}"
+            mkdir -p pkgroot/DEBIAN pkgroot/usr/bin
+            ln -s /opt/wrustic/wrustic pkgroot/usr/bin/wrustic
+            {
+              echo "Package: wrustic"
+              echo "Version: ${version}"
+              echo "Architecture: ${arch}"
+              echo "Maintainer: andrewtheguy <andrewchen5678@gmail.com>"
+              echo "Section: utils"
+              echo "Priority: optional"
+              echo "Homepage: https://github.com/andrewtheguy/wrustic"
+              echo "Description: Terminal UI for restic-format backup repositories"
+              echo " Installs under /opt/wrustic with a pinned restic for the prune flow."
+            } > pkgroot/DEBIAN/control
+            dpkg-deb --build --root-owner-group pkgroot "dist/wrustic-${{ matrix.label }}.deb"
+          fi
+
       # bash is present on the Windows runners too, so one step works
       # everywhere instead of a pwsh variant. Windows releases the installer;
-      # the other platforms release the bare binary.
+      # the other platforms release the bare binary (install.sh consumes it)
+      # plus the platform package.
       - name: Prepare release asset
         shell: bash
         run: |
@@ -160,6 +224,7 @@ jobs:
             mv dist/wrustic-windows-amd64-setup.exe out/
           else
             mv target/release/wrustic${{ matrix.ext }} out/wrustic-${{ matrix.label }}${{ matrix.ext }}
+            mv dist/* out/
           fi
 
       - name: Upload artifact
