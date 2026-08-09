@@ -115,9 +115,10 @@ jobs:
 
       # The installer payload: wrustic.exe, the vendored wintun driver, and a
       # pinned restic (verified against the SHA256SUMS restic publishes for the
-      # release before anything is extracted). wrustic prefers this sibling
-      # restic over PATH at runtime, so the pin here decides the restic every
-      # Windows install prunes with.
+      # release before anything is extracted). wrustic prefers this bundled
+      # restic (installed into the restic\ subdirectory, off the PATH entry
+      # the installer adds) over PATH at runtime, so the pin here decides
+      # the restic every Windows install prunes with.
       - name: Build Windows installer
         if: matrix.label == 'windows-amd64'
         shell: bash

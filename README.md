@@ -26,8 +26,9 @@ exactly which workflows that means.
   repository lock; when the repo is locked, `u` on the error screen removes
   stale locks (live ones are kept) and retries
 - **Prune** (`p` on the snapshot list): reclaim the space deleted snapshots
-  left behind — runs `restic prune` (restic >= 0.19, bundled next to the
-  executable or on PATH) with live progress and safe Ctrl+C cancellation;
+  left behind — runs `restic prune` (restic >= 0.19, bundled with the
+  Windows installer or found on PATH) with live progress and safe Ctrl+C
+  cancellation;
   stale locks are removed automatically before the run via restic's own
   `unlock`
 - **File sharing**: one-time signed download URLs served from localhost
@@ -86,8 +87,10 @@ to the **user** PATH — per-user, no admin rights:
 - `wrustic.exe`
 - `wintun-amd64.dll` — the signed wintun driver `--smb-tun` loads from next
   to the executable
-- `restic.exe` — a pinned restic the prune flow uses (a sibling restic wins
-  over PATH)
+- `restic\restic.exe` — a pinned restic the prune flow uses (the bundled
+  copy wins over PATH). It sits in a subdirectory on purpose: only the
+  install directory itself joins the user PATH, so the bundled restic
+  never shadows or becomes a terminal-visible `restic`
 
 You can download and run the installer from the releases page, or use
 `install.ps1`, which fetches the installer, verifies its SHA-256 against the
@@ -232,9 +235,11 @@ Then in the TUI:
 
 `wrustic` invokes the `restic` executable for exactly one feature: prune,
 through a secure spawn harness (password piped over stdin, credentials
-over env vars, secrets never on argv). A `restic(.exe)` sitting next to
-the wrustic executable is preferred — that is how the Windows installer's
-pinned restic is found — with PATH lookup as the fallback. Everything else
+over env vars, secrets never on argv). A bundled `restic/restic(.exe)`
+under the wrustic executable's directory is preferred — that is how the
+Windows installer's pinned restic is found, tucked into a subdirectory so
+it stays off the PATH entry the installer adds — with PATH lookup as the
+fallback. Everything else
 is native: `rustic_core` reads the on-disk repository format, and the
 native write operations wrustic exposes (snapshot delete, tag edits) hold
 restic-compatible repository locks, so they coexist safely with

@@ -1017,7 +1017,7 @@ fn render_prune_confirm(frame: &mut Frame, app: &App, area: Rect) {
          exclusive repository lock — concurrent backups are blocked while it\n\
          runs — and can take a long time on a large or remote repository.\n\
          Progress is shown live, and Ctrl+C cancels safely at any point.\n\n\
-         Requires restic >= 0.19 (bundled next to wrustic, or on PATH).\n\
+         Requires restic >= 0.19 (bundled with wrustic, or on PATH).\n\
          Cache: {cache}.\n\n\
          y/Enter start   n/Esc cancel"
     );

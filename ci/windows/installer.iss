@@ -1,8 +1,10 @@
-; wrustic Windows installer: installs wrustic.exe, the wintun driver
-; (wintun-amd64.dll), and a pinned restic.exe side by side in one directory.
-; wrustic loads the driver from next to its executable (src/smb/tun.rs) and
-; prefers the sibling restic over PATH (src/restic.rs), so the install
-; directory is the whole runtime contract.
+; wrustic Windows installer: installs wrustic.exe and the wintun driver
+; (wintun-amd64.dll) into the install directory, and a pinned restic.exe
+; into its restic\ subdirectory. wrustic loads the driver from next to its
+; executable (src/smb/tun.rs) and prefers the bundled restic\restic.exe
+; over PATH (src/restic.rs). The subdirectory matters: the install
+; directory itself is appended to the user PATH so `wrustic` is typeable
+; in a terminal, and restic must not ride along onto PATH with it.
 ;
 ; Built by .github/workflows/release.yml with Inno Setup 6:
 ;   ISCC.exe /DAppVersion=<version> /DStageDir=<dir> /DOutDir=<dir> ci\windows\installer.iss
@@ -48,7 +50,7 @@ Uninstallable=yes
 [Files]
 Source: "{#StageDir}\wrustic.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StageDir}\wintun-amd64.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#StageDir}\restic.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#StageDir}\restic.exe"; DestDir: "{app}\restic"; Flags: ignoreversion
 
 [Registry]
 ; Append the install directory to the user PATH so `wrustic` works from any

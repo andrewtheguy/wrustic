@@ -3,8 +3,9 @@
 # wrustic installer for Windows
 # Downloads the latest installer (wrustic-windows-amd64-setup.exe) from
 # https://github.com/andrewtheguy/wrustic/releases and runs it silently.
-# The installer lays down wrustic.exe, wintun-amd64.dll, and a pinned
-# restic.exe together in $env:LOCALAPPDATA\Programs\wrustic.
+# The installer lays down wrustic.exe and wintun-amd64.dll in
+# $env:LOCALAPPDATA\Programs\wrustic, plus a pinned restic.exe in its
+# restic\ subdirectory (kept off the PATH the install directory joins).
 #
 # Adapted from the beam-rs installer. Flags are read from $args or
 # $env:WRUSTIC_INSTALL_ARGS; there is no param() block, so the script behaves
@@ -378,9 +379,10 @@ function Install-Binary {
 
         Download-Binary -Url $url -OutputPath $tempBinary -ExpectedChecksum $ExpectedChecksum
 
-        # The Inno Setup installer places wrustic.exe, wintun-amd64.dll, and
-        # the pinned restic.exe in $installDir and appends it to the user
-        # PATH. /VERYSILENT keeps it non-interactive.
+        # The Inno Setup installer places wrustic.exe and wintun-amd64.dll
+        # in $installDir (appended to the user PATH) and the pinned
+        # restic.exe in its restic\ subdirectory, off that PATH entry.
+        # /VERYSILENT keeps it non-interactive.
         Print-Info "Running installer..."
         $setup = Start-Process -FilePath $tempBinary `
             -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' `
@@ -402,14 +404,15 @@ function Install-Binary {
     }
 }
 
-# The installer ships a pinned restic.exe next to wrustic.exe — wrustic
-# prefers it over PATH for the prune flow — so report what landed.
+# The installer ships a pinned restic.exe in the install directory's
+# restic\ subdirectory — wrustic prefers it over PATH for the prune flow,
+# and the subdirectory keeps it off the user PATH — so report what landed.
 function Test-BundledRestic {
     param([string]$InstallDir)
 
-    $restic = Join-Path $InstallDir "restic.exe"
+    $restic = Join-Path $InstallDir "restic\restic.exe"
     if (-not (Test-Path $restic)) {
-        Print-Warn "restic.exe was not found in $InstallDir."
+        Print-Warn "restic\restic.exe was not found in $InstallDir."
         Print-Warn "The prune flow will fall back to a restic >= 0.19 on PATH."
         return
     }
@@ -447,7 +450,8 @@ Examples:
 
 Installs to: `$env:LOCALAPPDATA\Programs\wrustic (added to the user PATH),
 containing wrustic.exe, wintun-amd64.dll (the driver --smb-tun loads), and a
-pinned restic.exe that wrustic's prune flow uses.
+pinned restic.exe in the restic\ subdirectory that wrustic's prune flow uses
+(kept out of the PATH entry on purpose).
 
 Supported platforms: Windows (amd64). The Windows build ships with the
 'keychain' feature enabled, so passphrases can be saved to Windows Credential
