@@ -1,0 +1,7 @@
+# Shell scripts run on Linux and macOS. Git already stores them with LF, but a
+# Windows checkout with core.autocrlf=true rewrites the working copy to CRLF,
+# and bash reads the \r as part of the shebang: "bad interpreter: bash^M". That
+# only bites when the working copy reaches a shell without going through git —
+# WSL against /mnt/c, a scp of the tree, a bind-mounted checkout — so pin the
+# checkout and the working copy matches what ships, on every machine.
+*.sh text eol=lf
