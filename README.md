@@ -163,6 +163,8 @@ cargo run
 
 ```text
 wrustic [-c|--config-dir <PATH>] [-p|--port <N>] [--smb-port <N>] [--no-restic-cache] [--no-keychain] [-h|--help]
+wrustic env <PROFILE> [--json]
+wrustic profiles [--json]
 ```
 
 `--config-dir <PATH>` overrides the default config location —
@@ -236,6 +238,41 @@ cache root, private to this tool and garbage-collected by restic itself
 binary was built with the `keychain` feature. See
 [`docs/keychain.md`](docs/keychain.md) for details on keychain support,
 why it is not enabled on Linux by default, and how to build with it.
+
+### Headless automation: `env` and `profiles`
+
+Backup scripts and scheduled tasks can pull a profile's credentials out of the
+encrypted config without starting the TUI:
+
+```sh
+wrustic profiles              # profile names, one per line (no passphrase needed)
+wrustic env myrepo            # KEY=VALUE lines for restic
+wrustic env myrepo --json     # same as a JSON object
+```
+
+`env` prints the environment restic needs for the profile: `RESTIC_REPOSITORY`
+(REST credentials embedded in the URL), `RESTIC_PASSWORD`, and for S3 backends
+`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_DEFAULT_REGION`. The
+config passphrase comes from the `WRUSTIC_PASSPHRASE` environment variable if
+set, otherwise from the OS keychain entry saved by the TUI's
+"save passphrase to keychain" option — so on a machine where that option is
+enabled, `wrustic env` works unattended. Both commands are read-only and skip
+the config-directory lock, so they keep working while a TUI session is open.
+
+`env` prints secrets — `RESTIC_PASSWORD`, S3 credentials — in cleartext on
+stdout. That is its job, so treat the output accordingly: consume it directly
+into environment variables, and never redirect it to shared logs or save it in
+committed files.
+
+PowerShell example (the pattern the
+[windowsresticbackup](https://github.com/andrewtheguy/windowsresticbackup)
+scripts use):
+
+```powershell
+$vars = wrustic env myrepo --json | ConvertFrom-Json
+foreach ($p in $vars.PSObject.Properties) { Set-Item "Env:$($p.Name)" $p.Value }
+restic snapshots
+```
 
 ### First run
 

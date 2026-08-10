@@ -1,4 +1,5 @@
 mod app;
+mod automation;
 mod cli;
 mod config;
 mod crypto;
@@ -62,6 +63,15 @@ fn main() -> Result<()> {
     }
 
     restic::set_cache_enabled(cli.restic_cache);
+
+    // Headless subcommands never touch the terminal, and they read the config
+    // without the exclusive directory lock — the TUI's atomic rename-on-save
+    // means a concurrent reader only ever sees a complete config, so `env` in
+    // a scheduled task keeps working while a TUI session is open.
+    if let Some(command) = cli.command {
+        let paths = config::paths(cli.config_dir)?;
+        return automation::run(command, paths, cli.no_keychain);
+    }
 
     #[cfg(feature = "keychain")]
     let no_keychain = cli.no_keychain || !keychain::init_store();

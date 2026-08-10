@@ -122,8 +122,25 @@ impl Default for SmbOptions {
 
 pub(crate) const USAGE: &str = "\
 Usage: wrustic [OPTIONS]
+       wrustic env <PROFILE> [--json] [OPTIONS]
+       wrustic profiles [--json] [OPTIONS]
+
+Commands (headless, for scripts and scheduled tasks — no TUI is started):
+  env <PROFILE>       Decrypt profile <PROFILE> and print the environment
+                      variables restic needs (RESTIC_REPOSITORY,
+                      RESTIC_PASSWORD, and for S3 backends AWS_ACCESS_KEY_ID,
+                      AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION) as KEY=VALUE
+                      lines, or as a JSON object with --json. The config
+                      passphrase is taken from the WRUSTIC_PASSPHRASE
+                      environment variable if set, otherwise from the OS
+                      keychain entry the TUI's \"save to keychain\" option
+                      wrote. Read-only: safe to run while the TUI is open.
+  profiles            Print the profile names in the config, one per line, or
+                      as a JSON array with --json. Needs no passphrase.
 
 Options:
+      --json                  With `env` or `profiles`: print JSON instead of
+                              plain lines.
   -c, --config-dir <PATH>     Use <PATH> as the wrustic config directory instead
                               of the platform default (~/.config/wrustic on Linux).
                               The directory will be created on first run.
@@ -186,6 +203,13 @@ Options:
   -h, --help                  Print this help text.
 ";
 
+/// A headless subcommand — automation entry points that never start the TUI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Command {
+    Env { profile: String, json: bool },
+    Profiles { json: bool },
+}
+
 pub(crate) struct Cli {
     pub(crate) config_dir: Option<PathBuf>,
     pub(crate) port: u16,
@@ -195,6 +219,7 @@ pub(crate) struct Cli {
     pub(crate) no_keychain: bool,
     pub(crate) show_version: bool,
     pub(crate) show_help: bool,
+    pub(crate) command: Option<Command>,
 }
 
 impl Default for Cli {
@@ -208,17 +233,29 @@ impl Default for Cli {
             no_keychain: false,
             show_version: false,
             show_help: false,
+            command: None,
         }
     }
 }
 
 pub(crate) fn parse_cli() -> Result<Cli> {
+    parse_args(std::env::args().skip(1))
+}
+
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Cli> {
     let mut cli = Cli::default();
-    let mut args = std::env::args().skip(1);
+    // Positional words (the subcommand and its arguments) are collected and
+    // interpreted after the flag loop, so flags may appear on either side of
+    // the subcommand — scripts get to say `wrustic env foo --json` as well as
+    // `wrustic --config-dir X env foo`.
+    let mut positionals: Vec<String> = Vec::new();
+    let mut json = false;
+    let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => cli.show_help = true,
             "-V" | "--version" | "version" => cli.show_version = true,
+            "--json" => json = true,
             // Rejected at parse time rather than ignored: silently falling back
             // to the loopback port would look like the tun came up and the
             // mount was at fault.
@@ -280,8 +317,34 @@ requires compiling with `--features smb-tun`"
                 let value = &other["--smb-port=".len()..];
                 cli.smb.port = parse_port(value, "--smb-port=")?;
             }
-            other => bail!("unknown argument: {other}"),
+            other if other.starts_with('-') => bail!("unknown argument: {other}"),
+            other => positionals.push(other.to_string()),
         }
+    }
+
+    cli.command = match positionals.first().map(String::as_str) {
+        None => None,
+        Some("env") => {
+            let [_, profile] = positionals.as_slice() else {
+                bail!("usage: wrustic env <PROFILE> [--json]");
+            };
+            Some(Command::Env {
+                profile: profile.clone(),
+                json,
+            })
+        }
+        Some("profiles") => {
+            if positionals.len() > 1 {
+                bail!("`profiles` takes no arguments");
+            }
+            Some(Command::Profiles { json })
+        }
+        Some(other) => bail!("unknown command: {other}"),
+    };
+    // A stray flag that silently does nothing would look like broken output
+    // rather than a mistyped invocation — refuse it instead.
+    if json && cli.command.is_none() {
+        bail!("--json only applies to `env` and `profiles`");
     }
     Ok(cli)
 }
@@ -369,6 +432,64 @@ mod tests {
                 "{good} should parse"
             );
         }
+    }
+
+    fn parse(args: &[&str]) -> Result<Cli> {
+        parse_args(args.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn no_positionals_means_tui() {
+        let cli = parse(&[]).expect("parses");
+        assert_eq!(cli.command, None);
+    }
+
+    /// Scripts compose invocations both ways round; the subcommand must not
+    /// care which side of it the flags land on.
+    #[test]
+    fn env_command_parses_with_flags_on_either_side() {
+        for argv in [
+            &["env", "myrepo", "--json", "--config-dir", "d"][..],
+            &["--config-dir", "d", "--json", "env", "myrepo"][..],
+        ] {
+            let cli = parse(argv).expect("parses");
+            assert_eq!(
+                cli.command,
+                Some(Command::Env {
+                    profile: "myrepo".into(),
+                    json: true
+                })
+            );
+            assert_eq!(cli.config_dir.as_deref(), Some(std::path::Path::new("d")));
+        }
+    }
+
+    #[test]
+    fn env_requires_exactly_one_profile() {
+        assert!(parse(&["env"]).is_err());
+        assert!(parse(&["env", "a", "b"]).is_err());
+    }
+
+    #[test]
+    fn profiles_command_parses() {
+        assert_eq!(
+            parse(&["profiles", "--json"]).expect("parses").command,
+            Some(Command::Profiles { json: true })
+        );
+        assert!(parse(&["profiles", "extra"]).is_err());
+    }
+
+    /// A flag that silently does nothing would read as broken output; it must
+    /// be refused up front instead.
+    #[test]
+    fn json_flag_is_refused_without_a_command() {
+        assert!(parse(&["--json"]).is_err());
+    }
+
+    #[test]
+    fn unknown_command_is_refused() {
+        assert!(parse(&["frobnicate"]).is_err());
+        assert!(parse(&["--nonsense"]).is_err());
     }
 
     #[test]
