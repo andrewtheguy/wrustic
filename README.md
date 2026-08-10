@@ -259,6 +259,11 @@ set, otherwise from the OS keychain entry saved by the TUI's
 enabled, `wrustic env` works unattended. Both commands are read-only and skip
 the config-directory lock, so they keep working while a TUI session is open.
 
+`env` prints secrets — `RESTIC_PASSWORD`, S3 credentials — in cleartext on
+stdout. That is its job, so treat the output accordingly: consume it directly
+into environment variables, and never redirect it to shared logs or save it in
+committed files.
+
 PowerShell example (the pattern the
 [windowsresticbackup](https://github.com/andrewtheguy/windowsresticbackup)
 scripts use):

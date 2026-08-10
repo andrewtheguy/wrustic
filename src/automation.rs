@@ -1,5 +1,5 @@
-//! Headless entry points for scripts and scheduled tasks: `env`, `profiles`
-//! and `import`. Nothing here starts the TUI or prompts — the passphrase
+//! Headless entry points for scripts and scheduled tasks: `env` and
+//! `profiles`. Nothing here starts the TUI or prompts — the passphrase
 //! comes from `WRUSTIC_PASSPHRASE` or the OS keychain, and every failure is a
 //! plain error on stderr with a non-zero exit.
 
@@ -42,6 +42,12 @@ fn run_env(paths: &Paths, profile_name: &str, json: bool, no_keychain: bool) -> 
     // to contend for the exclusive config lock a running TUI holds.
     let config = unlock(paths, no_keychain)?;
     let Some(profile) = config.profiles.get(profile_name) else {
+        if config.profiles.is_empty() {
+            bail!(
+                "no profile `{profile_name}` in {} — the config has no profiles yet; create one in the TUI",
+                paths.config.display()
+            );
+        }
         let available = config
             .profiles
             .keys()
@@ -58,16 +64,26 @@ fn run_env(paths: &Paths, profile_name: &str, json: bool, no_keychain: bool) -> 
             .collect();
         println!("{}", serde_json::to_string(&map)?);
     } else {
-        for (key, value) in vars {
-            // KEY=VALUE consumers are line-oriented; a value with a line break
-            // would silently truncate a secret. JSON mode carries anything.
-            if value.contains('\n') || value.contains('\r') {
-                bail!("value of {key} contains a line break — use --json");
-            }
-            println!("{key}={value}");
-        }
+        print!("{}", render_dotenv(&vars)?);
     }
     Ok(())
+}
+
+/// KEY=VALUE lines. Line-oriented consumers would silently truncate a secret
+/// containing a line break, so such values are refused — JSON mode carries
+/// anything.
+fn render_dotenv(vars: &[(String, String)]) -> Result<String> {
+    let mut out = String::new();
+    for (key, value) in vars {
+        if value.contains('\n') || value.contains('\r') {
+            bail!("value of {key} contains a line break — use --json");
+        }
+        out.push_str(key);
+        out.push('=');
+        out.push_str(value);
+        out.push('\n');
+    }
+    Ok(out)
 }
 
 /// The environment restic needs for `profile`, in a stable order. Matches
@@ -135,6 +151,10 @@ fn unlock_cipher(paths: &Paths, no_keychain: bool) -> Result<Cipher> {
 }
 
 fn resolve_passphrase(instance: &str, no_keychain: bool) -> Result<String> {
+    // Only the keychain branch below consumes the flag; without the feature
+    // the binding would otherwise warn under -D warnings.
+    #[cfg(not(feature = "keychain"))]
+    let _ = no_keychain;
     if let Ok(pass) = std::env::var(PASSPHRASE_ENV)
         && !pass.is_empty()
     {
@@ -193,6 +213,26 @@ mod tests {
                 ),
                 ("RESTIC_PASSWORD".to_string(), "repo-pw".to_string()),
             ]
+        );
+    }
+
+    /// Line-oriented consumers would silently truncate a secret containing a
+    /// line break, so the KEY=VALUE writer refuses it and points at --json.
+    #[test]
+    fn dotenv_rejects_line_breaks_and_renders_single_line_values() {
+        for bad in ["with\nnewline", "with\rcarriage-return"] {
+            let vars = vec![("RESTIC_PASSWORD".to_string(), bad.to_string())];
+            let err = render_dotenv(&vars).expect_err("line break must be refused");
+            assert!(format!("{err:#}").contains("use --json"), "{err:#}");
+        }
+
+        let vars = vec![
+            ("RESTIC_REPOSITORY".to_string(), "rest:http://h/repo".to_string()),
+            ("RESTIC_PASSWORD".to_string(), "pw=with=equals".to_string()),
+        ];
+        assert_eq!(
+            render_dotenv(&vars).expect("single-line values render"),
+            "RESTIC_REPOSITORY=rest:http://h/repo\nRESTIC_PASSWORD=pw=with=equals\n"
         );
     }
 
