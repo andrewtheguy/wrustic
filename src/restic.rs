@@ -634,7 +634,7 @@ pub(crate) fn run(profile: &Profile, args: &[&str]) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
-fn repo_url(profile: &Profile) -> Result<String> {
+pub(crate) fn repo_url(profile: &Profile) -> Result<String> {
     match profile {
         Profile::Local { local_path, .. } => Ok(local_path.clone()),
         Profile::Rest {
