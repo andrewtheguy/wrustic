@@ -328,22 +328,22 @@ mod tests {
         );
     }
 
-    // Live: the full ReadBackend + WriteBackend surface against a real Garage
-    // S3 server (scripts/garage-test-server.sh). Uses a per-run root so the
+    // Live: the full ReadBackend + WriteBackend surface against a real Silo
+    // S3 server (scripts/silo-test-server.sh). Uses a per-run root so the
     // seeded read-test repository is never touched, and removes everything it
     // writes.
     #[test]
     #[ignore]
-    fn live_garage_s3_data_backend_read_write_cycle() {
-        let endpoint = std::env::var("WRUSTIC_GARAGE_ENDPOINT")
-            .unwrap_or_else(|_| "http://127.0.0.1:3900".into());
+    fn live_silo_s3_data_backend_read_write_cycle() {
+        let endpoint = std::env::var("WRUSTIC_SILO_ENDPOINT")
+            .unwrap_or_else(|_| "http://127.0.0.1:9000".into());
         let backend = S3DataBackend::new(
             &endpoint,
             "wrustic-it",
-            "garage",
+            "us-east-1",
             &format!("data-backend-it-{}", std::process::id()),
-            "GK22222222222222222222222222222222",
-            "3333333333333333333333333333333333333333333333333333333333333333",
+            "wrustic-it",
+            "wrustic-it-secret",
         )
         .unwrap();
 

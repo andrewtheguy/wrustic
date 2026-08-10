@@ -245,7 +245,7 @@ Run from `CLAUDE.md`:
 - Test fixtures live under `./tmp/` (gitignored). The scripts that build them
   live in `scripts/` and are tracked, so a fresh clone can recreate every
   fixture from nothing:
-  - `scripts/garage-test-server.sh` / `garage-e2e.sh` — Garage S3 backend
+  - `scripts/silo-test-server.sh` / `scripts/silo-e2e.sh` — Silo S3 backend
   - `scripts/smb-sample.sh` — `seed` / `serve` / `verify` for the SMB server
     ([smb.md](smb.md))
 - For write operations not exposed by the TUI, use the `restic` CLI

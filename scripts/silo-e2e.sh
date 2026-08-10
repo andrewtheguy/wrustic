@@ -2,49 +2,52 @@
 
 set -euo pipefail
 
-GARAGE_ACCESS_KEY="GK22222222222222222222222222222222"
-GARAGE_SECRET_KEY="3333333333333333333333333333333333333333333333333333333333333333"
-GARAGE_BUCKET="wrustic-it"
-RESTIC_REPOSITORY_PASSWORD="garage-repository-password"
-GARAGE_S3_PORT="${GARAGE_S3_PORT:-3900}"
+SILO_ACCESS_KEY="wrustic-it"
+SILO_SECRET_KEY="wrustic-it-secret"
+SILO_REGION="us-east-1"
+SILO_BUCKET="wrustic-it"
+RESTIC_REPOSITORY_PASSWORD="silo-repository-password"
+SILO_S3_PORT="${SILO_S3_PORT:-9000}"
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-runtime="${project_root}/tmp/garage-e2e/runtime"
+runtime="${project_root}/tmp/silo-e2e/runtime"
 tool_dir="${project_root}/tmp/tools"
 
 info() {
-    printf '[garage-e2e] %s\n' "$*"
+    printf '[silo-e2e] %s\n' "$*"
 }
 
 fail() {
-    printf '[garage-e2e] ERROR: %s\n' "$*" >&2
+    printf '[silo-e2e] ERROR: %s\n' "$*" >&2
     exit 1
 }
 
-[[ "$GARAGE_S3_PORT" =~ ^[0-9]+$ ]] &&
-    (( GARAGE_S3_PORT >= 1 && GARAGE_S3_PORT <= 65535 )) ||
-    fail "GARAGE_S3_PORT must be an integer from 1 through 65535"
+[[ "$SILO_S3_PORT" =~ ^[0-9]+$ ]] &&
+    (( SILO_S3_PORT >= 1 && SILO_S3_PORT <= 65535 )) ||
+    fail "SILO_S3_PORT must be an integer from 1 through 65535"
 
 usage() {
     cat <<'EOF'
-Usage: ./scripts/garage-e2e.sh COMMAND
+Usage: ./scripts/silo-e2e.sh COMMAND
 
 Commands:
   seed    Initialize a fresh restic repository and create two snapshots
-  test    Run wrustic's ignored live Garage integration test
+  test    Run wrustic's ignored live Silo integration test
   run     Seed and test, leaving the independently managed server running
 
 Start a fresh server in another terminal with:
-  ./scripts/garage-test-server.sh --reset
+  ./scripts/silo-test-server.sh --reset
 
-Set GARAGE_S3_PORT on both commands to use a port other than 3900.
+Set SILO_S3_PORT on both commands to use a port other than 9000.
 EOF
 }
 
 require_running_server() {
-    command -v curl >/dev/null 2>&1 || fail "curl is required to probe Garage"
-    curl --silent --output /dev/null "http://127.0.0.1:${GARAGE_S3_PORT}/" ||
-        fail "Garage is not running; start ./scripts/garage-test-server.sh in another terminal"
+    command -v curl >/dev/null 2>&1 || fail "curl is required to probe Silo"
+    # Silo is a MinIO fork and keeps MinIO's wire surface, health path included.
+    curl --fail --silent --output /dev/null \
+        "http://127.0.0.1:${SILO_S3_PORT}/minio/health/live" ||
+        fail "Silo is not running; start ./scripts/silo-test-server.sh in another terminal"
 }
 
 find_restic() {
@@ -78,12 +81,12 @@ require_restic_0191() {
 run_restic() {
     local restic_binary="$1"
     shift
-    local repository="s3:http://127.0.0.1:${GARAGE_S3_PORT}/${GARAGE_BUCKET}/repository"
+    local repository="s3:http://127.0.0.1:${SILO_S3_PORT}/${SILO_BUCKET}/repository"
 
     printf '%s\n' "$RESTIC_REPOSITORY_PASSWORD" |
-        AWS_ACCESS_KEY_ID="$GARAGE_ACCESS_KEY" \
-            AWS_SECRET_ACCESS_KEY="$GARAGE_SECRET_KEY" \
-            AWS_DEFAULT_REGION="garage" \
+        AWS_ACCESS_KEY_ID="$SILO_ACCESS_KEY" \
+            AWS_SECRET_ACCESS_KEY="$SILO_SECRET_KEY" \
+            AWS_DEFAULT_REGION="$SILO_REGION" \
             "$restic_binary" \
             --repo "$repository" \
             --password-file /dev/stdin \
@@ -98,23 +101,25 @@ seed_repository() {
     source="${runtime}/source"
     mkdir -p "${source}/nested"
 
-    info "seeding a fresh restic repository through Garage S3"
-    printf 'hello from Garage S3 integration, revision 1\n' >"${source}/hello.txt"
-    printf '{"backend":"garage","revision":1}\n' >"${source}/nested/metadata.json"
+    # `init` creates the bucket as well: Silo, like MinIO, has none until a
+    # client makes one, and restic's S3 backend does that on init.
+    info "seeding a fresh restic repository through Silo S3"
+    printf 'hello from Silo S3 integration, revision 1\n' >"${source}/hello.txt"
+    printf '{"backend":"silo","revision":1}\n' >"${source}/nested/metadata.json"
     run_restic "$restic_binary" init
-    run_restic "$restic_binary" backup --tag garage-e2e "$source"
+    run_restic "$restic_binary" backup --tag silo-e2e "$source"
 
-    printf 'hello from Garage S3 integration, revision 2\n' >"${source}/hello.txt"
+    printf 'hello from Silo S3 integration, revision 2\n' >"${source}/hello.txt"
     printf 'added in revision 2\n' >"${source}/nested/second.txt"
-    run_restic "$restic_binary" backup --tag garage-e2e-second "$source"
+    run_restic "$restic_binary" backup --tag silo-e2e-second "$source"
 }
 
 run_test() {
     require_running_server
-    info "running the live wrustic Garage S3 integration test"
-    WRUSTIC_GARAGE_ENDPOINT="http://127.0.0.1:${GARAGE_S3_PORT}" \
+    info "running the live wrustic Silo S3 integration test"
+    WRUSTIC_SILO_ENDPOINT="http://127.0.0.1:${SILO_S3_PORT}" \
         cargo test --manifest-path "${project_root}/Cargo.toml" --all-features \
-        repo::tests::live_garage_s3_profile_reads_seeded_repository \
+        repo::tests::live_silo_s3_profile_reads_seeded_repository \
         -- --ignored --nocapture
 }
 
@@ -129,7 +134,7 @@ case "$command" in
     run)
         seed_repository
         run_test
-        info "Garage S3 end-to-end test passed; standalone server remains running"
+        info "Silo S3 end-to-end test passed; standalone server remains running"
         ;;
     -h | --help | help)
         usage

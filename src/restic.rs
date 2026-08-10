@@ -1038,14 +1038,14 @@ mod tests {
     fn repo_url_s3_custom_endpoint_defaults_to_https() {
         let p = Profile::S3 {
             password: "pw".into(),
-            s3_endpoint: "garage.example.com/".into(),
+            s3_endpoint: "objects.example.com/".into(),
             s3_bucket: "buk".into(),
-            s3_region: "garage".into(),
+            s3_region: "us-east-1".into(),
             s3_root: String::new(),
             s3_access_key: "AK".into(),
             s3_secret_key: "SK".into(),
         };
-        assert_eq!(repo_url(&p).unwrap(), "s3:https://garage.example.com/buk");
+        assert_eq!(repo_url(&p).unwrap(), "s3:https://objects.example.com/buk");
     }
 
     // End-to-end: actually shells out to `restic` against a fresh local repo.
