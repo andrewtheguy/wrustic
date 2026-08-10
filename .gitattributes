@@ -1,5 +1,0 @@
-# These are run by bash — from WSL on a Windows checkout, among other places —
-# and bash fails at the shebang on a CRLF file. core.autocrlf=true, which is
-# the default on Windows installs of git, would produce exactly that on a fresh
-# clone. Keep them LF in the working copy whatever the client is set to.
-ci/windows/*.sh text eol=lf
