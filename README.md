@@ -286,10 +286,11 @@ Then in the TUI:
 
 `wrustic` invokes the `restic` executable for exactly one feature: prune,
 through a secure spawn harness (password piped over stdin, credentials
-over env vars, secrets never on argv). A bundled `restic/restic(.exe)`
-under the wrustic executable's directory is preferred — that is how the
-installers' pinned restic is found, tucked into a subdirectory so it
-never rides onto PATH — with PATH lookup as the fallback. Everything else
+over env vars, secrets never on argv). The executable it runs is always
+`restic/restic(.exe)` under the wrustic executable's own directory — that
+is where the installers put their pinned restic, tucked into a
+subdirectory so it never rides onto PATH — and nothing else: a missing one
+is an error, never a fall back to a `restic` on PATH. Everything else
 is native: `rustic_core` reads the on-disk repository format, and the
 native write operations wrustic exposes (snapshot delete, tag edits) hold
 restic-compatible repository locks, so they coexist safely with
@@ -299,9 +300,10 @@ concurrent restic processes; stale-lock removal takes no lock — like
 of where the restic CLI appears (the prune flow, manual use, and tests).
 
 You *will* want `restic` (>= 0.19.0 — the release whose locking protocol and
-JSON output wrustic is built against) on your `$PATH`. Use it for:
+JSON output wrustic is built against) on your `$PATH` as well, for the work
+you do outside wrustic. That copy is yours alone; wrustic never looks at it,
+and the prune flow is unaffected by whether it exists. Use it for:
 
-- **The prune flow** (`p` in the TUI shells out to it).
 - **Write operations wrustic doesn't expose** (init, backup, copy, key
   management, …).
 - Any read operation not yet wired up in the TUI.
