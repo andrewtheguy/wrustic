@@ -170,8 +170,13 @@ wrustic profiles [--json]
 `--config-dir <PATH>` overrides the default config location —
 `$XDG_CONFIG_HOME/wrustic` (else `~/.config/wrustic`) on Linux,
 `~/Library/Application Support/wrustic` on macOS,
-`%APPDATA%\wrustic` on Windows. Useful for keeping separate profile sets,
-running tests, or driving an automation/CI flow against a throwaway directory:
+`%APPDATA%\wrustic` on Windows. The `WRUSTIC_CONFIG_DIR` environment variable
+sets the same thing with lower precedence (`-c` flag beats it, it beats the
+platform default; an empty value counts as unset) — set it once when the
+config lives somewhere non-default, e.g. inside a versioned repo, so plain
+`wrustic` and `wrustic env` find it without the flag. Also useful for keeping
+separate profile sets, running tests, or driving an automation/CI flow
+against a throwaway directory:
 
 ```sh
 cargo run -- --config-dir ./tmp/wrustic-sandbox
