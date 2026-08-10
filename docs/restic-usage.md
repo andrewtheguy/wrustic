@@ -80,5 +80,6 @@ plan — they stay on the restic CLI indefinitely.
   end (stdin password channel, the native pre-spawn lock check that
   unlocks stale locks before running a restic command, and the streaming
   prune runner the TUI uses).
-- `scripts/garage-e2e.sh seed` initializes and seeds the Garage S3 test
-  repository with restic (requires restic >= 0.19.1).
+- `scripts/silo-e2e.sh seed` initializes and seeds the Silo S3 test
+  repository with restic (requires restic >= 0.19.1). `restic init` creates
+  the bucket too — Silo, like the MinIO it forks, ships with none.

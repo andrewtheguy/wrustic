@@ -1308,44 +1308,43 @@ mod tests {
 
     #[test]
     #[ignore]
-    fn live_garage_s3_profile_reads_seeded_repository() {
-        let endpoint = std::env::var("WRUSTIC_GARAGE_ENDPOINT")
-            .unwrap_or_else(|_| "http://127.0.0.1:3900".into());
+    fn live_silo_s3_profile_reads_seeded_repository() {
+        let endpoint = std::env::var("WRUSTIC_SILO_ENDPOINT")
+            .unwrap_or_else(|_| "http://127.0.0.1:9000".into());
         let profile = Profile::S3 {
-            password: "garage-repository-password".into(),
+            password: "silo-repository-password".into(),
             s3_endpoint: endpoint,
             s3_bucket: "wrustic-it".into(),
-            s3_region: "garage".into(),
+            s3_region: "us-east-1".into(),
             s3_root: "repository".into(),
-            s3_access_key: "GK22222222222222222222222222222222".into(),
-            s3_secret_key:
-                "3333333333333333333333333333333333333333333333333333333333333333".into(),
+            s3_access_key: "wrustic-it".into(),
+            s3_secret_key: "wrustic-it-secret".into(),
         };
 
-        verify_profile(&profile).expect("verify Garage profile");
-        let snapshots = load_snapshots(&profile).expect("list Garage snapshots");
-        let snapshot = snapshots.first().expect("seeded Garage snapshot");
-        let previous = snapshots.get(1).expect("second seeded Garage snapshot");
-        assert!(snapshot.tags.iter().any(|tag| tag == "garage-e2e-second"));
+        verify_profile(&profile).expect("verify Silo profile");
+        let snapshots = load_snapshots(&profile).expect("list Silo snapshots");
+        let snapshot = snapshots.first().expect("seeded Silo snapshot");
+        let previous = snapshots.get(1).expect("second seeded Silo snapshot");
+        assert!(snapshot.tags.iter().any(|tag| tag == "silo-e2e-second"));
 
-        let repo = open_indexed(&profile).expect("open Garage repository");
+        let repo = open_indexed(&profile).expect("open Silo repository");
         let (summary, changes) =
-            diff_snapshots(&repo, &previous.id, &snapshot.id).expect("diff Garage snapshots");
+            diff_snapshots(&repo, &previous.id, &snapshot.id).expect("diff Silo snapshots");
         assert!(summary.changed_files > 0);
         assert!(changes.iter().any(|change| change.path.ends_with("/hello.txt")));
         assert!(changes.iter().any(|change| change.path.ends_with("/second.txt")));
 
         let preview =
-            preview_snapshot_contents(&repo, &snapshot.id, 100).expect("preview Garage tree");
+            preview_snapshot_contents(&repo, &snapshot.id, 100).expect("preview Silo tree");
         let hello = preview
             .entries
             .iter()
             .find(|entry| entry.path.ends_with("/hello.txt"))
-            .expect("hello.txt in Garage snapshot");
+            .expect("hello.txt in Silo snapshot");
 
-        let full_repo = open_indexed_full(&profile).expect("open full Garage repository");
+        let full_repo = open_indexed_full(&profile).expect("open full Silo repository");
         let mut parent_tree =
-            snapshot_root_tree(&repo, &snapshot.id).expect("Garage snapshot root tree");
+            snapshot_root_tree(&repo, &snapshot.id).expect("Silo snapshot root tree");
         let mut components = hello.path.trim_start_matches('/').split('/').peekable();
         let file_name = loop {
             let component = components.next().expect("hello.txt path component");
@@ -1354,13 +1353,13 @@ mod tests {
             }
             let tree = full_repo
                 .get_tree(&parent_tree)
-                .expect("read Garage directory tree");
+                .expect("read Silo directory tree");
             parent_tree = tree
                 .nodes
                 .into_iter()
                 .find(|node| node.name().to_string_lossy() == component)
                 .and_then(|node| node.subtree)
-                .expect("Garage directory subtree");
+                .expect("Silo directory subtree");
         };
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
@@ -1369,11 +1368,11 @@ mod tests {
         });
         let mut bytes = Vec::new();
         while let Some(chunk) = rx.blocking_recv() {
-            bytes.extend_from_slice(&chunk.expect("Garage file chunk"));
+            bytes.extend_from_slice(&chunk.expect("Silo file chunk"));
         }
         dump.join()
-            .expect("Garage dump thread")
-            .expect("stream Garage hello.txt");
-        assert_eq!(bytes, b"hello from Garage S3 integration, revision 2\n");
+            .expect("Silo dump thread")
+            .expect("stream Silo hello.txt");
+        assert_eq!(bytes, b"hello from Silo S3 integration, revision 2\n");
     }
 }

@@ -1575,23 +1575,23 @@ mod tests {
         assert!(backend.write("aaaa", b"x").is_err());
     }
 
-    // Live: full LockBackend + RepoLock protocol cycle against a real Garage
-    // S3 server (scripts/garage-test-server.sh). Uses a per-run root so the
+    // Live: full LockBackend + RepoLock protocol cycle against a real Silo
+    // S3 server (scripts/silo-test-server.sh). Uses a per-run root so the
     // seeded read-test repository is never touched.
     #[test]
     #[ignore]
-    fn live_garage_s3_lock_backend_cycle() {
+    fn live_silo_s3_lock_backend_cycle() {
         let _guard = test_acquire_guard();
-        let endpoint = std::env::var("WRUSTIC_GARAGE_ENDPOINT")
-            .unwrap_or_else(|_| "http://127.0.0.1:3900".into());
+        let endpoint = std::env::var("WRUSTIC_SILO_ENDPOINT")
+            .unwrap_or_else(|_| "http://127.0.0.1:9000".into());
         let backend: Arc<dyn LockBackend> = Arc::new(
             crate::s3_backend::S3LockBackend::new(
                 &endpoint,
                 "wrustic-it",
-                "garage",
+                "us-east-1",
                 &format!("lock-backend-it-{}", std::process::id()),
-                "GK22222222222222222222222222222222",
-                "3333333333333333333333333333333333333333333333333333333333333333",
+                "wrustic-it",
+                "wrustic-it-secret",
                 "locks",
             )
             .unwrap(),

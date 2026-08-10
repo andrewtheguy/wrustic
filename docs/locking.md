@@ -345,9 +345,9 @@ the dev profile only.
    restic's side — `restic forget` is blocked by our exclusive lock with
    "already locked" (so restic lists *and decrypts* our lock files), and
    `restic unlock` leaves our fresh lock in place — and
-   `live_garage_s3_lock_backend_cycle` runs the raw file ops plus the
+   `live_silo_s3_lock_backend_cycle` runs the raw file ops plus the
    full acquire/conflict/release/stale-removal protocol against a real
-   Garage S3 server (`scripts/garage-test-server.sh`).
+   Silo S3 server (`scripts/silo-test-server.sh`).
 2. **Native forget/delete** — DONE. The delete flow's `restic forget`
    subprocess became `Repository::delete_snapshots` under a native
    exclusive lock (`repo::delete_snapshot`), and the `u` shortcut's
