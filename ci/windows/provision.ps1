@@ -103,4 +103,8 @@ try {
     Log 'DONE-OK'
 } catch {
     Log "DONE-FAIL $($_.Exception.Message)"
+    # The log is for a human; the exit code is for the scheduler. Without it
+    # the task records success and `Get-ScheduledTaskInfo` says 0 on a failed
+    # provision.
+    exit 1
 }

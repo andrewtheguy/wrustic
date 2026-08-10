@@ -3,8 +3,13 @@
 `.github/workflows/windows-ci.yml` runs three steps on a `windows-latest`
 runner: clippy with `-D warnings`, `cargo test --all-features`, and a release
 build with `keychain,smb-tun` on. This describes how to run those same three
-steps on a Windows Server 2022 VM, so a Windows-only failure can be found
+steps on a local Windows Server VM, so a Windows-only failure can be found
 without pushing a branch and waiting.
+
+The VM is close to the runner but not equal to it: `windows-latest` is
+currently **Windows Server 2025** on the `windows-2025-vs2026` image, and this
+VM is Server 2022 with VS Build Tools 17. See
+[Where this is not the real runner](#where-this-is-not-the-real-runner).
 
 Everything is in `ci/windows/`:
 
@@ -23,11 +28,10 @@ without the trip over ssh.
 This replaces an earlier setup that ran the same steps in a Windows container
 on the dev box. The VM is better on the points that matter:
 
-- **It matches the runner's OS.** `windows-latest` is Windows Server 2022, and
-  so is this VM — build 20348, the same Server release. The container was
-  `servercore:ltsc2022`, which shares the kernel but is a far smaller image
-  than the runner's. (GitHub does move `windows-latest` between Server
-  releases; when it moves, this VM is what has to follow it.)
+- **It is a whole Server install, not an image slice.** The container was
+  `servercore:ltsc2022` — same kernel, but a far smaller image than any
+  runner's. A full Server guest can be moved onto whatever release
+  `windows-latest` points at; a base image cannot be made to grow into one.
 - **Nothing is installed on the dev box.** No container engine, no daemon
   running as a service, no `nat` switch, no 20 GB of layers under
   `C:\ProgramData\docker`.
@@ -88,10 +92,26 @@ denied":
 [System.IO.File]::ReadAllBytes($akf)[0..2]   # want 115 115 104, i.e. "ssh"
 ```
 
-Password authentication is still enabled on the VM. Turning it off
-(`PasswordAuthentication no` in `C:\ProgramData\ssh\sshd_config`) is the
-tightening to make once you are confident in the key — it also removes the
-console-typed password as a way back in, so do it deliberately.
+**Password authentication is still enabled**, which leaves the Administrator
+account reachable over the network by password alone. Close it once the key
+works, in this order:
+
+1. From a *second*, separate session, confirm the key alone authenticates:
+   `ssh -o PasswordAuthentication=no -o BatchMode=yes winci whoami`. Do this
+   before touching the config, and keep the first session open.
+2. Set `PasswordAuthentication no` in `C:\ProgramData\ssh\sshd_config` — as a
+   real line, not under a `Match` block, and ahead of any later duplicate:
+   sshd honours the *first* occurrence of a keyword.
+3. `Restart-Service sshd`, then re-run the check from step 1. A config sshd
+   refuses to parse leaves the service stopped and the VM unreachable over ssh,
+   which is why the check comes after the restart and not before.
+
+Getting back in when that goes wrong: the VM has a console. Open it from
+Hyper-V Manager, sign in as Administrator with the password (console logon is
+unaffected by `sshd_config`), and either fix the file or
+`Set-Service sshd -StartupType Automatic; Start-Service sshd`. Locking yourself
+out of ssh is recoverable; there is no state on this VM worth protecting beyond
+that, and a rebuild from `provision.ps1` is the fallback.
 
 ## Provisioning
 
@@ -195,15 +215,33 @@ recreates it. Nothing under it needs to survive — the cargo caches live in
 Paths on the remote side deliberately contain no spaces, so no remote command
 needs quoting. A quoted string has to survive PowerShell, then ssh, then
 cmd.exe, and the layers do not agree; not needing quotes is cheaper than
-getting them right.
+getting them right. `WRUSTIC_WINCI_REMOTE_DIR` and `WRUSTIC_WINCI_TARGET_DIR`
+are checked against that rule before use — they are interpolated into command
+lines that include `rmdir /s /q`, and a space or an `&` in one of them is not a
+parse error so much as a demolition order.
+
+**One run at a time.** The workspace and the cargo target directory are single
+and shared — that is what makes a warm run 20 seconds — so a second run
+starting mid-build would delete the tree the first is compiling. `remote.ps1`
+claims `C:\ci-workspaces\wrustic.lock` with `mkdir` (which fails, atomically,
+if it exists) and drops it in a `finally`. If a run is killed hard enough to
+skip that, the next one says so and prints the `ssh winci rmdir ...` to clear
+it.
 
 ## Where this is not the real runner
 
 Worth knowing before trusting a green run:
 
-- **The toolchain floats.** GitHub's runner image pins its Rust and MSVC to
-  whatever the image ships; this VM has whatever `stable` and VS Build Tools
-  were on the day they were installed. Both drift.
+- **The OS is a release behind.** `windows-latest` is Windows Server 2025
+  (image `windows-2025-vs2026`); this VM is Server 2022, build 20348. Check
+  with `gh run view <id> --log | grep 'Image:'` — GitHub moves the label, and
+  the two silently diverge when it does. Two ways to close the gap when it
+  starts mattering: rebuild the VM on Server 2025, or pin the workflow to
+  `runs-on: windows-2022`. Pinning is the wrong one — it makes CI test an OS
+  older than the one users get.
+- **The toolchain floats, and differs.** The runner image ships VS 2026 build
+  tools; this VM has VS Build Tools 17 (VS 2022). Rust is pinned by the image
+  on GitHub and is whatever `stable` was on install day here. All of it drifts.
 - **It is a bare Server install.** `windows-latest` carries an enormous
   preinstalled toolbox. This VM has MSVC, the Windows SDK and rustup, and
   nothing else — a test that quietly depends on some other preinstalled tool
