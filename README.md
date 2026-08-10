@@ -237,8 +237,13 @@ wrustic env myrepo --json     # same as a JSON object
 config passphrase comes from the `WRUSTIC_PASSPHRASE` environment variable if
 set, otherwise from the OS keychain entry saved by the TUI's
 "save passphrase to keychain" option — so on a machine where that option is
-enabled, `wrustic env` works unattended. Both commands are read-only and skip
-the config-directory lock, so they keep working while a TUI session is open.
+enabled, `wrustic env` works unattended. When neither source has the
+passphrase and stdin is a terminal, `env` falls back to a hidden prompt on
+the terminal itself (so it still works while a script captures stdout);
+without a terminal — a scheduled task, cron, a keychain-less Linux host — it
+fails with a non-zero exit instead of hanging. Both commands are read-only
+and skip the config-directory lock, so they keep working while a TUI session
+is open.
 
 `env` prints secrets — `RESTIC_PASSWORD`, S3 credentials — in cleartext on
 stdout. That is its job, so treat the output accordingly: consume it directly

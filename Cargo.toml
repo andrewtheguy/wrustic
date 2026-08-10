@@ -1,6 +1,6 @@
 [package]
 name = "wrustic"
-version = "0.0.60"
+version = "0.0.61"
 edition = "2024"
 
 [dependencies]
@@ -25,6 +25,10 @@ rand = "0.10.1"
 # same features rustic_backend already compiles reqwest with.
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 ratatui = "0.30.0"
+# Hidden-input passphrase prompt for `wrustic env` when neither the env var
+# nor the keychain has the passphrase. Talks to the controlling terminal
+# directly (/dev/tty, CONIN$), so the prompt works while stdout is captured.
+rpassword = "7"
 # No `opendal` feature: it has no per-service knob and compiles every opendal
 # service crate (~150 packages). S3 repo data goes through wrustic's own
 # rustic_core backend over `opendal-service-s3` instead (src/s3_backend.rs).

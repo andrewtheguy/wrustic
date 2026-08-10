@@ -1,13 +1,17 @@
 //! Headless entry points for scripts and scheduled tasks: `env` and
-//! `profiles`. Nothing here starts the TUI or prompts — the passphrase
-//! comes from `WRUSTIC_PASSPHRASE` or the OS keychain, and every failure is a
-//! plain error on stderr with a non-zero exit.
+//! `profiles`. Nothing here starts the TUI — the passphrase comes from
+//! `WRUSTIC_PASSPHRASE` or the OS keychain, with a plain hidden-input prompt
+//! on the controlling terminal as the interactive fallback. Without a
+//! terminal (scheduled tasks, cron) there is no prompt to hang on: every
+//! failure is a plain error on stderr with a non-zero exit.
+
+use std::io::IsTerminal;
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 
 use crate::cli::Command;
-use crate::config::{self, Config, Paths, Profile};
+use crate::config::{self, Config, PassphraseMeta, Paths, Profile};
 use crate::crypto::Cipher;
 use crate::passphrase;
 
@@ -125,9 +129,12 @@ fn unlock(paths: &Paths, no_keychain: bool) -> Result<Config> {
     config::load(paths, &cipher)
 }
 
-/// Derive and verify the config key without any prompt. `peek` first so the
-/// scrypt cost is only paid when there is actually a passphrase-protected
-/// config to unlock.
+/// How many interactive prompts before giving up. Matches the tolerance of a
+/// typo without letting a wrapper script that feeds wrong input loop forever.
+const PROMPT_ATTEMPTS: u32 = 3;
+
+/// Derive and verify the config key. `peek` first so the scrypt cost is only
+/// paid when there is actually a passphrase-protected config to unlock.
 fn unlock_cipher(paths: &Paths, no_keychain: bool) -> Result<Cipher> {
     let peeked = peek_existing(paths)?;
     let meta = peeked.passphrase.ok_or_else(|| {
@@ -136,42 +143,86 @@ fn unlock_cipher(paths: &Paths, no_keychain: bool) -> Result<Cipher> {
             paths.config.display()
         )
     })?;
-    let pass = resolve_passphrase(&meta.instance, no_keychain)?;
     let salt = BASE64
         .decode(&meta.salt)
         .context("bad base64 salt in [passphrase]")?;
-    let key = passphrase::derive_config_key(&pass, &salt).map_err(|e| anyhow!(e))?;
+    // A wrong *stored* passphrase fails outright instead of falling back to a
+    // prompt: prompting would paper over a stale keychain entry or env var
+    // that every unattended run is about to trip on.
+    if let Some(pass) = stored_passphrase(&meta.instance, no_keychain) {
+        return cipher_from_passphrase(&pass, &salt, &meta);
+    }
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "no passphrase available for instance `{}`: {PASSPHRASE_ENV} is not set, no \
+             keychain entry was found, and there is no terminal to prompt on (save the \
+             passphrase to the keychain from the TUI's unlock screen, or export \
+             {PASSPHRASE_ENV})",
+            meta.instance
+        );
+    }
+    unlock_via_prompts(&meta, &salt, PROMPT_ATTEMPTS, |_| {
+        // rpassword prompts on the controlling terminal itself (/dev/tty,
+        // CONIN$), not stdout — the prompt stays visible even when a script
+        // is capturing the env output.
+        rpassword::prompt_password(format!("Passphrase for instance `{}`: ", meta.instance))
+            .context("reading passphrase from terminal")
+    })
+}
+
+/// The interactive fallback: prompt, derive, verify, retry. Takes the reader
+/// as a closure so the retry behaviour is testable without a terminal.
+fn unlock_via_prompts(
+    meta: &PassphraseMeta,
+    salt: &[u8],
+    attempts: u32,
+    mut read_passphrase: impl FnMut(u32) -> Result<String>,
+) -> Result<Cipher> {
+    for attempt in 1..=attempts {
+        let pass = read_passphrase(attempt)?;
+        match cipher_from_passphrase(&pass, salt, meta) {
+            Ok(cipher) => return Ok(cipher),
+            Err(e) if attempt == attempts => return Err(e),
+            Err(e) => eprintln!("{e:#}"),
+        }
+    }
+    bail!("no passphrase attempts were made")
+}
+
+/// One derive-and-verify. The instance signature check gives a fast "wrong
+/// passphrase" answer before any decryption is attempted.
+fn cipher_from_passphrase(pass: &str, salt: &[u8], meta: &PassphraseMeta) -> Result<Cipher> {
+    let key = passphrase::derive_config_key(pass, salt).map_err(|e| anyhow!(e))?;
     if !passphrase::verify_instance_sig(&meta.instance, &key, &meta.instance_sig) {
         bail!(
             "wrong passphrase for instance `{}` (or config.toml was corrupted)",
             meta.instance
         );
     }
-    Ok(Cipher::new(key, meta.instance, &meta.instance_sig))
+    Ok(Cipher::new(key, meta.instance.clone(), &meta.instance_sig))
 }
 
-fn resolve_passphrase(instance: &str, no_keychain: bool) -> Result<String> {
-    // Only the keychain branch below consumes the flag; without the feature
-    // the binding would otherwise warn under -D warnings.
+/// The two unattended sources, in override order: environment, then keychain.
+/// `None` means neither had anything to offer — not that a passphrase was
+/// wrong.
+fn stored_passphrase(instance: &str, no_keychain: bool) -> Option<String> {
+    // Only the keychain branch below consumes these; without the feature the
+    // bindings would otherwise warn under -D warnings.
     #[cfg(not(feature = "keychain"))]
-    let _ = no_keychain;
+    let _ = (instance, no_keychain);
     if let Ok(pass) = std::env::var(PASSPHRASE_ENV)
         && !pass.is_empty()
     {
-        return Ok(pass);
+        return Some(pass);
     }
     #[cfg(feature = "keychain")]
     if !no_keychain
         && crate::keychain::init_store()
         && let Some(pass) = crate::keychain::load_passphrase(instance)
     {
-        return Ok(pass);
+        return Some(pass);
     }
-    bail!(
-        "no passphrase available for instance `{instance}`: {PASSPHRASE_ENV} is not set and \
-         no keychain entry was found (save the passphrase to the keychain from the TUI's \
-         unlock screen, or export {PASSPHRASE_ENV})"
-    )
+    None
 }
 
 #[cfg(test)]
@@ -234,6 +285,65 @@ mod tests {
             render_dotenv(&vars).expect("single-line values render"),
             "RESTIC_REPOSITORY=rest:http://h/repo\nRESTIC_PASSWORD=pw=with=equals\n"
         );
+    }
+
+    /// Passphrase metadata whose signature verifies for exactly `pass`.
+    fn meta_for(pass: &str, salt: &[u8]) -> PassphraseMeta {
+        let instance = "test-instance";
+        let key = passphrase::derive_config_key(pass, salt).expect("derive");
+        PassphraseMeta {
+            instance: instance.into(),
+            instance_sig: passphrase::compute_instance_sig(instance, &key),
+            salt: BASE64.encode(salt),
+        }
+    }
+
+    /// The whole point of the prompt loop: a typo costs a retry, not the run.
+    #[test]
+    fn prompt_unlock_retries_wrong_passphrases_until_one_verifies() {
+        let salt = [0x24u8; 32];
+        let meta = meta_for("Right Passphrase 1!", &salt);
+        let mut seen = Vec::new();
+        unlock_via_prompts(&meta, &salt, 3, |attempt| {
+            seen.push(attempt);
+            Ok(if attempt < 3 {
+                "wrong".into()
+            } else {
+                "Right Passphrase 1!".into()
+            })
+        })
+        .expect("the third attempt verifies");
+        assert_eq!(seen, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn prompt_unlock_gives_up_after_the_last_wrong_attempt() {
+        let salt = [0x25u8; 32];
+        let meta = meta_for("Right Passphrase 1!", &salt);
+        let mut calls = 0;
+        let err = unlock_via_prompts(&meta, &salt, 2, |_| {
+            calls += 1;
+            Ok("wrong".into())
+        })
+        .expect_err("a wrong passphrase must not unlock");
+        assert_eq!(calls, 2, "exactly the allowed attempts, no more");
+        assert!(format!("{err:#}").contains("wrong passphrase"), "{err:#}");
+    }
+
+    /// A dead terminal (EOF, closed tty) ends the loop immediately — retrying
+    /// a reader that cannot produce input would spin through the attempts.
+    #[test]
+    fn prompt_unlock_stops_on_a_reader_error() {
+        let salt = [0x26u8; 32];
+        let meta = meta_for("Right Passphrase 1!", &salt);
+        let mut calls = 0;
+        let err = unlock_via_prompts(&meta, &salt, 3, |_| {
+            calls += 1;
+            Err(anyhow!("tty gone"))
+        })
+        .expect_err("reader failure must propagate");
+        assert_eq!(calls, 1);
+        assert!(format!("{err:#}").contains("tty gone"), "{err:#}");
     }
 
     #[test]

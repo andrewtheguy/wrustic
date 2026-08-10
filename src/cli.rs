@@ -134,7 +134,10 @@ Commands (headless, for scripts and scheduled tasks — no TUI is started):
                       passphrase is taken from the WRUSTIC_PASSPHRASE
                       environment variable if set, otherwise from the OS
                       keychain entry the TUI's \"save to keychain\" option
-                      wrote. Read-only: safe to run while the TUI is open.
+                      wrote; when neither has it and stdin is a terminal, a
+                      hidden prompt asks for it instead. Without a terminal
+                      (scheduled task, cron) the command fails rather than
+                      hangs. Read-only: safe to run while the TUI is open.
   profiles            Print the profile names in the config, one per line, or
                       as a JSON array with --json. Needs no passphrase.
 
