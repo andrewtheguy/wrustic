@@ -11,6 +11,8 @@ use crate::crypto::{Cipher, is_passphrase_encrypted};
 const CONFIG_DIR_NAME: &str = "wrustic";
 const CONFIG_FILE: &str = "config.toml";
 const LOCK_FILE: &str = "config.lock";
+/// Default config directory when `-c/--config-dir` is not given.
+pub const CONFIG_DIR_ENV: &str = "WRUSTIC_CONFIG_DIR";
 const CONFIG_VERSION: u32 = 2;
 
 pub const CIPHER_MARKER_PASSPHRASE: &str = "passphrase-v1";
@@ -122,7 +124,21 @@ pub struct Paths {
 }
 
 pub fn paths(override_dir: Option<PathBuf>) -> Result<Paths> {
-    let base = match override_dir {
+    resolve_paths(override_dir, std::env::var_os(CONFIG_DIR_ENV))
+}
+
+/// `-c/--config-dir` beats `WRUSTIC_CONFIG_DIR` beats the platform default.
+/// An empty environment value counts as unset, matching how shells leave
+/// cleared variables behind.
+fn resolve_paths(
+    override_dir: Option<PathBuf>,
+    env_dir: Option<std::ffi::OsString>,
+) -> Result<Paths> {
+    let base = match override_dir.or_else(|| {
+        env_dir
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    }) {
         Some(p) => p,
         None => dirs::config_dir()
             .ok_or_else(|| anyhow!("could not determine config directory"))?
@@ -594,6 +610,29 @@ mod tests {
         assert_eq!(p.config, dir.join("config.toml"));
         assert_eq!(p.lock, dir.join("config.lock"));
         fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    /// Exercises [`resolve_paths`] directly instead of mutating the process
+    /// environment, which would race against other tests in the same binary.
+    #[test]
+    fn env_var_supplies_config_dir_but_flag_wins() -> Result<()> {
+        let env_dir = std::ffi::OsString::from("env-dir");
+
+        let p = resolve_paths(None, Some(env_dir.clone()))?;
+        assert_eq!(p.dir, PathBuf::from("env-dir"));
+        assert_eq!(p.config, PathBuf::from("env-dir").join("config.toml"));
+
+        let flag = PathBuf::from("flag-dir");
+        let p = resolve_paths(Some(flag.clone()), Some(env_dir))?;
+        assert_eq!(p.dir, flag, "-c/--config-dir must beat the env var");
+
+        let p = resolve_paths(None, Some(std::ffi::OsString::new()))?;
+        assert_ne!(
+            p.dir,
+            PathBuf::from(""),
+            "an empty env value must fall through to the platform default"
+        );
         Ok(())
     }
 

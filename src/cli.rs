@@ -142,7 +142,8 @@ Options:
       --json                  With `env` or `profiles`: print JSON instead of
                               plain lines.
   -c, --config-dir <PATH>     Use <PATH> as the wrustic config directory instead
-                              of the platform default (~/.config/wrustic on Linux).
+                              of the WRUSTIC_CONFIG_DIR environment variable or
+                              the platform default (~/.config/wrustic on Linux).
                               The directory will be created on first run.
   -p, --port <N>              Localhost port for the file-share dialog.
                               Default: 7834.
