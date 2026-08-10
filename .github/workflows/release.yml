@@ -66,22 +66,22 @@ jobs:
           # restic_build/restic_sha256 pin the restic each platform's package
           # bundles (checksums from the SHA256SUMS restic publishes for the
           # release). Windows pins its zip in the installer step instead.
+          # rpm_arch marks the platforms that also get an .rpm.
           - runner: ubuntu-latest
             label: linux-amd64
             features: ""
-            ext: ""
             restic_build: linux_amd64
             restic_sha256: f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c
+            rpm_arch: x86_64
           - runner: ubuntu-24.04-arm
             label: linux-arm64
             features: ""
-            ext: ""
             restic_build: linux_arm64
             restic_sha256: a5f64aaab53d51e311fa3829124c5b703f2d14cf187d8640b6be3b2b49376465
+            rpm_arch: aarch64
           - runner: macos-latest
             label: macos-arm64
             features: "--features keychain"
-            ext: ""
             restic_build: darwin_arm64
             restic_sha256: 7be0a144ccc377880f294204aa271d76e4b79554b42a751151d425ce6ebac143
           # Windows Credential Manager is part of the OS — no build or runtime
@@ -95,7 +95,6 @@ jobs:
           - runner: windows-latest
             label: windows-amd64
             features: "--features keychain,smb-tun"
-            ext: ".exe"
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -125,10 +124,10 @@ jobs:
 
       # The installer payload: wrustic.exe, the vendored wintun driver, and a
       # pinned restic (verified against the SHA256SUMS restic publishes for the
-      # release before anything is extracted). wrustic prefers this bundled
-      # restic (installed into the restic\ subdirectory, off the PATH entry
-      # the installer adds) over PATH at runtime, so the pin here decides
-      # the restic every Windows install prunes with.
+      # release before anything is extracted). A packaged wrustic runs this
+      # bundled restic and no other (installed into the restic\ subdirectory,
+      # off the PATH entry the installer adds), so the pin here *is* the
+      # restic every Windows install prunes with.
       - name: Build Windows installer
         if: matrix.label == 'windows-amd64'
         shell: bash
@@ -161,9 +160,10 @@ jobs:
       # The unix counterpart of the Windows installer: a .deb (Linux) / .pkg
       # (macOS) that installs /opt/wrustic/wrustic, the pinned restic at
       # /opt/wrustic/restic/restic (same subdirectory contract as Windows —
-      # wrustic prefers it over PATH, and it stays off PATH itself), and a
-      # wrustic symlink in the standard bin directory. Program files only:
-      # config, state, and the restic cache stay per-user at runtime.
+      # the only restic a packaged wrustic will run, and it stays off PATH
+      # itself), and a wrustic symlink in the standard bin directory. Program
+      # files only: config, state, and the restic cache stay per-user at
+      # runtime. The staged pkgroot/ is also what the .rpm step packages.
       - name: Build the Linux .deb / macOS .pkg
         if: matrix.restic_build != ''
         shell: bash
@@ -211,21 +211,66 @@ jobs:
             dpkg-deb --build --root-owner-group pkgroot "dist/wrustic-${{ matrix.label }}.deb"
           fi
 
+      # The Fedora/RHEL/openSUSE counterpart of the .deb: same layout, same
+      # bundled restic, packaged straight out of the pkgroot/ the previous
+      # step staged. rpmbuild comes from Ubuntu's `rpm` package; nothing is
+      # compiled here, so the spec has no %build and rpm's compile-oriented
+      # post-install processing is switched off.
+      - name: Build the Linux .rpm
+        if: matrix.rpm_arch != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y rpm
+          version=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          top="$PWD/rpmbuild"
+          mkdir -p "$top"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS} dist
+          cat > "$top/SPECS/wrustic.spec" <<SPEC
+          %global debug_package %{nil}
+          %global __os_install_post %{nil}
+          Name:           wrustic
+          Version:        ${version}
+          Release:        1
+          Summary:        Terminal UI for restic-format backup repositories
+          License:        Proprietary
+          URL:            https://github.com/andrewtheguy/wrustic
+          BuildArch:      ${{ matrix.rpm_arch }}
+          # rpm's dependency scan runs on a Debian host here, so it would name
+          # Debian's libraries; the payload is one Rust binary against the base
+          # system libraries plus a static Go restic, so declare nothing.
+          AutoReqProv:    no
+
+          %description
+          Installs under /opt/wrustic with a pinned restic for the prune flow.
+          Config, state, and the restic cache stay per-user at runtime.
+
+          %install
+          mkdir -p %{buildroot}/opt/wrustic/restic %{buildroot}/usr/bin
+          install -m 0755 $PWD/pkgroot/opt/wrustic/wrustic %{buildroot}/opt/wrustic/wrustic
+          install -m 0755 $PWD/pkgroot/opt/wrustic/restic/restic %{buildroot}/opt/wrustic/restic/restic
+          ln -s /opt/wrustic/wrustic %{buildroot}/usr/bin/wrustic
+
+          %files
+          %dir /opt/wrustic
+          %dir /opt/wrustic/restic
+          /opt/wrustic/wrustic
+          /opt/wrustic/restic/restic
+          /usr/bin/wrustic
+          SPEC
+          rpmbuild -bb --define "_topdir $top" "$top/SPECS/wrustic.spec"
+          mv "$top/RPMS/${{ matrix.rpm_arch }}"/wrustic-*.rpm "dist/wrustic-${{ matrix.label }}.rpm"
+
       # bash is present on the Windows runners too, so one step works
-      # everywhere instead of a pwsh variant. Windows releases the installer;
-      # the other platforms release the bare binary (install.sh consumes it)
-      # plus the platform package.
+      # everywhere instead of a pwsh variant. Packages only: a bare binary
+      # would ship without the restic subdirectory next to it, and a packaged
+      # wrustic runs no other restic, so it would be dead on arrival.
       - name: Prepare release asset
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p out
-          if [ "${{ matrix.label }}" = "windows-amd64" ]; then
-            mv dist/wrustic-windows-amd64-setup.exe out/
-          else
-            mv target/release/wrustic${{ matrix.ext }} out/wrustic-${{ matrix.label }}${{ matrix.ext }}
-            mv dist/* out/
-          fi
+          mv dist/* out/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

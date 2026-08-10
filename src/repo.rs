@@ -1103,8 +1103,8 @@ mod tests {
     // unlock` must not remove it while fresh, and the native delete must
     // work. restic CLI is used only for repo setup (init/backup — dev-flow
     // write ops) and for observing lock behavior from restic's side.
-    // Marked #[ignore]; run with `cargo test -- --ignored` (needs restic on
-    // PATH).
+    // Marked #[ignore]; run with `cargo test -- --ignored` (needs a restic
+    // copied to target/debug/deps/restic/, the harness's only lookup).
     #[test]
     #[ignore]
     fn live_native_lock_and_delete_interop_with_restic() {
@@ -1193,7 +1193,8 @@ mod tests {
     // it survives an edit), wrustic retags natively under the exclusive
     // lock, and restic must afterwards see the new tags with everything else
     // intact and the repository healthy. Marked #[ignore]; run with
-    // `cargo test -- --ignored` (needs restic on PATH).
+    // `cargo test -- --ignored` (needs a restic copied to
+    // target/debug/deps/restic/, the harness's only lookup).
     #[test]
     #[ignore]
     fn live_native_tag_edit_interop_with_restic() {

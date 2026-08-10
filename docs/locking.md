@@ -382,9 +382,9 @@ the dev profile only.
    stale-lock removal, then retry.
 4. **Prune through the harness** — DONE. The TUI's prune action runs
    `restic prune` via `restic::run_unsticking_locks_streaming`: version
-   detection first (restic ≥ 0.19, a bundled `restic/restic(.exe)` under
-   the executable's directory preferred over PATH), then the native
-   unstick pre-check
+   detection first (restic ≥ 0.19, the bundled `restic/restic(.exe)` under
+   the executable's directory — the only path ever run, PATH included in
+   neither), then the native unstick pre-check
    from phase 2, then a streaming spawn whose stdout lines feed the
    running screen live and whose PID a `ChildTracker` records so Ctrl+C
    can interrupt it (SIGINT on Unix — restic catches it and removes its

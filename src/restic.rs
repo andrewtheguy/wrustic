@@ -8,10 +8,13 @@
 //! the Snapshots screen) is its main caller, via
 //! [`run_unsticking_locks_streaming`].
 //!
-//! The binary run is a bundled `restic/restic(.exe)` under the wrustic
-//! executable's directory when one is there — the Windows installer ships a
-//! pinned restic in that subdirectory, off the PATH the install directory
-//! itself joins — and otherwise `restic` from PATH.
+//! The binary run is the bundled `restic/restic(.exe)` under the wrustic
+//! executable's directory — every installer ships a pinned restic in that
+//! subdirectory, off the PATH the install directory itself joins — and
+//! nothing else, in any build: a missing bundle is a hard error, never a
+//! fall back to whatever `restic` the PATH happens to hold. A checkout
+//! resolves the same path under `target/…`, so working on the prune flow
+//! locally means copying a restic there once.
 //!
 //! Launch semantics mirror resterm's: secrets never touch argv — the
 //! master password is piped through the child's stdin (`--password-file
@@ -51,31 +54,46 @@ const MIN_MAJOR: u32 = 0;
 const MIN_MINOR: u32 = 19;
 const MIN_PATCH: u32 = 0;
 
-/// The restic binary the harness spawns: a bundled `restic/restic(.exe)`
-/// under the wrustic executable's directory wins over PATH lookup. That is
-/// how the installers' pinned restic is found — and the extra `restic`
-/// path component is deliberate: the installers put the *install
-/// directory* (or a symlink to the binary) on PATH so `wrustic` is
+/// Where the bundled restic must live: `restic/restic(.exe)` under the
+/// wrustic executable's directory. `None` when the executable's own path is
+/// unavailable.
+///
+/// The extra `restic` path component is deliberate: the installers put the
+/// *install directory* (or a symlink to the binary) on PATH so `wrustic` is
 /// typeable in a terminal, and a restic sitting directly next to wrustic
 /// would ride along onto PATH. In a subdirectory it stays private to
-/// wrustic. Every other setup falls through to plain `restic` from PATH.
-fn restic_program() -> PathBuf {
+/// wrustic.
+fn bundled_restic_path() -> Option<PathBuf> {
     let name = if cfg!(windows) { "restic.exe" } else { "restic" };
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| {
-            // The .deb/.pkg installs launch wrustic through a symlink in
-            // /usr/bin or /usr/local/bin; macOS's current_exe() can return
-            // that symlink unresolved, which would miss the bundled restic
-            // sitting next to the real binary in /opt/wrustic. (Windows is
-            // left alone: canonicalize yields a verbatim \\?\ path there,
-            // and the installer creates no symlinks.)
-            #[cfg(unix)]
-            let exe = exe.canonicalize().unwrap_or(exe);
-            let candidate = exe.parent()?.join("restic").join(name);
-            candidate.is_file().then_some(candidate)
-        })
-        .unwrap_or_else(|| PathBuf::from("restic"))
+    let exe = std::env::current_exe().ok()?;
+    // The .deb/.rpm/.pkg installs launch wrustic through a symlink in
+    // /usr/bin or /usr/local/bin; macOS's current_exe() can return that
+    // symlink unresolved, which would miss the bundled restic sitting next
+    // to the real binary in /opt/wrustic. (Windows is left alone:
+    // canonicalize yields a verbatim \\?\ path there, and the installer
+    // creates no symlinks.)
+    #[cfg(unix)]
+    let exe = exe.canonicalize().unwrap_or(exe);
+    Some(exe.parent()?.join("restic").join(name))
+}
+
+/// The restic binary the harness spawns: the bundled one from
+/// [`bundled_restic_path`], and only ever that one.
+///
+/// There is no PATH fallback, in any build. Falling back would silently run
+/// whatever restic the machine happens to have — any version, possibly older
+/// than the locking protocol wrustic is written against — so which binary
+/// pruned a repository would depend on the user's PATH rather than on what
+/// was installed. The rule is the same everywhere rather than build-kind
+/// dependent: a dev build resolves the identical path (under `target/debug`,
+/// or `target/debug/deps` for a test binary), so working on the prune flow
+/// from a checkout means copying a restic there once.
+fn restic_program() -> Result<PathBuf, ResticError> {
+    let expected = bundled_restic_path();
+    match expected.as_ref().filter(|path| path.is_file()) {
+        Some(bundled) => Ok(bundled.clone()),
+        None => Err(ResticError::BundleMissing { expected }),
+    }
 }
 
 /// wrustic's own restic cache directory, or `None` when no per-user cache
@@ -146,7 +164,11 @@ pub(crate) struct ResticInfo;
 
 #[derive(Debug)]
 pub(crate) enum ResticError {
-    NotFound,
+    /// Nothing at the one path a restic may be run from — see
+    /// [`restic_program`].
+    BundleMissing { expected: Option<PathBuf> },
+    /// The bundled restic is there but could not be spawned.
+    NotRunnable { program: PathBuf },
     TooOld { found: String },
     Unparseable { output: String },
 }
@@ -155,12 +177,27 @@ impl ResticError {
     pub(crate) fn user_message(&self) -> String {
         let min = format!("{MIN_MAJOR}.{MIN_MINOR}.{MIN_PATCH}");
         match self {
-            ResticError::NotFound => format!(
-                "restic not found on PATH. Install restic >= {min} to run restic commands."
+            ResticError::BundleMissing { expected: Some(path) } => format!(
+                "No restic at {}. wrustic runs the restic bundled at that \
+                 path and no other — a restic on PATH is never used — so \
+                 reinstall wrustic from a release package to restore it (or, \
+                 in a build from a checkout, copy a restic >= {min} there).",
+                path.display()
             ),
-            ResticError::TooOld { found } => format!(
-                "restic {found} found on PATH, but >= {min} is required to run restic commands."
+            ResticError::BundleMissing { expected: None } => {
+                "Could not determine the wrustic executable's own directory, \
+                 so the restic bundled next to it could not be located. \
+                 Reinstall wrustic from a release package."
+                    .to_string()
+            }
+            ResticError::NotRunnable { program } => format!(
+                "The bundled restic at {} could not be run. Reinstall wrustic \
+                 from a release package.",
+                program.display()
             ),
+            ResticError::TooOld { found } => {
+                format!("restic {found} found, but >= {min} is required to run restic commands.")
+            }
             ResticError::Unparseable { output } => {
                 format!("Could not parse restic version output: {output}")
             }
@@ -174,11 +211,12 @@ struct VersionDocument {
 }
 
 pub(crate) fn detect() -> Result<ResticInfo, ResticError> {
-    let mut cmd = Command::new(restic_program());
+    let program = restic_program()?;
+    let mut cmd = Command::new(&program);
     apply_cache_flag(&mut cmd);
     let output = match cmd.arg("version").arg("--json").output() {
         Ok(o) => o,
-        Err(_) => return Err(ResticError::NotFound),
+        Err(_) => return Err(ResticError::NotRunnable { program }),
     };
     if !output.status.success() {
         return Err(ResticError::Unparseable {
@@ -551,7 +589,14 @@ fn run_streaming(
 /// lets restic use its default on-disk cache, which other restic CLI instances
 /// share.
 fn command(profile: &Profile, args: &[&str]) -> Result<Command> {
-    let mut cmd = Command::new(restic_program());
+    let program = restic_program().map_err(|e| anyhow!(e.user_message()))?;
+    command_for(program, profile, args)
+}
+
+/// [`command`] with the program supplied, so the argv and credential
+/// handling can be asserted without a restic staged next to the test binary.
+fn command_for(program: PathBuf, profile: &Profile, args: &[&str]) -> Result<Command> {
+    let mut cmd = Command::new(program);
     apply_cache_flag(&mut cmd);
     // Windows has no `/dev/stdin` path for restic to open. It doesn't need
     // one: when stdin is not a terminal — which it never is here, since
@@ -719,21 +764,34 @@ mod tests {
         assert_eq!(parse_version("0.19"), None);
     }
 
-    // The test binary has no bundled restic under target/…/deps, so the
-    // probe must fall through to PATH lookup rather than pointing at a file
-    // that is not there.
+    // A missing restic is a broken install, so the message has to name the
+    // path that was empty and point at the fix.
     #[test]
-    fn restic_program_falls_back_to_path_lookup() {
-        let program = restic_program();
-        if program.as_os_str() != "restic" {
-            assert!(program.is_file(), "{program:?} must exist if preferred over PATH");
-            // Compare by directory name, not full path: restic_program
-            // canonicalizes the executable path, current_exe here may not be.
-            assert_eq!(
-                program.parent().and_then(|dir| dir.file_name()),
-                Some(std::ffi::OsStr::new("restic")),
-                "a non-PATH restic must live in the executable's restic/ subdirectory"
-            );
+    fn missing_bundle_message_names_the_expected_path() {
+        let expected = PathBuf::from("/opt/wrustic/restic/restic");
+        let msg = ResticError::BundleMissing { expected: Some(expected) }.user_message();
+        assert!(msg.contains("/opt/wrustic/restic/restic"), "{msg}");
+        assert!(msg.contains("Reinstall") || msg.contains("reinstall"), "{msg}");
+    }
+
+    // The rule this whole arrangement exists for: the bundled path or an
+    // error, never a PATH lookup — and no build kind is exempt, this test
+    // binary included.
+    #[test]
+    fn the_bundled_path_is_the_only_program_ever_resolved() {
+        match restic_program() {
+            Ok(program) => {
+                assert!(program.is_file(), "{program:?} must exist to be resolved");
+                // Compare by directory name, not full path: bundled_restic_path
+                // canonicalizes the executable path, current_exe here may not be.
+                assert_eq!(
+                    program.parent().and_then(|dir| dir.file_name()),
+                    Some(std::ffi::OsStr::new("restic")),
+                    "the only runnable restic lives in the executable's restic/ subdirectory"
+                );
+            }
+            // The usual case: nothing staged under target/…/deps/restic.
+            Err(e) => assert!(matches!(e, ResticError::BundleMissing { .. }), "{e:?}"),
         }
     }
 
@@ -840,7 +898,7 @@ mod tests {
     }
 
     fn command_args(profile: &Profile) -> Vec<String> {
-        command(profile, &["snapshots", "--json"])
+        command_for(PathBuf::from("restic"), profile, &["snapshots", "--json"])
             .unwrap()
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
