@@ -26,11 +26,16 @@ path private to wrustic> --cleanup-cache` unless the user passed
 `--no-restic-cache`, which switches it to `--no-cache`). Before spawning,
 the harness evaluates the repo's lock files natively and runs
 `restic unlock` if a stale lock would block the exclusive acquisition.
-restic ≥ 0.19 must be available for this one action — a bundled
-`restic/restic(.exe)` under the wrustic executable's directory wins (the
-installers on every platform ship a pinned one there, in a subdirectory
-so it stays off the PATH they put wrustic on), otherwise PATH is
-searched; every other feature works without it. restic 0.19 has no JSON output for prune, so the report
+restic ≥ 0.19 must be available for this one action, and at exactly one
+place: the bundled `restic/restic(.exe)` under the wrustic executable's
+directory, which the installers on every platform ship a pinned copy of
+(in a subdirectory so it stays off the PATH they put wrustic on). Nothing
+else is ever run — no PATH lookup, in any build. A missing one fails with
+"reinstall wrustic" rather than silently pruning with whatever `restic`
+the machine's PATH holds, which could be any version and is not the one
+the release was tested against. A build from a checkout resolves the same
+path under `target/…`, so working on the prune flow locally means copying
+a restic there once. Every other feature works without restic at all. restic 0.19 has no JSON output for prune, so the report
 is shown verbatim, never parsed; restic's stdout is streamed into the
 running screen live (on a pipe restic reports progress roughly every
 10 s). Ctrl+C interrupts the run safely — restic never removes data still
@@ -62,6 +67,11 @@ plan — they stay on the restic CLI indefinitely.
 
 ## Development and tests
 
+- The `#[ignore]`d live tests spawn restic through the same harness, so
+  they resolve the same bundled path — for a test binary that is
+  `target/debug/deps/restic/restic(.exe)`. Copy a restic >= 0.19 there
+  before running them with `cargo test -- --ignored`; a restic on PATH is
+  not consulted.
 - The live interop tests in `src/repo.rs` use `restic::run` for `init`,
   `backup`, `forget`, `unlock`, `snapshots --json`,
   `check --read-data --json`, and `tag` to prove the native lock, delete,

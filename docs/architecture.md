@@ -207,10 +207,11 @@ One TUI flow shells out to restic: prune (`p` on the Snapshots screen)
 runs `restic prune` on a worker thread through the secure spawn harness
 in `src/restic.rs`, streaming restic's stdout into the running screen
 (docs/restic-usage.md is the per-workflow overview, and docs/locking.md
-Tier 3 has the rationale for keeping prune on restic). The binary is a
-bundled `restic/restic(.exe)` under the wrustic executable's directory
-when present (the installers ship a pinned one there, off the PATH they
-put wrustic on), otherwise `restic` from PATH. Write
+Tier 3 has the rationale for keeping prune on restic). The binary is the
+bundled `restic/restic(.exe)` under the wrustic executable's directory —
+the pinned one every installer ships, in a subdirectory so it stays off
+the PATH they put wrustic on — and never anything else: no PATH fallback
+in any build, a missing one is an error. Write
 operations without an implementation (init, backup, key management,
 repair, migrate) are for the user to run with the restic CLI outside
 the app.

@@ -26,8 +26,8 @@ exactly which workflows that means.
   repository lock; when the repo is locked, `u` on the error screen removes
   stale locks (live ones are kept) and retries
 - **Prune** (`p` on the snapshot list): reclaim the space deleted snapshots
-  left behind — runs `restic prune` (restic >= 0.19, bundled with the
-  installers or found on PATH) with live progress and safe Ctrl+C
+  left behind — runs `restic prune` (restic >= 0.19, the one the installers
+  bundle and only that one) with live progress and safe Ctrl+C
   cancellation;
   stale locks are removed automatically before the run via restic's own
   `unlock`
@@ -52,22 +52,36 @@ exactly which workflows that means.
 
 See [`docs/roadmap.md`](docs/roadmap.md) for planned features.
 
-## Install (prebuilt binary)
+## Install (packages)
 
-Every platform installer lays down the program files only — config, state,
-and the restic cache stay per-user, derived from the running user's profile
-at runtime.
+A release ships packages only — a `.deb`, `.rpm`, `.pkg`, or the Windows
+installer. Each lays down the program files only (config, state, and the
+restic cache stay per-user, derived from the running user's profile at
+runtime) and, crucially, a pinned restic in a `restic` subdirectory next to
+the wrustic binary. wrustic prunes with **that** restic or none: it never
+falls back to a `restic` on PATH, so which binary touches a repository is
+decided by what was installed rather than by the machine's PATH. That is
+also why there is no bare-binary download and no curl-to-shell install
+script — an unpackaged copy would have no restic to run.
 
 ### Linux (.deb)
 
 Each release ships `wrustic-linux-amd64.deb` / `wrustic-linux-arm64.deb`. The
-package installs `/opt/wrustic/wrustic` and a pinned restic at
-`/opt/wrustic/restic/restic` (the prune flow prefers it over PATH; the
-subdirectory keeps it from ever being a terminal-visible `restic`), plus a
-`/usr/bin/wrustic` symlink:
+package installs `/opt/wrustic/wrustic` and the pinned restic at
+`/opt/wrustic/restic/restic` (the subdirectory keeps it from ever being a
+terminal-visible `restic`), plus a `/usr/bin/wrustic` symlink:
 
 ```sh
 sudo apt install ./wrustic-linux-amd64.deb   # or: sudo dpkg -i ...
+```
+
+### Linux (.rpm)
+
+Same layout for Fedora / RHEL / openSUSE, as
+`wrustic-linux-amd64.rpm` / `wrustic-linux-arm64.rpm`:
+
+```sh
+sudo dnf install ./wrustic-linux-amd64.rpm   # or: sudo rpm -i ...
 ```
 
 ### macOS (.pkg)
@@ -86,30 +100,6 @@ sudo installer -pkg wrustic-macos-arm64.pkg -target /
 To remove it: `sudo rm -rf /opt/wrustic /usr/local/bin/wrustic` and
 `sudo pkgutil --forget com.andrewtheguy.wrustic`.
 
-### Linux / macOS (install script, per-user)
-
-Alternatively, a convenience script downloads the latest release binary from
-GitHub and drops it at `$HOME/.local/bin/wrustic` — no `sudo`, no system-wide
-install, no bundled restic (prune then needs a restic >= 0.19 on PATH).
-Supported targets: `linux-amd64`, `linux-arm64`, `macos-arm64`.
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/andrewtheguy/wrustic/main/install.sh | bash
-```
-
-Or clone the repo and run `./install.sh` directly. Useful flags:
-
-- `./install.sh v0.0.1` — install a specific release tag
-- `./install.sh --prerelease` — grab the latest prerelease
-- `./install.sh --download-only` — drop the binary in the current directory
-- `RELEASE_TAG=v0.0.1 ./install.sh` — same as passing the tag positionally
-
-The script verifies the SHA-256 of the downloaded binary against the digest
-GitHub publishes in the release metadata before installing, and runs the
-binary's `--help` once to confirm it loads on the host. If `$HOME/.local/bin`
-is not on your `$PATH`, the script prints the line you need to add to your
-shell profile.
-
 ### Windows
 
 Windows releases as an installer, `wrustic-windows-amd64-setup.exe` (built
@@ -120,33 +110,12 @@ with Inno Setup from `ci/windows/installer.iss`). It installs machine-wide
 - `wrustic.exe`
 - `wintun-amd64.dll` — the signed wintun driver `--smb-tun` loads from next
   to the executable
-- `restic\restic.exe` — a pinned restic the prune flow uses (the bundled
-  copy wins over PATH). It sits in a subdirectory on purpose: only the
-  install directory itself joins the system PATH, so the bundled restic
-  never shadows or becomes a terminal-visible `restic`
+- `restic\restic.exe` — the pinned restic the prune flow runs, and the only
+  one it will run. It sits in a subdirectory on purpose: only the install
+  directory itself joins the system PATH, so the bundled restic never
+  shadows or becomes a terminal-visible `restic`
 
-You can download and run the installer from the releases page, or use
-`install.ps1` from an **elevated** PowerShell — it fetches the installer,
-verifies its SHA-256 against the digest GitHub publishes in the release
-metadata, and runs it silently.
-
-```powershell
-irm https://raw.githubusercontent.com/andrewtheguy/wrustic/main/install.ps1 | iex
-```
-
-Or clone the repo and run `.\install.ps1` directly. Useful flags:
-
-- `.\install.ps1 <release-tag>` — install a specific release tag
-- `.\install.ps1 -PreRelease` — grab the latest prerelease
-- `.\install.ps1 -DownloadOnly` — drop the installer in the current directory
-- `$env:RELEASE_TAG='<release-tag>'; .\install.ps1` — same as passing the tag
-
-A piped `iex` one-liner cannot take arguments, so set
-`$env:WRUSTIC_INSTALL_ARGS` instead:
-
-```powershell
-$env:WRUSTIC_INSTALL_ARGS='-PreRelease'; irm https://raw.githubusercontent.com/andrewtheguy/wrustic/main/install.ps1 | iex
-```
+Download the installer from the releases page and run it (elevated).
 
 ## Build & run
 
@@ -158,6 +127,13 @@ Platform: Linux, macOS, and Windows.
 ```sh
 cargo run
 ```
+
+A binary built from a checkout resolves its restic exactly like an installed
+one — `restic/restic(.exe)` next to itself, never PATH — so the prune flow
+needs a restic >= 0.19 copied to `target/debug/restic/` (and to
+`target/debug/deps/restic/` for the `#[ignore]`d live tests, which spawn
+restic through the same harness). Everything else works with no restic at
+all.
 
 ### CLI flags
 
@@ -310,10 +286,11 @@ Then in the TUI:
 
 `wrustic` invokes the `restic` executable for exactly one feature: prune,
 through a secure spawn harness (password piped over stdin, credentials
-over env vars, secrets never on argv). A bundled `restic/restic(.exe)`
-under the wrustic executable's directory is preferred — that is how the
-installers' pinned restic is found, tucked into a subdirectory so it
-never rides onto PATH — with PATH lookup as the fallback. Everything else
+over env vars, secrets never on argv). The executable it runs is always
+`restic/restic(.exe)` under the wrustic executable's own directory — that
+is where the installers put their pinned restic, tucked into a
+subdirectory so it never rides onto PATH — and nothing else: a missing one
+is an error, never a fall back to a `restic` on PATH. Everything else
 is native: `rustic_core` reads the on-disk repository format, and the
 native write operations wrustic exposes (snapshot delete, tag edits) hold
 restic-compatible repository locks, so they coexist safely with
@@ -323,9 +300,10 @@ concurrent restic processes; stale-lock removal takes no lock — like
 of where the restic CLI appears (the prune flow, manual use, and tests).
 
 You *will* want `restic` (>= 0.19.0 — the release whose locking protocol and
-JSON output wrustic is built against) on your `$PATH`. Use it for:
+JSON output wrustic is built against) on your `$PATH` as well, for the work
+you do outside wrustic. That copy is yours alone; wrustic never looks at it,
+and the prune flow is unaffected by whether it exists. Use it for:
 
-- **The prune flow** (`p` in the TUI shells out to it).
 - **Write operations wrustic doesn't expose** (init, backup, copy, key
   management, …).
 - Any read operation not yet wired up in the TUI.

@@ -1,8 +1,9 @@
 ; wrustic Windows installer: installs wrustic.exe and the wintun driver
 ; (wintun-amd64.dll) into the install directory, and a pinned restic.exe
 ; into its restic\ subdirectory. wrustic loads the driver from next to its
-; executable (src/smb/tun.rs) and prefers the bundled restic\restic.exe
-; over PATH (src/restic.rs). The subdirectory matters: the install
+; executable (src/smb/tun.rs) and runs that bundled restic\restic.exe and
+; no other — a missing one is an error rather than a fall back to PATH
+; (src/restic.rs). The subdirectory matters: the install
 ; directory itself is appended to the system PATH so `wrustic` is typeable
 ; in a terminal, and restic must not ride along onto PATH with it.
 ;
