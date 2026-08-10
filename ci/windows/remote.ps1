@@ -92,7 +92,7 @@ switch ($Command) {
 # pipeline is text, not bytes, and it re-encodes — which corrupts the stream.
 # Writing a file and handing it to scp keeps the transfer binary-clean, and has
 # the side benefit that a half-finished transfer can never be unpacked.
-$Archive = Join-Path $env:TEMP "wrustic-winci-$PID.tgz"
+$Archive = Join-Path ([IO.Path]::GetTempPath()) "wrustic-winci-$PID.tgz"
 # Per-run, so two invocations cannot land on each other's upload in the shared
 # login home directory.
 $RemoteArchive = "wrustic-winci-src-$PID.tgz"
@@ -110,7 +110,10 @@ if ($LASTEXITCODE -ne 0) {
 
 try {
     Info "packing $(Split-Path -Leaf $ProjectRoot)"
-    & tar -C $ProjectRoot --exclude=./target --exclude=./tmp --exclude=./.git -czf $Archive .
+    # -L: ship symlinks (AGENTS.md -> CLAUDE.md) as regular files — cmd.exe's
+    # tar on the VM cannot recreate them, and a Windows checkout would have
+    # materialized them as files anyway.
+    & tar -C $ProjectRoot -L --exclude=./target --exclude=./tmp --exclude=./.git -czf $Archive .
     if ($LASTEXITCODE -ne 0) { throw "tar failed (exit $LASTEXITCODE)" }
 
     Info "copying to ${Target}:${RemoteDir}"
