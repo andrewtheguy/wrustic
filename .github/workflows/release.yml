@@ -185,9 +185,24 @@ jobs:
             # arm64. The pkg is unsigned/un-notarized: a browser download
             # gets quarantined and refused by Gatekeeper, but fetching with
             # curl and running `sudo installer -pkg` works — see README.
-            mkdir -p pkgroot/usr/local/bin
-            ln -s /opt/wrustic/wrustic pkgroot/usr/local/bin/wrustic
+            #
+            # The symlink is made by postinstall rather than shipped in the
+            # payload on purpose: a payload entry makes the installer assert
+            # the payload's ownership and mode on /usr, /usr/local and
+            # /usr/local/bin, which resets a Homebrew-owned prefix to
+            # root:wheel. mkdir -p leaves an existing directory's owner and
+            # mode alone. So the pkg's payload is /opt/wrustic and nothing
+            # else.
+            mkdir -p scripts
+            cat > scripts/postinstall <<'POSTINSTALL'
+          #!/bin/sh
+          set -eu
+          mkdir -p /usr/local/bin
+          ln -sfn /opt/wrustic/wrustic /usr/local/bin/wrustic
+          POSTINSTALL
+            chmod 0755 scripts/postinstall
             pkgbuild --root pkgroot \
+              --scripts scripts \
               --identifier com.andrewtheguy.wrustic \
               --version "${version}" \
               --install-location / \
