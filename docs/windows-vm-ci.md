@@ -101,26 +101,12 @@ denied":
 [System.IO.File]::ReadAllBytes($akf)[0..2]   # want 115 115 104, i.e. "ssh"
 ```
 
-**Password authentication is still enabled**, which leaves the Administrator
-account reachable over the network by password alone. Close it once the key
-works, in this order:
-
-1. From a *second*, separate session, confirm the key alone authenticates:
-   `ssh -o PasswordAuthentication=no -o BatchMode=yes winci whoami`. Do this
-   before touching the config, and keep the first session open.
-2. Set `PasswordAuthentication no` in `C:\ProgramData\ssh\sshd_config` — as a
-   real line, not under a `Match` block, and ahead of any later duplicate:
-   sshd honours the *first* occurrence of a keyword.
-3. `Restart-Service sshd`, then re-run the check from step 1. A config sshd
-   refuses to parse leaves the service stopped and the VM unreachable over ssh,
-   which is why the check comes after the restart and not before.
-
-Getting back in when that goes wrong: the VM has a console. Open it from
-Hyper-V Manager, sign in as Administrator with the password (console logon is
+Getting back in when ssh breaks: the VM has a console. Open it from Hyper-V
+Manager, sign in as Administrator with the password (console logon is
 unaffected by `sshd_config`), and either fix the file or
-`Set-Service sshd -StartupType Automatic; Start-Service sshd`. Locking yourself
-out of ssh is recoverable; there is no state on this VM worth protecting beyond
-that, and a rebuild from `provision.ps1` is the fallback.
+`Set-Service sshd -StartupType Automatic; Start-Service sshd`. Losing ssh is
+recoverable; there is no state on this VM worth protecting beyond that, and a
+rebuild from `provision.ps1` is the fallback.
 
 ## Provisioning
 
