@@ -5,7 +5,7 @@
 #   .\ci\windows\remote.ps1 doctor       # report on the VM, change nothing
 #   .\ci\windows\remote.ps1 clean        # drop the VM's cargo target cache
 #
-# The far end is a Hyper-V VM running Windows Server 2022 with rustup and the
+# The far end is a Hyper-V VM running Windows Server 2025 with rustup and the
 # MSVC build tools installed machine-wide; ci/windows/ci.ps1 is the half that
 # runs over there. See docs/windows-vm-ci.md for how the VM was built.
 #
