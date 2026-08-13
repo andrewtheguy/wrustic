@@ -6,9 +6,10 @@ build with `keychain,smb-tun` on. This describes how to run those same three
 steps on a local Windows Server VM, so a Windows-only failure can be found
 without pushing a branch and waiting.
 
-The VM is close to the runner but not equal to it: `windows-latest` is
-currently **Windows Server 2025** on the `windows-2025-vs2026` image, and this
-VM is Server 2022 with VS Build Tools 17. See
+The VM tracks the runner on both halves of the image name: `windows-latest` is
+currently the `windows-2025-vs2026` image — **Windows Server 2025** with
+**Visual Studio 2026** — and this VM is Server 2025 with the VS 2026 build
+tools. It is still not the same machine; see
 [Where this is not the real runner](#where-this-is-not-the-real-runner).
 
 Everything is in `ci/windows/`:
@@ -23,40 +24,48 @@ Everything is in `ci/windows/`:
 dev box directly — `.\ci\windows\ci.ps1` — when you just want the three steps
 without the trip over ssh.
 
-## Why a VM rather than a container
-
-This replaces an earlier setup that ran the same steps in a Windows container
-on the dev box. The VM is better on the points that matter:
-
-- **It is a whole Server install, not an image slice.** The container was
-  `servercore:ltsc2022` — same kernel, but a far smaller image than any
-  runner's. A full Server guest can be moved onto whatever release
-  `windows-latest` points at; a base image cannot be made to grow into one.
-- **Nothing is installed on the dev box.** No container engine, no daemon
-  running as a service, no `nat` switch, no 20 GB of layers under
-  `C:\ProgramData\docker`.
-- **The rmeta problem is gone.** Under process isolation rustc could not emit
-  `.rmeta` into a mapped directory, which forced Hyper-V isolation and a
-  ~15-second utility-VM boot on every run. A VM has no mapped directories in
-  the build path, so nothing to work around.
-
-What it costs: the VM's disk and RAM, always allocated, and provisioning is an
-imperative script rather than a Dockerfile — so it is idempotent by hand
-(see below) rather than by construction.
-
 ## The VM
 
-`ci-builder`, on this machine's Hyper-V: 4 vCPU, 8 GB RAM, 128 GB disk,
-Windows Server 2022 Datacenter **Evaluation**, at `10.22.38.75`. The
-evaluation edition is time-limited; when it lapses the VM stops being usable
-and has to be rebuilt or licensed.
+A whole Server guest, rather than a container, because it can be moved onto
+whatever release `windows-latest` points at and it keeps the dev box clean —
+no container engine, no daemon, no `nat` switch, no layer store. The price is
+disk and RAM that stay allocated, and a provisioning script that is idempotent
+only because every step is guarded by hand.
+
+`ci-builder`, on this machine's Hyper-V: 4 vCPU, dynamic memory (1 GB startup
+and minimum, 8 GB maximum), 128 GB disk, Windows Server 2025 Datacenter
+**Evaluation**, build 26100, at `10.22.38.75`. The evaluation edition is
+time-limited; when it lapses the VM stops being usable and has to be rebuilt or
+licensed.
+
+**It needs a page file, and a bare install may not have one.** With dynamic
+memory, Windows' commit limit is the RAM currently ballooned in plus the page
+file — so with no page file a 1 GB guest has a ~1.6 GB commit limit, and four
+parallel `rustc` processes exhaust it in seconds. What that looks like is not
+an out-of-memory message but a compiler that appears broken:
+
+```
+failed to mmap file '...libcore-....rlib': The paging file is too small for
+this operation to complete. (os error 1455)
+memory allocation of 129536 bytes failed
+error: could not compile `version_check` (lib) ... (exit code: 0xc0000409,
+STATUS_STACK_BUFFER_OVERRUN)
+```
+
+`0xc0000409` is Rust's abort path on Windows, not a corrupted toolchain — the
+allocation failure above it is the real error, and it lands on whichever trivial
+crate happened to be compiling. Leave the page file system-managed (`System
+Properties > Advanced > Performance > Virtual memory`, or
+`(Get-CimInstance Win32_ComputerSystem).AutomaticManagedPagefile`); it grows on
+demand, and dynamic memory needs it to signal pressure and balloon at all.
+Ballooning is also why RAM does not need to be raised: the guest reports 1–2 GB
+at rest and grows toward the 8 GB maximum under a build.
 
 ## SSH
 
-The VM had OpenSSH Server installed but unconfigured. `sshd` is now Automatic
-and running, and the `OpenSSH-Server-In-TCP` firewall rule is enabled for all
-profiles (the adapter is classified Private, so a Private-scoped rule would
-have been enough, but Any survives a reclassification).
+`sshd` runs Automatic, and the `OpenSSH-Server-In-TCP` firewall rule is enabled
+for all profiles — the adapter is classified Private, so a Private-scoped rule
+would do, but Any survives a reclassification.
 
 Auth is by key. `~/.ssh/wrustic-winci` is a dedicated ed25519 key with **no
 passphrase** — CI has to connect unattended, and a passphrase-less key scoped
@@ -85,8 +94,8 @@ denied":
 - **The ACL.** sshd refuses the file if anyone outside Administrators/SYSTEM
   can write it, and refuses it if the owner is neither.
 - **No BOM.** Windows PowerShell 5.1 writes UTF-8 *with* a BOM, and sshd then
-  rejects the file. It was written with `[System.IO.File]::WriteAllText` and
-  ASCII encoding, which cannot produce one. Check with:
+  rejects the file. Write it with `[System.IO.File]::WriteAllText` and ASCII
+  encoding, which cannot produce one. Check with:
 
 ```powershell
 [System.IO.File]::ReadAllBytes($akf)[0..2]   # want 115 115 104, i.e. "ssh"
@@ -124,10 +133,54 @@ logs two skips and finishes in a second.
 
 It installs two things:
 
-- **VS Build Tools 17** into `C:\BuildTools`, workload
+- **VS Build Tools 2026** into `C:\BuildTools`, workload
   `Microsoft.VisualStudio.Workload.VCTools` with `--includeRecommended` —
-  that flag is what brings the Windows SDK along with the compiler.
+  that flag is what brings the Windows SDK along with the compiler. See
+  [The build tools step](#the-build-tools-step); it is more than one
+  `Start-Process`.
 - **rustup**, `stable-x86_64-pc-windows-msvc` with the `clippy` component.
+
+### The build tools step
+
+The bootstrapper comes from `https://aka.ms/vs/18/stable/vs_BuildTools.exe`.
+**Note the channel.** VS 2026 uses `stable`/`insiders` where VS 2022 used
+`release`, and `aka.ms/vs/18/release/...` is not a dead link — unknown `aka.ms`
+shortlinks redirect to a Bing search, so it answers `200` and writes an HTML
+page over `vs_BuildTools.exe`. Checking the HTTP status proves nothing.
+
+Whether the step runs at all is decided by `vswhere`, not `Test-Path`, on two
+questions:
+
+- **Is it complete?** An install interrupted part way — the VM reboots, the
+  task is killed — leaves `C:\BuildTools\VC\Tools\MSVC` populated but the
+  toolchain unusable, and `Test-Path` would call that good and hand every later
+  run a compiler that cannot link. `isComplete`/`isLaunchable` are false for
+  such an instance. It is deliberately not deleted: the bootstrapper resumes
+  one, which is far cheaper than starting over.
+- **Is it the right product line?** `installationVersion` major 18 is VS 2026.
+  An older instance would build perfectly well while testing a compiler the
+  runner does not have, which is the one thing this box exists to prevent.
+
+An instance failing the second question is uninstalled and replaced, and both
+halves of that have a trap:
+
+- `vs_installer.exe uninstall` **rejects `--wait`** — exit 87,
+  `ERROR_INVALID_PARAMETER`, and no log written to say so. `-Wait` on
+  `Start-Process` is what blocks. Exit 3010 is success with a restart pending.
+  (The bootstrapper, confusingly, does accept `--wait`.)
+- Uninstalling deregisters the instance but **leaves the directory behind**,
+  and the installer refuses a non-empty target: `Visual Studio cannot be
+  installed to a nonempty directory 'C:\BuildTools'`, exit 1 — logged as a
+  *warning* in `%TEMP%\dd_installer_*.log`, with nothing in
+  `dd_setup_*_errors.log`. So the leftover shell goes whenever there is no
+  instance left to resume.
+
+Drop the build cache after the toolset changes — `.\ci\windows\remote.ps1
+clean`. Cargo fingerprints do not include the MSVC version, so C code compiled
+by the old toolset would otherwise be linked into the new one's output without
+a rebuild.
+
+## Rust
 
 Rust is installed **machine-wide**, not into a profile:
 
@@ -186,8 +239,8 @@ the whole story; there is no image to rebuild.
 `C:\ci-workspaces\wrustic`).
 
 The first run is cold in two ways — it fetches the whole crates.io graph and
-compiles it three times over, once per step — and took a bit over ten minutes
-on 4 vCPU, of which the release build alone was 6m26s. After that the registry
+compiles it three times over, once per step — and takes a bit over ten minutes
+on 4 vCPU, of which the release build alone is about five. After that the registry
 lives in `C:\rust\cargo` and the build cache in `C:\ci-cache\target`, and both
 survive the workspace being replaced, so later runs only rebuild what changed —
 a warm run with no source changes is about 20 seconds end to end, most of it
@@ -198,7 +251,7 @@ of pushing a branch is to test what is in front of you, uncommitted changes
 included. There is no git on the VM and nothing needs it — cargo fetches
 crates.io over the sparse protocol, and the crate has no git dependencies.
 
-## Two things that shape `remote.ps1`
+## Three things that shape `remote.ps1`
 
 **The transfer is a file, not a pipe.** The obvious `tar -czf - . | ssh "tar
 -xzf -"` does not work from PowerShell: a native-to-native pipeline is text,
@@ -232,16 +285,24 @@ it.
 
 Worth knowing before trusting a green run:
 
-- **The OS is a release behind.** `windows-latest` is Windows Server 2025
-  (image `windows-2025-vs2026`); this VM is Server 2022, build 20348. Check
-  with `gh run view <id> --log | grep 'Image:'` — GitHub moves the label, and
-  the two silently diverge when it does. Two ways to close the gap when it
-  starts mattering: rebuild the VM on Server 2025, or pin the workflow to
-  `runs-on: windows-2022`. Pinning is the wrong one — it makes CI test an OS
-  older than the one users get.
-- **The toolchain floats, and differs.** The runner image ships VS 2026 build
-  tools; this VM has VS Build Tools 17 (VS 2022). Rust is pinned by the image
-  on GitHub and is whatever `stable` was on install day here. All of it drifts.
+- **The OS matches, for now.** Both are Windows Server 2025 build 26100
+  (`windows-latest` is the `windows-2025-vs2026` image). GitHub moves the
+  label without notice, so re-check rather than assume:
+  `gh run view <id> --log | grep 'Image:'`. When it moves again, rebuild the
+  VM on the new release — do not pin the workflow to an older `runs-on`, which
+  would make CI test an OS older than the one users get.
+- **The compiler is the same product, not the same install.** The runner has
+  Visual Studio *Enterprise* 2026; this VM has the *Build Tools* — the same
+  MSVC toolset and Windows SDK without the IDE, which is all a Rust build
+  touches. The runner also keeps older toolsets side by side (`VC.14.44`, and
+  `VC.14.29` for ARM), so a project pinning one would get it there and not
+  here; nothing in this repo does.
+- **Both toolchains float, and neither is pinned.** Rust here is whatever
+  `stable` was on install day (`rustup update` is the whole story); on GitHub
+  it is whatever the image ships. The VS build tools update on their own
+  channel. Re-read the versions rather than trusting this paragraph — the
+  provisioning log records the MSVC toolset it installed, and
+  `.\ci\windows\remote.ps1 doctor` reports what is there now.
 - **It is a bare Server install.** `windows-latest` carries an enormous
   preinstalled toolbox. This VM has MSVC, the Windows SDK and rustup, and
   nothing else — a test that quietly depends on some other preinstalled tool
