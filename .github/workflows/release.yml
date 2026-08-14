@@ -193,6 +193,11 @@ jobs:
             # root:wheel. mkdir -p leaves an existing directory's owner and
             # mode alone. So the pkg's payload is /opt/wrustic and nothing
             # else.
+            #
+            # macOS has no package manager to undo an install, so the
+            # uninstaller rides along in the payload: whatever version is on
+            # the machine, the script that removes it is next to it.
+            install -m 0755 ci/macos/uninstall.sh pkgroot/opt/wrustic/uninstall.sh
             mkdir -p scripts
             cat > scripts/postinstall <<'POSTINSTALL'
           #!/bin/sh

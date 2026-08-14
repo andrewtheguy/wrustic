@@ -97,8 +97,18 @@ curl -fsSLO https://github.com/andrewtheguy/wrustic/releases/latest/download/wru
 sudo installer -pkg wrustic-macos-arm64.pkg -target /
 ```
 
-To remove it: `sudo rm -rf /opt/wrustic /usr/local/bin/wrustic` and
-`sudo pkgutil --forget com.andrewtheguy.wrustic`.
+The package installs its own uninstaller at `/opt/wrustic/uninstall.sh`
+(source: `ci/macos/uninstall.sh`). It removes `/opt/wrustic`, the
+`/usr/local/bin/wrustic` symlink — only while that symlink still points into
+`/opt/wrustic` — and the installer receipt:
+
+```sh
+sudo /opt/wrustic/uninstall.sh             # --dry-run first to see the list
+```
+
+That leaves this user's data alone. Add `--purge` to delete it too: the config
+directory, the restic cache wrustic keeps for itself, and any passphrases
+saved in the login keychain. Backup repositories are never touched either way.
 
 ### Windows
 
