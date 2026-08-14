@@ -144,7 +144,7 @@ Commands (headless, for scripts and scheduled tasks — no TUI is started):
 Options:
       --json                  With `env` or `profiles`: print JSON instead of
                               plain lines.
-  -c, --config-dir <PATH>     Use <PATH> as the wrustic config directory instead
+  -d, --config-dir <PATH>     Use <PATH> as the wrustic config directory instead
                               of the WRUSTIC_CONFIG_DIR environment variable or
                               the platform default (~/.config/wrustic on Linux).
                               The directory will be created on first run.
@@ -285,7 +285,7 @@ requires compiling with `--features smb-tun`"
             "--no-restic-cache" => cli.restic_cache = false,
             "--no-mouse" => cli.no_mouse = true,
             "--no-keychain" => cli.no_keychain = true,
-            "-c" | "--config-dir" => {
+            "-d" | "--config-dir" => {
                 let value = args
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("{arg} requires a path argument"))?;
@@ -455,6 +455,8 @@ mod tests {
         for argv in [
             &["env", "myrepo", "--json", "--config-dir", "d"][..],
             &["--config-dir", "d", "--json", "env", "myrepo"][..],
+            &["env", "myrepo", "--json", "-d", "d"][..],
+            &["--config-dir=d", "--json", "env", "myrepo"][..],
         ] {
             let cli = parse(argv).expect("parses");
             assert_eq!(

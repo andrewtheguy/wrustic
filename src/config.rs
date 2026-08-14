@@ -11,7 +11,7 @@ use crate::crypto::{Cipher, is_passphrase_encrypted};
 const CONFIG_DIR_NAME: &str = "wrustic";
 const CONFIG_FILE: &str = "config.toml";
 const LOCK_FILE: &str = "config.lock";
-/// Default config directory when `-c/--config-dir` is not given.
+/// Default config directory when `-d/--config-dir` is not given.
 pub const CONFIG_DIR_ENV: &str = "WRUSTIC_CONFIG_DIR";
 const CONFIG_VERSION: u32 = 2;
 
@@ -127,7 +127,7 @@ pub fn paths(override_dir: Option<PathBuf>) -> Result<Paths> {
     resolve_paths(override_dir, std::env::var_os(CONFIG_DIR_ENV))
 }
 
-/// `-c/--config-dir` beats `WRUSTIC_CONFIG_DIR` beats the platform default.
+/// `-d/--config-dir` beats `WRUSTIC_CONFIG_DIR` beats the platform default.
 /// An empty environment value counts as unset, matching how shells leave
 /// cleared variables behind.
 fn resolve_paths(
@@ -625,7 +625,7 @@ mod tests {
 
         let flag = PathBuf::from("flag-dir");
         let p = resolve_paths(Some(flag.clone()), Some(env_dir))?;
-        assert_eq!(p.dir, flag, "-c/--config-dir must beat the env var");
+        assert_eq!(p.dir, flag, "-d/--config-dir must beat the env var");
 
         let p = resolve_paths(None, Some(std::ffi::OsString::new()))?;
         assert_ne!(

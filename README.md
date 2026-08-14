@@ -138,7 +138,7 @@ all.
 ### CLI flags
 
 ```text
-wrustic [-c|--config-dir <PATH>] [-p|--port <N>] [--smb-port <N>] [--no-restic-cache] [--no-keychain] [-h|--help]
+wrustic [-d|--config-dir <PATH>] [-p|--port <N>] [--smb-port <N>] [--no-restic-cache] [--no-keychain] [-h|--help]
 wrustic env <PROFILE> [--json]
 wrustic profiles [--json]
 ```
@@ -147,7 +147,7 @@ wrustic profiles [--json]
 `$XDG_CONFIG_HOME/wrustic` (else `~/.config/wrustic`) on Linux,
 `~/Library/Application Support/wrustic` on macOS,
 `%APPDATA%\wrustic` on Windows. The `WRUSTIC_CONFIG_DIR` environment variable
-sets the same thing with lower precedence (`-c` flag beats it, it beats the
+sets the same thing with lower precedence (`-d` flag beats it, it beats the
 platform default; an empty value counts as unset) — set it once when the
 config lives somewhere non-default, e.g. inside a versioned repo, so plain
 `wrustic` and `wrustic env` find it without the flag. Also useful for keeping
