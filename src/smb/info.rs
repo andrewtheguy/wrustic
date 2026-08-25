@@ -662,8 +662,10 @@ mod tests {
             let name_start = offset + 104;
             let name = String::from_utf16_lossy(
                 &buf[name_start..name_start + name_len]
-                    .chunks_exact(2)
-                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| u16::from_le_bytes(*c))
                     .collect::<Vec<_>>(),
             );
             seen.push(name);

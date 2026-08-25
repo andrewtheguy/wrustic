@@ -1382,8 +1382,10 @@ mod tests {
                 u32::from_le_bytes(buf[offset + 60..offset + 64].try_into().unwrap()) as usize;
             let start = offset + 104;
             let units: Vec<u16> = buf[start..start + name_len]
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes(*c))
                 .collect();
             names.push(String::from_utf16_lossy(&units));
             if next == 0 {

@@ -207,8 +207,10 @@ pub(crate) fn from_utf16le(b: &[u8]) -> Result<String> {
         bail!("UTF-16LE field has odd length {}", b.len());
     }
     let units: Vec<u16> = b
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect();
     Ok(String::from_utf16_lossy(&units))
 }
