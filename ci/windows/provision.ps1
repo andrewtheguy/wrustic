@@ -5,14 +5,19 @@
 # 20-minute installer half way:
 #
 #   $a  = New-ScheduledTaskAction -Execute 'powershell.exe' `
-#           -Argument '-NoProfile -ExecutionPolicy Bypass -File C:\provision\provision.ps1'
+#           -Argument '-NoProfile -ExecutionPolicy Bypass -File C:\ci-workspaces\provision\provision.ps1'
 #   $pr = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
 #   Register-ScheduledTask -TaskName 'wrustic-provision' -Action $a -Principal $pr
 #   Start-ScheduledTask -TaskName 'wrustic-provision'
 #
 # Every step is guarded, so re-running it after adding a step is a no-op for
-# everything already installed. Progress goes to C:\provision\provision.log;
-# the last line is DONE-OK or DONE-FAIL.
+# everything already installed. Progress goes to
+# C:\ci-workspaces\provision\provision.log; the last line is DONE-OK or DONE-FAIL.
+#
+# C:\ci-workspaces is the staging root: every scratch file either this script or
+# remote.ps1 writes — installers, logs, the shipped tree, the build cache —
+# lives under it. Only the two toolchains, which are installations rather than
+# scratch, land elsewhere (C:\BuildTools and C:\rust).
 #
 # See docs/windows-vm-ci.md.
 $ErrorActionPreference = 'Stop'
@@ -21,7 +26,7 @@ $ErrorActionPreference = 'Stop'
 # and ssh logs in as Administrator; a per-profile install would land in
 # SYSTEM's profile and be invisible to every CI run.
 
-function Log($m) { "[{0:HH:mm:ss}] {1}" -f (Get-Date), $m | Tee-Object -FilePath C:\provision\provision.log -Append }
+function Log($m) { "[{0:HH:mm:ss}] {1}" -f (Get-Date), $m | Tee-Object -FilePath C:\ci-workspaces\provision\provision.log -Append }
 
 # The instance installed at C:\BuildTools, or $null. -products *: Build Tools
 # is not in vswhere's default product set.
@@ -60,7 +65,7 @@ function Add-MachinePath($dir) {
 
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    New-Item -ItemType Directory -Force -Path C:\provision | Out-Null
+    New-Item -ItemType Directory -Force -Path C:\ci-workspaces\provision | Out-Null
 
     # --- MSVC toolchain + Windows SDK -------------------------------------
     if (-not (Test-BuildToolsCurrent)) {
@@ -100,11 +105,11 @@ try {
         # channel: VS 2026 replaced `release` with `stable`/`insiders`, so
         # aka.ms/vs/18/release/... is not a broken link, it is a Bing search
         # that returns 200 and downloads an HTML page over the .exe.
-        Invoke-WebRequest 'https://aka.ms/vs/18/stable/vs_BuildTools.exe' -OutFile C:\provision\vs_BuildTools.exe -UseBasicParsing
+        Invoke-WebRequest 'https://aka.ms/vs/18/stable/vs_BuildTools.exe' -OutFile C:\ci-workspaces\provision\vs_BuildTools.exe -UseBasicParsing
         Log 'installing VC++ build tools + Windows SDK (long)'
         # --includeRecommended is what drags in the Windows SDK and the CMake
         # that $CMakeBin points at; without it you get a compiler and no SDK.
-        $p = Start-Process C:\provision\vs_BuildTools.exe -Wait -PassThru -ArgumentList @(
+        $p = Start-Process C:\ci-workspaces\provision\vs_BuildTools.exe -Wait -PassThru -ArgumentList @(
             '--quiet', '--wait', '--norestart', '--nocache',
             '--installPath', 'C:\BuildTools',
             '--add', 'Microsoft.VisualStudio.Workload.VCTools',
@@ -126,9 +131,9 @@ try {
 
     if (-not (Test-Path 'C:\rust\cargo\bin\rustc.exe')) {
         Log 'downloading rustup-init.exe'
-        Invoke-WebRequest 'https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe' -OutFile C:\provision\rustup-init.exe -UseBasicParsing
+        Invoke-WebRequest 'https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe' -OutFile C:\ci-workspaces\provision\rustup-init.exe -UseBasicParsing
         Log 'installing rust stable (msvc) + clippy'
-        $p = Start-Process C:\provision\rustup-init.exe -Wait -PassThru -ArgumentList @(
+        $p = Start-Process C:\ci-workspaces\provision\rustup-init.exe -Wait -PassThru -ArgumentList @(
             '-y', '--no-modify-path', '--profile', 'minimal',
             '--default-toolchain', 'stable-x86_64-pc-windows-msvc',
             '--component', 'clippy'
@@ -150,12 +155,13 @@ try {
     # C:\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin
 
     # --- Cargo cache layout -----------------------------------------------
-    # Outside the workspace: remote.ps1 replaces the workspace directory
-    # outright on every run, so a target dir inside it would compile from cold
-    # every time. Incremental is off because those artefacts are never reused
-    # across a workspace that is recreated each run.
-    New-Item -ItemType Directory -Force -Path 'C:\ci-cache\target', 'C:\ci-workspaces' | Out-Null
-    [Environment]::SetEnvironmentVariable('CARGO_TARGET_DIR', 'C:\ci-cache\target', 'Machine')
+    # A sibling of the workspace inside the staging root, not a child of it:
+    # remote.ps1 replaces the workspace directory outright on every run, so a
+    # target dir inside it would compile from cold every time. Incremental is
+    # off because those artefacts are never reused across a workspace that is
+    # recreated each run.
+    New-Item -ItemType Directory -Force -Path 'C:\ci-workspaces\cargo-target' | Out-Null
+    [Environment]::SetEnvironmentVariable('CARGO_TARGET_DIR', 'C:\ci-workspaces\cargo-target', 'Machine')
     [Environment]::SetEnvironmentVariable('CARGO_INCREMENTAL', '0', 'Machine')
 
     # sshd captured its environment when the service started, and children

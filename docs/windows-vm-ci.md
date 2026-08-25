@@ -67,16 +67,15 @@ at rest and grows toward the 8 GB maximum under a build.
 for all profiles — the adapter is classified Private, so a Private-scoped rule
 would do, but Any survives a reclassification.
 
-Auth is by key. `~/.ssh/wrustic-winci` is a dedicated ed25519 key with **no
-passphrase** — CI has to connect unattended, and a passphrase-less key scoped
-to one sandbox VM is the smaller evil versus an agent that must be unlocked.
-`~/.ssh/config` carries the alias:
+Auth is by key: this machine's default `~/.ssh/id_ed25519`, which has **no
+passphrase** — CI has to connect unattended, and a passphrase-less key is the
+smaller evil versus an agent that must be unlocked. `~/.ssh/config` carries the
+alias `remote.ps1` connects to:
 
 ```
- Host winci
+ Host windows-ci-build
     HostName 10.22.38.75
     User Administrator
-    IdentityFile ~/.ssh/wrustic-winci
 ```
 
 **Keys for an administrator account do not go in `~/.ssh/authorized_keys`.**
@@ -110,8 +109,9 @@ rebuild from `provision.ps1` is the fallback.
 
 ## Provisioning
 
-`ci/windows/provision.ps1`, deployed to `C:\provision\provision.ps1` on the VM
-and run as a SYSTEM scheduled task, logging to `C:\provision\provision.log`
+`ci/windows/provision.ps1`, deployed to
+`C:\ci-workspaces\provision\provision.ps1` on the VM and run as a SYSTEM
+scheduled task, logging to `C:\ci-workspaces\provision\provision.log`
 with `DONE-OK` or `DONE-FAIL` as its last line. It runs as a task rather than
 inline over WinRM so a dropped connection cannot kill a 20-minute installer
 half way, and every step is guarded so re-running it is a no-op — a second run
@@ -174,7 +174,7 @@ Rust is installed **machine-wide**, not into a profile:
 RUSTUP_HOME       C:\rust\rustup
 CARGO_HOME        C:\rust\cargo
 Path             += C:\rust\cargo\bin
-CARGO_TARGET_DIR  C:\ci-cache\target
+CARGO_TARGET_DIR  C:\ci-workspaces\cargo-target
 CARGO_INCREMENTAL 0
 ```
 
@@ -183,10 +183,11 @@ Administrator; a default rustup install would land in SYSTEM's profile and be
 invisible to every CI run. Machine-scoped variables and a machine PATH entry
 are what make the two agree.
 
-`CARGO_TARGET_DIR` points outside the workspace deliberately: `remote.ps1`
-replaces the workspace directory outright on every run, so a target directory
-inside it would mean compiling from cold every time. Kept at `C:\ci-cache`, the
-build cache survives the swap. `CARGO_INCREMENTAL=0` because incremental
+`CARGO_TARGET_DIR` is a sibling of the workspace, not a child, deliberately:
+`remote.ps1` replaces the workspace directory outright on every run, so a
+target directory inside it would mean compiling from cold every time. Kept at
+`C:\ci-workspaces\cargo-target`, the build cache survives the swap while still
+staying inside the staging root. `CARGO_INCREMENTAL=0` because incremental
 artefacts are never reused across a workspace that is recreated each run —
 they would only cost disk.
 
@@ -220,14 +221,15 @@ the whole story; there is no image to rebuild.
 .\ci\windows\remote.ps1 clean        # drop the VM's cargo target cache
 ```
 
-`WRUSTIC_WINCI_HOST` overrides the ssh target (default: the `winci` alias) and
-`WRUSTIC_WINCI_REMOTE_DIR` the landing directory (default
-`C:\ci-workspaces\wrustic`).
+`WRUSTIC_WINCI_HOST` overrides the ssh target (default: the
+`windows-ci-build` alias) and `WRUSTIC_WINCI_STAGING` the staging root
+(default `C:\ci-workspaces`), under which the workspace, its lock, the upload
+and the build cache all live.
 
 The first run is cold in two ways — it fetches the whole crates.io graph and
 compiles it three times over, once per step — and takes a bit over ten minutes
 on 4 vCPU, of which the release build alone is about five. After that the registry
-lives in `C:\rust\cargo` and the build cache in `C:\ci-cache\target`, and both
+lives in `C:\rust\cargo` and the build cache in `C:\ci-workspaces\cargo-target`, and both
 survive the workspace being replaced, so later runs only rebuild what changed —
 a warm run with no source changes is about 20 seconds end to end, most of it
 the transfer.
@@ -242,29 +244,33 @@ crates.io over the sparse protocol, and the crate has no git dependencies.
 **The transfer is a file, not a pipe.** The obvious `tar -czf - . | ssh "tar
 -xzf -"` does not work from PowerShell: a native-to-native pipeline is text,
 not bytes, and PowerShell re-encodes it, corrupting the archive. So the tree is
-packed to a temp `.tgz`, handed to `scp`, and unpacked at the far end. The
-happy side effect is that a half-finished transfer can never be unpacked.
+packed to a `.tgz`, handed to `scp`, and unpacked at the far end. The happy
+side effect is that a half-finished transfer can never be unpacked. Both ends
+of that transfer are staged: the archive is written to this repo's gitignored
+`tmp/` rather than the machine temp directory, and it lands in the staging root
+on the VM rather than the login user's home directory. Both copies are deleted
+when the run ends.
 
 **The workspace is replaced, not updated.** `tar` has no `--delete`, so
 unpacking over the previous tree would leave a file you deleted here still
 sitting there and still being compiled. `remote.ps1` removes the directory and
-recreates it. Nothing under it needs to survive — the cargo caches live in
-`C:\rust` and `C:\ci-cache`.
+recreates it. Nothing under it needs to survive — the registry cache lives in
+`C:\rust` and the build cache in the sibling `C:\ci-workspaces\cargo-target`.
 
 Paths on the remote side deliberately contain no spaces, so no remote command
 needs quoting. A quoted string has to survive PowerShell, then ssh, then
 cmd.exe, and the layers do not agree; not needing quotes is cheaper than
-getting them right. `WRUSTIC_WINCI_REMOTE_DIR` and `WRUSTIC_WINCI_TARGET_DIR`
-are checked against that rule before use — they are interpolated into command
-lines that include `rmdir /s /q`, and a space or an `&` in one of them is not a
-parse error so much as a demolition order.
+getting them right. `WRUSTIC_WINCI_STAGING` is checked against that rule
+before use — every remote path is built from it, including command lines that
+include `rmdir /s /q`, and a space or an `&` in it is not a parse error so much
+as a demolition order.
 
 **One run at a time.** The workspace and the cargo target directory are single
 and shared — that is what makes a warm run 20 seconds — so a second run
 starting mid-build would delete the tree the first is compiling. `remote.ps1`
 claims `C:\ci-workspaces\wrustic.lock` with `mkdir` (which fails, atomically,
 if it exists) and drops it in a `finally`. If a run is killed hard enough to
-skip that, the next one says so and prints the `ssh winci rmdir ...` to clear
+skip that, the next one says so and prints the `ssh windows-ci-build rmdir ...` to clear
 it.
 
 ## Where this is not the real runner

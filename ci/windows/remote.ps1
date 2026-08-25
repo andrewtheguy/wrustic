@@ -13,9 +13,14 @@
 # run this instead of pushing a branch is to test what you have in front of
 # you, uncommitted changes included.
 #
+# Everything either end writes is scratch, and all of it stays in a staging
+# directory: this repo's own gitignored tmp/ here, and one root on the VM that
+# holds the upload, the unpacked workspace, its lock and the cargo target cache.
+# Neither the machine temp directory nor the login home directory is written to.
+#
 # Overrides:
-#   WRUSTIC_WINCI_HOST        ssh target        (default: the 'winci' ssh alias)
-#   WRUSTIC_WINCI_REMOTE_DIR  landing directory (default: C:\ci-workspaces\wrustic)
+#   WRUSTIC_WINCI_HOST     ssh target   (default: the 'windows-ci-build' ssh alias)
+#   WRUSTIC_WINCI_STAGING  staging root (default: C:\ci-workspaces)
 param(
     [ValidateSet('ci', 'shell', 'doctor', 'clean')]
     [string] $Command = 'ci'
@@ -36,9 +41,16 @@ function Assert-RemotePath {
 }
 
 # Not $Host — that name is taken by an automatic variable.
-$Target    = if ($env:WRUSTIC_WINCI_HOST)       { $env:WRUSTIC_WINCI_HOST }       else { 'winci' }
-$RemoteDir = if ($env:WRUSTIC_WINCI_REMOTE_DIR) { $env:WRUSTIC_WINCI_REMOTE_DIR } else { 'C:\ci-workspaces\wrustic' }
-Assert-RemotePath $RemoteDir 'WRUSTIC_WINCI_REMOTE_DIR'
+$Target  = if ($env:WRUSTIC_WINCI_HOST)    { $env:WRUSTIC_WINCI_HOST }    else { 'windows-ci-build' }
+$Staging = if ($env:WRUSTIC_WINCI_STAGING) { $env:WRUSTIC_WINCI_STAGING } else { 'C:\ci-workspaces' }
+Assert-RemotePath $Staging 'WRUSTIC_WINCI_STAGING'
+
+# Both hang off the staging root, and the cache is a sibling of the workspace
+# rather than a child: the workspace is deleted outright on every run, so a
+# target directory inside it would compile from cold every time.
+$RemoteDir = "$Staging\wrustic"
+$CacheDir  = "$Staging\cargo-target"
+
 $ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 
 function Info($m) { Write-Host "[winci] $m" }
@@ -76,10 +88,6 @@ switch ($Command) {
     }
 
     'clean' {
-        # Not $target: PowerShell variable names are case-insensitive, so that
-        # would be the same variable as the $Target ssh host.
-        $CacheDir = if ($env:WRUSTIC_WINCI_TARGET_DIR) { $env:WRUSTIC_WINCI_TARGET_DIR } else { 'C:\ci-cache\target' }
-        Assert-RemotePath $CacheDir 'WRUSTIC_WINCI_TARGET_DIR'
         Info "dropping $CacheDir on $Target"
         Invoke-Remote "if exist $CacheDir rmdir /s /q $CacheDir"
         Info 'done'
@@ -92,10 +100,14 @@ switch ($Command) {
 # pipeline is text, not bytes, and it re-encodes — which corrupts the stream.
 # Writing a file and handing it to scp keeps the transfer binary-clean, and has
 # the side benefit that a half-finished transfer can never be unpacked.
-$Archive = Join-Path ([IO.Path]::GetTempPath()) "wrustic-winci-$PID.tgz"
-# Per-run, so two invocations cannot land on each other's upload in the shared
-# login home directory.
-$RemoteArchive = "wrustic-winci-src-$PID.tgz"
+# In this repo's tmp/, not the machine temp directory — scratch for this
+# project stays inside the project. tar excludes ./tmp, so the archive cannot
+# end up inside itself.
+$LocalStaging = Join-Path $ProjectRoot 'tmp'
+New-Item -ItemType Directory -Force -Path $LocalStaging | Out-Null
+$Archive = Join-Path $LocalStaging "wrustic-winci-$PID.tgz"
+# Per-run, so two invocations cannot land on each other's upload.
+$RemoteArchive = "$Staging\wrustic-winci-src-$PID.tgz"
 
 # The workspace and the cargo target directory are single, fixed and shared by
 # design — that is what makes a warm run 20 seconds. It also means a second run
@@ -103,6 +115,10 @@ $RemoteArchive = "wrustic-winci-src-$PID.tgz"
 # Claim the workspace first: mkdir on an existing directory fails, and fails
 # atomically, which is all a lock has to do.
 $Lock = "${RemoteDir}.lock"
+# The staging root is the one directory this script creates outside its own
+# scratch; provision.ps1 makes it too, so normally this is a no-op.
+& ssh $Target "if not exist $Staging mkdir $Staging"
+if ($LASTEXITCODE -ne 0) { throw "could not create $Staging on $Target" }
 & ssh $Target "mkdir $Lock"
 if ($LASTEXITCODE -ne 0) {
     throw "$Target is busy: $Lock already exists. Either another run holds the workspace, or one died holding it — clear it with: ssh $Target rmdir $Lock"
@@ -110,25 +126,27 @@ if ($LASTEXITCODE -ne 0) {
 
 try {
     Info "packing $(Split-Path -Leaf $ProjectRoot)"
-    # -L: ship symlinks (AGENTS.md -> CLAUDE.md) as regular files — cmd.exe's
-    # tar on the VM cannot recreate them, and a Windows checkout would have
-    # materialized them as files anyway.
-    & tar -C $ProjectRoot -L --exclude=./target --exclude=./tmp --exclude=./.git -czf $Archive .
+    # --dereference: ship symlinks (AGENTS.md -> CLAUDE.md) as regular files —
+    # cmd.exe's tar on the VM cannot recreate them, and a Windows checkout
+    # would have materialized them as files anyway. Spelled long because the
+    # client may be either tar: -L is bsdtar's dereference and GNU tar's
+    # --tape-length, which fails with `Invalid tape length`.
+    & tar -C $ProjectRoot --dereference --exclude=./target --exclude=./tmp --exclude=./.git -czf $Archive .
     if ($LASTEXITCODE -ne 0) { throw "tar failed (exit $LASTEXITCODE)" }
 
-    Info "copying to ${Target}:${RemoteDir}"
-    # A relative destination lands in the login user's home directory, which
-    # sidesteps scp's habit of reading the colon in C:\... as a host separator.
+    Info "copying to ${Target}:${RemoteArchive}"
+    # scp splits the destination on its *first* colon, so the drive letter here
+    # is part of the path and not a second host spec.
     & scp -q $Archive "${Target}:$RemoteArchive"
     if ($LASTEXITCODE -ne 0) { throw "scp failed (exit $LASTEXITCODE)" }
 
     # Replace the workspace outright. tar has no --delete, so unpacking over
     # the old tree would leave a file deleted here still sitting there, still
-    # getting compiled. The cargo target directory lives outside the workspace
+    # getting compiled. The cargo target directory is a sibling, not a child
     # (CARGO_TARGET_DIR on the VM), so the build cache survives this.
     Invoke-Remote "if exist $RemoteDir rmdir /s /q $RemoteDir"
     Invoke-Remote "mkdir $RemoteDir"
-    Invoke-Remote "tar -xzf %USERPROFILE%\$RemoteArchive -C $RemoteDir"
+    Invoke-Remote "tar -xzf $RemoteArchive -C $RemoteDir"
 
     if ($Command -eq 'shell') {
         Info "opening a shell on $Target at $RemoteDir"
@@ -141,7 +159,7 @@ try {
 }
 finally {
     Remove-Item -LiteralPath $Archive -Force -ErrorAction SilentlyContinue
-    # Don't leave a copy of the source tree in the login home dir, and never
+    # Don't leave a copy of the source tree in the staging root, and never
     # leave the lock behind — a stale one blocks every later run.
-    try { & ssh $Target "del %USERPROFILE%\$RemoteArchive & rmdir $Lock" 2>&1 | Out-Null } catch { }
+    try { & ssh $Target "del $RemoteArchive & rmdir $Lock" 2>&1 | Out-Null } catch { }
 }
