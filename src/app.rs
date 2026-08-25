@@ -2715,7 +2715,43 @@ mod tests {
         assert!(matches!(entries.last(), Some(FilterDimEntry::Clear)));
     }
 
-    fn boot_app_with_snapshots(snaps: Vec<SnapshotRow>) -> App {
+    /// A booted [`App`] and the throwaway config directory it holds the lock
+    /// on. Derefs to the `App`, so a test uses it as if it were one.
+    ///
+    /// The directory is removed when the test ends, panic included — without
+    /// this every run left one behind under tmp/.
+    struct TestApp {
+        // Only ever `None` inside `drop`, where the app has to go before the
+        // directory does.
+        app: Option<App>,
+        dir: std::path::PathBuf,
+    }
+
+    impl std::ops::Deref for TestApp {
+        type Target = App;
+
+        fn deref(&self) -> &App {
+            self.app.as_ref().expect("app dropped before the test ended")
+        }
+    }
+
+    impl std::ops::DerefMut for TestApp {
+        fn deref_mut(&mut self) -> &mut App {
+            self.app.as_mut().expect("app dropped before the test ended")
+        }
+    }
+
+    impl Drop for TestApp {
+        fn drop(&mut self) {
+            // The app owns the config lock, and Windows refuses to remove a
+            // directory that still has an open file in it — so the app is
+            // dropped first, not left to the field-drop that follows this.
+            drop(self.app.take());
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn boot_app_with_snapshots(snaps: Vec<SnapshotRow>) -> TestApp {
         // Test workspaces live under the project's tmp/, not the system temp
         // dir (project convention — avoids permission surprises).
         let tmp = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2726,12 +2762,15 @@ mod tests {
                 uniq()
             ));
         std::fs::create_dir_all(&tmp).expect("create test config dir");
-        let paths = config::paths(Some(tmp)).expect("paths");
+        let paths = config::paths(Some(tmp.clone())).expect("paths");
         let lock = config::acquire_lock(&paths).expect("lock fresh test config dir");
         let mut app =
             App::boot(paths, lock, 7834, crate::cli::SmbOptions::default(), false).expect("boot");
         app.snapshots = snaps;
-        app
+        TestApp {
+            app: Some(app),
+            dir: tmp,
+        }
     }
 
     // Cheap monotonic counter for unique config-dir names per test.

@@ -2813,8 +2813,7 @@ mod tests {
 
     #[test]
     fn smbclient_reads_file_content() {
-        let dir = tempdir_path("smb-read");
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let dir = ScratchDir::new("smb-read");
         let dest = dir.join("readme.txt");
         // Quoted: the scratch path runs through CARGO_MANIFEST_DIR, and
         // smbclient splits its -c command on whitespace.
@@ -2829,7 +2828,6 @@ mod tests {
             got, b"hello from a snapshot\n",
             "content read over SMB must match the source"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2849,8 +2847,7 @@ mod tests {
         .expect("server starts");
         let target = format!("//127.0.0.1/{}", handle.share_name);
 
-        let src = tempdir_path("smb-write");
-        std::fs::create_dir_all(&src).expect("scratch dir");
+        let src = ScratchDir::new("smb-write");
         let file = src.join("payload.txt");
         std::fs::write(&file, b"should not land").expect("write scratch file");
 
@@ -2864,7 +2861,6 @@ mod tests {
             .output()
             .expect("smbclient runs");
         handle.stop();
-        let _ = std::fs::remove_dir_all(&src);
 
         let combined = format!(
             "{}{}",
@@ -2878,10 +2874,29 @@ mod tests {
         );
     }
 
-    fn tempdir_path(tag: &str) -> std::path::PathBuf {
-        // Per the project convention, scratch data lives under tmp/.
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tmp")
-            .join(format!("{tag}-{}", std::process::id()))
+    /// A scratch directory under tmp/, removed when the test ends — including
+    /// the early return every one of these tests takes when smbclient is not
+    /// installed, which is always the case on Windows.
+    struct ScratchDir(std::path::PathBuf);
+
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            // Per the project convention, scratch data lives under tmp/.
+            let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tmp")
+                .join(format!("{tag}-{}", std::process::id()));
+            std::fs::create_dir_all(&path).expect("scratch dir");
+            Self(path)
+        }
+
+        fn join(&self, name: &str) -> std::path::PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 }
