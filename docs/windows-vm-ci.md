@@ -24,6 +24,11 @@ Everything is in `ci/windows/`:
 dev box directly — `.\ci\windows\ci.ps1` — when you just want the three steps
 without the trip over ssh.
 
+`remote.ps1` needs **PowerShell 7** on this machine: it drives the VM over
+PowerShell remoting on the SSH transport rather than by sending shell command
+lines, and that is a PowerShell 7 parameter set. See
+[PowerShell remoting, on the SSH transport](#powershell-remoting-on-the-ssh-transport).
+
 ## The VM
 
 A whole Server guest, rather than a container, because it can be moved onto
@@ -107,6 +112,63 @@ unaffected by `sshd_config`), and either fix the file or
 recoverable; there is no state on this VM worth protecting beyond that, and a
 rebuild from `provision.ps1` is the fallback.
 
+### PowerShell remoting, on the SSH transport
+
+`remote.ps1` does not hand shell command lines to the VM. It opens a
+PowerShell session on it — `New-PSSession -HostName windows-ci-build
+-SSHTransport` — and every remote step is a script block that runs verbatim in
+PowerShell 7 over there, with results coming back as objects.
+
+This is **not WinRM**. Nothing listens on 5985/5986, `Enable-PSRemoting` is
+never run, and there is no `TrustedHosts` list and no certificate: the
+transport is the same sshd, the same port and the same key as a plain
+`ssh windows-ci-build`. Two things make it work, both of them handled by
+`provision.ps1`:
+
+- **PowerShell 7 on the VM**, at `C:\Program Files\PowerShell\7\pwsh.exe`;
+  Windows PowerShell 5.1 speaks only WS-Man. This one is installed **by hand**,
+  from the MSI on the [PowerShell releases
+  page](https://github.com/PowerShell/PowerShell/releases) — `provision.ps1`
+  checks for it and stops rather than installing it. It must not be the
+  Microsoft Store package: that runs in an app container which sshd cannot
+  launch as a subsystem, so it leaves you with a working `pwsh` on the box and
+  a remoting connection that closes without an error to read. (winget is no
+  help here either — its source fails on a bare Server install with
+  `0x8a15000f`, *Data required by the source is missing*, after downloading
+  the package.)
+- **A subsystem line** in `C:\ProgramData\ssh\sshd_config`:
+
+  ```
+  Subsystem powershell C:\progra~1\PowerShell\7\pwsh.exe -sshs -NoLogo
+  ```
+
+  The 8.3 short path is required, not cosmetic: sshd splits the line on
+  whitespace, so `C:\Program Files\...` parses as a command followed by an
+  argument.
+
+sshd has to restart to read that line, and **restarting it from inside an ssh
+session kills the session that asked for it** — the service takes its children
+with it, including the PowerShell running `Restart-Service`, so whether the
+service comes back up is not something the caller gets to find out.
+`provision.ps1` runs as a scheduled task and is unaffected; by hand, put the
+restart in a task of its own:
+
+```
+schtasks /create /tn RestartSshdOnce /tr "powershell -NoProfile -Command Restart-Service sshd" /sc once /st 00:00 /ru SYSTEM /rl HIGHEST /f
+schtasks /run /tn RestartSshdOnce
+schtasks /delete /tn RestartSshdOnce /f
+```
+
+One line proves the whole path:
+
+```powershell
+pwsh -Command "Invoke-Command -HostName windows-ci-build -SSHTransport { $PSVersionTable.PSVersion }"
+```
+
+A connection that closes immediately is the subsystem line — check it is there
+and that sshd has restarted since. A permission denied is the key or the ACL
+above, and plain `ssh windows-ci-build` will fail the same way.
+
 ## Provisioning
 
 `ci/windows/provision.ps1`, deployed to
@@ -117,7 +179,8 @@ inline over WinRM so a dropped connection cannot kill a 20-minute installer
 half way, and every step is guarded so re-running it is a no-op — a second run
 logs two skips and finishes in a second.
 
-It installs two things:
+It installs two things, and requires a third — PowerShell 7 — to be there
+already:
 
 - **VS Build Tools 2026** into `C:\BuildTools`, workload
   `Microsoft.VisualStudio.Workload.VCTools` with `--includeRecommended` —
@@ -125,6 +188,14 @@ It installs two things:
   [The build tools step](#the-build-tools-step); it is more than one
   `Start-Process`.
 - **rustup**, `stable-x86_64-pc-windows-msvc` with the `clippy` component.
+
+It also adds the `Subsystem powershell` line to `sshd_config` — the line
+`remote.ps1` connects through, see
+[PowerShell remoting, on the SSH transport](#powershell-remoting-on-the-ssh-transport)
+— and stops with a message if PowerShell 7 is not installed, since that is a
+manual step. The config guard tests for *no line matched* rather than using
+`-notmatch`, which against an array filters it instead of answering the
+question and would append a second copy of the line on every run.
 
 ### The build tools step
 
@@ -221,6 +292,9 @@ the whole story; there is no image to rebuild.
 .\ci\windows\remote.ps1 clean        # drop the VM's cargo target cache
 ```
 
+Run it under PowerShell 7 (`pwsh`); under Windows PowerShell 5.1 it stops with
+a message saying so, because the remoting it uses does not exist there.
+
 `WRUSTIC_WINCI_HOST` overrides the ssh target (default: the
 `windows-ci-build` alias) and `WRUSTIC_WINCI_STAGING` the staging root
 (default `C:\ci-workspaces`), under which the workspace, its lock, the upload
@@ -239,17 +313,21 @@ of pushing a branch is to test what is in front of you, uncommitted changes
 included. There is no git on the VM and nothing needs it — cargo fetches
 crates.io over the sparse protocol, and the crate has no git dependencies.
 
-## Three things that shape `remote.ps1`
+## Four things that shape `remote.ps1`
 
 **The transfer is a file, not a pipe.** The obvious `tar -czf - . | ssh "tar
 -xzf -"` does not work from PowerShell: a native-to-native pipeline is text,
 not bytes, and PowerShell re-encodes it, corrupting the archive. So the tree is
-packed to a `.tgz`, handed to `scp`, and unpacked at the far end. The happy
-side effect is that a half-finished transfer can never be unpacked. Both ends
-of that transfer are staged: the archive is written to this repo's gitignored
-`tmp/` rather than the machine temp directory, and it lands in the staging root
-on the VM rather than the login user's home directory. Both copies are deleted
-when the run ends.
+packed to a `.tgz`, copied over the open session with `Copy-Item -ToSession`,
+and unpacked at the far end. The happy side effect is that a half-finished
+transfer can never be unpacked. Copying over the session rather than by `scp`
+costs nothing at this size — the archive is well under a megabyte — and saves a
+second authentication and a destination path that `scp` would try to split on
+its first colon, which is where the drive letter is. Both ends of that transfer
+are staged: the archive is written to this repo's gitignored `tmp/` rather than
+the machine temp directory, and it lands in the staging root on the VM rather
+than the login user's home directory. Both copies are deleted when the run
+ends.
 
 **The workspace is replaced, not updated.** `tar` has no `--delete`, so
 unpacking over the previous tree would leave a file you deleted here still
@@ -257,21 +335,31 @@ sitting there and still being compiled. `remote.ps1` removes the directory and
 recreates it. Nothing under it needs to survive — the registry cache lives in
 `C:\rust` and the build cache in the sibling `C:\ci-workspaces\cargo-target`.
 
-Paths on the remote side deliberately contain no spaces, so no remote command
-needs quoting. A quoted string has to survive PowerShell, then ssh, then
-cmd.exe, and the layers do not agree; not needing quotes is cheaper than
-getting them right. `WRUSTIC_WINCI_STAGING` is checked against that rule
-before use — every remote path is built from it, including command lines that
-include `rmdir /s /q`, and a space or an `&` in it is not a parse error so much
-as a demolition order.
+`WRUSTIC_WINCI_STAGING` is still checked before use, though the reason has
+narrowed. Remote steps are script blocks now, so a path with a space in it is
+just a string and no longer has to survive being quoted for PowerShell, then
+ssh, then cmd.exe. What has not changed is that every remote path is built from
+that root and two of them are handed to `Remove-Item -Recurse -Force`, so a
+`..` or a typo in it is a demolition order aimed at the wrong directory. Only a
+plain drive-letter path is accepted.
 
 **One run at a time.** The workspace and the cargo target directory are single
 and shared — that is what makes a warm run 20 seconds — so a second run
 starting mid-build would delete the tree the first is compiling. `remote.ps1`
-claims `C:\ci-workspaces\wrustic.lock` with `mkdir` (which fails, atomically,
-if it exists) and drops it in a `finally`. If a run is killed hard enough to
-skip that, the next one says so and prints the `ssh windows-ci-build rmdir ...` to clear
+claims `C:\ci-workspaces\wrustic.lock` by creating the directory (which fails,
+atomically, if it exists) and drops it in a `finally`. If a run is killed hard
+enough to skip that, the next one says so and prints the one-liner that clears
 it.
+
+**An exit code is not a result.** `ci.ps1` reports failure the way a CI script
+does, with `exit <code>`, and that does not cross a remoting boundary: the
+caller's `$LASTEXITCODE` is untouched by anything that happened remotely. So
+the code is parked in a session variable on the VM and read back in a second
+call — the same session, so the same runspace. The other half of the same
+problem is cargo's stderr, which arrives as error records: red, out of order
+with the rest of the log, and liable to be promoted to a terminating error by
+an `$ErrorActionPreference` the session inherited. `& $CiScript 2>&1` merges it
+into the output stream *on the VM*, before any of that can happen.
 
 ## Where this is not the real runner
 

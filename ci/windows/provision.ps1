@@ -154,6 +154,36 @@ try {
     # cmake, VS Build Tools already ships one that only needs a PATH entry:
     # C:\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin
 
+    # --- PowerShell 7 + the sshd remoting subsystem ------------------------
+    # remote.ps1 drives this box with PowerShell remoting over the SSH
+    # transport, which needs PowerShell 7 at both ends plus a Subsystem line
+    # telling sshd how to start it. Deliberately not WinRM: no service to
+    # enable, no TrustedHosts list, no certificate — the same sshd, port and
+    # key as a plain ssh session.
+    #
+    # PowerShell 7 itself is a prerequisite, not a step: this script checks for
+    # it and stops. It has to be the MSI build — a Microsoft Store package runs
+    # in an app container that sshd cannot launch as a subsystem, so installing
+    # the wrong one produces a working `pwsh` and a remoting path that closes
+    # the connection with no error to read.
+    $Pwsh = 'C:\Program Files\PowerShell\7\pwsh.exe'
+    if (-not (Test-Path $Pwsh)) {
+        throw "PowerShell 7 is missing ($Pwsh). Install it by hand from the MSI at https://github.com/PowerShell/PowerShell/releases — not the Microsoft Store build — and run this again."
+    }
+    Log "PowerShell $(& $Pwsh -NoProfile -NoLogo -Command '$PSVersionTable.PSVersion.ToString()') present"
+
+    $SshdConfig = 'C:\ProgramData\ssh\sshd_config'
+    # -match against an array *filters* it, so this is a test for "no line
+    # matched", not a negated match — `-notmatch` here would return every other
+    # line in the file and read as true on a config that already has it.
+    if (-not ((Get-Content $SshdConfig) -match '^\s*Subsystem\s+powershell\b')) {
+        # The 8.3 short path is not a stylistic choice: sshd splits a Subsystem
+        # line on whitespace, so C:\Program Files\... would be read as a
+        # command followed by an argument.
+        Add-Content -Path $SshdConfig -Value 'Subsystem powershell C:\progra~1\PowerShell\7\pwsh.exe -sshs -NoLogo'
+        Log 'added the powershell subsystem to sshd_config'
+    } else { Log 'sshd powershell subsystem already present, skipping' }
+
     # --- Cargo cache layout -----------------------------------------------
     # A sibling of the workspace inside the staging root, not a child of it:
     # remote.ps1 replaces the workspace directory outright on every run, so a
@@ -166,8 +196,9 @@ try {
 
     # sshd captured its environment when the service started, and children
     # inherit that block — so machine PATH changes are invisible over ssh until
-    # it restarts. Nothing else here takes effect without this.
-    Log 'restarting sshd so ssh sessions see the new machine environment'
+    # it restarts. Nothing else here takes effect without this, and the
+    # Subsystem line added above needs the restart to be read at all.
+    Log 'restarting sshd so sessions see the new machine environment and the powershell subsystem'
     Restart-Service sshd
 
     Log 'DONE-OK'
