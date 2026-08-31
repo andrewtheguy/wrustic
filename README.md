@@ -245,15 +245,42 @@ wrustic env myrepo --json     # same as a JSON object
 (REST credentials embedded in the URL), `RESTIC_PASSWORD`, and for S3 backends
 `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_DEFAULT_REGION`. The
 config passphrase comes from the `WRUSTIC_PASSPHRASE` environment variable if
-set, otherwise from the OS keychain entry saved by the TUI's
-"save passphrase to keychain" option — so on a machine where that option is
-enabled, `wrustic env` works unattended. When neither source has the
-passphrase and stdin is a terminal, `env` falls back to a hidden prompt on
-the terminal itself (so it still works while a script captures stdout);
-without a terminal — a scheduled task, cron, a keychain-less Linux host — it
-fails with a non-zero exit instead of hanging. Both commands are read-only
-and skip the config-directory lock, so they keep working while a TUI session
-is open.
+set, otherwise from the file named by `WRUSTIC_PASSPHRASE_FILE`, otherwise
+from the OS keychain entry saved by the TUI's "save passphrase to keychain"
+option — so on a machine where that option is enabled, `wrustic env` works
+unattended. When no source has the passphrase and stdin is a terminal, `env`
+falls back to a hidden prompt on the terminal itself (so it still works while
+a script captures stdout); without a terminal — a scheduled task, cron, a
+keychain-less Linux host — it fails with a non-zero exit instead of hanging.
+Both commands are read-only and skip the config-directory lock, so they keep
+working while a TUI session is open.
+
+Both variables unlock the TUI as well: with either set, `wrustic` goes
+straight from launch to the profile list, skipping the unlock-method choice
+and the passphrase prompt. A wrong or unreadable one is not fatal there the
+way it is headless — a human is at the terminal — but it is never swallowed:
+the unlock screen names the variable and takes the passphrase by hand
+instead. Setup is unaffected; a brand-new config still has its passphrase
+chosen in the TUI.
+
+`WRUSTIC_PASSPHRASE_FILE` is the option for hosts with no keychain, where
+putting the passphrase in the environment would expose it to every process
+that can read `/proc/<pid>/environ` or a crash dump. The file holds the
+passphrase and nothing else; one trailing line ending is stripped, so a
+plain `printf '%s\n' ...` or an editor's newline is fine, but leading and
+interior whitespace is part of the secret. Protect it with the filesystem —
+`chmod 600` and an owner that only the backup account has:
+
+```sh
+install -m 600 /dev/null ~/.config/wrustic/passphrase
+printf '%s' 'my config passphrase' > ~/.config/wrustic/passphrase
+WRUSTIC_PASSPHRASE_FILE=~/.config/wrustic/passphrase wrustic env myrepo
+```
+
+A `WRUSTIC_PASSPHRASE_FILE` that is missing, unreadable, or empty is an
+error — `env` does not quietly fall through to the keychain, so a broken
+path is reported the first time it is used rather than the first time the
+keychain is gone.
 
 `env` prints secrets — `RESTIC_PASSWORD`, S3 credentials — in cleartext on
 stdout. That is its job, so treat the output accordingly: consume it directly

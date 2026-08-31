@@ -1,9 +1,10 @@
 //! Headless entry points for scripts and scheduled tasks: `env` and
 //! `profiles`. Nothing here starts the TUI — the passphrase comes from
-//! `WRUSTIC_PASSPHRASE` or the OS keychain, with a plain hidden-input prompt
-//! on the controlling terminal as the interactive fallback. Without a
-//! terminal (scheduled tasks, cron) there is no prompt to hang on: every
-//! failure is a plain error on stderr with a non-zero exit.
+//! `WRUSTIC_PASSPHRASE`, the file named by `WRUSTIC_PASSPHRASE_FILE`, or the
+//! OS keychain, with a plain hidden-input prompt on the controlling terminal
+//! as the interactive fallback. Without a terminal (scheduled tasks, cron)
+//! there is no prompt to hang on: every failure is a plain error on stderr
+//! with a non-zero exit.
 
 use std::io::IsTerminal;
 
@@ -15,9 +16,15 @@ use crate::config::{self, Config, PassphraseMeta, Paths, Profile};
 use crate::crypto::Cipher;
 use crate::passphrase;
 
-/// Overrides the keychain when set. This is the only non-interactive way in
-/// for builds without the `keychain` feature (or hosts without a keyring).
+/// Overrides the keychain when set. Together with [`PASSPHRASE_FILE_ENV`]
+/// this is the non-interactive way in for builds without the `keychain`
+/// feature (or hosts without a keyring).
 pub(crate) const PASSPHRASE_ENV: &str = "WRUSTIC_PASSPHRASE";
+
+/// Path to a file holding the passphrase. Keeps the secret out of the
+/// process environment, where anything from `ps -e` to a crash dump can pick
+/// it up — a scheduled task can point at a file only its own account reads.
+pub(crate) const PASSPHRASE_FILE_ENV: &str = "WRUSTIC_PASSPHRASE_FILE";
 
 pub(crate) fn run(command: Command, paths: Paths, no_keychain: bool) -> Result<()> {
     match command {
@@ -149,15 +156,15 @@ fn unlock_cipher(paths: &Paths, no_keychain: bool) -> Result<Cipher> {
     // A wrong *stored* passphrase fails outright instead of falling back to a
     // prompt: prompting would paper over a stale keychain entry or env var
     // that every unattended run is about to trip on.
-    if let Some(pass) = stored_passphrase(&meta.instance, no_keychain) {
+    if let Some(pass) = stored_passphrase(&meta.instance, no_keychain)? {
         return cipher_from_passphrase(&pass, &salt, &meta);
     }
     if !std::io::stdin().is_terminal() {
         bail!(
-            "no passphrase available for instance `{}`: {PASSPHRASE_ENV} is not set, no \
-             keychain entry was found, and there is no terminal to prompt on (save the \
-             passphrase to the keychain from the TUI's unlock screen, or export \
-             {PASSPHRASE_ENV})",
+            "no passphrase available for instance `{}`: neither {PASSPHRASE_ENV} nor \
+             {PASSPHRASE_FILE_ENV} is set, no keychain entry was found, and there is no \
+             terminal to prompt on (save the passphrase to the keychain from the TUI's \
+             unlock screen, or export {PASSPHRASE_ENV} or {PASSPHRASE_FILE_ENV})",
             meta.instance
         );
     }
@@ -202,27 +209,71 @@ fn cipher_from_passphrase(pass: &str, salt: &[u8], meta: &PassphraseMeta) -> Res
     Ok(Cipher::new(key, meta.instance.clone(), &meta.instance_sig))
 }
 
-/// The two unattended sources, in override order: environment, then keychain.
-/// `None` means neither had anything to offer — not that a passphrase was
-/// wrong.
-fn stored_passphrase(instance: &str, no_keychain: bool) -> Option<String> {
+/// A passphrase from the process environment, with the variable it came from
+/// so a caller can name the source in an error. `WRUSTIC_PASSPHRASE` wins
+/// over `WRUSTIC_PASSPHRASE_FILE`; a file that cannot be read is an error
+/// rather than a fall-through, because the caller named it and quietly
+/// unlocking with something else would hide the misconfiguration until the
+/// file mattered.
+///
+/// Shared with the TUI (`App::start_passphrase_flow`), which honours the same
+/// two variables on its unlock screen — the environment means the same thing
+/// whichever entry point reads it.
+pub(crate) fn env_passphrase() -> Result<Option<(&'static str, String)>> {
+    if let Ok(pass) = std::env::var(PASSPHRASE_ENV)
+        && !pass.is_empty()
+    {
+        return Ok(Some((PASSPHRASE_ENV, pass)));
+    }
+    if let Some(path) = std::env::var_os(PASSPHRASE_FILE_ENV)
+        && !path.is_empty()
+    {
+        return read_passphrase_file(path.as_ref()).map(|p| Some((PASSPHRASE_FILE_ENV, p)));
+    }
+    Ok(None)
+}
+
+/// The unattended sources, in override order: environment (variable or file),
+/// then keychain. `None` means none of them had anything to offer — not that
+/// a passphrase was wrong.
+fn stored_passphrase(instance: &str, no_keychain: bool) -> Result<Option<String>> {
     // Only the keychain branch below consumes these; without the feature the
     // bindings would otherwise warn under -D warnings.
     #[cfg(not(feature = "keychain"))]
     let _ = (instance, no_keychain);
-    if let Ok(pass) = std::env::var(PASSPHRASE_ENV)
-        && !pass.is_empty()
-    {
-        return Some(pass);
+    if let Some((_, pass)) = env_passphrase()? {
+        return Ok(Some(pass));
     }
     #[cfg(feature = "keychain")]
     if !no_keychain
         && crate::keychain::init_store()
         && let Some(pass) = crate::keychain::load_passphrase(instance)
     {
-        return Some(pass);
+        return Ok(Some(pass));
     }
-    None
+    Ok(None)
+}
+
+/// The file holds the passphrase and nothing else. Only the trailing line
+/// ending is stripped — a passphrase may legitimately start or end with a
+/// space, and trimming it would lock the caller out of their own config with
+/// a "wrong passphrase" they cannot see.
+fn read_passphrase_file(path: &std::path::Path) -> Result<String> {
+    let raw = std::fs::read(path)
+        .with_context(|| format!("reading {PASSPHRASE_FILE_ENV} ({})", path.display()))?;
+    let text = String::from_utf8(raw).with_context(|| {
+        format!(
+            "{PASSPHRASE_FILE_ENV} ({}) is not valid UTF-8",
+            path.display()
+        )
+    })?;
+    let pass = text
+        .strip_suffix('\n')
+        .map_or(text.as_str(), |t| t.strip_suffix('\r').unwrap_or(t));
+    if pass.is_empty() {
+        bail!("{PASSPHRASE_FILE_ENV} ({}) is empty", path.display());
+    }
+    Ok(pass.to_string())
 }
 
 #[cfg(test)]
@@ -285,6 +336,52 @@ mod tests {
             render_dotenv(&vars).expect("single-line values render"),
             "RESTIC_REPOSITORY=rest:http://h/repo\nRESTIC_PASSWORD=pw=with=equals\n"
         );
+    }
+
+    /// Scratch file under the project's tmp/, unique per test and per
+    /// process so a parallel run never collides.
+    fn passphrase_file(name: &str, contents: &[u8]) -> std::path::PathBuf {
+        let dir = std::path::Path::new("tmp").join(format!("pwfile-{}-{}", name, std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("passphrase");
+        std::fs::write(&path, contents).expect("write passphrase file");
+        path
+    }
+
+    /// The file is the passphrase verbatim, minus one trailing line ending —
+    /// the artefact every editor adds. Interior and leading whitespace is
+    /// part of the secret.
+    #[test]
+    fn passphrase_file_strips_only_the_trailing_line_ending() {
+        for (name, contents, want) in [
+            ("plain", &b"Right Passphrase 1!"[..], "Right Passphrase 1!"),
+            ("lf", &b"Right Passphrase 1!\n"[..], "Right Passphrase 1!"),
+            ("crlf", &b"Right Passphrase 1!\r\n"[..], "Right Passphrase 1!"),
+            ("spaced", &b" pad ded \n"[..], " pad ded "),
+            ("two-lf", &b"pw\n\n"[..], "pw\n"),
+        ] {
+            let path = passphrase_file(name, contents);
+            assert_eq!(
+                read_passphrase_file(&path).expect("readable passphrase file"),
+                want,
+                "case {name}"
+            );
+            std::fs::remove_dir_all(path.parent().expect("scratch dir")).ok();
+        }
+    }
+
+    /// A named file that yields nothing is a misconfiguration, not a reason
+    /// to unlock with some other source.
+    #[test]
+    fn passphrase_file_rejects_empty_and_missing_files() {
+        let path = passphrase_file("empty", b"\n");
+        let err = read_passphrase_file(&path).expect_err("an empty file must be refused");
+        assert!(format!("{err:#}").contains("is empty"), "{err:#}");
+        std::fs::remove_dir_all(path.parent().expect("scratch dir")).ok();
+
+        let missing = std::path::Path::new("tmp").join("pwfile-does-not-exist");
+        let err = read_passphrase_file(&missing).expect_err("a missing file must be refused");
+        assert!(format!("{err:#}").contains(PASSPHRASE_FILE_ENV), "{err:#}");
     }
 
     /// Passphrase metadata whose signature verifies for exactly `pass`.

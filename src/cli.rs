@@ -131,13 +131,13 @@ Commands (headless, for scripts and scheduled tasks — no TUI is started):
                       RESTIC_PASSWORD, and for S3 backends AWS_ACCESS_KEY_ID,
                       AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION) as KEY=VALUE
                       lines, or as a JSON object with --json. The config
-                      passphrase is taken from the WRUSTIC_PASSPHRASE
-                      environment variable if set, otherwise from the OS
-                      keychain entry the TUI's \"save to keychain\" option
-                      wrote; when neither has it and stdin is a terminal, a
-                      hidden prompt asks for it instead. Without a terminal
-                      (scheduled task, cron) the command fails rather than
-                      hangs. Read-only: safe to run while the TUI is open.
+                      passphrase comes from the environment (see below),
+                      otherwise from the OS keychain entry the TUI's \"save to
+                      keychain\" option wrote; when none of them has it and
+                      stdin is a terminal, a hidden prompt asks for it
+                      instead. Without a terminal (scheduled task, cron) the
+                      command fails rather than hangs. Read-only: safe to run
+                      while the TUI is open.
   profiles            Print the profile names in the config, one per line, or
                       as a JSON array with --json. Needs no passphrase.
 
@@ -205,6 +205,23 @@ Options:
                               was built with the 'keychain' feature.
   -V, --version               Print version and exit.
   -h, --help                  Print this help text.
+
+Environment:
+  WRUSTIC_PASSPHRASE        The config passphrase. Unlocks the TUI and the
+                            headless commands alike, with no prompt and
+                            without consulting the keychain.
+  WRUSTIC_PASSPHRASE_FILE   Path to a file holding the config passphrase —
+                            its contents minus one trailing line ending, so
+                            leading and interior whitespace is part of the
+                            secret. Read only when WRUSTIC_PASSPHRASE is
+                            unset. Keeps the passphrase out of the process
+                            environment, where a crash dump or another
+                            process can read it; protect the file with its
+                            permissions instead. A missing, unreadable, or
+                            empty file is an error, not a quiet fall-through
+                            to the keychain.
+  WRUSTIC_CONFIG_DIR        Config directory, as -d/--config-dir. The flag
+                            wins when both are given.
 ";
 
 /// A headless subcommand — automation entry points that never start the TUI.
