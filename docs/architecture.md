@@ -168,10 +168,10 @@ smbanything's own docs. The architectural points:
   is released, and explicit `.stop()` joins first.
 - Binds `127.0.0.1` and `[::1]` via `local_server::bind_localhost`, the same
   helper the HTTP share uses (both now from `smbanything_core`).
-  `Bind::AllInterfaces` exists but is constructed only by the
-  `smb_manual_snapshot` ignored test — validating against macOS and Windows
-  needs a reachable server. Nothing here is encrypted, so that stays a test
-  affordance rather than a shipped option.
+  `Bind::AllInterfaces` exists but is constructed only by the `dev smb-serve`
+  harness — validating against macOS and Windows needs a reachable server.
+  Nothing here is encrypted, so that stays a harness affordance rather than a
+  shipped option.
 - The port is fixed (`--smb-port`, default 4456), not ephemeral: a mount
   outlives the screen that created it, so an fstab line has to keep resolving.
   A clash therefore surfaces inline on the share screen, with the flag that

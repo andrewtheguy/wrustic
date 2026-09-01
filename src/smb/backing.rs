@@ -378,7 +378,13 @@ impl FileReader for SnapshotFile {
     }
 }
 
-#[cfg(test)]
+// Also built for the tun harness, which serves this tree rather than standing
+// up a repository so a mount can be timed against a known shape. That harness
+// is the only non-test user, hence the same narrow gate it carries.
+#[cfg(any(
+    test,
+    all(windows, feature = "dev-harness", feature = "smb-tun")
+))]
 pub(crate) mod test_support {
     //! An in-memory backing, so the wire encoders can be tested against a known
     //! tree without standing up a repository.

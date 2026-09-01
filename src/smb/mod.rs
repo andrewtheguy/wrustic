@@ -20,6 +20,9 @@ use smbanything_core::smb;
 pub(crate) use smbanything_core::smb::{Bind, Credentials, random_password};
 #[cfg(all(windows, feature = "smb-tun"))]
 pub(crate) use smbanything_core::smb::{STANDARD_SMB_PORT, TunConfig};
+/// For the `dev smb-tun` harness, the only user outside this module's tests.
+#[cfg(all(windows, feature = "dev-harness", feature = "smb-tun"))]
+pub(crate) use backing::test_support::MemBacking;
 
 /// The share name clients connect to: `\\127.0.0.1\snap`.
 pub(crate) const DEFAULT_SHARE_NAME: &str = "snap";
@@ -59,8 +62,8 @@ impl SmbHandle {
     /// The port the SMB listener actually bound. Equal to the mount port for
     /// every transport except the tun, where it is the private loopback socket
     /// the proxy talks to — which is why nothing user-facing reads it, and only
-    /// the manual harness does.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// the `dev smb-serve` harness does.
+    #[cfg_attr(not(feature = "dev-harness"), allow(dead_code))]
     pub(crate) fn port(&self) -> u16 {
         self.server.port()
     }
@@ -288,121 +291,6 @@ mod tests {
             "the host's own srvnet listener on 445 disappeared; the tun transport \
              must never disturb it"
         );
-    }
-
-    /// Hold a tun share open so an external client can be timed against it.
-    /// Serves the in-memory test tree; no repository needed.
-    ///   cargo test --features smb-tun smb_manual_tun -- --ignored --nocapture
-    #[test]
-    #[ignore = "manual harness: needs administrator rights"]
-    #[cfg(all(windows, feature = "smb-tun"))]
-    fn smb_manual_tun() {
-        let secs: u64 = std::env::var("WRUSTIC_SMB_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(180);
-        let handle = start(
-            0,
-            DEFAULT_SHARE_NAME,
-            Bind::Tun(TunConfig {
-                port: STANDARD_SMB_PORT,
-                addrs: smb::DEFAULT_TUN_ADDRS,
-            }),
-            test_credentials(),
-        )
-        .expect("tun share starts (are you elevated?)");
-        handle.load(test_backing());
-        eprintln!("READY {} user={TEST_USER} pass={TEST_PASSWORD}", handle.unc());
-        std::thread::sleep(std::time::Duration::from_secs(secs));
-        handle.stop();
-    }
-
-    /// Serve a real restic snapshot, for validating the `SnapshotBacking` path
-    /// against a live client. This is the cross-platform test harness: the TUI
-    /// share dies when you leave the screen, and mounting from macOS or Windows
-    /// needs a server that stays up while you walk over to another machine.
-    ///
-    /// Driven by environment variables so it needs no wrustic config, and so no
-    /// password ever reaches argv:
-    ///
-    ///   WRUSTIC_SMB_REPO=<path>       repository to open          (required)
-    ///   WRUSTIC_SMB_PASSWORD=<pw>     its password                (required)
-    ///   WRUSTIC_SMB_SNAPSHOT=<id>     snapshot, or 'latest'       (required)
-    ///   WRUSTIC_SMB_PORT=<n>          listen port                 (default 4456)
-    ///   WRUSTIC_SMB_SHARE_PASSWORD    share password              (default hunter2)
-    ///   WRUSTIC_SMB_SECONDS=<n>       how long to stay up         (default 1200)
-    ///   WRUSTIC_SMB_BIND_ALL=1        every interface, not just loopback
-    ///   WRUSTIC_SMB_LOG=1             trace every command to stderr
-    ///
-    ///   WRUSTIC_SMB_REPO=<path> WRUSTIC_SMB_PASSWORD=<pw> WRUSTIC_SMB_SNAPSHOT=latest \
-    ///     cargo test --all-features smb_manual_snapshot -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    fn smb_manual_snapshot() {
-        let repo = std::env::var("WRUSTIC_SMB_REPO").expect("WRUSTIC_SMB_REPO");
-        let password = std::env::var("WRUSTIC_SMB_PASSWORD").expect("WRUSTIC_SMB_PASSWORD");
-        let snapshot = std::env::var("WRUSTIC_SMB_SNAPSHOT").expect("WRUSTIC_SMB_SNAPSHOT");
-        let port: u16 = std::env::var("WRUSTIC_SMB_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(4456);
-
-        let profile = Profile::Local {
-            password,
-            local_path: repo,
-        };
-        // Long enough to mount, poke around and unmount by hand. Bounded rather
-        // than infinite so a forgotten server does not hold the port for ever.
-        let secs: u64 = std::env::var("WRUSTIC_SMB_SECONDS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1200);
-
-        let bind = if std::env::var_os("WRUSTIC_SMB_BIND_ALL").is_some() {
-            Bind::AllInterfaces
-        } else {
-            Bind::Loopback
-        };
-        let bind_all = matches!(bind, Bind::AllInterfaces);
-        let password = std::env::var("WRUSTIC_SMB_SHARE_PASSWORD")
-            .unwrap_or_else(|_| TEST_PASSWORD.to_string());
-        let handle = start_snapshot_share(
-            port,
-            &profile,
-            &snapshot,
-            bind,
-            Credentials {
-                user: TEST_USER.to_string(),
-                password: password.clone(),
-            },
-        )
-        .expect("snapshot share starts");
-        let host = if bind_all { "<this-host>" } else { "127.0.0.1" };
-        let port = handle.port();
-        eprintln!("serving snapshot {snapshot} on {host}:{port} for {secs}s");
-        eprintln!();
-        eprintln!("  username  {TEST_USER}");
-        eprintln!("  password  {password}");
-        if bind_all {
-            eprintln!();
-            eprintln!(
-                "NOTE: listening on every interface. Traffic is signed but not encrypted, \
-                 so anyone on the network can read file contents in transit."
-            );
-        }
-        eprintln!();
-        eprintln!("Mount it with:");
-        eprintln!(
-            "  Linux    sudo mount -t cifs -o port={port},vers=2.1,username={TEST_USER},ro,uid=$(id -u),gid=$(id -g),file_mode=0444,dir_mode=0555 //{host}/{DEFAULT_SHARE_NAME} /mnt/snap"
-        );
-        eprintln!(
-            "  macOS    Finder → Go → Connect to Server (Cmd+K): smb://{TEST_USER}@{host}:{port}/{DEFAULT_SHARE_NAME}"
-        );
-        eprintln!(
-            "  Windows  net use Z: \\\\{host}\\{DEFAULT_SHARE_NAME} * /user:{TEST_USER} /TCPPORT:{port}"
-        );
-        std::thread::sleep(std::time::Duration::from_secs(secs));
-        handle.stop();
     }
 
     /// A snapshot share's layout as a real client sees it: the share root

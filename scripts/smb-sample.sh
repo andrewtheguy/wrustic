@@ -56,10 +56,11 @@ Environment:
   SMB_BIND_ALL=1               listen on every interface, not just loopback
   SMB_LOG=1                    trace every SMB command to stderr
 
-`serve` runs the `smb_manual_snapshot` ignored test, not a wrustic subcommand:
-the only shipped way to share a snapshot is `s` in the TUI, which is bound to
-that screen and to loopback. A long-lived server and a non-loopback bind are
-testing affordances and live in the test harness.
+`serve` runs the `dev smb-serve` harness, which exists only in a
+`--features dev-harness` build: the only shipped way to share a snapshot is `s`
+in the TUI, which is bound to that screen and to loopback. A long-lived server
+and a non-loopback bind are testing affordances and stay out of the binary
+users get.
 
 Mount from another machine (after `serve` with SMB_BIND_ALL=1). Each prompts for
 the password rather than taking it on the command line, where every process on
@@ -173,9 +174,7 @@ serve_snapshot() {
     fi
 
     info "serving on port ${SMB_PORT} for ${SMB_SECONDS}s (Ctrl-C to stop early)"
-    # --nocapture so the credentials and mount commands reach the terminal;
-    # without it the test harness swallows them until the test ends.
-    exec cargo test --all-features smb_manual_snapshot -- --ignored --nocapture
+    exec cargo run --all-features -- dev smb-serve
 }
 
 verify_mount() {

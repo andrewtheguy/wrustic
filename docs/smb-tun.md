@@ -58,6 +58,10 @@ driver is loaded from next to the running executable, copy
 `vendor/wintun/wintun-amd64.dll` into the test binary's directory
 (`target/debug/deps/`) first — the error message names the path it looked at.
 
-`smb_manual_tun` holds a share open so an external client can be pointed at it:
+The `dev smb-tun` harness holds a share open so an external client can be
+pointed at it:
 
-    cargo test --features smb-tun smb_manual_tun -- --ignored --nocapture
+    cargo run --features smb-tun,dev-harness -- dev smb-tun
+
+It serves the in-memory tree, so no repository is needed, and stays up for
+`WRUSTIC_SMB_SECONDS` (default 180 here) — the same knob `dev smb-serve` uses.
