@@ -106,21 +106,21 @@ jobs:
         run: cargo build --release ${{ matrix.features }}
 
       # The vendored wintun driver is a committed binary the installer ships to
-      # be loaded as code, and its hash is pinned in WINTUN_DLL_SHA256. Nothing
-      # else in the release path would notice the two drifting apart, so assert
-      # it here rather than ship a driver the constant no longer describes. A
-      # cargo test filter that matches nothing still exits 0, so a renamed or
-      # gated-out test would silently stop guarding anything — require the test
-      # to be discovered before trusting its run.
+      # be loaded as code, and smbanything_core refuses to load any driver but
+      # the digest it pins. Nothing else in the release path would notice the
+      # two drifting apart, so assert it here rather than ship a driver the
+      # crate will then refuse. A cargo test filter that matches nothing still
+      # exits 0, so a renamed or gated-out test would silently stop guarding
+      # anything — require the test to be discovered before trusting its run.
       - name: Verify the vendored driver matches its pinned hash
         if: matrix.label == 'windows-amd64'
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --release ${{ matrix.features }} vendored_driver_matches_its_pinned_hash -- --list \
-            | grep -q vendored_driver_matches_its_pinned_hash \
-            || { echo "::error::vendored_driver_matches_its_pinned_hash was not discovered; the driver hash is unverified"; exit 1; }
-          cargo test --release ${{ matrix.features }} vendored_driver_matches_its_pinned_hash
+          cargo test --release ${{ matrix.features }} vendored_driver_matches_the_digest_core_will_load -- --list \
+            | grep -q vendored_driver_matches_the_digest_core_will_load \
+            || { echo "::error::vendored_driver_matches_the_digest_core_will_load was not discovered; the driver hash is unverified"; exit 1; }
+          cargo test --release ${{ matrix.features }} vendored_driver_matches_the_digest_core_will_load
 
       # The installer payload: wrustic.exe, the vendored wintun driver, and a
       # pinned restic (verified against the SHA256SUMS restic publishes for the
