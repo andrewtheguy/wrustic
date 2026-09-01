@@ -1,6 +1,8 @@
 name: Unix CI
 
-# Linux and macOS, on every change — the platforms Windows CI cannot speak for.
+# Linux and macOS, on demand — the platforms Windows CI cannot speak for.
+# Dispatch it against any branch:
+#   gh workflow run unix-ci.yml --ref <branch>
 #
 # This exists for one class of bug: name handling that is right on one platform
 # and wrong on another. `src/smb/name.rs` decodes the quoting restic applies to
@@ -18,9 +20,6 @@ name: Unix CI
 # Advisory, not a gate: `main` carries no branch protection, so nothing here is
 # a *required* status check and a red one never stops a merge.
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
 
 jobs:
