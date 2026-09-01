@@ -148,30 +148,37 @@ No server is started. `passphrase.rs` exposes
 `passphrase_policy_error` for direct use by `app.rs`. Key derivation runs
 synchronously on `Screen::PassphraseDerivingKey`.
 
-## SMB server (`src/smb/`)
+## SMB server (`src/smb/` + the `smbanything_core` crate)
 
 A hand-rolled read-only SMB 2.1 server exporting one snapshot, started with `s`
-on the snapshot list — the only entry point there is. Full treatment — protocol
-scope, security model, module map, tracing — in [smb.md](smb.md). The
-architectural points:
+on the snapshot list — the only entry point there is. The server itself —
+protocol, NTLMv2, signing, the tun transport, and the `local_server` loopback
+binder — lives in the shared `smbanything_core` crate; `src/smb/` holds the
+restic side: `SnapshotBacking`, restic's filename quoting (`name.rs`), and
+`start_snapshot_share`, which ties the server to the repository lock. Full
+treatment of the wrustic side in [smb.md](smb.md), of the protocol in
+smbanything's own docs. The architectural points:
 
 - One OS thread and a `new_multi_thread` runtime with 2 workers, unlike
   `share.rs`. Protocol handling is synchronous code calling into `rustic_core`,
   wrapped in `tokio::task::block_in_place`; that requires a runtime that can
   hand the reactor to another worker while one is parked on a backend fetch.
-- `SmbHandle` mirrors `ShareHandle`: `oneshot::Sender<()>` plus a `JoinHandle`,
-  drop = stop, explicit `.stop()` joins.
+- wrustic's `SmbHandle` wraps the crate's server handle together with the
+  repository lock, in that field order: drop stops the server before the lock
+  is released, and explicit `.stop()` joins first.
 - Binds `127.0.0.1` and `[::1]` via `local_server::bind_localhost`, the same
-  helper the HTTP share uses. `Bind::AllInterfaces` exists but is constructed
-  only by the `smb_manual_snapshot` ignored test — validating against macOS and
-  Windows needs a reachable server. Nothing here is encrypted, so that stays a
-  test affordance rather than a shipped option.
+  helper the HTTP share uses (both now from `smbanything_core`).
+  `Bind::AllInterfaces` exists but is constructed only by the
+  `smb_manual_snapshot` ignored test — validating against macOS and Windows
+  needs a reachable server. Nothing here is encrypted, so that stays a test
+  affordance rather than a shipped option.
 - The port is fixed (`--smb-port`, default 4456), not ephemeral: a mount
   outlives the screen that created it, so an fstab line has to keep resolving.
   A clash therefore surfaces inline on the share screen, with the flag that
   fixes it named in the message.
-- `Backing` is a trait over `rustic_core::vfs` so the byte-exact wire encoders
-  are testable against an in-memory tree with no repository.
+- `Backing` is the crate's trait; `SnapshotBacking` implements it over a
+  `Repository<IndexedFullStatus>`, and the crate's byte-exact wire encoders
+  stay testable against an in-memory tree with no repository.
 
 ## Repository access (`src/repo.rs`, `src/lock.rs`)
 

@@ -29,7 +29,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::Profile;
-use crate::local_server;
+use smbanything_core::local_server;
 use crate::repo::{open_indexed_full, stream_file_content};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -688,7 +688,7 @@ mod tests {
 
         // Bind to an ephemeral port instead of 7834 so this test can run
         // alongside a real wrustic instance.
-        let listeners = crate::local_server::bind_localhost(0).unwrap();
+        let listeners = local_server::bind_localhost(0).unwrap();
         let port = listeners[0].local_addr().unwrap().port();
         drop(listeners);
 
