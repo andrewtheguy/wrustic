@@ -384,6 +384,67 @@ mod tests {
         assert!(format!("{err:#}").contains(PASSPHRASE_FILE_ENV), "{err:#}");
     }
 
+    /// Not a test but a fixture, and the only way to get a config without the
+    /// TUI: it writes `tmp/wrustic-sandbox/` — one local profile behind a known
+    /// passphrase, plus that passphrase in a file — so the sources documented
+    /// above can be checked by hand against something real.
+    ///
+    ///   cargo test --all-features -- --ignored --nocapture sandbox_config
+    ///
+    /// It goes through wrustic's own [`Cipher`] rather than restating the
+    /// scrypt and AES-256-GCM details, so there is no second implementation of
+    /// the config format here to drift out of step with the real one.
+    #[test]
+    #[ignore = "manual harness: writes a sandbox config to tmp/wrustic-sandbox"]
+    fn sandbox_config() {
+        const PASSPHRASE: &str = "Sandbox Pass 1!";
+        const INSTANCE: &str = "sandbox";
+
+        let dir = std::path::PathBuf::from("tmp/wrustic-sandbox");
+        let paths = config::paths(Some(dir.clone())).expect("sandbox paths");
+        std::fs::create_dir_all(&paths.dir).expect("create the sandbox directory");
+
+        let salt: [u8; 32] = rand::random();
+        let key = passphrase::derive_config_key(PASSPHRASE, &salt).expect("derive the config key");
+        let instance_sig = passphrase::compute_instance_sig(INSTANCE, &key);
+        let mut config = Config {
+            passphrase: Some(PassphraseMeta {
+                instance: INSTANCE.to_string(),
+                instance_sig: instance_sig.clone(),
+                salt: BASE64.encode(salt),
+            }),
+            ..Config::default()
+        };
+        config.profiles.insert(
+            "sample".to_string(),
+            Profile::Local {
+                password: "sample-repo-password".to_string(),
+                local_path: dir.join("repo").to_string_lossy().into_owned(),
+            },
+        );
+        let cipher = Cipher::new(key, INSTANCE.to_string(), &instance_sig);
+        config::save(&config, &paths, &cipher).expect("write the sandbox config");
+
+        let pass_file = paths.dir.join("passphrase");
+        std::fs::write(&pass_file, PASSPHRASE).expect("write the passphrase file");
+
+        println!(
+            "\nwrote {} (instance `{INSTANCE}`, profile `sample`, passphrase `{PASSPHRASE}`)\n\n\
+             Neither of these should ask for anything:\n\
+             \n  {PASSPHRASE_ENV}='{PASSPHRASE}' \\\n    \
+                 cargo run --all-features -- --config-dir ./{} env sample\n\
+             \n  {PASSPHRASE_FILE_ENV}={} \\\n    \
+                 cargo run --all-features -- --config-dir ./{} env sample\n\
+             \nDrop `env sample` from either line to check the TUI: it should open on the\n\
+             profile list, not on the unlock screen. Delete {} when done.\n",
+            paths.config.display(),
+            dir.display(),
+            pass_file.display(),
+            dir.display(),
+            dir.display(),
+        );
+    }
+
     /// Passphrase metadata whose signature verifies for exactly `pass`.
     fn meta_for(pass: &str, salt: &[u8]) -> PassphraseMeta {
         let instance = "test-instance";

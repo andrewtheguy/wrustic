@@ -282,6 +282,28 @@ error — `env` does not quietly fall through to the keychain, so a broken
 path is reported the first time it is used rather than the first time the
 keychain is gone.
 
+To try any of this without touching your own config, build a throwaway one:
+
+```sh
+cargo test --all-features -- --ignored --nocapture sandbox_config
+```
+
+That writes `tmp/wrustic-sandbox/` — one local profile behind a known
+passphrase, and that passphrase in a file — and prints the commands to run
+against it. Neither of them should ask for anything:
+
+```sh
+WRUSTIC_PASSPHRASE='Sandbox Pass 1!' \
+  cargo run --all-features -- --config-dir ./tmp/wrustic-sandbox env sample
+
+WRUSTIC_PASSPHRASE_FILE=tmp/wrustic-sandbox/passphrase \
+  cargo run --all-features -- --config-dir ./tmp/wrustic-sandbox env sample
+```
+
+Drop `env sample` from either line to check the TUI the same way: it opens on
+the profile list rather than the unlock screen. `rm -rf tmp/wrustic-sandbox`
+when you are done.
+
 `env` prints secrets — `RESTIC_PASSWORD`, S3 credentials — in cleartext on
 stdout. That is its job, so treat the output accordingly: consume it directly
 into environment variables, and never redirect it to shared logs or save it in
