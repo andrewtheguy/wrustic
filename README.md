@@ -266,16 +266,23 @@ chosen in the TUI.
 `WRUSTIC_PASSPHRASE_FILE` is the option for hosts with no keychain, where
 putting the passphrase in the environment would expose it to every process
 that can read `/proc/<pid>/environ` or a crash dump. The file holds the
-passphrase and nothing else; one trailing line ending is stripped, so a
-plain `printf '%s\n' ...` or an editor's newline is fine, but leading and
-interior whitespace is part of the secret. Protect it with the filesystem —
-`chmod 600` and an owner that only the backup account has:
+passphrase and nothing else; one trailing line ending is stripped, so an
+editor's newline is fine, but leading and interior whitespace is part of the
+secret. Protect it with the filesystem — `chmod 600` and an owner that only
+the backup account has. Type the passphrase into a hidden prompt rather than
+putting it on a command line, where it would land in the shell history and in
+every process list on the machine:
 
 ```sh
 install -m 600 /dev/null ~/.config/wrustic/passphrase
-printf '%s' 'my config passphrase' > ~/.config/wrustic/passphrase
+IFS= read -r -s -p 'Config passphrase: ' pass && printf '%s' "$pass" \
+  > ~/.config/wrustic/passphrase
+unset pass; echo
 WRUSTIC_PASSPHRASE_FILE=~/.config/wrustic/passphrase wrustic env myrepo
 ```
+
+(`IFS= read -r` keeps leading whitespace and backslashes verbatim; `-s` keeps
+the passphrase off the screen.)
 
 A `WRUSTIC_PASSPHRASE_FILE` that is missing, unreadable, or empty is an
 error — `env` does not quietly fall through to the keychain, so a broken
