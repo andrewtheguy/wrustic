@@ -179,8 +179,9 @@ QUERY_DIRECTORY to page, and a symlink for the known limitation above. `verify`
 compares every file by sha256 against the source, then checks that `touch`,
 `mkdir` and `rm` are all refused.
 
-`serve` runs `smb_manual_snapshot`, an `#[ignore]`d test in `src/smb/mod.rs`
-that starts the same server and holds it open for `SMB_SECONDS` (default 1200)
+`serve` runs `dev smb-serve`, a harness in `src/devharness.rs` built only with
+`--features dev-harness`, which starts the same server and holds it open for
+`SMB_SECONDS` (default 1200)
 — bounded rather than infinite so a forgotten server does not hold the port for
 ever. Knobs: `SMB_PORT`, `SMB_SECONDS`, `WRUSTIC_SMB_SHARE_PASSWORD`,
 `SMB_BIND_ALL`, `SMB_LOG`. Everything reaches the server through the

@@ -3,6 +3,8 @@ mod automation;
 mod cli;
 mod config;
 mod crypto;
+#[cfg(feature = "dev-harness")]
+mod devharness;
 #[cfg(feature = "keychain")]
 mod keychain;
 mod lock;
@@ -33,7 +35,7 @@ use ratatui::{
 use ratatui::widgets::TableState;
 
 use crate::app::{App, BrowseFrame, Screen, UnlockReturn};
-use crate::cli::{USAGE, parse_cli};
+use crate::cli::{parse_cli, usage};
 use crate::config::{ConfigLock, Paths};
 use crate::repo::{
     ContentRow, delete_snapshot, diff_snapshots, edit_snapshot_tags, get_file_details, list_tree,
@@ -48,7 +50,7 @@ fn main() -> Result<()> {
         Ok(cli) => cli,
         Err(e) => {
             eprintln!("{e:#}");
-            eprintln!("\n{USAGE}");
+            eprintln!("\n{}", usage());
             std::process::exit(2);
         }
     };
@@ -57,11 +59,18 @@ fn main() -> Result<()> {
         return Ok(());
     }
     if cli.show_help {
-        println!("{USAGE}");
+        println!("{}", usage());
         return Ok(());
     }
 
     restic::set_cache_enabled(cli.restic_cache);
+
+    // Dispatched before a config directory is resolved: a harness either writes
+    // its own config or needs none at all.
+    #[cfg(feature = "dev-harness")]
+    if let Some(dev) = cli.dev {
+        return devharness::run(dev);
+    }
 
     // Headless subcommands never touch the terminal, and they read the config
     // without the exclusive directory lock — the TUI's atomic rename-on-save

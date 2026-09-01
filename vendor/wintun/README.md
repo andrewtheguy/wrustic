@@ -1,8 +1,8 @@
 # Vendored Wintun driver
 
-`wintun-amd64.dll` is embedded into the wrustic binary by `src/smb/tun.rs`
-(`include_bytes!`) when built with `--features smb-tun`, and written to the
-user's config directory at runtime so wrustic ships as a single executable.
+`wintun-amd64.dll` is the driver the `smb-tun` transport loads from next to the
+wrustic executable. The Windows installer stages it there; for a source build,
+copy it next to the built binary yourself.
 
 | | |
 | --- | --- |
@@ -12,14 +12,16 @@ user's config directory at runtime so wrustic ships as a single executable.
 | This file's SHA-256 | `e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce` |
 | Authenticode | Valid — `CN=WireGuard LLC, O=WireGuard LLC, L=Boulder, S=Colorado, C=US`, thumbprint `DF98E075A012ED8C86FBCF14854B8F9555CB3D45` |
 
-The DLL hash is pinned in `WINTUN_DLL_SHA256` and asserted by
-`embedded_driver_matches_its_pinned_hash`, so this file cannot be replaced
-without the build failing. It is also re-verified on disk before it is ever
-loaded as code.
+The digest is pinned by `smbanything_core`, which refuses to load any driver
+that is not byte-for-byte the one it expects, and
+`vendored_driver_matches_the_digest_core_will_load` in `src/smb/mod.rs` asserts
+this copy against that pin — so replacing this file without updating the crate
+fails the build instead of shipping a driver `--smb-tun` would then refuse.
 
 To update: download the new archive, confirm its SHA2-256 against wintun.net,
-confirm the Authenticode signature on the extracted DLL, replace this file, and
-update `WINTUN_DLL_SHA256` in `src/smb/tun.rs` to match. See `docs/smb-tun.md`.
+confirm the Authenticode signature on the extracted DLL, update the pin in
+smbanything_core and repin the dependency, then replace this file. See
+`docs/smb-tun.md`.
 
 `LICENSE.txt` is the Wintun *Prebuilt Binaries License*. §3(d) permits
 redistribution alongside software that uses the driver only through the

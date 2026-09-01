@@ -295,7 +295,7 @@ keychain is gone.
 To try any of this without touching your own config, build a throwaway one:
 
 ```sh
-cargo test --all-features -- --ignored --nocapture sandbox_config
+cargo run --features dev-harness -- dev sandbox-config
 ```
 
 That writes `tmp/wrustic-sandbox/` — one local profile behind a known

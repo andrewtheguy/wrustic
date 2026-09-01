@@ -170,6 +170,19 @@ pub(crate) enum Command {
     Profiles { json: bool },
 }
 
+/// A developer harness, reached as `wrustic dev <name>`. Kept out of
+/// [`Command`] because these are not automation: they exist only in a
+/// `--features dev-harness` build, and `main` dispatches them before it
+/// resolves a config directory they have no use for.
+#[cfg(feature = "dev-harness")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DevCommand {
+    SandboxConfig,
+    SmbServe,
+    #[cfg(all(windows, feature = "smb-tun"))]
+    SmbTun,
+}
+
 pub(crate) struct Cli {
     pub(crate) config_dir: Option<PathBuf>,
     pub(crate) port: u16,
@@ -180,6 +193,8 @@ pub(crate) struct Cli {
     pub(crate) show_version: bool,
     pub(crate) show_help: bool,
     pub(crate) command: Option<Command>,
+    #[cfg(feature = "dev-harness")]
+    pub(crate) dev: Option<DevCommand>,
 }
 
 impl Default for Cli {
@@ -194,6 +209,8 @@ impl Default for Cli {
             show_version: false,
             show_help: false,
             command: None,
+            #[cfg(feature = "dev-harness")]
+            dev: None,
         }
     }
 }
@@ -299,6 +316,13 @@ requires compiling with `--features smb-tun`"
             }
             Some(Command::Profiles { json })
         }
+        // `dev` is not a [`Command`]: it is dispatched on its own, so this
+        // arm records it and leaves the automation command unset.
+        #[cfg(feature = "dev-harness")]
+        Some("dev") => {
+            cli.dev = Some(parse_dev(&positionals)?);
+            None
+        }
         Some(other) => bail!("unknown command: {other}"),
     };
     // A stray flag that silently does nothing would look like broken output
@@ -307,6 +331,58 @@ requires compiling with `--features smb-tun`"
         bail!("--json only applies to `env` and `profiles`");
     }
     Ok(cli)
+}
+
+#[cfg(feature = "dev-harness")]
+fn parse_dev(positionals: &[String]) -> Result<DevCommand> {
+    let [_, name] = positionals else {
+        bail!("usage: wrustic dev <{DEV_SUBCOMMANDS}>");
+    };
+    Ok(match name.as_str() {
+        "sandbox-config" => DevCommand::SandboxConfig,
+        "smb-serve" => DevCommand::SmbServe,
+        #[cfg(all(windows, feature = "smb-tun"))]
+        "smb-tun" => DevCommand::SmbTun,
+        other => bail!("unknown dev harness: {other} (expected one of {DEV_SUBCOMMANDS})"),
+    })
+}
+
+/// The harnesses this build actually has — `smb-tun` needs both Windows and
+/// the `smb-tun` feature, so naming it unconditionally would advertise a
+/// subcommand that cannot run.
+#[cfg(feature = "dev-harness")]
+const DEV_SUBCOMMANDS: &str = if cfg!(all(windows, feature = "smb-tun")) {
+    "sandbox-config|smb-serve|smb-tun"
+} else {
+    "sandbox-config|smb-serve"
+};
+
+/// Help for the harnesses, appended to [`USAGE`] only where they exist.
+#[cfg(feature = "dev-harness")]
+const DEV_USAGE: &str = "\
+Developer harnesses (this build only — `--features dev-harness`):
+  dev sandbox-config  Write tmp/wrustic-sandbox: a config with one local
+                      profile behind a known passphrase, plus that passphrase
+                      in a file, for checking the passphrase sources by hand.
+  dev smb-serve       Serve a real snapshot over SMB until a timer runs out, so
+                      it can be mounted from another machine. Configured
+                      entirely by environment variables, so no password reaches
+                      argv: WRUSTIC_SMB_REPO, WRUSTIC_SMB_PASSWORD and
+                      WRUSTIC_SMB_SNAPSHOT are required; WRUSTIC_SMB_PORT,
+                      WRUSTIC_SMB_SHARE_PASSWORD, WRUSTIC_SMB_SECONDS,
+                      WRUSTIC_SMB_BIND_ALL and WRUSTIC_SMB_LOG are optional.
+";
+
+/// The help text, plus the harness section where this build has one.
+pub(crate) fn usage() -> String {
+    #[cfg(feature = "dev-harness")]
+    {
+        format!("{USAGE}{DEV_USAGE}")
+    }
+    #[cfg(not(feature = "dev-harness"))]
+    {
+        String::from(USAGE)
+    }
 }
 
 fn parse_port(value: &str, flag: &str) -> Result<u16> {
