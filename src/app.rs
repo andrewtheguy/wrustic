@@ -267,6 +267,11 @@ pub(crate) struct App {
     pub(crate) passphrase_error: Option<String>,
     pub(crate) passphrase_instance_value: String,
     pub(crate) passphrase_phase: Option<PassphrasePhase>,
+    /// The environment variable the passphrase now in `passphrase_input` came
+    /// from, so a failure can name it instead of reporting a bare "wrong
+    /// passphrase" for something the user never typed. `None` once the
+    /// passphrase is typed by hand.
+    pub(crate) passphrase_env_source: Option<&'static str>,
 
     pub(crate) no_keychain: bool,
     pub(crate) save_to_keychain: bool,
@@ -453,6 +458,7 @@ impl App {
             passphrase_input: Input::default(),
             passphrase_confirm: Input::default(),
             passphrase_error: None,
+            passphrase_env_source: None,
             passphrase_instance_value: String::new(),
             passphrase_phase: None,
             no_keychain,
@@ -593,6 +599,9 @@ impl App {
                         self.passphrase_instance_value = meta.instance.clone();
                         self.config.passphrase = Some(meta);
                         self.passphrase_phase = Some(PassphrasePhase::Unlock);
+                        if self.unlock_from_env() {
+                            return;
+                        }
                         if self.keychain_enabled() {
                             self.auth_method_list.select(Some(0));
                             self.screen = Screen::AuthMethodChoice;
@@ -609,6 +618,37 @@ impl App {
                         ));
                     }
                 }
+            }
+        }
+    }
+
+    /// `WRUSTIC_PASSPHRASE` / `WRUSTIC_PASSPHRASE_FILE` unlock the TUI too,
+    /// on exactly the terms `wrustic env` reads them on: a passphrase set in
+    /// the environment that the unlock screen ignored would be the surprise.
+    /// It goes straight to key derivation, skipping both the unlock method
+    /// choice and the prompt.
+    ///
+    /// Returns whether the screen was set. A wrong or unreadable one is not
+    /// fatal here the way it is headless — there is a human at the terminal,
+    /// so the failure is reported and the prompt takes over — but it is never
+    /// swallowed: the message names the variable.
+    fn unlock_from_env(&mut self) -> bool {
+        match crate::automation::env_passphrase() {
+            Ok(Some((source, pass))) => {
+                self.passphrase_input = Input::new(pass);
+                self.passphrase_error = None;
+                self.passphrase_env_source = Some(source);
+                // Nothing to save: the environment already has it, and the
+                // user never chose to put it in the keychain.
+                self.save_to_keychain = false;
+                self.screen = Screen::PassphraseDerivingKey;
+                true
+            }
+            Ok(None) => false,
+            Err(e) => {
+                self.enter_manual_passphrase(false);
+                self.passphrase_error = Some(format!("{e:#}"));
+                true
             }
         }
     }
@@ -637,6 +677,7 @@ impl App {
         self.passphrase_input = Input::default();
         self.passphrase_confirm = Input::default();
         self.passphrase_error = None;
+        self.passphrase_env_source = None;
         self.save_to_keychain = save_to_keychain;
         self.screen = match self.passphrase_phase {
             Some(PassphrasePhase::Setup) => Screen::PassphraseSetup,
@@ -742,12 +783,12 @@ impl App {
                 &config_key,
                 &meta.instance_sig,
             ) {
-                self.passphrase_error = Some(
-                    "Wrong passphrase (or config.toml was corrupted).".to_string(),
-                );
-                self.passphrase_input = Input::default();
-                self.field_focus = 0;
-                self.screen = Screen::PassphraseUnlock;
+                let message = match self.passphrase_env_source {
+                    Some(source) => format!("Wrong passphrase from {source} — type it instead."),
+                    None => "Wrong passphrase (or config.toml was corrupted).".to_string(),
+                };
+                self.enter_manual_passphrase(self.save_to_keychain);
+                self.passphrase_error = Some(message);
                 return;
             }
             let instance = meta.instance.clone();
@@ -771,6 +812,7 @@ impl App {
         self.passphrase_instance_input = Input::default();
         self.passphrase_instance_value.clear();
         self.passphrase_error = None;
+        self.passphrase_env_source = None;
         self.passphrase_phase = None;
         self.save_to_keychain = true;
     }
