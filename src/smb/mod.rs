@@ -146,7 +146,8 @@ pub(crate) fn start_snapshot_share(
     // snapshot they came from.
     let backing = backing::NestedBacking::new(backing, short_id);
 
-    let server = smb::start(port, DEFAULT_SHARE_NAME, Arc::new(backing), bind, credentials)?;
+    let server = smb::start(port, DEFAULT_SHARE_NAME, bind, credentials)?;
+    server.load(Arc::new(backing));
     Ok(SmbHandle {
         server,
         lock: repo_lock,
@@ -236,7 +237,6 @@ mod tests {
         let handle = start(
             0,
             DEFAULT_SHARE_NAME,
-            test_backing(),
             Bind::Tun(TunConfig {
                 port: STANDARD_SMB_PORT,
                 addrs,
@@ -244,6 +244,7 @@ mod tests {
             test_credentials(),
         )
         .expect("tun share starts (are you elevated?)");
+        handle.load(test_backing());
 
         // Only now, with the adapter up and the route in place, is talking to
         // the address cheap.
@@ -303,7 +304,6 @@ mod tests {
         let handle = start(
             0,
             DEFAULT_SHARE_NAME,
-            test_backing(),
             Bind::Tun(TunConfig {
                 port: STANDARD_SMB_PORT,
                 addrs: smb::DEFAULT_TUN_ADDRS,
@@ -311,6 +311,7 @@ mod tests {
             test_credentials(),
         )
         .expect("tun share starts (are you elevated?)");
+        handle.load(test_backing());
         eprintln!("READY {} user={TEST_USER} pass={TEST_PASSWORD}", handle.unc());
         std::thread::sleep(std::time::Duration::from_secs(secs));
         handle.stop();
@@ -422,8 +423,9 @@ mod tests {
                 .with_file("docs\\readme.txt", b"nested hello\n"),
             "1a2b3c4d",
         ));
-        let handle = start(0, DEFAULT_SHARE_NAME, backing, Bind::Loopback, test_credentials())
+        let handle = start(0, DEFAULT_SHARE_NAME, Bind::Loopback, test_credentials())
             .expect("server starts");
+        handle.load(backing);
         let target = format!("//127.0.0.1/{}", handle.share_name());
 
         let out = Command::new("smbclient")

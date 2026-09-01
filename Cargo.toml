@@ -23,7 +23,7 @@ rand = "0.10.1"
 # The read-only SMB 2.1 server the snapshot share runs on, shared with the
 # smbanything project. Default features off: the `tun` transport (wintun +
 # a userspace TCP stack) is compiled in only by wrustic's `smb-tun` feature.
-smbanything_core = { git = "https://github.com/andrewtheguy/smbanything.git", tag = "v0.0.4", default-features = false }
+smbanything_core = { git = "https://github.com/andrewtheguy/smbanything.git", tag = "v0.0.5", default-features = false }
 # Direct HTTP access to the rest-server `locks/` endpoints (rustic_backend's
 # REST backend is FileType-addressed and cannot reach them). Blocking client;
 # same features rustic_backend already compiles reqwest with.
