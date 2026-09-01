@@ -13,85 +13,24 @@ pub(crate) const DEFAULT_SMB_PORT: u16 = 4456;
 /// Windows-only, and only when compiled with the `smb-tun` feature.
 pub(crate) const SMB_TUN_SUPPORTED: bool = cfg!(all(windows, feature = "smb-tun"));
 
-/// The address pair the tun transport uses when `--smb-tun-ip` is not given.
-///
-/// 169.254.255.x is link-local, and inside the block RFC 3927 *reserves*:
-/// APIPA only ever self-assigns from 169.254.1.0–169.254.254.255, so these two
-/// can never collide with an auto-configured address, and link-local traffic
-/// is never routed off the machine at all — unlike a private subnet, there is
-/// no corporate VPN or LAN range this default can shadow.
-pub(crate) const DEFAULT_SMB_TUN_ADDRS: TunAddrs = TunAddrs {
-    virtual_ip: std::net::Ipv4Addr::new(169, 254, 255, 1),
-};
-
-/// The two host addresses the tun transport claims while a share is open.
-///
-/// There is no subnet: each address is a /32, and the transport's entire
-/// routing footprint is two host routes. The split matters: the adapter gets
-/// the *second* address, and the *first* is assigned to nothing — wrustic's
-/// own TCP stack answers for it, reached through an explicit on-link /32
-/// route. An address Windows holds itself would be looped back internally and
-/// hit srvnet.sys's port 445 reservation, which is the whole thing the tun
-/// exists to avoid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TunAddrs {
-    virtual_ip: std::net::Ipv4Addr,
-}
-
-// The flag parses and validates on every platform, so a Linux user gets a real
-// error rather than "unknown argument", but only the Windows tun build has
-// anything that consumes the derived addresses.
-#[cfg_attr(not(all(windows, feature = "smb-tun")), allow(dead_code))]
-impl TunAddrs {
-    /// The address the share answers on, and the one that goes in the UNC path.
-    pub(crate) fn virtual_ip(&self) -> std::net::Ipv4Addr {
-        self.virtual_ip
-    }
-
-    /// The address assigned to the tun adapter — the next one up, which is
-    /// what gives Windows a source address and an interface to route through.
-    pub(crate) fn adapter_ip(&self) -> std::net::Ipv4Addr {
-        std::net::Ipv4Addr::from(u32::from(self.virtual_ip) + 1)
-    }
-}
-
-impl std::fmt::Display for TunAddrs {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/32 and {}/32", self.virtual_ip(), self.adapter_ip())
-    }
-}
+/// The address pair the tun transport uses when `--smb-tun-ip` is not given —
+/// 169.254.255.x, inside the block RFC 3927 reserves, so no APIPA interface
+/// can ever autoconfigure either address. The pair itself (and its
+/// validation) lives in `smbanything_core`; this alias keeps the flag's name
+/// for it.
+pub(crate) use smbanything_core::smb::DEFAULT_TUN_ADDRS as DEFAULT_SMB_TUN_ADDRS;
+pub(crate) use smbanything_core::smb::TunAddrs;
 
 /// Parse the `--smb-tun-ip` override: the address clients mount, with the next
 /// address up going on the adapter.
 ///
-/// Rejects addresses that cannot work rather than failing later at adapter
-/// creation — anything the local stack treats specially, for either of the
-/// two derived addresses.
+/// The validation — both derived addresses must be usable, so a mount address
+/// that borders a reserved range is refused too — is `TunAddrs`' `FromStr`;
+/// this only pins the offending flag onto its error.
 fn parse_tun_ip(value: &str, flag: &str) -> Result<TunAddrs> {
-    let virtual_ip: std::net::Ipv4Addr = value
-        .parse()
-        .map_err(|_| anyhow::anyhow!("{flag} expects an IPv4 address like 169.254.255.1, got `{value}`"))?;
-    let adapter_ip = u32::from(virtual_ip)
-        .checked_add(1)
-        .map(std::net::Ipv4Addr::from)
-        .ok_or_else(|| {
-            anyhow::anyhow!("{flag}: the adapter takes the next address after {virtual_ip}, and there is none")
-        })?;
-    // Both derived addresses have to be usable, so a mount address that is fine
-    // on its own but borders a reserved range is refused too.
-    for addr in [virtual_ip, adapter_ip] {
-        // The octet ranges are 0.0.0.0/8 ("this network", covering unspecified)
-        // and 240.0.0.0/4 (class E, covering broadcast) — no stable is_* helper
-        // spans either, and Windows refuses to assign both.
-        let first_octet = addr.octets()[0];
-        if addr.is_loopback() || addr.is_multicast() || first_octet == 0 || first_octet >= 240 {
-            bail!(
-                "{flag}: the transport needs {virtual_ip} and the next address up, \
-and {addr} is in a range the local stack reserves"
-            );
-        }
-    }
-    Ok(TunAddrs { virtual_ip })
+    value
+        .parse::<TunAddrs>()
+        .map_err(|e| anyhow::anyhow!("{flag}: {e}"))
 }
 
 /// Everything that decides how the snapshot SMB share is exposed.
@@ -378,19 +317,6 @@ fn parse_port(value: &str, flag: &str) -> Result<u16> {
         bail!("{flag} cannot be 0");
     }
     Ok(n)
-}
-
-/// Constructors the rest of the crate's tests need, without exposing a way to
-/// build an unvalidated address pair in normal code.
-#[cfg(test)]
-pub(crate) mod tests_support {
-    use super::TunAddrs;
-
-    /// Parse an address the caller knows is valid. Only the tun tests need it.
-    #[cfg_attr(not(all(windows, feature = "smb-tun")), allow(dead_code))]
-    pub(crate) fn addrs(ip: &str) -> TunAddrs {
-        super::parse_tun_ip(ip, "--smb-tun-ip").expect("valid test address")
-    }
 }
 
 #[cfg(test)]

@@ -1447,12 +1447,12 @@ fn render_snapshot_smb(frame: &mut Frame, app: &mut App, area: Rect) {
     match (app.smb_handle.as_ref(), app.smb_password.as_deref()) {
         (Some(h), Some(pw)) => {
             let user = crate::smb::DEFAULT_SHARE_USER;
-            let share = &h.share_name;
-            // Not `h.port`: with the tun transport that is the private loopback
-            // socket the proxy talks to, and printing it would send the reader
-            // to an endpoint no mount command should ever name.
-            let host = &h.mount().host;
-            let port = h.mount().port;
+            let share = h.share_name();
+            // Not `h.port()`: with the tun transport that is the private
+            // loopback socket the proxy talks to, and printing it would send
+            // the reader to an endpoint no mount command should ever name.
+            let host = h.mount().host();
+            let port = h.mount().port();
             lines.push_str(&format!(
                 "Server: listening on {host}:{port}  (read-only, this machine only)\n"
             ));
@@ -1464,8 +1464,9 @@ fn render_snapshot_smb(frame: &mut Frame, app: &mut App, area: Rect) {
             if app.smb.tun {
                 lines.push_str(&format!(
                     "Tun:    private adapter, standard SMB port. The machine's own file \
-                     sharing is untouched; {} route here until this screen closes.\n",
-                    app.smb.tun_addrs
+                     sharing is untouched; {}/32 and {}/32 route here until this screen closes.\n",
+                    app.smb.tun_addrs.virtual_ip(),
+                    app.smb.tun_addrs.adapter_ip()
                 ));
             }
             lines.push_str(

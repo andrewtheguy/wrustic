@@ -5,7 +5,6 @@ mod config;
 mod crypto;
 #[cfg(feature = "keychain")]
 mod keychain;
-mod local_server;
 mod lock;
 mod passphrase;
 mod repo;

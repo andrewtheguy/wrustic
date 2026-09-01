@@ -15,83 +15,8 @@ use rustic_core::repofile::Node;
 use rustic_core::vfs::OpenFile;
 use rustic_core::{IndexedFullStatus, Repository, TreeId};
 
-use super::path::SmbPath;
-use super::proto::status;
-
-/// What kind of entry this is, as far as SMB is concerned.
-///
-/// SMB2 without POSIX extensions has exactly two answers, so everything that is
-/// neither a regular file nor a directory — symlinks, devices, fifos, sockets —
-/// is reported as an empty regular file. restic stores no content for any of
-/// them, so nothing is lost from a read; what is lost is the distinction, which
-/// a browse-only share can live without. Presenting them as reparse points
-/// instead would drag in FSCTL_GET_REPARSE_POINT and a reparse-tag vocabulary
-/// for no gain here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NodeKind {
-    File,
-    Dir,
-}
-
-impl NodeKind {
-    pub(crate) fn is_dir(self) -> bool {
-        matches!(self, Self::Dir)
-    }
-}
-
-/// One directory entry, flattened to what the wire format needs.
-///
-/// Timestamps are not optional. A repository may hold nodes with no recorded
-/// mtime, and SMB has no way to say "unknown" — a client shown the zero
-/// FILETIME renders the year 1601. Following rustic's own FUSE mount, a missing
-/// timestamp becomes the server's start time, which is at least plausible and
-/// is identical across every node in the share.
-#[derive(Debug, Clone)]
-pub(crate) struct NodeInfo {
-    pub(crate) name: String,
-    pub(crate) kind: NodeKind,
-    pub(crate) size: u64,
-    pub(crate) mtime: SystemTime,
-    pub(crate) atime: SystemTime,
-    pub(crate) ctime: SystemTime,
-}
-
-impl NodeInfo {
-    /// A directory with no metadata of its own — the share root, and the
-    /// synthetic `.` and `..` entries.
-    pub(crate) fn synthetic_dir(name: &str, now: SystemTime) -> Self {
-        Self {
-            name: name.to_string(),
-            kind: NodeKind::Dir,
-            size: 0,
-            mtime: now,
-            atime: now,
-            ctime: now,
-        }
-    }
-}
-
-/// A file opened for reading. Held by the handle table for the lifetime of an
-/// SMB handle so that repeated READs do not re-resolve the path or rebuild the
-/// blob start-point index.
-pub(crate) trait FileReader: Send + Sync {
-    /// Read up to `len` bytes at `offset`. A read starting at or past EOF
-    /// returns empty, which the READ handler turns into STATUS_END_OF_FILE.
-    fn read_at(&self, offset: u64, len: u32) -> Result<Bytes, u32>;
-}
-
-/// What the share serves. Errors are NTSTATUS values because every caller is
-/// about to put one on the wire.
-pub(crate) trait Backing: Send + Sync {
-    fn stat(&self, path: &SmbPath) -> Result<NodeInfo, u32>;
-    fn list(&self, path: &SmbPath) -> Result<Vec<NodeInfo>, u32>;
-    fn open(&self, path: &SmbPath) -> Result<Arc<dyn FileReader>, u32>;
-    /// Volume label reported by FileFsVolumeInformation.
-    fn label(&self) -> &str;
-    /// Total bytes, reported as the volume size. A snapshot has no free space,
-    /// which is both true and what makes a client stop offering to write.
-    fn total_size(&self) -> u64;
-}
+use smbanything_core::smb::{Backing, FileReader, NodeInfo, NodeKind, SmbPath, status};
+use smbanything_core::smb_log;
 
 fn to_system_time(ts: Option<rustic_core::jiff::Timestamp>) -> Option<SystemTime> {
     let ts = ts?;

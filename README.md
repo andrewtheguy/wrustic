@@ -33,8 +33,10 @@ exactly which workflows that means.
   `unlock`
 - **File sharing**: one-time signed download URLs served from localhost
 - **Snapshot sharing over SMB** (`s` on the snapshot list): mount a whole
-  snapshot read-only from Linux, macOS, or Windows 11 24H2+, served by a
-  hand-rolled SMB 2.1 server bound to localhost, with NTLMv2 authentication
+  snapshot read-only from Linux, macOS, or Windows 11 24H2+, served by the
+  hand-rolled SMB 2.1 server shared with the
+  [smbanything](https://github.com/andrewtheguy/smbanything) project
+  (`smbanything_core`), bound to localhost, with NTLMv2 authentication
   and signing. Files mount `0444` and directories `0555` on Linux and macOS,
   and on every client opening a file for execute is refused — a share is for
   browsing a snapshot, not restoring from one; see
