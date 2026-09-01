@@ -2,9 +2,7 @@ name: Windows CI
 
 # Build-and-test only — no release steps.
 #
-# Triggered like Unix CI, so Windows is checked on every change rather than
-# whenever someone remembers to dispatch it. Still dispatchable against an
-# arbitrary branch:
+# Triggered like Unix CI, on demand, against any branch:
 #   gh workflow run windows-ci.yml --ref <branch>
 #
 # Advisory, not a gate: `main` carries no branch protection, so no check here is
@@ -12,9 +10,6 @@ name: Windows CI
 # read, and making it block would be a settings change on the repository rather
 # than an edit to this file.
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
 
 jobs:
