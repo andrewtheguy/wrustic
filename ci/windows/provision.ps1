@@ -187,12 +187,12 @@ try {
     # --- Cargo cache layout -----------------------------------------------
     # A sibling of the workspace inside the staging root, not a child of it:
     # remote.ps1 replaces the workspace directory outright on every run, so a
-    # target dir inside it would compile from cold every time. Incremental is
-    # off because those artefacts are never reused across a workspace that is
-    # recreated each run.
+    # target dir inside it would compile from cold every time. Incremental
+    # compilation is left to each profile: its cache lives in this target dir,
+    # and the recreated workspace keeps its path and its files' times, so a
+    # rerun picks it up.
     New-Item -ItemType Directory -Force -Path 'C:\ci-workspaces\cargo-target' | Out-Null
     [Environment]::SetEnvironmentVariable('CARGO_TARGET_DIR', 'C:\ci-workspaces\cargo-target', 'Machine')
-    [Environment]::SetEnvironmentVariable('CARGO_INCREMENTAL', '0', 'Machine')
 
     # sshd captured its environment when the service started, and children
     # inherit that block — so machine PATH changes are invisible over ssh until
