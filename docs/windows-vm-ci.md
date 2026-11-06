@@ -347,9 +347,9 @@ that root and two of them are handed to `Remove-Item -Recurse -Force`, so a
 `..` or a typo in it is a demolition order aimed at the wrong directory. Only a
 plain drive-letter path is accepted.
 
-**One run at a time.** The workspace and the cargo target directory are single
-and shared — that is what makes a warm run 20 seconds — so a second run
-starting mid-build would delete the tree the first is compiling. `remote.ps1`
+**One run at a time.** The workspace and the run's target directory are single
+and fixed per repo, so a second run starting mid-build would delete the tree
+the first is compiling. `remote.ps1`
 claims `C:\ci-workspaces\wrustic.lock` by creating the directory (which fails,
 atomically, if it exists) and drops it in a `finally`. If a run is killed hard
 enough to skip that, the next one says so and prints the one-liner that clears
