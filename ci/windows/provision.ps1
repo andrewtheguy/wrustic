@@ -173,15 +173,30 @@ try {
     Log "PowerShell $(& $Pwsh -NoProfile -NoLogo -Command '$PSVersionTable.PSVersion.ToString()') present"
 
     $SshdConfig = 'C:\ProgramData\ssh\sshd_config'
-    # -match against an array *filters* it, so this is a test for "no line
-    # matched", not a negated match — `-notmatch` here would return every other
-    # line in the file and read as true on a config that already has it.
-    if (-not ((Get-Content $SshdConfig) -match '^\s*Subsystem\s+powershell\b')) {
-        # The 8.3 short path is not a stylistic choice: sshd splits a Subsystem
-        # line on whitespace, so C:\Program Files\... would be read as a
-        # command followed by an argument.
-        Add-Content -Path $SshdConfig -Value 'Subsystem powershell C:\progra~1\PowerShell\7\pwsh.exe -sshs -NoLogo'
-        Log 'added the powershell subsystem to sshd_config'
+    # The line goes above the first Match block, not at the end of the file:
+    # Windows' default config ends in `Match Group administrators`, and from
+    # OpenSSH 9.5 a Subsystem inside a Match block replaces the global list for
+    # whoever matches — so an appended line takes sftp away from Administrator
+    # and scp fails with `subsystem request failed`. The wanted file is built
+    # and written only when it differs, so a line already in that wrong place
+    # is moved and a rerun on a right one is a no-op.
+    #
+    # The 8.3 short path is not a stylistic choice: sshd splits a Subsystem line
+    # on whitespace, so C:\Program Files\... would be read as a command followed
+    # by an argument.
+    $SubsystemLine = 'Subsystem powershell C:\progra~1\PowerShell\7\pwsh.exe -sshs -NoLogo'
+    $lines = @(Get-Content $SshdConfig)
+    $wanted = [Collections.Generic.List[string]]::new()
+    $inserted = $false
+    foreach ($line in $lines) {
+        if ($line -match '^\s*Subsystem\s+powershell\b') { continue }
+        if (-not $inserted -and $line -match '^\s*Match\s') { $wanted.Add($SubsystemLine); $inserted = $true }
+        $wanted.Add($line)
+    }
+    if (-not $inserted) { $wanted.Add($SubsystemLine) }
+    if (($lines -join "`n") -ne ($wanted -join "`n")) {
+        Set-Content -Path $SshdConfig -Value $wanted -Encoding ascii
+        Log 'placed the powershell subsystem above the Match blocks in sshd_config'
     } else { Log 'sshd powershell subsystem already present, skipping' }
 
     # --- Cargo cache layout -----------------------------------------------
