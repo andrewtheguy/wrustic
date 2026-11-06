@@ -146,6 +146,12 @@ transport is the same sshd, the same port and the same key as a plain
   whitespace, so `C:\Program Files\...` parses as a command followed by an
   argument.
 
+  It goes above the first `Match` block, not at the end of the file. The
+  default config ends in `Match Group administrators`, and from OpenSSH 9.5 a
+  `Subsystem` inside a `Match` block replaces the global list for whoever
+  matches: an appended line leaves remoting working and takes `sftp` away
+  from Administrator, so `scp` fails with `subsystem request failed`.
+
 sshd has to restart to read that line, and **restarting it from inside an ssh
 session kills the session that asked for it** — the service takes its children
 with it, including the PowerShell running `Restart-Service`, so whether the
