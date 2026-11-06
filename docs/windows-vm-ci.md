@@ -239,7 +239,7 @@ halves of that have a trap:
   instance left to resume.
 
 Drop the build cache after the toolset changes — `.\ci\windows\remote.ps1
-clean`. Cargo fingerprints do not include the MSVC version, so C code compiled
+clean`, which deletes this repo's cache archives. Cargo fingerprints do not include the MSVC version, so C code compiled
 by the old toolset would otherwise be linked into the new one's output without
 a rebuild.
 
@@ -251,8 +251,6 @@ Rust is installed **machine-wide**, not into a profile:
 RUSTUP_HOME       C:\rust\rustup
 CARGO_HOME        C:\rust\cargo
 Path             += C:\rust\cargo\bin
-CARGO_TARGET_DIR  C:\ci-workspaces\cargo-target
-CARGO_INCREMENTAL 0
 ```
 
 That is not tidiness. The provisioning task runs as SYSTEM and ssh logs in as
@@ -260,13 +258,14 @@ Administrator; a default rustup install would land in SYSTEM's profile and be
 invisible to every CI run. Machine-scoped variables and a machine PATH entry
 are what make the two agree.
 
-`CARGO_TARGET_DIR` is a sibling of the workspace, not a child, deliberately:
-`remote.ps1` replaces the workspace directory outright on every run, so a
-target directory inside it would mean compiling from cold every time. Kept at
-`C:\ci-workspaces\cargo-target`, the build cache survives the swap while still
-staying inside the staging root. `CARGO_INCREMENTAL=0` because incremental
-artefacts are never reused across a workspace that is recreated each run —
-they would only cost disk.
+There is no machine-wide `CARGO_TARGET_DIR`. The build cache works like GitHub
+Actions' cache, and the VM keeps none between runs: `remote.ps1` gives each
+run `C:\ci-workspaces\wrustic-target`, restores it beforehand from a zstd
+archive in the driving machine's cache store (`/mnt/dasdata/tmp/winci-cache`,
+or `DEVTOOLS_WINCI_CACHE_STORE`), and deletes it afterwards. A passing run
+whose key — the lock and toolchain files and `rustc -vV` — had no archive saves
+one, pruned to third-party dependencies. The details are at the top of
+devtools' `ci/windows/remote.ps1`.
 
 Nothing pins the toolchain, so `stable` drifts. `rustup update` on the VM is
 the whole story; there is no image to rebuild.
@@ -295,7 +294,7 @@ the whole story; there is no image to rebuild.
 .\ci\windows\remote.ps1              # clippy, test, release-profile build
 .\ci\windows\remote.ps1 shell        # interactive shell on the VM, in the tree
 .\ci\windows\remote.ps1 doctor       # report on the VM, change nothing
-.\ci\windows\remote.ps1 clean        # drop the VM's cargo target cache
+.\ci\windows\remote.ps1 clean        # drop this repo's build cache archives
 ```
 
 Run it under PowerShell 7 (`pwsh`); under Windows PowerShell 5.1 it stops with
@@ -304,15 +303,13 @@ a message saying so, because the remoting it uses does not exist there.
 `WRUSTIC_WINCI_HOST` overrides the ssh target (default: the
 `windows-ci-build` alias) and `WRUSTIC_WINCI_STAGING` the staging root
 (default `C:\ci-workspaces`), under which the workspace, its lock, the upload
-and the build cache all live.
+and the run's target dir all live.
 
 The first run is cold in two ways — it fetches the whole crates.io graph and
 compiles it three times over, once per step — and takes a bit over ten minutes
-on 4 vCPU, of which the release build alone is about five. After that the registry
-lives in `C:\rust\cargo` and the build cache in `C:\ci-workspaces\cargo-target`, and both
-survive the workspace being replaced, so later runs only rebuild what changed —
-a warm run with no source changes is about 20 seconds end to end, most of it
-the transfer.
+on 4 vCPU, of which the release build alone is about five. After that the
+registry lives in `C:\rust\cargo`, and later runs restore the third-party
+dependencies from the cache store and rebuild only wrustic's own crates.
 
 The tree is copied rather than fetched from git: the reason to run this instead
 of pushing a branch is to test what is in front of you, uncommitted changes
@@ -339,7 +336,8 @@ ends.
 unpacking over the previous tree would leave a file you deleted here still
 sitting there and still being compiled. `remote.ps1` removes the directory and
 recreates it. Nothing under it needs to survive — the registry cache lives in
-`C:\rust` and the build cache in the sibling `C:\ci-workspaces\cargo-target`.
+`C:\rust` and the build cache in the sibling `C:\ci-workspaces\wrustic-target`,
+restored from the cache store.
 
 `WRUSTIC_WINCI_STAGING` is still checked before use, though the reason has
 narrowed. Remote steps are script blocks now, so a path with a space in it is

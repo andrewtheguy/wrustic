@@ -15,7 +15,7 @@
 # C:\ci-workspaces\provision\provision.log; the last line is DONE-OK or DONE-FAIL.
 #
 # C:\ci-workspaces is the staging root: every scratch file either this script or
-# remote.ps1 writes — installers, logs, the shipped tree, the build cache —
+# remote.ps1 writes — installers, logs, the shipped tree, a run's target dir —
 # lives under it. Only the two toolchains, which are installations rather than
 # scratch, land elsewhere (C:\BuildTools and C:\rust).
 #
@@ -199,15 +199,8 @@ try {
         Log 'placed the powershell subsystem above the Match blocks in sshd_config'
     } else { Log 'sshd powershell subsystem already present, skipping' }
 
-    # --- Cargo cache layout -----------------------------------------------
-    # A sibling of the workspace inside the staging root, not a child of it:
-    # remote.ps1 replaces the workspace directory outright on every run, so a
-    # target dir inside it would compile from cold every time. Incremental
-    # compilation is left to each profile: its cache lives in this target dir,
-    # and the recreated workspace keeps its path and its files' times, so a
-    # rerun picks it up.
-    New-Item -ItemType Directory -Force -Path 'C:\ci-workspaces\cargo-target' | Out-Null
-    [Environment]::SetEnvironmentVariable('CARGO_TARGET_DIR', 'C:\ci-workspaces\cargo-target', 'Machine')
+    # No CARGO_TARGET_DIR here: devtools' remote.ps1 gives each repo's run its
+    # own target dir and restores it from the driving machine's cache store.
 
     # sshd captured its environment when the service started, and children
     # inherit that block — so machine PATH changes are invisible over ssh until
