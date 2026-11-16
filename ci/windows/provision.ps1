@@ -200,7 +200,7 @@ try {
     } else { Log 'sshd powershell subsystem already present, skipping' }
 
     # No CARGO_TARGET_DIR here: devtools' remote.ps1 gives each repo's run its
-    # own target dir and restores it from the driving machine's cache store.
+    # own target dir and restores it from the build cache's restic repository.
 
     # sshd captured its environment when the service started, and children
     # inherit that block — so machine PATH changes are invisible over ssh until
