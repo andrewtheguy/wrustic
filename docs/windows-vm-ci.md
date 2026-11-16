@@ -239,7 +239,7 @@ halves of that have a trap:
   instance left to resume.
 
 Drop the build cache after the toolset changes — `.\ci\windows\remote.ps1
-clean`, which deletes this repo's cache archives. Cargo fingerprints do not include the MSVC version, so C code compiled
+clean`, which forgets this repo's restic cache snapshots. Cargo fingerprints do not include the MSVC version, so C code compiled
 by the old toolset would otherwise be linked into the new one's output without
 a rebuild.
 
@@ -260,11 +260,11 @@ are what make the two agree.
 
 There is no machine-wide `CARGO_TARGET_DIR`. The build cache works like GitHub
 Actions' cache, and the VM keeps none between runs: `remote.ps1` gives each
-run `C:\ci-workspaces\wrustic-target`, restores it beforehand from a zstd
-archive in the driving machine's cache store (`/mnt/dasdata/tmp/winci-cache`,
-or `DEVTOOLS_WINCI_CACHE_STORE`), and deletes it afterwards. A passing run
-whose key — the lock and toolchain files and `rustc -vV` — had no archive saves
-one, pruned to third-party dependencies. The details are at the top of
+run `C:\ci-workspaces\wrustic-target`, restores it beforehand from a
+snapshot in the restic repository on the LAN's REST server (run by the driving
+machine, tagged `repo:wrustic`), and deletes it afterwards. A passing run whose
+key — the lock and toolchain files and `rustc -vV` — had no snapshot saves one,
+pruned to third-party dependencies; the repo's three newest are kept. The details are at the top of
 devtools' `ci/windows/remote.ps1`.
 
 Nothing pins the toolchain, so `stable` drifts. `rustup update` on the VM is
@@ -294,7 +294,7 @@ the whole story; there is no image to rebuild.
 .\ci\windows\remote.ps1              # clippy, test, release-profile build
 .\ci\windows\remote.ps1 shell        # interactive shell on the VM, in the tree
 .\ci\windows\remote.ps1 doctor       # report on the VM, change nothing
-.\ci\windows\remote.ps1 clean        # drop this repo's build cache archives
+.\ci\windows\remote.ps1 clean        # forget this repo's restic build cache snapshots
 ```
 
 Run it under PowerShell 7 (`pwsh`); under Windows PowerShell 5.1 it stops with
@@ -309,7 +309,7 @@ The first run is cold in two ways — it fetches the whole crates.io graph and
 compiles it three times over, once per step — and takes a bit over ten minutes
 on 4 vCPU, of which the release build alone is about five. After that the
 registry lives in `C:\rust\cargo`, and later runs restore the third-party
-dependencies from the cache store and rebuild only wrustic's own crates.
+dependencies from restic and rebuild only wrustic's own crates.
 
 The tree is copied rather than fetched from git: the reason to run this instead
 of pushing a branch is to test what is in front of you, uncommitted changes
@@ -337,7 +337,7 @@ unpacking over the previous tree would leave a file you deleted here still
 sitting there and still being compiled. `remote.ps1` removes the directory and
 recreates it. Nothing under it needs to survive — the registry cache lives in
 `C:\rust` and the build cache in the sibling `C:\ci-workspaces\wrustic-target`,
-restored from the cache store.
+restored from restic.
 
 `WRUSTIC_WINCI_STAGING` is still checked before use, though the reason has
 narrowed. Remote steps are script blocks now, so a path with a space in it is
