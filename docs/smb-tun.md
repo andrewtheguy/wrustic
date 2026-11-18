@@ -26,7 +26,7 @@ full design is documented in
 why no normal socket can bind 445 on Windows (`srvnet.sys` holds a system-wide
 exclusive reservation), the two-/32 link-local routing trick, why a crash or
 `taskkill /F` leaves no stale adapter or route behind (measured, not assumed),
-and the vendored Wintun driver's provenance and hash pinning.
+and the vendored Wintun driver's provenance.
 
 ## What wrustic adds
 
@@ -37,12 +37,12 @@ and the vendored Wintun driver's provenance and hash pinning.
   start the share if either exact address is already owned by the machine.
 - **The shipped driver.** `wintun-amd64.dll` (signed by WireGuard LLC) is
   vendored in `vendor/wintun/` and shipped by the Windows installer into the
-  install directory next to `wrustic.exe`; `smbanything_core` loads it from
-  there and refuses any copy that is not byte-for-byte the driver it pins. For
-  a source build, copy `vendor/wintun/wintun-amd64.dll` next to the built
-  executable. The `vendored_driver_matches_the_digest_core_will_load` test in
-  `src/smb/mod.rs` checks wrustic's vendored copy against that same pin, so a
-  driver update that touches one side and not the other fails the build.
+  install directory next to `wrustic.exe`; `smbanything_core` loads it by full
+  path from there, so the DLL search order never picks up another copy. It
+  does not verify the file, so a copy run from anywhere else belongs in a
+  folder only administrators can write: whoever can replace the DLL runs code
+  in the elevated process. For a source build, copy
+  `vendor/wintun/wintun-amd64.dll` next to the built executable.
   Wintun's *Prebuilt Binaries License* §3(d) permits redistribution alongside
   software that uses it only through the documented API;
   `vendor/wintun/LICENSE.txt` is the copy that governs it.

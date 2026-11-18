@@ -188,12 +188,12 @@ fn smb_serve() -> Result<()> {
 fn smb_tun() -> Result<()> {
     use std::sync::Arc;
 
-    use smbanything_core::smb::{self, Backing, start};
+    use smbanything_core::smb::{self, Backing};
 
     use crate::smb::{MemBacking, STANDARD_SMB_PORT, TunConfig};
 
     let secs = harness_seconds(180);
-    let handle = start(
+    let handle = smb::bind(
         0,
         DEFAULT_SHARE_NAME,
         Bind::Tun(TunConfig {
@@ -205,6 +205,7 @@ fn smb_tun() -> Result<()> {
             password: DEFAULT_HARNESS_PASSWORD.to_string(),
         },
     )
+    .and_then(smb::Bound::start)
     .context("tun share starts (are you elevated?)")?;
     let backing: Arc<dyn Backing> = Arc::new(
         MemBacking::new()

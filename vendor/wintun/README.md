@@ -12,16 +12,13 @@ copy it next to the built binary yourself.
 | This file's SHA-256 | `e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce` |
 | Authenticode | Valid — `CN=WireGuard LLC, O=WireGuard LLC, L=Boulder, S=Colorado, C=US`, thumbprint `DF98E075A012ED8C86FBCF14854B8F9555CB3D45` |
 
-The digest is pinned by `smbanything_core`, which refuses to load any driver
-that is not byte-for-byte the one it expects, and
-`vendored_driver_matches_the_digest_core_will_load` in `src/smb/mod.rs` asserts
-this copy against that pin — so replacing this file without updating the crate
-fails the build instead of shipping a driver `--smb-tun` would then refuse.
+`smbanything_core` loads it by full path from beside the executable and does
+not check its contents, so the digests above are the record of what was
+vendored.
 
 To update: download the new archive, confirm its SHA2-256 against wintun.net,
-confirm the Authenticode signature on the extracted DLL, update the pin in
-smbanything_core and repin the dependency, then replace this file. See
-`docs/smb-tun.md`.
+confirm the Authenticode signature on the extracted DLL, then replace this file
+and the digests above. See `docs/smb-tun.md`.
 
 `LICENSE.txt` is the Wintun *Prebuilt Binaries License*. §3(d) permits
 redistribution alongside software that uses the driver only through the

@@ -149,7 +149,7 @@ pub(crate) fn start_snapshot_share(
     // snapshot they came from.
     let backing = backing::NestedBacking::new(backing, short_id);
 
-    let server = smb::start(port, DEFAULT_SHARE_NAME, bind, credentials)?;
+    let server = smb::bind(port, DEFAULT_SHARE_NAME, bind, credentials)?.start()?;
     server.load(Arc::new(backing));
     Ok(SmbHandle {
         server,
@@ -163,7 +163,6 @@ mod tests {
     use backing::test_support::MemBacking;
     #[cfg(all(windows, feature = "smb-tun"))]
     use smbanything_core::smb::Backing;
-    use smbanything_core::smb::start;
 
     /// A small tree the end-to-end tests can list and read.
     #[cfg(all(windows, feature = "smb-tun"))]
@@ -185,22 +184,6 @@ mod tests {
             user: TEST_USER.to_string(),
             password: TEST_PASSWORD.to_string(),
         }
-    }
-
-    /// The Windows installer stages `vendor/wintun/wintun-amd64.dll` next to
-    /// wrustic.exe, and smbanything_core refuses to load any driver that is
-    /// not byte-for-byte the one it pins. Checking the vendored copy here
-    /// turns a driver update that forgets one side into a build failure
-    /// instead of a broken `--smb-tun` in the field.
-    #[test]
-    #[cfg(all(windows, feature = "smb-tun"))]
-    fn vendored_driver_matches_the_digest_core_will_load() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("vendor")
-            .join("wintun")
-            .join("wintun-amd64.dll");
-        smb::verify_driver(&path)
-            .expect("the vendored Wintun DLL must match smbanything_core's pinned digest");
     }
 
     /// End-to-end over the tun transport: a real Windows mount of
@@ -237,7 +220,7 @@ mod tests {
             }
         };
 
-        let handle = start(
+        let handle = smb::bind(
             0,
             DEFAULT_SHARE_NAME,
             Bind::Tun(TunConfig {
@@ -246,6 +229,7 @@ mod tests {
             }),
             test_credentials(),
         )
+        .and_then(smb::Bound::start)
         .expect("tun share starts (are you elevated?)");
         handle.load(test_backing());
 
@@ -311,7 +295,8 @@ mod tests {
                 .with_file("docs\\readme.txt", b"nested hello\n"),
             "1a2b3c4d",
         ));
-        let handle = start(0, DEFAULT_SHARE_NAME, Bind::Loopback, test_credentials())
+        let handle = smb::bind(0, DEFAULT_SHARE_NAME, Bind::Loopback, test_credentials())
+            .and_then(smb::Bound::start)
             .expect("server starts");
         handle.load(backing);
         let target = format!("//127.0.0.1/{}", handle.share_name());
