@@ -86,7 +86,11 @@ Options:
   -d, --config-dir <PATH>     Use <PATH> as the wrustic config directory instead
                               of the WRUSTIC_CONFIG_DIR environment variable or
                               the platform default (~/.config/wrustic on Linux).
-                              The directory will be created on first run.
+                              A directory named here or in WRUSTIC_CONFIG_DIR
+                              that does not exist yet is created only after
+                              you confirm at a prompt; with no terminal to ask
+                              on, wrustic exits instead. The platform default
+                              is created on first run without asking.
   -p, --port <N>              Localhost port for the file-share dialog.
                               Default: 7834.
       --smb-port <N>          Localhost port for the snapshot SMB share ('s' on

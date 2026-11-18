@@ -90,7 +90,33 @@ fn main() -> Result<()> {
     // "second instance" refusal prints as plain text instead of flashing an
     // empty TUI first.
     let paths = config::paths(cli.config_dir)?;
-    let config_lock = match config::acquire_lock(&paths) {
+    let setup = config::confirm_create(&paths, |question| {
+        use std::io::{IsTerminal, Write};
+        if !std::io::stdin().is_terminal() {
+            anyhow::bail!(
+                "config directory {} does not exist and there is no terminal to confirm \
+                 creating it — create it first",
+                paths.dir.display()
+            );
+        }
+        eprint!("{question}");
+        std::io::stderr().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        Ok(answer)
+    });
+    let setup = match setup {
+        Ok(Some(setup)) => setup,
+        Ok(None) => {
+            eprintln!("{} was not created", paths.dir.display());
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("{e:#}");
+            std::process::exit(1);
+        }
+    };
+    let config_lock = match config::acquire_lock(&paths, setup) {
         Ok(lock) => lock,
         Err(e) => {
             eprintln!("{e:#}");

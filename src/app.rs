@@ -2805,7 +2805,7 @@ mod tests {
             ));
         std::fs::create_dir_all(&tmp).expect("create test config dir");
         let paths = config::paths(Some(tmp.clone())).expect("paths");
-        let lock = config::acquire_lock(&paths).expect("lock fresh test config dir");
+        let lock = config::acquire_lock(&paths, config::DirSetup::UseExisting).expect("lock fresh test config dir");
         let mut app =
             App::boot(paths, lock, 7834, crate::cli::SmbOptions::default(), false).expect("boot");
         app.snapshots = snaps;
