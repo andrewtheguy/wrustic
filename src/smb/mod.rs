@@ -32,6 +32,32 @@ pub(crate) const DEFAULT_SHARE_NAME: &str = "snap";
 /// wrong buys nothing.
 pub(crate) const DEFAULT_SHARE_USER: &str = "wrustic";
 
+/// See [`SmbHandle::mount_commands`].
+pub(crate) struct MountCommands {
+    pub(crate) linux: String,
+    /// The address for Finder's Connect to Server.
+    pub(crate) macos: String,
+    pub(crate) windows: String,
+    pub(crate) unc: String,
+    standard_port: bool,
+}
+
+impl MountCommands {
+    /// What the copy key puts on the clipboard: the entry for the OS wrustic
+    /// runs on, since that is where the share is reachable (it binds this
+    /// machine only). On Windows the UNC path when it works on its own — it
+    /// pastes straight into Explorer — and the mapped-drive command otherwise.
+    pub(crate) fn for_this_os(&self) -> &str {
+        if cfg!(target_os = "macos") {
+            &self.macos
+        } else if cfg!(windows) {
+            if self.standard_port { &self.unc } else { &self.windows }
+        } else {
+            &self.linux
+        }
+    }
+}
+
 /// A running snapshot share: the SMB server plus the repository lock it holds.
 ///
 /// Field order is drop order, and it is load-bearing: the server (whose own
@@ -45,7 +71,7 @@ pub(crate) struct SmbHandle {
 }
 
 impl SmbHandle {
-    /// UNC path for a Linux `mount -t cifs`.
+    /// Windows UNC path, `\\host\share`.
     pub(crate) fn unc(&self) -> String {
         self.server.unc()
     }
@@ -72,6 +98,34 @@ impl SmbHandle {
     /// as a plain UNC path with no port option anywhere in the command.
     pub(crate) fn on_standard_port(&self) -> bool {
         self.server.on_standard_port()
+    }
+
+    /// How each client OS mounts this share, as shown on the share screen.
+    /// None carries the password: a password on a command line is readable by
+    /// every process on the machine while the command runs, and stays in
+    /// shell history after, so each one prompts for it instead.
+    pub(crate) fn mount_commands(&self) -> MountCommands {
+        let user = DEFAULT_SHARE_USER;
+        let share = self.share_name();
+        let host = self.mount().host();
+        let port = self.mount().port();
+        let unc = self.unc();
+        // On the standard port there is no port option to carry, which is the
+        // entire reason the tun exists.
+        let (cifs_port, url_port, tcpport) = if self.on_standard_port() {
+            (String::new(), String::new(), String::new())
+        } else {
+            (format!("port={port},"), format!(":{port}"), format!(" /TCPPORT:{port}"))
+        };
+        MountCommands {
+            linux: format!(
+                "sudo mount -t cifs -o {cifs_port}vers=2.1,username={user},ro,uid=$(id -u),gid=$(id -g),file_mode=0444,dir_mode=0555 //{host}/{share} /mnt/snap"
+            ),
+            macos: format!("smb://{user}@{host}{url_port}/{share}"),
+            windows: format!("net use Z: {unc} * /user:{user}{tcpport}"),
+            unc,
+            standard_port: self.on_standard_port(),
+        }
     }
 
     /// restic's abort-if-unrefreshable rule: true once the held lock went

@@ -58,6 +58,7 @@ pub(crate) fn help_rows(screen: &Screen) -> Option<&'static [(&'static str, &'st
             ("g / G", "jump to the first / last snapshot"),
             ("Enter", "browse this snapshot's files"),
             ("i", "show this snapshot's full details (untruncated paths)"),
+            ("y", "copy this snapshot's full ID to the clipboard"),
             ("s", "share this snapshot as a read-only SMB mount"),
             ("c", "compare this snapshot against another"),
             ("f", "filter the list by host, tag or path"),
@@ -235,8 +236,19 @@ fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_bottom_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let text = bottom_bar_text(app);
     let content_width = area.width.saturating_sub(2) as usize;
+    if let Some(notice) = &app.notice {
+        let line = Line::from(Span::styled(
+            notice.chars().take(content_width).collect::<String>(),
+            Style::new().fg(Color::Green),
+        ));
+        frame.render_widget(
+            Paragraph::new(line).block(Block::default().borders(Borders::ALL)),
+            area,
+        );
+        return;
+    }
+    let text = bottom_bar_text(app);
     let segments: Vec<&str> = text.split("  ").collect();
     let footer_line = build_footer_line(&segments, content_width);
     let para = Paragraph::new(footer_line)
@@ -318,9 +330,11 @@ fn footer_text(screen: &Screen, keychain_enabled: bool) -> &'static str {
         Screen::FileDetails => {
             "s share  Up/Dn scroll  ? keys  Esc/Backspace/q back"
         }
-        Screen::ShareUrl => "Esc/Backspace/q back (stops the server)",
+        Screen::ShareUrl => "y copy short URL  l copy long URL  Esc/Backspace/q back (stops the server)",
         Screen::SnapshotSmbStarting => "starting the SMB server…",
-        Screen::SnapshotSmb => "Esc/Backspace/q back (stops the server)",
+        Screen::SnapshotSmb => {
+            "y copy password  m copy mount command  Esc/Backspace/q back (stops the server)"
+        }
         Screen::PassphraseInstancePrompt => "type  Enter submit  Esc quit",
         Screen::PassphraseSetup => if keychain_enabled {
             "Tab/Shift+Tab field  Space toggle  Enter submit  Esc back"
@@ -1447,7 +1461,6 @@ fn render_snapshot_smb(frame: &mut Frame, app: &mut App, area: Rect) {
     match (app.smb_handle.as_ref(), app.smb_password.as_deref()) {
         (Some(h), Some(pw)) => {
             let user = crate::smb::DEFAULT_SHARE_USER;
-            let share = h.share_name();
             // Not `h.port()`: with the tun transport that is the private
             // loopback socket the proxy talks to, and printing it would send
             // the reader to an endpoint no mount command should ever name.
@@ -1482,38 +1495,22 @@ fn render_snapshot_smb(frame: &mut Frame, app: &mut App, area: Rect) {
             // stays in shell history — or console history on Windows — long
             // after. Type in the one shown above when asked.
             lines.push_str("\nMount it with (each prompts for the password above):\n\n");
+            let cmds = h.mount_commands();
+            lines.push_str(&format!("  Linux    {}\n\n", cmds.linux));
+            lines.push_str(&format!(
+                "  macOS    Finder → Go → Connect to Server (Cmd+K), then enter:\n\
+                 \x20          {}\n\n",
+                cmds.macos
+            ));
+            lines.push_str(&format!("  Windows  {}\n", cmds.windows));
             if h.on_standard_port() {
-                // On the standard port there is no port option to carry, which
-                // is the entire reason the tun exists: a UNC path works in
-                // Explorer's address bar and in any program that takes one,
-                // not only as a mapped drive letter.
-                lines.push_str(&format!(
-                    "  Linux    sudo mount -t cifs -o vers=2.1,username={user},ro,uid=$(id -u),gid=$(id -g),file_mode=0444,dir_mode=0555 //{host}/{share} /mnt/snap\n\n"
-                ));
-                lines.push_str(&format!(
-                    "  macOS    Finder → Go → Connect to Server (Cmd+K), then enter:\n\
-                     \x20          smb://{user}@{host}/{share}\n\n"
-                ));
-                lines.push_str(&format!(
-                    "  Windows  net use Z: {} * /user:{user}\n",
-                    h.unc()
-                ));
+                // A UNC path works in Explorer's address bar and in any
+                // program that takes one, not only as a mapped drive letter.
                 lines.push_str(&format!(
                     "           Or paste {} straight into Explorer's address bar.\n",
-                    h.unc()
+                    cmds.unc
                 ));
             } else {
-                lines.push_str(&format!(
-                    "  Linux    sudo mount -t cifs -o port={port},vers=2.1,username={user},ro,uid=$(id -u),gid=$(id -g),file_mode=0444,dir_mode=0555 //{host}/{share} /mnt/snap\n\n"
-                ));
-                lines.push_str(&format!(
-                    "  macOS    Finder → Go → Connect to Server (Cmd+K), then enter:\n\
-                     \x20          smb://{user}@{host}:{port}/{share}\n\n"
-                ));
-                lines.push_str(&format!(
-                    "  Windows  net use Z: {} * /user:{user} /TCPPORT:{port}\n",
-                    h.unc()
-                ));
                 // A custom port is reachable only as a mapped drive, and only
                 // from 24H2 or newer — two separate limits, both lifted by
                 // serving the standard port, so --smb-tun is not just the
