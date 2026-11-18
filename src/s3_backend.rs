@@ -2,7 +2,7 @@
 //!
 //! [`S3DataBackend`] implements rustic_core's `ReadBackend`/`WriteBackend`
 //! over an opendal S3 operator, replacing rustic_backend's generic opendal
-//! backend. rustic_backend 0.6.2 offers no per-service opendal features — its
+//! backend. rustic_backend 0.8.0 still offers no per-service opendal features — its
 //! `opendal` feature drags in every service crate (~150 packages) — so
 //! wrustic carries this thin wrapper instead and compiles only
 //! `opendal-service-s3`.
@@ -23,7 +23,9 @@ use opendal::{
     options::{ListOptions, ReadOptions},
     services::S3,
 };
-use rustic_core::{ErrorKind, FileType, Id, ReadBackend, RusticError, RusticResult, WriteBackend};
+use rustic_core::{
+    BytesList, ErrorKind, FileType, Id, ReadBackend, RusticError, RusticResult, WriteBackend,
+};
 use tokio::runtime::Runtime;
 
 use crate::lock::LockBackend;
@@ -149,7 +151,7 @@ fn runtime() -> &'static Runtime {
 // ---------------------------------------------------------------------------
 
 /// rustic_core backend for repository *data* on S3. A trimmed-down port of
-/// rustic_backend 0.6.2's `OpenDALBackend` (same layout rules, same operator
+/// rustic_backend 0.8.0's `OpenDALBackend` (same layout rules, same operator
 /// calls), S3-only and without the throttle/connection-limit knobs wrustic
 /// never exposed. `create()` keeps its default no-op — repository init stays
 /// on the restic CLI.
@@ -292,10 +294,16 @@ impl ReadBackend for S3DataBackend {
 }
 
 impl WriteBackend for S3DataBackend {
-    fn write_bytes(&self, tpe: FileType, id: &Id, _cacheable: bool, buf: Bytes) -> RusticResult<()> {
+    fn write_bytes(
+        &self,
+        tpe: FileType,
+        id: &Id,
+        _cacheable: bool,
+        content: BytesList,
+    ) -> RusticResult<()> {
         let path = Self::path(tpe, id);
         self.operator
-            .write(&path, buf)
+            .write(&path, content.into_vec())
             .map(|_| ())
             .map_err(|err| backend_error(err, "write", &path))
     }
@@ -356,7 +364,7 @@ mod tests {
             .unwrap();
         let payload = Bytes::from_static(b"snapshot payload for the data backend");
         backend
-            .write_bytes(FileType::Snapshot, &id, false, payload.clone())
+            .write_bytes(FileType::Snapshot, &id, false, payload.clone().into())
             .unwrap();
         assert_eq!(
             backend.list_with_size(FileType::Snapshot).unwrap(),
@@ -370,7 +378,12 @@ mod tests {
 
         // The config singleton is addressed by the default id.
         backend
-            .write_bytes(FileType::Config, &Id::default(), false, Bytes::from_static(b"cfg"))
+            .write_bytes(
+                FileType::Config,
+                &Id::default(),
+                false,
+                Bytes::from_static(b"cfg").into(),
+            )
             .unwrap();
         assert_eq!(
             backend.list_with_size(FileType::Config).unwrap(),

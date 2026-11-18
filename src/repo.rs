@@ -121,7 +121,16 @@ pub(crate) fn build_backends(profile: &Profile) -> Result<RepositoryBackends> {
                 url.set_password(Some(rest_password))
                     .map_err(|_| anyhow!("REST URL `{rest_url}` cannot carry a password"))?;
             }
-            opts = opts.repository(format!("rest:{url}"));
+            // rustic_backend's overall request `timeout` stays at its 10-minute
+            // default so large packs can stream, which leaves a host that
+            // never answers the connect waiting on the OS connect timeout —
+            // for every retry. Bound the connect alone, matching the 30 s the
+            // lock module's REST client allows a whole request.
+            opts = opts.repository(format!("rest:{url}")).options(
+                [("http-connect-timeout".to_string(), "30s".to_string())]
+                    .into_iter()
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+            );
         }
         Profile::S3 {
             s3_endpoint,

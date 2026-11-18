@@ -11,11 +11,11 @@ locking problem turns out to be solvable.
 All restic facts below were verified against the restic 0.19.1 source
 (`internal/restic/lock.go`, `internal/repository/lock.go`,
 `cmd/restic/lock.go`, `doc/design.rst`). rustic_core facts were verified
-against rustic_core 0.12.0 as pinned in `Cargo.lock`.
+against rustic_core 0.14.0 as pinned in `Cargo.lock`.
 
 ## The problem
 
-rustic_core 0.12.0 is completely lock-oblivious. Its `FileType` enum has
+rustic_core 0.14.0 is completely lock-oblivious. Its `FileType` enum has
 no `Lock` variant, so the crate cannot even address a repository's
 `locks/` directory — it cannot create, read, refresh, or honor restic
 lock files. Every write API it exposes (`delete_snapshots`, `backup`,
@@ -170,7 +170,7 @@ both tools:
   (restic's own `tag --set` rewrites unconditionally; wrustic is
   deliberately stricter.)
 - Cross-tool field round-trip (restic 0.19.1 `internal/data/snapshot.go`
-  vs rustic_core 0.12.0 `SnapshotFile`): `description` (and `label`,
+  vs rustic_core 0.14.0 `SnapshotFile`): `description` (and `label`,
   `delete`) are rustic-only — restic ignores them on read and silently
   drops them when *it* rewrites the snapshot (`restic tag`/`rewrite`
   round-trip through Go structs that don't have the fields). This is why
@@ -235,9 +235,9 @@ runs them with restic outside the app.
 
 ### Crypto
 
-`Repository::key()` is public in rustic_core 0.12.0 and returns
+`Repository::key()` is public in rustic_core 0.14.0 and returns
 `MasterKey`, whose fields are public raw key material
-(`repofile/keyfile.rs:324`): `encrypt` (32-byte AES-256 key) and `mac.k`
+(`repofile/keyfile.rs:350`): `encrypt` (32-byte AES-256 key) and `mac.k`
 / `mac.r` (Poly1305-AES MAC keys). rustic_core's own
 `encrypt_data`/`decrypt_data` are `pub(crate)` and not reachable, so
 wrustic implements the small envelope itself (in `src/lock.rs`, using the

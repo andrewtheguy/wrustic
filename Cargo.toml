@@ -11,7 +11,7 @@ aes256ctr_poly1305aes = "0.2"
 anyhow = "1"
 base64 = "0.22"
 bytes = "1"
-dirs = "6"
+dirs = "7"
 gethostname = "1"
 hmac = "0.13"
 http-body-util = "0.1"
@@ -36,8 +36,8 @@ rpassword = "7"
 # No `opendal` feature: it has no per-service knob and compiles every opendal
 # service crate (~150 packages). S3 repo data goes through wrustic's own
 # rustic_core backend over `opendal-service-s3` instead (src/s3_backend.rs).
-rustic_backend = { version = "0.6.2", default-features = false, features = ["rest"] }
-rustic_core = { version = "0.12.0", default-features = false }
+rustic_backend = { version = "0.8.0", default-features = false, features = ["rest"] }
+rustic_core = { version = "0.14.0", default-features = false }
 scrypt = { version = "0.12", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -46,7 +46,7 @@ tokio ={ version = "1", features = ["rt-multi-thread", "net", "io-util", "sync",
 toml = "1"
 tui-input = { version = "0.15", default-features = false, features = ["crossterm"] }
 url = "2"
-zstd = "0.13"
+zstd = "0.14"
 keyring-core = { version = "1", optional = true }
 
 [target.'cfg(unix)'.dependencies]
