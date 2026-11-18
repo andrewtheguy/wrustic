@@ -121,6 +121,9 @@ pub struct Paths {
     pub dir: PathBuf,
     pub config: PathBuf,
     pub lock: PathBuf,
+    /// The directory was named by `-d/--config-dir` or `WRUSTIC_CONFIG_DIR`
+    /// rather than being the platform default.
+    pub explicit: bool,
 }
 
 pub fn paths(override_dir: Option<PathBuf>) -> Result<Paths> {
@@ -134,21 +137,44 @@ fn resolve_paths(
     override_dir: Option<PathBuf>,
     env_dir: Option<std::ffi::OsString>,
 ) -> Result<Paths> {
-    let base = match override_dir.or_else(|| {
+    let (base, explicit) = match override_dir.or_else(|| {
         env_dir
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
     }) {
-        Some(p) => p,
-        None => dirs::config_dir()
-            .ok_or_else(|| anyhow!("could not determine config directory"))?
-            .join(CONFIG_DIR_NAME),
+        Some(p) => (p, true),
+        None => (
+            dirs::config_dir()
+                .ok_or_else(|| anyhow!("could not determine config directory"))?
+                .join(CONFIG_DIR_NAME),
+            false,
+        ),
     };
     Ok(Paths {
         config: base.join(CONFIG_FILE),
         lock: base.join(LOCK_FILE),
         dir: base,
+        explicit,
     })
+}
+
+/// Whether [`acquire_lock`] may create the config directory. A directory the
+/// user named that does not exist yet is created only once `ask` (given the
+/// question) returns a yes, so a mistyped `-d` path is not silently turned
+/// into a fresh, empty instance. The platform default is created without
+/// asking: that is just a first run.
+pub fn confirm_create(paths: &Paths, ask: impl FnOnce(&str) -> Result<String>) -> Result<bool> {
+    if !paths.explicit || paths.dir.exists() {
+        return Ok(true);
+    }
+    let answer = ask(&format!(
+        "Config directory {} does not exist. Create it? [y/N] ",
+        paths.dir.display()
+    ))?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 /// Restrict a file to its owner where the platform can express that. On Unix
@@ -408,6 +434,7 @@ mod tests {
             dir: dir.to_path_buf(),
             config: dir.join(CONFIG_FILE),
             lock: dir.join(LOCK_FILE),
+            explicit: true,
         }
     }
 
@@ -621,6 +648,7 @@ mod tests {
 
         let p = resolve_paths(None, Some(env_dir.clone()))?;
         assert_eq!(p.dir, PathBuf::from("env-dir"));
+        assert!(p.explicit);
         assert_eq!(p.config, PathBuf::from("env-dir").join("config.toml"));
 
         let flag = PathBuf::from("flag-dir");
@@ -633,6 +661,29 @@ mod tests {
             PathBuf::from(""),
             "an empty env value must fall through to the platform default"
         );
+        assert!(!p.explicit);
+        Ok(())
+    }
+
+    #[test]
+    fn confirm_create_asks_only_for_a_missing_named_dir() -> Result<()> {
+        let dir = fresh_dir("confirm-create");
+        let missing = dir.join("missing");
+        let never_asked = |_: &str| -> Result<String> { panic!("must not prompt") };
+
+        assert!(confirm_create(&test_paths(&dir), never_asked)?);
+        let default = Paths { explicit: false, ..test_paths(&missing) };
+        assert!(confirm_create(&default, never_asked)?);
+
+        for (answer, create) in [("y\n", true), (" YES \r\n", true), ("n\n", false), ("", false)] {
+            let got = confirm_create(&test_paths(&missing), |q| {
+                assert!(q.contains(&missing.display().to_string()));
+                Ok(answer.to_string())
+            })?;
+            assert_eq!(got, create, "answer {answer:?}");
+        }
+        assert!(!missing.exists(), "asking must not create the directory");
+        fs::remove_dir_all(&dir).ok();
         Ok(())
     }
 
