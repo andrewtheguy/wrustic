@@ -46,8 +46,12 @@ exactly which workflows that means.
   (`\\169.254.255.1\snap`, usable in Explorer rather than only as a mapped
   drive) and the only way in from builds before 24H2; see
   [`docs/smb-tun.md`](docs/smb-tun.md)
-- **Keyboard and mouse navigation**: Vim-style keys, arrow keys, PgUp/PgDn,
-  mouse click/scroll; `--no-mouse` to disable
+- **Keyboard navigation**: Vim-style keys, arrow keys, PgUp/PgDn, wheel
+  scrolling; `--mouse` adds click-to-select at the cost of native text
+  selection
+- **Copy and paste**: copy keys put snapshot IDs, share URLs, passwords and
+  mount commands on the clipboard; pastes go into the focused field as one
+  piece
 - **Passphrase entry**: masked TUI input, with optional keychain auto-unlock
 - **Keychain integration** (macOS, Windows, Linux desktop): optionally save
   the passphrase to the OS credential store for auto-unlock; see

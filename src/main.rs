@@ -1,6 +1,7 @@
 mod app;
 mod automation;
 mod cli;
+mod clipboard;
 mod config;
 mod crypto;
 #[cfg(feature = "dev-harness")]
@@ -26,8 +27,8 @@ use ratatui::{
     crossterm::{
         self,
         event::{
-            self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
-            KeyModifiers,
+            self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
+            EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
         },
     },
 };
@@ -132,11 +133,7 @@ fn main() -> Result<()> {
     // the other way round, any background thread's panic would switch the
     // shell back to its own screen underneath the live TUI.
     install_panic_hook();
-    // Enable mouse reporting after entering raw mode. With capture on,
-    // terminals route clicks/scroll to us instead of doing native text
-    // selection; users can hold Shift to bypass and select text.
-    let mouse_enabled = !cli.no_mouse
-        && crossterm::execute!(std::io::stdout(), EnableMouseCapture).is_ok();
+    enable_terminal_modes(cli.mouse);
     let result = run(
         &mut terminal,
         paths,
@@ -145,12 +142,59 @@ fn main() -> Result<()> {
         cli.smb,
         no_keychain,
     );
-    if mouse_enabled {
-        let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
-    }
+    disable_terminal_modes();
     ratatui::restore();
     report_withheld_panics();
     result
+}
+
+/// The terminal modes wrustic sets on top of ratatui's raw mode and alternate
+/// screen. Each is best effort: a terminal that does not know one ignores it.
+///
+/// * Bracketed paste, always. A paste arrives as one [`Event::Paste`] instead
+///   of as typed keys, so pasted text can never trigger a screen's hotkeys or
+///   submit a form at an embedded newline.
+/// * Mouse capture only with `--mouse`. Capturing the mouse takes text
+///   selection away from the terminal (getting it back takes a modifier that
+///   differs per terminal), and everything here is reachable from the
+///   keyboard, so the terminal keeps the mouse by default.
+/// * Without capture, alternate-scroll mode instead: the terminal turns wheel
+///   turns into Up/Down keys, so lists still scroll with the wheel while
+///   selecting text stays native.
+fn enable_terminal_modes(mouse: bool) {
+    let mut out = std::io::stdout();
+    let _ = crossterm::execute!(out, EnableBracketedPaste);
+    let _ = if mouse {
+        crossterm::execute!(out, EnableMouseCapture)
+    } else {
+        crossterm::execute!(out, AlternateScroll(true))
+    };
+}
+
+/// Undo [`enable_terminal_modes`]. Unconditional: turning off a mode that was
+/// never on is harmless, and the panic hook has no record of what was set.
+fn disable_terminal_modes() {
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        DisableMouseCapture,
+        AlternateScroll(false),
+        DisableBracketedPaste
+    );
+}
+
+/// DECSET 1007, which crossterm has no command for.
+struct AlternateScroll(bool);
+
+impl crossterm::Command for AlternateScroll {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        f.write_str(if self.0 { "\x1b[?1007h" } else { "\x1b[?1007l" })
+    }
+
+    /// A legacy Windows console has no such mode; there is nothing to set.
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Panic reports withheld from a live TUI, printed once the terminal is the
@@ -189,7 +233,7 @@ fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         if std::thread::current().id() == main_thread {
-            let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+            disable_terminal_modes();
             ratatui::restore();
             default_hook(info);
         } else {
@@ -670,6 +714,7 @@ fn run(
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
                     Event::Mouse(m) => app.handle_mouse(m),
+                    Event::Paste(text) => app.handle_paste(&text),
                     _ => {}
                 }
             }
@@ -692,6 +737,10 @@ fn run(
                 }
                 Event::Mouse(m) => {
                     app.handle_mouse(m);
+                    break;
+                }
+                Event::Paste(text) => {
+                    app.handle_paste(&text);
                     break;
                 }
                 Event::Resize(_, _) => break,

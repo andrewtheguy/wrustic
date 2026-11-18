@@ -143,7 +143,18 @@ Options:
                               days unused. To clean it out by hand, point restic
                               at the same directory:
                               'restic --cache-dir <that path> cache --cleanup'.
-      --no-mouse              Disable mouse reporting (useful for QA / copy-paste).
+      --mouse                 Capture the mouse: click selects a row,
+                              double-click opens it. Off by default, because a
+                              captured mouse takes text selection away from
+                              the terminal; with it on, hold a key while
+                              dragging to select anyway — Option in iTerm2, Fn
+                              in macOS Terminal, Shift in most others. The
+                              wheel scrolls lists either way in terminals that
+                              support alternate scroll. Values worth copying
+                              (snapshot IDs, share URLs, passwords, mount
+                              commands) have copy keys, listed in each
+                              screen's footer, that put them on the clipboard
+                              without selecting anything.
       --no-keychain           Disable keychain integration even when the binary
                               was built with the 'keychain' feature.
   -V, --version               Print version and exit.
@@ -192,7 +203,7 @@ pub(crate) struct Cli {
     pub(crate) port: u16,
     pub(crate) smb: SmbOptions,
     pub(crate) restic_cache: bool,
-    pub(crate) no_mouse: bool,
+    pub(crate) mouse: bool,
     pub(crate) no_keychain: bool,
     pub(crate) show_version: bool,
     pub(crate) show_help: bool,
@@ -208,7 +219,7 @@ impl Default for Cli {
             port: DEFAULT_SERVER_PORT,
             smb: SmbOptions::default(),
             restic_cache: true,
-            no_mouse: false,
+            mouse: false,
             no_keychain: false,
             show_version: false,
             show_help: false,
@@ -260,7 +271,7 @@ requires compiling with `--features smb-tun`"
                 cli.smb.tun_addrs = parse_tun_ip(value, "--smb-tun-ip=")?;
             }
             "--no-restic-cache" => cli.restic_cache = false,
-            "--no-mouse" => cli.no_mouse = true,
+            "--mouse" => cli.mouse = true,
             "--no-keychain" => cli.no_keychain = true,
             "-d" | "--config-dir" => {
                 let value = args

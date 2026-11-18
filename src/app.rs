@@ -409,6 +409,11 @@ pub(crate) struct App {
     // Last left-click on the SnapshotContents list: timestamp + clicked row
     // index. Used to detect a double-click for activating a content item.
     pub(crate) last_content_click: Option<(Instant, usize)>,
+
+    pub(crate) clipboard: crate::clipboard::Clipboard,
+    /// One-line outcome of the last copy key, shown in place of the footer
+    /// until the next key press.
+    pub(crate) notice: Option<String>,
 }
 
 // Two clicks on the same row within this window count as a double-click.
@@ -540,6 +545,8 @@ impl App {
             list_header_rows: 0,
             last_snapshot_click: None,
             last_content_click: None,
+            clipboard: crate::clipboard::Clipboard::default(),
+            notice: None,
         };
 
         app.start_passphrase_flow();
@@ -1474,6 +1481,72 @@ impl App {
         self.snapshots.get(abs)
     }
 
+    /// Put `text` on the clipboard and say so in the footer.
+    fn copy(&mut self, what: &str, text: &str) {
+        self.notice = Some(match self.clipboard.copy(text) {
+            Ok(crate::clipboard::Copied::Native) => format!("copied {what} to the clipboard"),
+            Ok(crate::clipboard::Copied::Terminal) => format!(
+                "sent {what} to the terminal's clipboard (OSC 52) — only lands if the \
+                 terminal allows clipboard access"
+            ),
+            Err(e) => format!("could not copy {what}: {e}"),
+        });
+    }
+
+    /// The text field a key or paste goes to on the current screen, if any.
+    /// Mirrors the field routing in [`Self::handle_key`].
+    fn focused_input(&mut self) -> Option<&mut Input> {
+        Some(match self.screen {
+            Screen::PassphraseInstancePrompt => &mut self.passphrase_instance_input,
+            Screen::PassphraseSetup => match self.field_focus {
+                0 => &mut self.passphrase_input,
+                1 => &mut self.passphrase_confirm,
+                _ => return None,
+            },
+            Screen::PassphraseUnlock if self.keychain_enabled() && self.field_focus != 0 => {
+                return None;
+            }
+            Screen::PassphraseUnlock => &mut self.passphrase_input,
+            Screen::SnapshotTagEdit => &mut self.tag_edit_input,
+            Screen::CreateProfileName => &mut self.new_profile_name,
+            Screen::LocalPath => &mut self.local_path,
+            Screen::RestConfig => match self.field_focus {
+                0 => &mut self.rest_url,
+                1 => &mut self.rest_user,
+                _ => &mut self.rest_password,
+            },
+            Screen::S3Location => match self.field_focus {
+                0 => &mut self.s3_endpoint,
+                1 => &mut self.s3_bucket,
+                2 => &mut self.s3_region,
+                _ => &mut self.s3_root,
+            },
+            Screen::S3Credentials => match self.field_focus {
+                0 => &mut self.s3_access_key,
+                _ => &mut self.s3_secret_key,
+            },
+            Screen::Password => &mut self.password,
+            _ => return None,
+        })
+    }
+
+    /// A bracketed paste: the whole text arrives as one event instead of as
+    /// keystrokes, so it can never fire a screen's hotkeys or submit a form
+    /// with an embedded newline. It goes into the focused field at the cursor
+    /// with control characters (line breaks, tabs) dropped — every field is a
+    /// single line — and is ignored where no field has focus.
+    pub(crate) fn handle_paste(&mut self, text: &str) {
+        self.notice = None;
+        if self.help_overlay || self.snapshot_info_overlay {
+            return;
+        }
+        if let Some(input) = self.focused_input() {
+            for c in text.chars().filter(|c| !c.is_control()) {
+                input.handle(tui_input::InputRequest::InsertChar(c));
+            }
+        }
+    }
+
     fn activate_backend(&mut self) {
         let idx = self
             .backend_list
@@ -1490,6 +1563,7 @@ impl App {
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) {
+        self.notice = None;
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.quit = true;
             return;
@@ -1736,6 +1810,11 @@ impl App {
                 KeyCode::Char('i') => {
                     if self.selected_snapshot().is_some() {
                         self.snapshot_info_overlay = true;
+                    }
+                }
+                KeyCode::Char('y') => {
+                    if let Some(id) = self.selected_snapshot_id() {
+                        self.copy("the snapshot ID", &id);
                     }
                 }
                 KeyCode::Char('s') => {
@@ -2152,6 +2231,16 @@ impl App {
                     self.stop_share_keep_target();
                     self.screen = Screen::FileDetails;
                 }
+                KeyCode::Char('y') => {
+                    if let Some(url) = self.share_short_url.clone() {
+                        self.copy("the short URL", &url);
+                    }
+                }
+                KeyCode::Char('l') => {
+                    if let Some(url) = self.share_url.clone() {
+                        self.copy("the long URL", &url);
+                    }
+                }
                 _ => {}
             },
 
@@ -2179,6 +2268,20 @@ impl App {
                 {
                     self.unlock_return = UnlockReturn::Smb;
                     self.screen = Screen::Unlocking;
+                }
+                KeyCode::Char('y') => {
+                    if let Some(pw) = self.smb_password.clone() {
+                        self.copy("the share password", &pw);
+                    }
+                }
+                KeyCode::Char('m') => {
+                    if let Some(cmd) = self
+                        .smb_handle
+                        .as_ref()
+                        .map(|h| h.mount_commands().for_this_os().to_string())
+                    {
+                        self.copy("the mount command", &cmd);
+                    }
                 }
                 _ => {}
             },
@@ -2874,6 +2977,99 @@ mod tests {
 
     fn press(app: &mut App, code: KeyCode) {
         app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn input_values(app: &App) -> Vec<String> {
+        [
+            &app.passphrase_instance_input,
+            &app.passphrase_input,
+            &app.passphrase_confirm,
+            &app.new_profile_name,
+            &app.local_path,
+            &app.rest_url,
+            &app.rest_user,
+            &app.rest_password,
+            &app.s3_endpoint,
+            &app.s3_bucket,
+            &app.s3_region,
+            &app.s3_root,
+            &app.s3_access_key,
+            &app.s3_secret_key,
+            &app.password,
+            &app.tag_edit_input,
+        ]
+        .iter()
+        .map(|i| i.value().to_string())
+        .collect()
+    }
+
+    /// `focused_input` duplicates the field routing in `handle_key`; a paste
+    /// must land exactly where typing would, on every screen and focus.
+    #[test]
+    fn paste_lands_where_typing_does() {
+        type Case = (&'static str, fn() -> Screen);
+        let screens: [Case; 12] = [
+            ("PassphraseInstancePrompt", || Screen::PassphraseInstancePrompt),
+            ("PassphraseSetup", || Screen::PassphraseSetup),
+            ("PassphraseUnlock", || Screen::PassphraseUnlock),
+            ("SnapshotTagEdit", || Screen::SnapshotTagEdit),
+            ("CreateProfileName", || Screen::CreateProfileName),
+            ("LocalPath", || Screen::LocalPath),
+            ("RestConfig", || Screen::RestConfig),
+            ("S3Location", || Screen::S3Location),
+            ("S3Credentials", || Screen::S3Credentials),
+            ("Password", || Screen::Password),
+            ("Home", || Screen::Home),
+            ("Snapshots", || Screen::Snapshots),
+        ];
+        for (screen, make) in screens {
+            for focus in 0..4 {
+                let fresh = || {
+                    let mut app = boot_app_with_snapshots(vec![]);
+                    app.screen = make();
+                    app.field_focus = focus;
+                    app
+                };
+                // What each field gained: boot fills the instance prompt with
+                // a random default name, so whole values differ between apps.
+                let gained = |before: Vec<String>, app: &App| -> Vec<String> {
+                    before
+                        .iter()
+                        .zip(input_values(app))
+                        .map(|(b, a)| a.strip_prefix(b.as_str()).unwrap_or(&a).to_string())
+                        .collect()
+                };
+                let mut typed = fresh();
+                let before = input_values(&typed);
+                press(&mut typed, KeyCode::Char('x'));
+                let typed_gain = gained(before, &typed);
+                let mut pasted = fresh();
+                let before = input_values(&pasted);
+                pasted.handle_paste("x\r\n");
+                assert_eq!(
+                    gained(before, &pasted),
+                    typed_gain,
+                    "{screen} focus {focus}: paste and typing disagree"
+                );
+                if typed_gain.iter().any(|g| !g.is_empty()) {
+                    assert_eq!(
+                        std::mem::discriminant(&pasted.screen),
+                        std::mem::discriminant(&make()),
+                        "{screen}: a paste must not submit"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn paste_on_a_list_screen_fires_no_hotkeys() {
+        let mut app = boot_app_with_snapshots(vec![row_with_id("aaa")]);
+        app.screen = Screen::Snapshots;
+        app.list_state.select(Some(0));
+        app.handle_paste("dq");
+        assert!(matches!(app.screen, Screen::Snapshots));
+        assert_eq!(app.snapshots.len(), 1);
     }
 
     fn row_with_id(id: &str) -> SnapshotRow {
