@@ -151,10 +151,11 @@ fn main() -> Result<()> {
 /// The terminal modes wrustic sets on top of ratatui's raw mode and alternate
 /// screen. Each is best effort: a terminal that does not know one ignores it.
 ///
-/// * Bracketed paste, always. A paste arrives as one [`Event::Paste`] instead
-///   of as typed keys, so pasted text can never trigger a screen's hotkeys or
-///   submit a form at an embedded newline. The Windows console has no such
-///   mode; [`Events`] reassembles pastes there instead.
+/// * Bracketed paste, except on Windows. A paste arrives as one
+///   [`Event::Paste`] instead of as typed keys, so pasted text can never
+///   trigger a screen's hotkeys or submit a form at an embedded newline.
+///   crossterm's Windows console reader cannot decode it, so it is not
+///   requested there; [`Events`] reassembles pastes instead.
 /// * Mouse capture only with `--mouse`. Capturing the mouse takes text
 ///   selection away from the terminal (getting it back takes a modifier that
 ///   differs per terminal), and everything here is reachable from the
@@ -164,7 +165,9 @@ fn main() -> Result<()> {
 ///   selecting text stays native.
 fn enable_terminal_modes(mouse: bool) {
     let mut out = std::io::stdout();
-    let _ = crossterm::execute!(out, EnableBracketedPaste);
+    if !cfg!(windows) {
+        let _ = crossterm::execute!(out, EnableBracketedPaste);
+    }
     let _ = if mouse {
         crossterm::execute!(out, EnableMouseCapture)
     } else {
@@ -172,15 +175,17 @@ fn enable_terminal_modes(mouse: bool) {
     };
 }
 
-/// Undo [`enable_terminal_modes`]. Unconditional: turning off a mode that was
-/// never on is harmless, and the panic hook has no record of what was set.
+/// Undo [`enable_terminal_modes`]. Unconditional, since the panic hook has no
+/// record of what was set, and one command at a time: a batched `execute!`
+/// stops at the first error, and on Windows turning off a mouse capture that
+/// was never on is one ("Initial console modes not set").
 fn disable_terminal_modes() {
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        DisableMouseCapture,
-        AlternateScroll(false),
-        DisableBracketedPaste
-    );
+    let mut out = std::io::stdout();
+    let _ = crossterm::execute!(out, DisableMouseCapture);
+    let _ = crossterm::execute!(out, AlternateScroll(false));
+    if !cfg!(windows) {
+        let _ = crossterm::execute!(out, DisableBracketedPaste);
+    }
 }
 
 /// DECSET 1007, which crossterm has no command for.
@@ -198,19 +203,37 @@ impl crossterm::Command for AlternateScroll {
     }
 }
 
-/// Reads terminal events, reassembling pastes on Windows.
+/// Reads terminal events, reassembling pastes on Windows. Every read in the
+/// main loop goes through here, so an event held back below is never skipped.
 ///
 /// crossterm's Windows console reader has no bracketed paste: a paste arrives
 /// as one key event per character, Enter included, so a multi-line paste
-/// would submit a form and pasted letters would fire hotkeys. The console
-/// queues a paste whole, though, so it is recognised the way PSReadLine
-/// recognises one: characters already waiting when a key is read were not
-/// typed one at a time. Such a run comes back as a single [`Event::Paste`].
+/// would submit a form and pasted letters would fire hotkeys. What gives a
+/// paste away is timing. The console queues it all at once, so when a key
+/// wakes an idle reader and more text keys follow within [`PASTE_GAP`] —
+/// faster than anyone types — the run comes back as one [`Event::Paste`].
+///
+/// Keys typed while the app was busy also arrive queued together, and they
+/// must still act as typed: those are recognised by having been waiting
+/// already when the read began, after the app spent [`BUSY`] or longer since
+/// the previous one, and are delivered one at a time until the queue is empty.
+///
+/// A paste of a single character is a single key event like any other and
+/// cannot be told apart from typing it.
 #[derive(Default)]
 struct Events {
     /// Read while collecting a run, but not part of it; returned next.
     held: Option<Event>,
+    /// When the previous read returned.
+    last_read: Option<std::time::Instant>,
+    /// Delivering typed-ahead keys one at a time.
+    draining: bool,
 }
+
+/// Longest gap between the keys of one pasted run.
+const PASTE_GAP: std::time::Duration = std::time::Duration::from_millis(5);
+/// Time between reads after which keys found waiting were typed ahead.
+const BUSY: std::time::Duration = std::time::Duration::from_millis(100);
 
 impl Events {
     fn poll(&self, timeout: std::time::Duration) -> std::io::Result<bool> {
@@ -221,23 +244,42 @@ impl Events {
     }
 
     fn read(&mut self) -> std::io::Result<Event> {
-        let first = match self.held.take() {
-            Some(event) => event,
-            None => event::read()?,
-        };
-        if !cfg!(windows) {
-            return Ok(first);
+        if let Some(event) = self.held.take() {
+            return Ok(event);
         }
-        let (event, held) = coalesce_paste(first, || {
-            Ok(if event::poll(std::time::Duration::ZERO)? {
-                Some(event::read()?)
-            } else {
-                None
-            })
-        })?;
-        self.held = held;
+        if !cfg!(windows) {
+            return event::read();
+        }
+        let waiting = event::poll(std::time::Duration::ZERO)?;
+        self.draining = typed_ahead(waiting, self.last_read.map(|t| t.elapsed()), self.draining);
+        let event = if self.draining {
+            event::read()?
+        } else {
+            let first = event::read()?;
+            let (event, held) = coalesce_paste(first, || {
+                Ok(if event::poll(PASTE_GAP)? {
+                    Some(event::read()?)
+                } else {
+                    None
+                })
+            })?;
+            self.held = held;
+            event
+        };
+        self.last_read = Some(std::time::Instant::now());
         Ok(event)
     }
+}
+
+/// Whether the keys `waiting` at the start of a read were typed ahead while
+/// the app was busy, `since_last_read` after the previous read returned. Once
+/// draining, it continues until nothing is waiting.
+fn typed_ahead(
+    waiting: bool,
+    since_last_read: Option<std::time::Duration>,
+    draining: bool,
+) -> bool {
+    waiting && (draining || since_last_read.is_some_and(|d| d >= BUSY))
 }
 
 /// Folds `first` and the text keys already waiting behind it (`ready` yields
@@ -778,8 +820,8 @@ fn run(
                     // child exists (detect / the unstick pre-check) is
                     // latched by the tracker, and the runner refuses to
                     // spawn restic after it — the cancel lands either way.
-                    if event::poll(std::time::Duration::from_millis(150))?
-                        && let Event::Key(key) = event::read()?
+                    if events.poll(std::time::Duration::from_millis(150))?
+                        && let Event::Key(key) = events.read()?
                         && key.kind == KeyEventKind::Press
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                         && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
@@ -938,6 +980,21 @@ mod tests {
         );
         assert_eq!(event, Event::Paste("a\nQ@".into()));
         assert_eq!(held, Some(press(KeyCode::Down)), "the run ends at the first non-text key");
+    }
+
+    #[test]
+    fn keys_waiting_after_busy_work_are_typed_ahead_until_drained() {
+        let quick = Some(std::time::Duration::from_millis(5));
+        let busy = Some(BUSY);
+        // An idle reader woken by a key: candidate paste.
+        assert!(!typed_ahead(false, busy, false));
+        // Waiting after a quick redraw: the rest of a paste, not typing.
+        assert!(!typed_ahead(true, quick, false));
+        // Waiting after busy work, and on until the queue is empty.
+        assert!(typed_ahead(true, busy, false));
+        assert!(typed_ahead(true, quick, true));
+        assert!(!typed_ahead(false, quick, true));
+        assert!(!typed_ahead(true, None, false));
     }
 
     #[test]

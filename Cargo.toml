@@ -10,8 +10,9 @@ aes-gcm = "0.10"
 aes256ctr_poly1305aes = "0.2"
 anyhow = "1"
 # The OS clipboard behind the TUI's copy keys (src/clipboard.rs). No image
-# support: only text is ever copied.
-arboard = { version = "3.7", default-features = false }
+# support: only text is ever copied. Wayland's data-control protocol as well
+# as X11, so a session without XWayland still copies natively.
+arboard = { version = "3.7", default-features = false, features = ["wayland-data-control"] }
 base64 = "0.22"
 bytes = "1"
 dirs = "7"
