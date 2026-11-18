@@ -158,23 +158,38 @@ fn resolve_paths(
     })
 }
 
-/// Whether [`acquire_lock`] may create the config directory. A directory the
-/// user named that does not exist yet is created only once `ask` (given the
-/// question) returns a yes, so a mistyped `-d` path is not silently turned
-/// into a fresh, empty instance. The platform default is created without
-/// asking: that is just a first run.
-pub fn confirm_create(paths: &Paths, ask: impl FnOnce(&str) -> Result<String>) -> Result<bool> {
-    if !paths.explicit || paths.dir.exists() {
-        return Ok(true);
+/// How [`acquire_lock`] treats the config directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirSetup {
+    /// The directory must already exist; one that vanished since the check is
+    /// an error, never silently recreated.
+    UseExisting,
+    /// Create the directory (and missing parents) if it is not there.
+    Create,
+}
+
+/// Decide how [`acquire_lock`] may treat the config directory, or `None` when
+/// the user declined to create it. A directory the user named that does not
+/// exist yet is created only once `ask` (given the question) returns a yes,
+/// so a mistyped `-d` path is not silently turned into a fresh, empty
+/// instance. The platform default is created without asking: that is just a
+/// first run.
+pub fn confirm_create(
+    paths: &Paths,
+    ask: impl FnOnce(&str) -> Result<String>,
+) -> Result<Option<DirSetup>> {
+    if !paths.explicit {
+        return Ok(Some(DirSetup::Create));
+    }
+    if paths.dir.exists() {
+        return Ok(Some(DirSetup::UseExisting));
     }
     let answer = ask(&format!(
         "Config directory {} does not exist. Create it? [y/N] ",
         paths.dir.display()
     ))?;
-    Ok(matches!(
-        answer.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
+    Ok(matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+        .then_some(DirSetup::Create))
 }
 
 /// Restrict a file to its owner where the platform can express that. On Unix
@@ -215,20 +230,22 @@ impl Drop for ConfigLock {
     }
 }
 
-pub fn acquire_lock(paths: &Paths) -> Result<ConfigLock> {
-    // Owner-only on Unix, like the files inside it. The mode applies only to
-    // directories this call creates — an existing config dir keeps its
-    // permissions. Windows: same parent-ACL story as `owner_only`.
-    let mut dir_builder = fs::DirBuilder::new();
-    dir_builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        dir_builder.mode(0o700);
+pub fn acquire_lock(paths: &Paths, setup: DirSetup) -> Result<ConfigLock> {
+    if setup == DirSetup::Create {
+        // Owner-only on Unix, like the files inside it. The mode applies only
+        // to directories this call creates — an existing config dir keeps its
+        // permissions. Windows: same parent-ACL story as `owner_only`.
+        let mut dir_builder = fs::DirBuilder::new();
+        dir_builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            dir_builder.mode(0o700);
+        }
+        dir_builder
+            .create(&paths.dir)
+            .with_context(|| format!("creating {}", paths.dir.display()))?;
     }
-    dir_builder
-        .create(&paths.dir)
-        .with_context(|| format!("creating {}", paths.dir.display()))?;
     // `truncate(false)`: the lock file is a zero-byte marker that outlives the
     // process, and truncating it is not the point — holding it is.
     let file = owner_only(
@@ -239,7 +256,13 @@ pub fn acquire_lock(paths: &Paths) -> Result<ConfigLock> {
             .truncate(false),
     )
     .open(&paths.lock)
-    .with_context(|| format!("opening lock file {}", paths.lock.display()))?;
+    .map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound && setup == DirSetup::UseExisting {
+            anyhow!("config directory {} no longer exists", paths.dir.display())
+        } else {
+            anyhow!(e).context(format!("opening lock file {}", paths.lock.display()))
+        }
+    })?;
     match file.try_lock() {
         Ok(()) => Ok(ConfigLock { file }),
         Err(fs::TryLockError::WouldBlock) => bail!(
@@ -671,11 +694,12 @@ mod tests {
         let missing = dir.join("missing");
         let never_asked = |_: &str| -> Result<String> { panic!("must not prompt") };
 
-        assert!(confirm_create(&test_paths(&dir), never_asked)?);
+        assert_eq!(confirm_create(&test_paths(&dir), never_asked)?, Some(DirSetup::UseExisting));
         let default = Paths { explicit: false, ..test_paths(&missing) };
-        assert!(confirm_create(&default, never_asked)?);
+        assert_eq!(confirm_create(&default, never_asked)?, Some(DirSetup::Create));
 
-        for (answer, create) in [("y\n", true), (" YES \r\n", true), ("n\n", false), ("", false)] {
+        let yes = Some(DirSetup::Create);
+        for (answer, create) in [("y\n", yes), (" YES \r\n", yes), ("n\n", None), ("", None)] {
             let got = confirm_create(&test_paths(&missing), |q| {
                 assert!(q.contains(&missing.display().to_string()));
                 Ok(answer.to_string())
@@ -684,6 +708,19 @@ mod tests {
         }
         assert!(!missing.exists(), "asking must not create the directory");
         fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn existing_dir_that_vanished_is_not_recreated() -> Result<()> {
+        let dir = fresh_dir("vanished");
+        let paths = test_paths(&dir);
+        assert_eq!(confirm_create(&paths, |_| panic!("must not prompt"))?, Some(DirSetup::UseExisting));
+        fs::remove_dir_all(&dir)?;
+
+        let err = acquire_lock(&paths, DirSetup::UseExisting).expect_err("vanished dir must fail");
+        assert!(format!("{err:#}").contains("no longer exists"), "got: {err:#}");
+        assert!(!dir.exists(), "a vanished directory must not be recreated");
         Ok(())
     }
 
@@ -736,7 +773,7 @@ mod tests {
             return;
         };
         let paths = test_paths(std::path::Path::new(&dir));
-        match acquire_lock(&paths) {
+        match acquire_lock(&paths, DirSetup::UseExisting) {
             // Hold the guard only until this scope ends; the parent waits for
             // the process to exit before checking anything further.
             Ok(_lock) => println!("{CHILD_ACQUIRED}"),
@@ -755,7 +792,7 @@ mod tests {
         let dir = std::path::absolute(&dir)?;
         let paths = test_paths(&dir);
 
-        let first = acquire_lock(&paths)?;
+        let first = acquire_lock(&paths, DirSetup::Create)?;
         assert!(paths.lock.exists(), "lock file should be created");
 
         let refused = run_lock_child(&dir);
@@ -783,7 +820,7 @@ mod tests {
         let paths = test_paths(&dir);
         let cipher = Cipher::new([0x11u8; 32], "test".into(), "testsig0");
 
-        let guard = acquire_lock(&paths)?;
+        let guard = acquire_lock(&paths, DirSetup::UseExisting)?;
         save(&Config::default(), &paths, &cipher)?;
         // Saving twice exercises the rename-over-existing path.
         save(&Config::default(), &paths, &cipher)?;
