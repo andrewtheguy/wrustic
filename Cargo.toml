@@ -18,15 +18,19 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 jiff = { version = "0.2", features = ["serde"] }
-opendal = { version = "0.57.0", default-features = false, features = ["blocking", "layers-retry", "reqwest-rustls-tls", "services-s3"] }
+# No HTTP transport feature: src/s3_backend.rs hands every operator its own
+# reqwest client (connect and stall timeouts) through the transport crate.
+opendal = { version = "0.59.5", default-features = false, features = ["blocking", "layers-retry", "services-s3"] }
+opendal-http-transport-reqwest = { version = "0.59.5", default-features = false, features = ["rustls"] }
 rand = "0.10.1"
 # The read-only SMB 2.1 server the snapshot share runs on, shared with the
 # smbanything project. Default features off: the `tun` transport (wintun +
 # a userspace TCP stack) is compiled in only by wrustic's `smb-tun` feature.
 smbanything_core = { git = "https://github.com/andrewtheguy/smbanything.git", tag = "v0.0.8", default-features = false }
 # Direct HTTP access to the rest-server `locks/` endpoints (rustic_backend's
-# REST backend is FileType-addressed and cannot reach them). Blocking client;
-# same features rustic_backend already compiles reqwest with.
+# REST backend is FileType-addressed and cannot reach them) through the
+# blocking client, and the async client behind the S3 backend's opendal
+# transport. Same features rustic_backend already compiles reqwest with.
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 ratatui = "0.30.0"
 # Hidden-input passphrase prompt for `wrustic env` when neither the env var

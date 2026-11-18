@@ -18,22 +18,25 @@ use std::sync::OnceLock;
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use opendal::{
+    HttpTransporter, OperationContext,
     blocking::Operator,
     layers::RetryLayer,
     options::{ListOptions, ReadOptions},
     services::S3,
 };
+use opendal_http_transport_reqwest::ReqwestTransport;
 use rustic_core::{
     BytesList, ErrorKind, FileType, Id, ReadBackend, RusticError, RusticResult, WriteBackend,
 };
 use tokio::runtime::Runtime;
 
 use crate::lock::LockBackend;
-
-const DEFAULT_RETRIES: usize = 5;
+use crate::repo::{CONNECT_TIMEOUT, DEFAULT_RETRIES, READ_TIMEOUT};
 
 /// Blocking S3 operator for a profile's repository root. Shared by the data
-/// and lock backends so both speak to the same place the same way.
+/// and lock backends so both speak to the same place the same way: the same
+/// connect and stall timeouts as the REST backend, over wrustic's own reqwest
+/// client (opendal's default client has neither).
 fn build_operator(
     endpoint: &str,
     bucket: &str,
@@ -41,6 +44,7 @@ fn build_operator(
     root: &str,
     access_key: &str,
     secret_key: &str,
+    retries: usize,
 ) -> Result<Operator> {
     let mut builder = S3::default()
         .bucket(bucket)
@@ -52,14 +56,18 @@ fn build_operator(
         builder = builder.endpoint(endpoint);
     }
 
+    let client = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
+        .build()
+        .context("building the S3 HTTP client")?;
+    let context = OperationContext::new()
+        .with_http_transport(HttpTransporter::new(ReqwestTransport::new(client)));
+
     let operator = opendal::Operator::new(builder)
         .context("creating the S3 backend")?
-        .layer(
-            RetryLayer::new()
-                .with_max_times(DEFAULT_RETRIES)
-                .with_jitter(),
-        )
-        .finish();
+        .with_context(context)
+        .layer(RetryLayer::new().with_max_times(retries).with_jitter());
 
     let _guard = runtime().enter();
     Operator::new(operator).context("creating the blocking S3 backend")
@@ -81,8 +89,16 @@ impl S3LockBackend {
         dir: &str,
     ) -> Result<Self> {
         Ok(Self {
-            operator: build_operator(endpoint, bucket, region, root, access_key, secret_key)
-                .with_context(|| format!("creating the S3 {dir} backend"))?,
+            operator: build_operator(
+                endpoint,
+                bucket,
+                region,
+                root,
+                access_key,
+                secret_key,
+                DEFAULT_RETRIES,
+            )
+            .with_context(|| format!("creating the S3 {dir} backend"))?,
             dir: dir.to_string(),
         })
     }
@@ -168,10 +184,13 @@ impl S3DataBackend {
         root: &str,
         access_key: &str,
         secret_key: &str,
+        retries: usize,
     ) -> Result<Self> {
         Ok(Self {
-            operator: build_operator(endpoint, bucket, region, root, access_key, secret_key)
-                .context("creating the S3 data backend")?,
+            operator: build_operator(
+                endpoint, bucket, region, root, access_key, secret_key, retries,
+            )
+            .context("creating the S3 data backend")?,
         })
     }
 
@@ -352,6 +371,7 @@ mod tests {
             &format!("data-backend-it-{}", std::process::id()),
             "wrustic-it",
             "wrustic-it-secret",
+            DEFAULT_RETRIES,
         )
         .unwrap();
 

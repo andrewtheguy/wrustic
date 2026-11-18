@@ -1,5 +1,7 @@
+use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::mem;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
@@ -93,10 +95,33 @@ pub(crate) struct FileDetails {
     pub(crate) content_hashes: Vec<String>,
 }
 
+/// How long a repository backend (REST or S3) waits for a connection before
+/// the attempt fails. Each request's overall time stays unbounded (S3) or
+/// generous (REST: rustic_backend's 10 minutes) so large packs can stream,
+/// so without this a host that never answers would hold every attempt for
+/// the OS connect timeout. 30 s is what the lock module's REST client allows
+/// a whole request.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a repository backend request may go without receiving a byte
+/// before the attempt fails and is retried — restic's own
+/// `--stuck-request-timeout` default, so wrustic never gives up on a slow
+/// server that restic itself would wait for (a REST server only starts
+/// answering a listing once it has walked every pack).
+pub(crate) const READ_TIMEOUT: Duration = Duration::from_mins(5);
+
+/// Retries after a failed backend request, matching the defaults of both
+/// rustic_backend's REST backend and its opendal one.
+pub(crate) const DEFAULT_RETRIES: usize = 5;
+
 // All backends are write-capable; keeping write operations safe against
 // concurrent restic processes is the lock module's job (docs/locking.md),
 // not the backend's.
 pub(crate) fn build_backends(profile: &Profile) -> Result<RepositoryBackends> {
+    build_backends_with_retries(profile, DEFAULT_RETRIES)
+}
+
+fn build_backends_with_retries(profile: &Profile, retries: usize) -> Result<RepositoryBackends> {
     let mut opts = BackendOptions::default();
     match profile {
         Profile::Local { local_path, .. } => {
@@ -121,16 +146,19 @@ pub(crate) fn build_backends(profile: &Profile) -> Result<RepositoryBackends> {
                 url.set_password(Some(rest_password))
                     .map_err(|_| anyhow!("REST URL `{rest_url}` cannot carry a password"))?;
             }
-            // rustic_backend's overall request `timeout` stays at its 10-minute
-            // default so large packs can stream, which leaves a host that
-            // never answers the connect waiting on the OS connect timeout —
-            // for every retry. Bound the connect alone, matching the 30 s the
-            // lock module's REST client allows a whole request.
-            opts = opts.repository(format!("rest:{url}")).options(
-                [("http-connect-timeout".to_string(), "30s".to_string())]
-                    .into_iter()
-                    .collect::<std::collections::BTreeMap<_, _>>(),
-            );
+            opts = opts
+                .repository(format!("rest:{url}"))
+                .options(BTreeMap::from([
+                    ("retry".to_string(), retries.to_string()),
+                    (
+                        "http-connect-timeout".to_string(),
+                        format!("{}s", CONNECT_TIMEOUT.as_secs()),
+                    ),
+                    (
+                        "http-read-timeout".to_string(),
+                        format!("{}s", READ_TIMEOUT.as_secs()),
+                    ),
+                ]));
         }
         Profile::S3 {
             s3_endpoint,
@@ -151,6 +179,7 @@ pub(crate) fn build_backends(profile: &Profile) -> Result<RepositoryBackends> {
                 s3_root,
                 s3_access_key,
                 s3_secret_key,
+                retries,
             )?;
             return Ok(RepositoryBackends::new(std::sync::Arc::new(backend), None));
         }
@@ -158,8 +187,12 @@ pub(crate) fn build_backends(profile: &Profile) -> Result<RepositoryBackends> {
     Ok(opts.to_backends()?)
 }
 
+/// The add-profile check. It runs while the user waits on the "verifying"
+/// screen, so a failed request is reported at once rather than retried —
+/// verifying again is one keypress, and an unreachable host fails within
+/// [`CONNECT_TIMEOUT`] instead of after every retry and its backoff.
 pub(crate) fn verify_profile(profile: &Profile) -> Result<()> {
-    let backends = build_backends(profile)?;
+    let backends = build_backends_with_retries(profile, 0)?;
     Repository::new(&RepositoryOptions::default(), &backends)?
         .open(&Credentials::password(profile.password()))?;
     Ok(())
