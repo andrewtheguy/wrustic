@@ -31,7 +31,7 @@ use rustic_core::{
 use tokio::runtime::Runtime;
 
 use crate::lock::LockBackend;
-use crate::repo::{CONNECT_TIMEOUT, DEFAULT_RETRIES, READ_TIMEOUT};
+use crate::repo::{CONNECT_TIMEOUT, RequestPolicy};
 
 /// Blocking S3 operator for a profile's repository root. Shared by the data
 /// and lock backends so both speak to the same place the same way: the same
@@ -44,7 +44,7 @@ fn build_operator(
     root: &str,
     access_key: &str,
     secret_key: &str,
-    retries: usize,
+    policy: RequestPolicy,
 ) -> Result<Operator> {
     let mut builder = S3::default()
         .bucket(bucket)
@@ -58,7 +58,7 @@ fn build_operator(
 
     let client = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
-        .read_timeout(READ_TIMEOUT)
+        .read_timeout(policy.read_timeout)
         .build()
         .context("building the S3 HTTP client")?;
     let context = OperationContext::new()
@@ -67,7 +67,7 @@ fn build_operator(
     let operator = opendal::Operator::new(builder)
         .context("creating the S3 backend")?
         .with_context(context)
-        .layer(RetryLayer::new().with_max_times(retries).with_jitter());
+        .layer(RetryLayer::new().with_max_times(policy.retries).with_jitter());
 
     let _guard = runtime().enter();
     Operator::new(operator).context("creating the blocking S3 backend")
@@ -96,7 +96,7 @@ impl S3LockBackend {
                 root,
                 access_key,
                 secret_key,
-                DEFAULT_RETRIES,
+                RequestPolicy::STANDARD,
             )
             .with_context(|| format!("creating the S3 {dir} backend"))?,
             dir: dir.to_string(),
@@ -184,11 +184,11 @@ impl S3DataBackend {
         root: &str,
         access_key: &str,
         secret_key: &str,
-        retries: usize,
+        policy: RequestPolicy,
     ) -> Result<Self> {
         Ok(Self {
             operator: build_operator(
-                endpoint, bucket, region, root, access_key, secret_key, retries,
+                endpoint, bucket, region, root, access_key, secret_key, policy,
             )
             .context("creating the S3 data backend")?,
         })
@@ -371,7 +371,7 @@ mod tests {
             &format!("data-backend-it-{}", std::process::id()),
             "wrustic-it",
             "wrustic-it-secret",
-            DEFAULT_RETRIES,
+            RequestPolicy::STANDARD,
         )
         .unwrap();
 

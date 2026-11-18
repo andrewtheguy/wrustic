@@ -103,25 +103,51 @@ pub(crate) struct FileDetails {
 /// a whole request.
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long a repository backend request may go without receiving a byte
-/// before the attempt fails and is retried — restic's own
-/// `--stuck-request-timeout` default, so wrustic never gives up on a slow
-/// server that restic itself would wait for (a REST server only starts
-/// answering a listing once it has walked every pack).
-pub(crate) const READ_TIMEOUT: Duration = Duration::from_mins(5);
+/// How a repository backend (REST or S3) handles a request that fails or
+/// stops receiving data.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RequestPolicy {
+    /// Retries after a failed request.
+    pub(crate) retries: usize,
+    /// How long a request may go without receiving a byte before the attempt
+    /// fails.
+    pub(crate) read_timeout: Duration,
+}
 
-/// Retries after a failed backend request, matching the defaults of both
-/// rustic_backend's REST backend and its opendal one.
-pub(crate) const DEFAULT_RETRIES: usize = 5;
+impl RequestPolicy {
+    /// Everything that reads or writes repository data. 5 retries match the
+    /// defaults of both rustic_backend's REST backend and its opendal one. The
+    /// 5-minute read timeout is restic's own `--stuck-request-timeout` default,
+    /// so wrustic never gives up on a slow server that restic itself would
+    /// wait for (a REST server only starts answering a listing once it has
+    /// walked every pack).
+    pub(crate) const STANDARD: Self = Self {
+        retries: 5,
+        read_timeout: Duration::from_mins(5),
+    };
+
+    /// The add-profile check, which blocks the TUI while the user waits on the
+    /// "verifying" screen. It reads only the config and key files, all tiny,
+    /// so a server that stops sending for [`CONNECT_TIMEOUT`] has failed. A
+    /// failure is reported at once rather than retried, because verifying
+    /// again is one keypress.
+    pub(crate) const VERIFY: Self = Self {
+        retries: 0,
+        read_timeout: CONNECT_TIMEOUT,
+    };
+}
 
 // All backends are write-capable; keeping write operations safe against
 // concurrent restic processes is the lock module's job (docs/locking.md),
 // not the backend's.
 pub(crate) fn build_backends(profile: &Profile) -> Result<RepositoryBackends> {
-    build_backends_with_retries(profile, DEFAULT_RETRIES)
+    build_backends_with_policy(profile, RequestPolicy::STANDARD)
 }
 
-fn build_backends_with_retries(profile: &Profile, retries: usize) -> Result<RepositoryBackends> {
+fn build_backends_with_policy(
+    profile: &Profile,
+    policy: RequestPolicy,
+) -> Result<RepositoryBackends> {
     let mut opts = BackendOptions::default();
     match profile {
         Profile::Local { local_path, .. } => {
@@ -149,14 +175,14 @@ fn build_backends_with_retries(profile: &Profile, retries: usize) -> Result<Repo
             opts = opts
                 .repository(format!("rest:{url}"))
                 .options(BTreeMap::from([
-                    ("retry".to_string(), retries.to_string()),
+                    ("retry".to_string(), policy.retries.to_string()),
                     (
                         "http-connect-timeout".to_string(),
                         format!("{}s", CONNECT_TIMEOUT.as_secs()),
                     ),
                     (
                         "http-read-timeout".to_string(),
-                        format!("{}s", READ_TIMEOUT.as_secs()),
+                        format!("{}s", policy.read_timeout.as_secs()),
                     ),
                 ]));
         }
@@ -179,7 +205,7 @@ fn build_backends_with_retries(profile: &Profile, retries: usize) -> Result<Repo
                 s3_root,
                 s3_access_key,
                 s3_secret_key,
-                retries,
+                policy,
             )?;
             return Ok(RepositoryBackends::new(std::sync::Arc::new(backend), None));
         }
@@ -187,12 +213,10 @@ fn build_backends_with_retries(profile: &Profile, retries: usize) -> Result<Repo
     Ok(opts.to_backends()?)
 }
 
-/// The add-profile check. It runs while the user waits on the "verifying"
-/// screen, so a failed request is reported at once rather than retried —
-/// verifying again is one keypress, and an unreachable host fails within
-/// [`CONNECT_TIMEOUT`] instead of after every retry and its backoff.
+/// The add-profile check, under [`RequestPolicy::VERIFY`]: an unreachable
+/// host or one that stops answering fails within about [`CONNECT_TIMEOUT`].
 pub(crate) fn verify_profile(profile: &Profile) -> Result<()> {
-    let backends = build_backends_with_retries(profile, 0)?;
+    let backends = build_backends_with_policy(profile, RequestPolicy::VERIFY)?;
     Repository::new(&RepositoryOptions::default(), &backends)?
         .open(&Credentials::password(profile.password()))?;
     Ok(())
