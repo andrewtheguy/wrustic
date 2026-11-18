@@ -2,7 +2,7 @@
 //!
 //! [`S3DataBackend`] implements rustic_core's `ReadBackend`/`WriteBackend`
 //! over an opendal S3 operator, replacing rustic_backend's generic opendal
-//! backend. rustic_backend 0.6.2 offers no per-service opendal features — its
+//! backend. rustic_backend 0.8.0 still offers no per-service opendal features — its
 //! `opendal` feature drags in every service crate (~150 packages) — so
 //! wrustic carries this thin wrapper instead and compiles only
 //! `opendal-service-s3`.
@@ -18,20 +18,25 @@ use std::sync::OnceLock;
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use opendal::{
+    HttpTransporter, OperationContext,
     blocking::Operator,
     layers::RetryLayer,
     options::{ListOptions, ReadOptions},
     services::S3,
 };
-use rustic_core::{ErrorKind, FileType, Id, ReadBackend, RusticError, RusticResult, WriteBackend};
+use opendal_http_transport_reqwest::ReqwestTransport;
+use rustic_core::{
+    BytesList, ErrorKind, FileType, Id, ReadBackend, RusticError, RusticResult, WriteBackend,
+};
 use tokio::runtime::Runtime;
 
 use crate::lock::LockBackend;
-
-const DEFAULT_RETRIES: usize = 5;
+use crate::repo::{CONNECT_TIMEOUT, RequestPolicy};
 
 /// Blocking S3 operator for a profile's repository root. Shared by the data
-/// and lock backends so both speak to the same place the same way.
+/// and lock backends so both speak to the same place the same way: the same
+/// connect and stall timeouts as the REST backend, over wrustic's own reqwest
+/// client (opendal's default client has neither).
 fn build_operator(
     endpoint: &str,
     bucket: &str,
@@ -39,6 +44,7 @@ fn build_operator(
     root: &str,
     access_key: &str,
     secret_key: &str,
+    policy: RequestPolicy,
 ) -> Result<Operator> {
     let mut builder = S3::default()
         .bucket(bucket)
@@ -50,14 +56,18 @@ fn build_operator(
         builder = builder.endpoint(endpoint);
     }
 
+    let client = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(policy.read_timeout)
+        .build()
+        .context("building the S3 HTTP client")?;
+    let context = OperationContext::new()
+        .with_http_transport(HttpTransporter::new(ReqwestTransport::new(client)));
+
     let operator = opendal::Operator::new(builder)
         .context("creating the S3 backend")?
-        .layer(
-            RetryLayer::new()
-                .with_max_times(DEFAULT_RETRIES)
-                .with_jitter(),
-        )
-        .finish();
+        .with_context(context)
+        .layer(RetryLayer::new().with_max_times(policy.retries).with_jitter());
 
     let _guard = runtime().enter();
     Operator::new(operator).context("creating the blocking S3 backend")
@@ -79,8 +89,16 @@ impl S3LockBackend {
         dir: &str,
     ) -> Result<Self> {
         Ok(Self {
-            operator: build_operator(endpoint, bucket, region, root, access_key, secret_key)
-                .with_context(|| format!("creating the S3 {dir} backend"))?,
+            operator: build_operator(
+                endpoint,
+                bucket,
+                region,
+                root,
+                access_key,
+                secret_key,
+                RequestPolicy::STANDARD,
+            )
+            .with_context(|| format!("creating the S3 {dir} backend"))?,
             dir: dir.to_string(),
         })
     }
@@ -149,7 +167,7 @@ fn runtime() -> &'static Runtime {
 // ---------------------------------------------------------------------------
 
 /// rustic_core backend for repository *data* on S3. A trimmed-down port of
-/// rustic_backend 0.6.2's `OpenDALBackend` (same layout rules, same operator
+/// rustic_backend 0.8.0's `OpenDALBackend` (same layout rules, same operator
 /// calls), S3-only and without the throttle/connection-limit knobs wrustic
 /// never exposed. `create()` keeps its default no-op — repository init stays
 /// on the restic CLI.
@@ -166,10 +184,13 @@ impl S3DataBackend {
         root: &str,
         access_key: &str,
         secret_key: &str,
+        policy: RequestPolicy,
     ) -> Result<Self> {
         Ok(Self {
-            operator: build_operator(endpoint, bucket, region, root, access_key, secret_key)
-                .context("creating the S3 data backend")?,
+            operator: build_operator(
+                endpoint, bucket, region, root, access_key, secret_key, policy,
+            )
+            .context("creating the S3 data backend")?,
         })
     }
 
@@ -292,10 +313,16 @@ impl ReadBackend for S3DataBackend {
 }
 
 impl WriteBackend for S3DataBackend {
-    fn write_bytes(&self, tpe: FileType, id: &Id, _cacheable: bool, buf: Bytes) -> RusticResult<()> {
+    fn write_bytes(
+        &self,
+        tpe: FileType,
+        id: &Id,
+        _cacheable: bool,
+        content: BytesList,
+    ) -> RusticResult<()> {
         let path = Self::path(tpe, id);
         self.operator
-            .write(&path, buf)
+            .write(&path, content.into_vec())
             .map(|_| ())
             .map_err(|err| backend_error(err, "write", &path))
     }
@@ -344,6 +371,7 @@ mod tests {
             &format!("data-backend-it-{}", std::process::id()),
             "wrustic-it",
             "wrustic-it-secret",
+            RequestPolicy::STANDARD,
         )
         .unwrap();
 
@@ -356,7 +384,7 @@ mod tests {
             .unwrap();
         let payload = Bytes::from_static(b"snapshot payload for the data backend");
         backend
-            .write_bytes(FileType::Snapshot, &id, false, payload.clone())
+            .write_bytes(FileType::Snapshot, &id, false, payload.clone().into())
             .unwrap();
         assert_eq!(
             backend.list_with_size(FileType::Snapshot).unwrap(),
@@ -370,7 +398,12 @@ mod tests {
 
         // The config singleton is addressed by the default id.
         backend
-            .write_bytes(FileType::Config, &Id::default(), false, Bytes::from_static(b"cfg"))
+            .write_bytes(
+                FileType::Config,
+                &Id::default(),
+                false,
+                Bytes::from_static(b"cfg").into(),
+            )
             .unwrap();
         assert_eq!(
             backend.list_with_size(FileType::Config).unwrap(),

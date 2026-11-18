@@ -540,13 +540,13 @@ mod tests {
 
     /// A node holding a name exactly as a repository stores it.
     fn stored_node(name: &str) -> Node {
-        Node::new(
-            name.to_string(),
-            NodeType::File,
-            Metadata::default(),
-            None,
-            None,
-        )
+        Node {
+            name: name.to_string(),
+            node_type: NodeType::File,
+            meta: Metadata::default(),
+            content: None,
+            subtree: None,
+        }
     }
 
     #[test]
