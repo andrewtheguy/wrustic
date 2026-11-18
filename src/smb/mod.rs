@@ -71,7 +71,7 @@ pub(crate) struct SmbHandle {
 }
 
 impl SmbHandle {
-    /// UNC path for a Linux `mount -t cifs`.
+    /// Windows UNC path, `\\host\share`.
     pub(crate) fn unc(&self) -> String {
         self.server.unc()
     }

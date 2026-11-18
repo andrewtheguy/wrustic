@@ -1530,10 +1530,10 @@ impl App {
         })
     }
 
-    /// A bracketed paste: the whole text arrives as one event instead of as
-    /// keystrokes, so it can never fire a screen's hotkeys or submit a form
-    /// with an embedded newline. It goes into the focused field at the cursor
-    /// with control characters (line breaks, tabs) dropped — every field is a
+    /// A paste: the whole text arrives as one event instead of as keystrokes,
+    /// so it can never fire a screen's hotkeys or submit a form with an
+    /// embedded newline. It goes into the focused field at the cursor with
+    /// control characters (line breaks, tabs) dropped — every field is a
     /// single line — and is ignored where no field has focus.
     pub(crate) fn handle_paste(&mut self, text: &str) {
         self.notice = None;
@@ -1541,9 +1541,15 @@ impl App {
             return;
         }
         if let Some(input) = self.focused_input() {
-            for c in text.chars().filter(|c| !c.is_control()) {
-                input.handle(tui_input::InputRequest::InsertChar(c));
-            }
+            // One splice, not an InsertChar per character: each of those
+            // rescans and shifts the whole value, so a large accidental paste
+            // would stall the event loop for seconds.
+            let pasted: String = text.chars().filter(|c| !c.is_control()).collect();
+            let cursor = input.cursor();
+            let value = input.value();
+            let at = value.char_indices().nth(cursor).map_or(value.len(), |(i, _)| i);
+            let spliced = format!("{}{pasted}{}", &value[..at], &value[at..]);
+            *input = Input::new(spliced).with_cursor(cursor + pasted.chars().count());
         }
     }
 
@@ -3060,6 +3066,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn paste_inserts_at_the_cursor_and_keeps_typing_there() {
+        let mut app = boot_app_with_snapshots(vec![]);
+        app.screen = Screen::CreateProfileName;
+        app.new_profile_name = Input::new("héllo".into()).with_cursor(2);
+        app.handle_paste("alpha\r\nq");
+        assert!(matches!(app.screen, Screen::CreateProfileName), "a paste must not submit");
+        assert_eq!(app.new_profile_name.value(), "héalphaqllo");
+        press(&mut app, KeyCode::Char('!'));
+        assert_eq!(app.new_profile_name.value(), "héalphaq!llo");
     }
 
     #[test]

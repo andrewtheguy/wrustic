@@ -153,7 +153,8 @@ fn main() -> Result<()> {
 ///
 /// * Bracketed paste, always. A paste arrives as one [`Event::Paste`] instead
 ///   of as typed keys, so pasted text can never trigger a screen's hotkeys or
-///   submit a form at an embedded newline.
+///   submit a form at an embedded newline. The Windows console has no such
+///   mode; [`Events`] reassembles pastes there instead.
 /// * Mouse capture only with `--mouse`. Capturing the mouse takes text
 ///   selection away from the terminal (getting it back takes a modifier that
 ///   differs per terminal), and everything here is reachable from the
@@ -194,6 +195,101 @@ impl crossterm::Command for AlternateScroll {
     #[cfg(windows)]
     fn execute_winapi(&self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+/// Reads terminal events, reassembling pastes on Windows.
+///
+/// crossterm's Windows console reader has no bracketed paste: a paste arrives
+/// as one key event per character, Enter included, so a multi-line paste
+/// would submit a form and pasted letters would fire hotkeys. The console
+/// queues a paste whole, though, so it is recognised the way PSReadLine
+/// recognises one: characters already waiting when a key is read were not
+/// typed one at a time. Such a run comes back as a single [`Event::Paste`].
+#[derive(Default)]
+struct Events {
+    /// Read while collecting a run, but not part of it; returned next.
+    held: Option<Event>,
+}
+
+impl Events {
+    fn poll(&self, timeout: std::time::Duration) -> std::io::Result<bool> {
+        if self.held.is_some() {
+            return Ok(true);
+        }
+        event::poll(timeout)
+    }
+
+    fn read(&mut self) -> std::io::Result<Event> {
+        let first = match self.held.take() {
+            Some(event) => event,
+            None => event::read()?,
+        };
+        if !cfg!(windows) {
+            return Ok(first);
+        }
+        let (event, held) = coalesce_paste(first, || {
+            Ok(if event::poll(std::time::Duration::ZERO)? {
+                Some(event::read()?)
+            } else {
+                None
+            })
+        })?;
+        self.held = held;
+        Ok(event)
+    }
+}
+
+/// Folds `first` and the text keys already waiting behind it (`ready` yields
+/// them until none is) into one paste. A lone key comes back unchanged. The
+/// first event that cannot be part of a paste ends the run and is handed back
+/// to be returned next.
+fn coalesce_paste(
+    first: Event,
+    mut ready: impl FnMut() -> std::io::Result<Option<Event>>,
+) -> std::io::Result<(Event, Option<Event>)> {
+    let Some(c) = paste_char(&first) else {
+        return Ok((first, None));
+    };
+    let mut text = String::from(c);
+    let mut held = None;
+    while let Some(next) = ready()? {
+        // The console reports key releases too; they carry no text.
+        if matches!(&next, Event::Key(k) if k.kind == KeyEventKind::Release) {
+            continue;
+        }
+        match paste_char(&next) {
+            Some(c) => text.push(c),
+            None => {
+                held = Some(next);
+                break;
+            }
+        }
+    }
+    Ok(if text.chars().count() > 1 {
+        (Event::Paste(text), held)
+    } else {
+        (first, held)
+    })
+}
+
+/// The text a key press contributes to a paste, if it can be part of one.
+/// Ctrl or Alt alone makes it a shortcut (Ctrl+C must still quit); both
+/// together is AltGr, which types characters on many keyboard layouts.
+fn paste_char(event: &Event) -> Option<char> {
+    let Event::Key(key) = event else {
+        return None;
+    };
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    if key.kind != KeyEventKind::Press || ctrl != alt {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char(c) => Some(c),
+        KeyCode::Enter => Some('\n'),
+        KeyCode::Tab => Some('\t'),
+        _ => None,
     }
 }
 
@@ -274,6 +370,7 @@ fn run(
     no_keychain: bool,
 ) -> Result<()> {
     let mut app = App::boot(paths, config_lock, server_port, smb, no_keychain)?;
+    let mut events = Events::default();
 
     while !app.quit {
         terminal.draw(|f| render(f, &mut app))?;
@@ -710,8 +807,8 @@ fn run(
         // lock means the server must stop before other processes remove the
         // lock as stale and a prune deletes data mid-read.
         if matches!(app.screen, Screen::SnapshotSmb) && app.smb_handle.is_some() {
-            if event::poll(std::time::Duration::from_secs(1))? {
-                match event::read()? {
+            if events.poll(std::time::Duration::from_secs(1))? {
+                match events.read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
                     Event::Mouse(m) => app.handle_mouse(m),
                     Event::Paste(text) => app.handle_paste(&text),
@@ -730,7 +827,7 @@ fn run(
         // that can change what's on screen. Ignoring focus/mouse/key-release
         // events keeps the terminal quiet when the app has nothing to do.
         loop {
-            match event::read()? {
+            match events.read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     app.handle_key(key);
                     break;
@@ -812,6 +909,51 @@ fn with_parent(items: Vec<ContentRow>) -> (Vec<ContentRow>, TableState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key(code: KeyCode, modifiers: KeyModifiers, kind: KeyEventKind) -> Event {
+        Event::Key(crossterm::event::KeyEvent::new_with_kind(code, modifiers, kind))
+    }
+
+    fn press(code: KeyCode) -> Event {
+        key(code, KeyModifiers::NONE, KeyEventKind::Press)
+    }
+
+    fn coalesce(first: Event, queued: Vec<Event>) -> (Event, Option<Event>) {
+        let mut queued = queued.into_iter();
+        coalesce_paste(first, || Ok(queued.next())).expect("no I/O")
+    }
+
+    #[test]
+    fn queued_text_keys_become_one_paste() {
+        let (event, held) = coalesce(
+            press(KeyCode::Char('a')),
+            vec![
+                key(KeyCode::Char('a'), KeyModifiers::NONE, KeyEventKind::Release),
+                press(KeyCode::Enter),
+                key(KeyCode::Char('Q'), KeyModifiers::SHIFT, KeyEventKind::Press),
+                key(KeyCode::Char('@'), KeyModifiers::CONTROL | KeyModifiers::ALT, KeyEventKind::Press),
+                press(KeyCode::Down),
+                press(KeyCode::Char('z')),
+            ],
+        );
+        assert_eq!(event, Event::Paste("a\nQ@".into()));
+        assert_eq!(held, Some(press(KeyCode::Down)), "the run ends at the first non-text key");
+    }
+
+    #[test]
+    fn a_lone_or_shortcut_key_is_not_a_paste() {
+        let a = press(KeyCode::Char('a'));
+        assert_eq!(coalesce(a.clone(), vec![]), (a.clone(), None));
+        // Only a release behind it: still one typed key.
+        let release = key(KeyCode::Char('a'), KeyModifiers::NONE, KeyEventKind::Release);
+        assert_eq!(coalesce(a.clone(), vec![release]), (a.clone(), None));
+
+        let ctrl_c = key(KeyCode::Char('c'), KeyModifiers::CONTROL, KeyEventKind::Press);
+        assert_eq!(coalesce(ctrl_c.clone(), vec![a.clone()]), (ctrl_c, None));
+        // A shortcut behind typed text ends the run rather than joining it.
+        let ctrl_c = key(KeyCode::Char('c'), KeyModifiers::CONTROL, KeyEventKind::Press);
+        assert_eq!(coalesce(a.clone(), vec![ctrl_c.clone()]), (a, Some(ctrl_c)));
+    }
 
     // A dying thread pool withholds one report per worker and they all say
     // the same thing, so the buffer is capped rather than unbounded.
