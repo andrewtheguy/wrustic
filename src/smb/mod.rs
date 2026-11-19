@@ -159,6 +159,7 @@ impl ShareServer {
         let summary = SnapshotSummary {
             short_id: short_id.clone(),
             id,
+            repository_id: crate::repo::repository_id(repo.as_ref()),
             profile: profile_name.to_string(),
             time: snap.time.strftime("%Y-%m-%d %H:%M:%S").to_string(),
             host: snap.hostname.clone(),
@@ -173,8 +174,15 @@ impl ShareServer {
         let total_size = snap.summary.as_ref().map(|s| s.total_bytes_processed);
         let backing = SnapshotBacking::new(repo, snap.tree, label, total_size)?;
 
-        self.server()
-            .load(Arc::new(RootBacking::with_snapshot(&summary, Arc::new(backing))));
+        // Checked by the share itself on every request, so a lock that goes
+        // bad takes the snapshot out at once even while the TUI is busy;
+        // `lock_poisoned` lets the owner catch up and say so.
+        let health = lock.health();
+        self.server().load(Arc::new(RootBacking::with_snapshot(
+            &summary,
+            Arc::new(backing),
+            Arc::new(move || health.poisoned()),
+        )));
         // The old lock, if any, drops here — after `load` returned.
         self.shared = Some(Shared { summary, lock });
         Ok(())
@@ -409,70 +417,126 @@ mod tests {
     }
 
 
-    /// The share as a real client sees it: the root lists the README beside
-    /// the shared snapshot's short-id folder, the tree lives inside that
-    /// folder, and taking the snapshot out leaves the README alone on the same
-    /// connection's next listing.
+    /// The share as one real client sees it, mounted once: the root lists the
+    /// README beside the shared snapshot's short-id folder, the tree lives
+    /// inside that folder, and on the same session — no reconnect — a replaced
+    /// snapshot's folder gives way to the new one, and taking the snapshot out
+    /// leaves the README alone.
     #[test]
     fn smbclient_sees_the_readme_and_the_shared_snapshot_folder() {
-        use std::process::Command;
+        use std::io::{Read, Write};
+        use std::process::{Command, Stdio};
+        use std::sync::Mutex;
 
-        if Command::new("smbclient").arg("--version").output().is_err() {
-            eprintln!("skipping: smbclient is not installed");
+        if ["smbclient", "stdbuf"]
+            .iter()
+            .any(|tool| Command::new(tool).arg("--version").output().is_err())
+        {
+            eprintln!("skipping: smbclient or stdbuf is not installed");
             return;
         }
 
-        let summary = SnapshotSummary {
-            id: "1a2b3c4d5e6f".into(),
-            short_id: "1a2b3c4d".into(),
+        let summary = |short_id: &str| SnapshotSummary {
+            id: format!("{short_id}5e6f"),
+            short_id: short_id.into(),
+            repository_id: "feedface".into(),
             profile: "laptop".into(),
             time: "2026-11-18 09:30:00".into(),
             host: "box".into(),
             paths: vec!["/docs".into()],
             tags: Vec::new(),
         };
+        let snapshot = |short_id: &str, content: &[u8]| {
+            RootBacking::with_snapshot(
+                &summary(short_id),
+                Arc::new(
+                    MemBacking::new()
+                        .with_dir("docs")
+                        .with_file("docs\\readme.txt", content),
+                ),
+                Arc::new(|| false),
+            )
+        };
         let handle = smb::bind(0, DEFAULT_SHARE_NAME, Bind::Loopback, test_credentials())
             .and_then(smb::Bound::start)
             .expect("server starts");
-        let target = format!("//127.0.0.1/{}", handle.share_name());
-        let smbclient = |commands: &str| {
-            let out = Command::new("smbclient")
-                .arg(&target)
-                .args(["-p", &handle.port().to_string()])
-                .args(["-U", &format!("{TEST_USER}%{TEST_PASSWORD}")])
-                .arg("--option=client min protocol=SMB2_10")
-                .arg("--option=client max protocol=SMB2_10")
-                .args(["-c", commands])
-                .output()
-                .expect("smbclient runs");
-            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-            assert!(
-                out.status.success(),
-                "smbclient failed\nstdout: {stdout}\nstderr: {}",
-                String::from_utf8_lossy(&out.stderr),
-            );
-            stdout
+        handle.load(Arc::new(snapshot("1a2b3c4d", b"first hello\n")));
+
+        // Unbuffered both ways. Piped, smbclient would hold its answers back
+        // until exit, and a buffered read would swallow the lines after the
+        // first into a buffer its wait for more input never looks at.
+        let mut client = Command::new("stdbuf")
+            .args(["-i0", "-o0", "-e0", "smbclient"])
+            .arg(format!("//127.0.0.1/{}", handle.share_name()))
+            .args(["-p", &handle.port().to_string()])
+            .args(["-U", &format!("{TEST_USER}%{TEST_PASSWORD}")])
+            .arg("--option=client min protocol=SMB2_10")
+            .arg("--option=client max protocol=SMB2_10")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("smbclient runs");
+        let mut stdin = client.stdin.take().expect("stdin");
+        let output = Arc::new(Mutex::new(String::new()));
+        let reader = |mut pipe: Box<dyn Read + Send>| {
+            let output = Arc::clone(&output);
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while let Ok(n @ 1..) = pipe.read(&mut buf) {
+                    output.lock().unwrap().push_str(&String::from_utf8_lossy(&buf[..n]));
+                }
+            })
+        };
+        let readers = [
+            reader(Box::new(client.stdout.take().expect("stdout"))),
+            reader(Box::new(client.stderr.take().expect("stderr"))),
+        ];
+        // Runs `commands` in the open session and returns what they printed.
+        // Each batch ends with `pwd`, which always answers, so its line marks
+        // the batch done.
+        const DONE: &str = "Current directory is";
+        let mut batches = 0;
+        let mut run = |commands: &str| {
+            let start = output.lock().unwrap().len();
+            batches += 1;
+            writeln!(stdin, "{commands}\npwd").expect("smbclient takes commands");
+            stdin.flush().expect("flush");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                let out = output.lock().unwrap();
+                if out.matches(DONE).count() >= batches {
+                    return out[start..].to_string();
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "smbclient never finished {commands:?}:\n{out}"
+                );
+                drop(out);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
         };
 
-        handle.load(Arc::new(RootBacking::with_snapshot(
-            &summary,
-            Arc::new(
-                MemBacking::new()
-                    .with_dir("docs")
-                    .with_file("docs\\readme.txt", b"nested hello\n"),
-            ),
-        )));
-        let shared = smbclient("ls; cd 1a2b3c4d; ls; cd docs; ls");
-
+        let first = run("ls\ncd 1a2b3c4d\\docs\nls\ncd \\\nget 1a2b3c4d\\docs\\readme.txt /dev/stdout");
+        handle.load(Arc::new(snapshot("9f8e7d6c", b"second hello\n")));
+        let replaced = run("ls\nls 1a2b3c4d\\*\nget 9f8e7d6c\\docs\\readme.txt /dev/stdout");
         handle.load(Arc::new(RootBacking::empty()));
-        let empty = smbclient("ls");
+        let empty = run("ls\nget README.txt /dev/stdout");
+        writeln!(stdin, "exit").expect("exit");
+        drop(stdin);
+        let status = client.wait().expect("smbclient exits");
+        readers.into_iter().for_each(|r| r.join().expect("reader"));
         handle.stop();
 
-        assert!(shared.contains("README.txt"), "root must list the README:\n{shared}");
-        assert!(shared.contains("1a2b3c4d"), "root must list the snapshot dir:\n{shared}");
-        assert!(shared.contains("readme.txt"), "tree must be walkable:\n{shared}");
-        assert!(empty.contains("README.txt"), "the README outlives the snapshot:\n{empty}");
-        assert!(!empty.contains("1a2b3c4d"), "the snapshot dir must go:\n{empty}");
+        assert!(status.success(), "smbclient failed:\n{}", output.lock().unwrap());
+        assert!(first.contains("README.txt"), "root must list the README:\n{first}");
+        assert!(first.contains("1a2b3c4d"), "root must list the snapshot dir:\n{first}");
+        assert!(first.contains("first hello"), "tree must be readable:\n{first}");
+        assert!(replaced.contains("9f8e7d6c"), "the new snapshot dir must appear:\n{replaced}");
+        assert!(replaced.contains("NT_STATUS_OBJECT"), "the old dir must be gone:\n{replaced}");
+        assert!(replaced.contains("second hello"), "the new tree must be readable:\n{replaced}");
+        assert!(empty.contains("No snapshot is shared"), "the README says so:\n{empty}");
+        assert!(!empty.contains("9f8e7d6c"), "the snapshot dir must go:\n{empty}");
     }
 
     /// A shared snapshot holds restic's non-exclusive lock on its repository,

@@ -83,10 +83,15 @@ struct includes:
   `pending_descend` / `pending_file_lookup` / `pending_refresh_path`.
 - Share dialog: `share_target`, `share_handle`, `share_url`, etc.
 - SMB share: `smb_server` (the running `ShareServer`, which owns the shared
-  snapshot and its repository lock), `smb_password`, `smb_error`,
-  `smb_pending` (the snapshot `s` captured, kept for an unlock-and-retry),
-  `smb_return`, `smb_scroll`. The server outlives the screen: the main loop
-  calls `App::poll_smb` every pass and wakes once a second while it is on.
+  snapshot and its repository lock), `smb_password`, `smb_error` (a failed
+  start or share, or why the server stopped), `smb_unshared` (why a
+  background check took the shared snapshot out, kept apart so a pending
+  share's failure and its `u` survive it), `smb_pending` (the snapshot `s`
+  captured, kept for an unlock-and-retry), `smb_return`, `smb_scroll`. The
+  server outlives the screen: the main loop calls `App::poll_smb` every pass
+  and wakes once a second while it is on. `snapshots_repository_id` is the
+  open list's repository id, which the share is matched against to refuse
+  delete, tag edits and prune on its repository.
 - `help_overlay` — the `?` key list, drawn over the body of whichever screen
   is underneath.
 - Passphrase dialog: `passphrase_input`, `passphrase_confirm`,
@@ -178,6 +183,10 @@ smbanything's own docs. The architectural points:
   no handle can read the old contents — and only then releases the old lock.
   The repository is opened afresh for every share rather than reused, since
   an index loaded earlier knows nothing of packs written since.
+- The shared snapshot's root asks its lock (`RepoLock::health()`) on every
+  request and every read, so an unrefreshable lock takes the snapshot out of
+  the share on its own, even while the main loop is busy with a slow
+  repository; `App::poll_smb` then releases the lock and reports it.
 - Binds `127.0.0.1` and `[::1]` via `local_server::bind_localhost`, the same
   helper the HTTP share uses (both now from `smbanything_core`).
   `Bind::AllInterfaces` exists but is constructed only by the `dev smb-serve`

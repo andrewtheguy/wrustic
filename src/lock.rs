@@ -583,18 +583,19 @@ impl RepoLock {
             }),
             Condvar::new(),
         ));
+        let poison_after = refreshability_timeout(refresh_interval);
         let refresher = {
             let backend = Arc::clone(&backend);
             let shared = Arc::clone(&shared);
             std::thread::spawn(move || {
-                refresh_loop(&backend, &crypto, exclusive, refresh_interval, &shared);
+                refresh_loop(&backend, &crypto, exclusive, refresh_interval, poison_after, &shared);
             })
         };
         Ok(Self {
             backend,
             shared,
             refresher: Some(refresher),
-            poison_after: refreshability_timeout(refresh_interval),
+            poison_after,
         })
     }
 
@@ -606,12 +607,16 @@ impl RepoLock {
     /// after the timeout was observed does not make the lock trustworthy
     /// again.
     pub(crate) fn poisoned(&self) -> bool {
-        use std::sync::PoisonError;
-        let mut state = self.shared.0.lock().unwrap_or_else(PoisonError::into_inner);
-        if !state.poisoned && state.last_refresh.elapsed() > self.poison_after {
-            state.poisoned = true;
+        self.health().poisoned()
+    }
+
+    /// A handle that answers [`Self::poisoned`] without owning the lock, for a
+    /// reader on another thread that has to stop as soon as the lock goes bad.
+    pub(crate) fn health(&self) -> LockHealth {
+        LockHealth {
+            shared: Arc::clone(&self.shared),
+            poison_after: self.poison_after,
         }
-        state.poisoned
     }
 
     // restic's acquisition protocol: write our lock, wait 200 ms, then check
@@ -629,6 +634,26 @@ impl RepoLock {
             return Err(e);
         }
         Ok(name)
+    }
+}
+
+/// See [`RepoLock::health`].
+#[derive(Clone)]
+pub(crate) struct LockHealth {
+    shared: Arc<(Mutex<LockShared>, Condvar)>,
+    poison_after: Duration,
+}
+
+impl LockHealth {
+    /// [`RepoLock::poisoned`]. Accurate whenever it is asked, not only when
+    /// asked often: the refresher latches a timeout it outlived, too.
+    pub(crate) fn poisoned(&self) -> bool {
+        use std::sync::PoisonError;
+        let mut state = self.shared.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if !state.poisoned && state.last_refresh.elapsed() > self.poison_after {
+            state.poisoned = true;
+        }
+        state.poisoned
     }
 }
 
@@ -663,6 +688,7 @@ fn refresh_loop(
     crypto: &RepoCrypto,
     exclusive: bool,
     refresh_interval: Duration,
+    poison_after: Duration,
     shared: &Arc<(Mutex<LockShared>, Condvar)>,
 ) {
     let (state, cv) = &**shared;
@@ -682,6 +708,12 @@ fn refresh_loop(
         if let Ok(new) = write_lock(backend.as_ref(), crypto, &LockData::ours(exclusive)) {
             let _ = backend.remove(&old);
             let mut s = state.lock().expect("lock state poisoned");
+            // A refresh that lands after the timeout ran out does not make
+            // the lock trustworthy again, whether or not anyone asked in
+            // between.
+            if s.last_refresh.elapsed() > poison_after {
+                s.poisoned = true;
+            }
             s.current_name = new;
             s.last_refresh = std::time::Instant::now();
         }
@@ -1255,6 +1287,39 @@ mod tests {
             "poisoning must latch: during the outage another process may have \
              removed the lock as stale"
         );
+
+        drop(lock);
+        assert_eq!(backend.count(), 0);
+    }
+
+    // The same outage with nobody asking until it is over: a holder busy
+    // elsewhere must still learn that the lock went bad, rather than see a
+    // healthy lock because the refresh that ended the outage reset the clock.
+    #[test]
+    fn an_outage_nobody_watched_still_poisons_the_lock() {
+        let _guard = test_acquire_guard();
+        let backend = MemLockBackend::new();
+        let crypto = test_crypto(true);
+        let lock = RepoLock::acquire_exclusive_with_refresh_interval(
+            Arc::clone(&backend) as Arc<dyn LockBackend>,
+            crypto,
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        let health = lock.health();
+
+        backend.fail_writes.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(300));
+        let before: Vec<String> =
+            backend.list().unwrap().into_iter().map(|(n, _)| n).collect();
+        backend.fail_writes.store(false, Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while backend.list().unwrap().into_iter().map(|(n, _)| n).collect::<Vec<_>>() == before {
+            assert!(std::time::Instant::now() < deadline, "refresh never resumed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(health.poisoned(), "the refresher must latch the outage it outlived");
+        assert!(lock.poisoned());
 
         drop(lock);
         assert_eq!(backend.count(), 0);

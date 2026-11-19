@@ -427,8 +427,9 @@ fn run(
                 continue;
             };
             match load_snapshots(profile) {
-                Ok(snaps) => {
-                    app.snapshots = snaps;
+                Ok(list) => {
+                    app.snapshots = list.rows;
+                    app.snapshots_repository_id = Some(list.repository_id);
                     let len = app.visible_snapshot_indices().len();
                     if len > 0 {
                         let idx = app
@@ -443,6 +444,7 @@ fn run(
                     app.screen = Screen::Snapshots;
                 }
                 Err(e) => {
+                    app.snapshots_repository_id = None;
                     app.screen = Screen::Error(format!("{e:#}"));
                 }
             }
@@ -622,6 +624,12 @@ fn run(
             // not be the list open now: the share screen is reachable from the
             // profile list too.
             let profile = match return_to {
+                // `poll_smb` stopping the server on this pass drops the pending
+                // share and records why; there is nothing left to retry.
+                UnlockReturn::Smb if app.smb_pending.is_none() => {
+                    app.screen = Screen::SmbShare;
+                    continue;
+                }
                 UnlockReturn::Smb => app.smb_pending.as_ref().map(|p| p.profile.clone()),
                 UnlockReturn::Delete | UnlockReturn::TagEdit => {
                     app.config.profile_at(app.loading_index).map(|(_, p)| p.clone())
@@ -863,11 +871,10 @@ fn run(
 
         // The SMB server runs across screens, and what it shares holds a repo
         // lock that refreshes on a background thread; instead of blocking on
-        // input indefinitely, wake once a second so `poll_smb` can enforce
-        // restic's refreshability rule — an unrefreshable lock means the
-        // snapshot must leave the share before other processes remove the lock
-        // as stale and a prune deletes data mid-read — and the server's own
-        // stop conditions.
+        // input indefinitely, wake once a second so `poll_smb` can act on
+        // restic's refreshability rule — the share already stops serving a
+        // snapshot whose lock went unrefreshed, and this releases the lock and
+        // says so — and on the server's own stop conditions.
         if app.smb_server.is_some() {
             if events.poll(std::time::Duration::from_secs(1))? {
                 match events.read()? {

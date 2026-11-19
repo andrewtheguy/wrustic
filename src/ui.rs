@@ -242,15 +242,32 @@ fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
         Some(name) => format!("wrustic — profile: {name}"),
         None => "wrustic".to_string(),
     };
-    let mut spans = vec![Span::raw(text)];
     // The server runs whichever screen is up, so every screen says so: a
     // server serving something the UI is not showing is the thing to avoid.
-    if let Some(server) = app.smb_server.as_ref() {
-        let status = match server.shared() {
-            Some(s) => format!("SMB on, sharing {} (m)", s.short_id),
-            None => "SMB on, nothing shared (m)".to_string(),
+    // The key is named only where `m` opens the share screen.
+    let status = app.smb_server.as_ref().map(|server| {
+        let key = if matches!(app.screen, Screen::Home | Screen::Snapshots) {
+            " (m)"
+        } else {
+            ""
         };
-        spans.push(Span::raw("   "));
+        match server.shared() {
+            Some(s) => format!("   SMB on, sharing {}{key}", s.short_id),
+            None => format!("   SMB on, nothing shared{key}"),
+        }
+    });
+    // A long profile name gives way first, so the status stays visible.
+    let width = usize::from(area.width.saturating_sub(2));
+    let room = width.saturating_sub(status.as_deref().map_or(0, |s| s.chars().count()));
+    let text = if text.chars().count() > room {
+        let mut cut: String = text.chars().take(room.saturating_sub(1)).collect();
+        cut.push('…');
+        cut
+    } else {
+        text
+    };
+    let mut spans = vec![Span::raw(text)];
+    if let Some(status) = status {
         spans.push(Span::styled(status, Style::new().fg(Color::Green)));
     }
     let para = Paragraph::new(Line::from(spans))
@@ -894,12 +911,9 @@ fn render_snapshots(frame: &mut Frame, app: &mut App, area: Rect) {
         ),
     };
 
-    // The open profile's snapshot in the SMB share, if any: its ID shows in
+    // The open repository's snapshot in the SMB share, if any: its ID shows in
     // green, and the title names it even when the list is filtered past it.
-    let shared = app
-        .smb_shared()
-        .filter(|s| app.active_profile_name.as_deref() == Some(s.profile.as_str()))
-        .map(|s| s.id.clone());
+    let shared = app.smb_shared_here().map(|s| s.id.clone());
     let title = match &shared {
         Some(id) => format!("{title} · {} shared over SMB", short_snap_id(id)),
         None => title,
@@ -1513,99 +1527,76 @@ fn render_share_url(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 // The one place the SMB share is run from, laid out like smbanything's: the
-// server and its credentials, what is shared, any problem, and — filling the
-// rest and scrolling — how to connect. Every panel above the last is sized to
-// the text it holds, wrapping included, so the mount commands get every row
-// the terminal can spare.
+// server and its credentials, what is shared, any problem, and how to
+// connect. Every panel is sized to the text it holds, wrapping included, and
+// the last one fills whatever room is left. When they do not all fit, the body
+// scrolls as a whole, so a long path or error never pushes the mount commands
+// out of reach.
 fn render_smb_share(frame: &mut Frame, app: &mut App, area: Rect) {
-    let width = area.width.saturating_sub(2);
-    let server = smb_server_lines(app);
-    let shared = smb_shared_lines(app);
-    let problem = smb_problem_lines(app);
-
-    let [server_area, shared_area, problem_area, connecting_area] = Layout::vertical([
-        Constraint::Length(boxed_height(&server, width)),
-        Constraint::Length(if shared.is_empty() { 0 } else { boxed_height(&shared, width) }),
-        Constraint::Length(if problem.is_empty() { 0 } else { boxed_height(&problem, width) }),
-        Constraint::Fill(1),
-    ])
-    .areas(area);
-
-    render_panel(frame, server, " SMB server ", server_area, Color::Reset);
-    if !shared.is_empty() {
-        render_panel(frame, shared, " Shared snapshot ", shared_area, Color::Reset);
-    }
-    if !problem.is_empty() {
-        render_panel(frame, problem, " Problem ", problem_area, Color::Red);
-    }
-
-    let lines = smb_connecting_lines(app);
-    let inner_height = connecting_area.height.saturating_sub(2);
-    let inner_width = connecting_area.width.saturating_sub(2);
-    let wrapped: u16 = lines
-        .iter()
-        .map(|line| wrapped_rows(&line.to_string(), inner_width))
-        .fold(0u16, u16::saturating_add);
-    app.smb_scroll_max = wrapped.saturating_sub(inner_height);
-    app.smb_scroll = app.smb_scroll.min(app.smb_scroll_max);
-    let hidden = app.smb_scroll_max - app.smb_scroll;
-    let title = match hidden {
-        0 => " Connecting ".to_string(),
-        1 => " Connecting  (1 more line below) ".to_string(),
-        n => format!(" Connecting  ({n} more lines below) "),
+    let panel = |lines: Vec<Line<'static>>, title: String, border: Color| {
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::bordered().title(title).border_style(Style::new().fg(border)))
     };
-    record_list_area(app, connecting_area);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .block(Block::bordered().title(title))
-            .scroll((app.smb_scroll, 0)),
-        connecting_area,
-    );
-}
+    let mut panels = vec![panel(smb_server_lines(app), " SMB server ".into(), Color::Reset)];
+    let shared = smb_shared_lines(app);
+    if !shared.is_empty() {
+        panels.push(panel(shared, " Shared snapshot ".into(), Color::Reset));
+    }
+    let problem = smb_problem_lines(app);
+    if !problem.is_empty() {
+        panels.push(panel(problem, " Problem ".into(), Color::Red));
+    }
+    let connecting = smb_connecting_lines(app);
 
-fn render_panel(frame: &mut Frame, lines: Vec<Line<'static>>, title: &str, area: Rect, border: Color) {
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .block(Block::bordered().title(title).border_style(Style::new().fg(border))),
-        area,
-    );
-}
+    // Measured by the paragraph's own wrapping at the width it renders at:
+    // `line_count` wraps at the width it is given and adds the block's border
+    // rows itself.
+    let inner_width = area.width.saturating_sub(2);
+    let height = |p: &Paragraph| u16::try_from(p.line_count(inner_width)).unwrap_or(u16::MAX);
+    let mut heights: Vec<u16> = panels.iter().map(height).collect();
+    let above = heights.iter().fold(0u16, |sum, h| sum.saturating_add(*h));
+    let connecting_height = height(&panel(connecting.clone(), String::new(), Color::Reset))
+        .max(area.height.saturating_sub(above));
+    heights.push(connecting_height);
+    let total = above.saturating_add(connecting_height);
 
-/// Rows a bordered panel needs to show `lines` in full at `width`.
-fn boxed_height(lines: &[Line<'_>], width: u16) -> u16 {
-    lines
-        .iter()
-        .map(|line| wrapped_rows(&line.to_string(), width))
-        .fold(0u16, u16::saturating_add)
-        .saturating_add(2)
-}
+    app.smb_scroll_max = total.saturating_sub(area.height);
+    app.smb_scroll = app.smb_scroll.min(app.smb_scroll_max);
+    panels.push(panel(connecting, " Connecting ".into(), Color::Reset));
 
-/// Rows one line of text occupies once wrapped at `width`, matching how the
-/// paragraph widget breaks at spaces. Ratatui keeps its own line count behind
-/// an unstable feature, and the panel heights and scroll limit need a number.
-fn wrapped_rows(text: &str, width: u16) -> u16 {
-    let width = usize::from(width.max(1));
-    let mut rows = 1u16;
-    let mut col = 0usize;
-    for (index, word) in text.split(' ').enumerate() {
-        let word_width = word.chars().count();
-        let needed = if index == 0 { word_width } else { word_width + 1 };
-        if col > 0 && col + needed > width {
-            rows = rows.saturating_add(1);
-            col = word_width;
-        } else {
-            col += needed;
-        }
-        // A word longer than the panel is broken across as many rows as it
-        // needs rather than pushed onto one.
-        while col > width {
-            col -= width;
-            rows = rows.saturating_add(1);
+    // Laid out at full height off screen, then the visible window copied in.
+    let canvas_area = Rect::new(0, 0, area.width, total);
+    let mut canvas = ratatui::buffer::Buffer::empty(canvas_area);
+    let mut y = 0u16;
+    for (paragraph, h) in panels.into_iter().zip(heights) {
+        ratatui::widgets::Widget::render(paragraph, Rect::new(0, y, area.width, h), &mut canvas);
+        y = y.saturating_add(h);
+    }
+    let buf = frame.buffer_mut();
+    for row in 0..area.height.min(total - app.smb_scroll) {
+        for col in 0..area.width {
+            buf[(area.x + col, area.y + row)] = canvas[(col, app.smb_scroll + row)].clone();
         }
     }
-    rows
+    // On the bottom row, which is always on screen, whatever has scrolled.
+    let hidden = app.smb_scroll_max - app.smb_scroll;
+    if hidden > 0 && area.height > 0 {
+        let hint = match hidden {
+            1 => " 1 more line below ".to_string(),
+            n => format!(" {n} more lines below "),
+        };
+        let hint_width = u16::try_from(hint.chars().count()).unwrap_or(u16::MAX);
+        if hint_width + 2 <= area.width {
+            buf.set_string(
+                area.right() - hint_width - 1,
+                area.bottom() - 1,
+                hint,
+                Style::new().fg(Color::Yellow),
+            );
+        }
+    }
+    record_list_area(app, area);
 }
 
 fn smb_server_lines(app: &App) -> Vec<Line<'static>> {
@@ -1683,19 +1674,33 @@ fn smb_shared_lines(app: &App) -> Vec<Line<'static>> {
             s.short_id
         )),
         Line::from(
-            "Lock:   holding restic's non-exclusive lock on this repository — backups keep \
-             working; prune, forget, delete and tag edits wait until the snapshot leaves \
-             the share (s on it again, or x here).",
+            "Lock:   holding restic's non-exclusive lock on this repository. Backups keep \
+             working, but restic prune and forget fail with a \"repository is already \
+             locked\" error (unless run with --retry-lock long enough), and wrustic refuses \
+             delete, tag edits and prune: take the snapshot out of the share (s on it again, \
+             or x here), then run them again.",
         ),
     ]
 }
 
 fn smb_problem_lines(app: &App) -> Vec<Line<'static>> {
-    let Some(err) = app.smb_error.as_deref() else {
-        return Vec::new();
-    };
     let red = Style::new().fg(Color::Red);
-    let mut lines: Vec<Line> = err.lines().map(|l| Line::styled(l.to_string(), red)).collect();
+    // A background removal and a pending share's failure can both stand: the
+    // first is about the snapshot that was shared, the second about the one
+    // being shared now.
+    let mut lines: Vec<Line> = app
+        .smb_unshared
+        .iter()
+        .flat_map(|why| why.lines())
+        .map(|l| Line::styled(l.to_string(), red))
+        .collect();
+    let Some(err) = app.smb_error.as_deref() else {
+        return lines;
+    };
+    if !lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    lines.extend(err.lines().map(|l| Line::styled(l.to_string(), red)));
     // Sharing needs restic's non-exclusive lock; an exclusive holder (prune,
     // forget — possibly one that crashed) blocks it. `u` mirrors the delete
     // flow: stale locks are removed, live ones survive.

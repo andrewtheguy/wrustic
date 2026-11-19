@@ -329,6 +329,9 @@ pub(crate) struct App {
     pub(crate) field_focus: usize,
 
     pub(crate) snapshots: Vec<SnapshotRow>,
+    // The id of the repository `snapshots` came from; see
+    // `SnapshotList::repository_id`.
+    pub(crate) snapshots_repository_id: Option<String>,
     pub(crate) snapshot_filter: Option<SnapshotFilter>,
     pub(crate) filter_picker_state: ListState,
     pub(crate) filter_values: Vec<String>,
@@ -366,8 +369,12 @@ pub(crate) struct App {
     pub(crate) smb_server: Option<smb::ShareServer>,
     pub(crate) smb_password: Option<String>,
     // Inline error for the share screen: a failed start or share, or why a
-    // background check stopped the server or took the snapshot out.
+    // background check stopped the server.
     pub(crate) smb_error: Option<String>,
+    // Why a background check took the shared snapshot out. Kept apart from
+    // `smb_error`, which may meanwhile hold a pending share's failure and the
+    // `u` that goes with it.
+    pub(crate) smb_unshared: Option<String>,
     pub(crate) smb_pending: Option<PendingShare>,
     pub(crate) smb_return: SmbReturn,
     // First visible line of the share screen's connecting panel, and how far
@@ -526,6 +533,7 @@ impl App {
             editing_original_name: None,
             field_focus: 0,
             snapshots: Vec::new(),
+            snapshots_repository_id: None,
             snapshot_filter: None,
             filter_picker_state: ListState::default(),
             filter_values: Vec::new(),
@@ -548,6 +556,7 @@ impl App {
             smb_server: None,
             smb_password: None,
             smb_error: None,
+            smb_unshared: None,
             smb_pending: None,
             smb_return: SmbReturn::default(),
             smb_scroll: 0,
@@ -1395,6 +1404,7 @@ impl App {
     // screen was saying about the last attempt is dropped.
     fn leave_smb_screen(&mut self) {
         self.smb_error = None;
+        self.smb_unshared = None;
         self.smb_pending = None;
         match self.smb_return {
             SmbReturn::Home => self.enter_home(),
@@ -1410,6 +1420,7 @@ impl App {
         }
         self.smb_password = None;
         self.smb_error = None;
+        self.smb_unshared = None;
         self.smb_pending = None;
     }
 
@@ -1423,6 +1434,7 @@ impl App {
         self.smb_password = None;
         self.smb_pending = None;
         self.smb_error = Some(why);
+        self.smb_unshared = None;
         self.notice = Some("The SMB server stopped — m for why.".into());
     }
 
@@ -1432,13 +1444,14 @@ impl App {
         self.smb_server.as_ref()?.shared()
     }
 
-    // Whether a snapshot from the profile whose list is open is in the share.
-    // Its lock is restic's non-exclusive one, which every exclusive operation
-    // on that repository — delete, tag edit, prune — would trip over.
-    fn smb_shares_active_profile(&self) -> Option<String> {
-        let shared = self.smb_shared()?;
-        (self.active_profile_name.as_deref() == Some(shared.profile.as_str()))
-            .then(|| shared.short_id.clone())
+    // The shared snapshot, if it is in the repository whose list is open —
+    // matched by repository id, so a renamed profile or a second profile for
+    // the same repository still counts. Its lock is restic's non-exclusive
+    // one, which every exclusive operation on that repository — delete, tag
+    // edit, prune — would trip over.
+    pub(crate) fn smb_shared_here(&self) -> Option<&smb::SnapshotSummary> {
+        let here = self.snapshots_repository_id.as_deref()?;
+        self.smb_shared().filter(|s| s.repository_id == here)
     }
 
     // What an exclusive operation on the open profile says instead of tripping
@@ -1448,7 +1461,7 @@ impl App {
         format!(
             "Snapshot {short_id} of this repository is shared over SMB, and while it is \
              shared wrustic holds restic's non-exclusive lock on the repository, which \
-             {what} has to wait for.\n\nTake it out of the share first: s on that \
+             {what} cannot run alongside.\n\nTake it out of the share first: s on that \
              snapshot, or x on the SMB share screen (m)."
         )
     }
@@ -1460,8 +1473,10 @@ impl App {
         let Some(id) = self.selected_snapshot_id() else {
             return;
         };
-        if let Some(short) = self.smb_shares_active_profile()
-            && self.smb_shared().is_some_and(|s| s.id == id)
+        if let Some(short) = self
+            .smb_shared_here()
+            .filter(|s| s.id == id)
+            .map(|s| s.short_id.clone())
         {
             if let Some(server) = self.smb_server.as_mut() {
                 server.unshare();
@@ -1529,7 +1544,7 @@ impl App {
                 .map(|s| s.short_id.clone())
                 .unwrap_or_default();
             server.unshare();
-            self.smb_error = Some(format!(
+            self.smb_unshared = Some(format!(
                 "Snapshot {short} was taken out of the share: the repository lock could \
                  not be refreshed for over 22 minutes (backend unreachable?), so other \
                  restic processes may treat it as stale and remove it. The server keeps \
@@ -1622,6 +1637,7 @@ impl App {
             Ok(()) => {
                 self.smb_pending = None;
                 self.smb_error = None;
+                self.smb_unshared = None;
                 if pending.show_share_screen {
                     self.smb_scroll = 0;
                     self.screen = Screen::SmbShare;
@@ -1970,9 +1986,12 @@ impl App {
                 // front rather than as a lock error offering `u`, which cannot
                 // remove a lock that is live.
                 KeyCode::Char(c @ ('d' | 'p' | 't'))
-                    if self.smb_shares_active_profile().is_some() =>
+                    if self.smb_shared_here().is_some() =>
                 {
-                    let short = self.smb_shares_active_profile().unwrap_or_default();
+                    let short = self
+                        .smb_shared_here()
+                        .map(|s| s.short_id.clone())
+                        .unwrap_or_default();
                     self.screen = match c {
                         'd' => Screen::SnapshotDeleteError(Self::smb_blocks("deleting a snapshot", &short)),
                         'p' => Screen::PruneError(Self::smb_blocks("prune", &short)),
@@ -3538,7 +3557,9 @@ mod tests {
         let _guard = crate::lock::test_acquire_guard();
         let fixture = crate::testrepo::TestRepo::init("app-share");
         let snap_id = fixture.backup(&[("a.txt", b"a\n")], &[]);
-        let mut app = boot_on_profile(vec![row_with_id(&snap_id)], fixture.profile().clone());
+        let list = crate::repo::load_snapshots(fixture.profile()).expect("list snapshots");
+        let mut app = boot_on_profile(list.rows, fixture.profile().clone());
+        app.snapshots_repository_id = Some(list.repository_id.clone());
         app.list_state.select(Some(0));
 
         press(&mut app, KeyCode::Char('s'));
@@ -3569,6 +3590,14 @@ mod tests {
             press(&mut app, KeyCode::Enter);
             assert!(matches!(app.screen, Screen::Snapshots));
         }
+
+        // Matched by repository, not by profile: another repository's list,
+        // whatever its profile is called, is not held up.
+        app.snapshots_repository_id = Some("another repository".into());
+        press(&mut app, KeyCode::Char('d'));
+        assert!(matches!(app.screen, Screen::SnapshotDeleteLoading));
+        app.screen = Screen::Snapshots;
+        app.snapshots_repository_id = Some(list.repository_id);
 
         press(&mut app, KeyCode::Char('s'));
         assert!(matches!(app.screen, Screen::Snapshots));

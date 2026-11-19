@@ -25,11 +25,12 @@ concurrent `restic prune`/`forget` is refused with restic's ordinary
 "repository is already locked" error until the snapshot leaves the share, and
 conversely a running prune stops a snapshot from being shared (the share screen
 then offers `u` to remove stale locks and retry). wrustic's own delete, tag
-edit and prune on that repository are refused up front while one of its
-snapshots is shared. If the lock cannot be refreshed for 22.5 minutes
-(restic's refreshability rule — e.g. the backend became unreachable), the
-snapshot is taken out of the share rather than served from a repo other
-processes may now treat as unlocked; the server and its README stay up. Details in
+edit and prune on that repository — whichever profile reaches it — are refused
+up front while one of its snapshots is shared. If the lock cannot be refreshed
+for 22.5 minutes (restic's refreshability rule — e.g. the backend became
+unreachable), the share takes the snapshot out by itself on its next request,
+and files open from it stop reading, rather than serve a repo other processes
+may now treat as unlocked; the server and its README stay up. Details in
 [locking.md](locking.md).
 
 ## Using it
@@ -40,10 +41,13 @@ the shared snapshot, if any; and ready mount instructions for each platform
 (scroll with Up/Dn, PgUp/PgDn). `o` there turns the server on or off, `x` takes
 the shared snapshot out, and `y`/`m` copy the password and this OS's mount
 command. Leaving the screen leaves the server running; the top bar says
-`SMB on` on every screen while it is. The server runs on `127.0.0.1:4456` until
-it is turned off or wrustic quits, either of which breaks every mount using it,
-and its password is new each time it is turned on. `--smb-port <N>` picks a
-different port.
+`SMB on` on every screen while it is. The server runs until it is turned off or
+wrustic quits, either of which breaks every mount using it, and its password is
+new each time it is turned on. By default it listens on `127.0.0.1:4456`, which
+the examples on this page use; `--smb-port <N>` picks a different port. With
+[`--smb-tun`](smb-tun.md) it is reached at the tun adapter's address on the
+standard port instead — use the mount commands the share screen shows, which
+always name the endpoint actually in use.
 
 The share root always holds a `README.txt`. With nothing shared it says so;
 with a snapshot shared it names the full snapshot id, profile, time, host,
@@ -54,11 +58,11 @@ new — in a directory beside the README named with its short id: restic's
 standard 8-hex-char form, so the name pastes straight into restic commands.
 `s` on another snapshot replaces it, and `s` on the shared one again takes it
 out; the list marks the shared snapshot's id in green. The share name and
-mount commands stay fixed (`\\127.0.0.1\snap`, fstab-safe), so mount the share
-once: switching snapshots needs no remount, while the folder name — and
-anything copied out of it — says which snapshot the files came from. Files
-still open from a replaced snapshot stop reading, and a client may show a
-stale listing until it refreshes.
+mount commands stay fixed while the server runs (`\\127.0.0.1\snap` with the
+default transport; fstab-safe), so mount the share once: switching snapshots
+needs no remount, while the folder name — and anything copied out of it — says
+which snapshot the files came from. Files still open from a replaced snapshot
+stop reading, and a client may show a stale listing until it refreshes.
 
 ## Mounting
 
@@ -148,7 +152,7 @@ local networking workaround, not something this project sets up or supports.
   without POSIX extensions has only "file" and "directory", and restic stores no
   content for a symlink, so the target is not reachable through the share.
   Regular files and directories round-trip exactly.
-- **One snapshot per server.** The share is bound at startup.
+- **One snapshot at a time.** Sharing another replaces it.
 - **A filename SMB2 cannot express is listed with its offending characters
   replaced by U+FFFD, and cannot be opened.** SMB2 filenames carry no path
   separator; macOS filenames may contain a backslash. Substituting is not

@@ -27,6 +27,10 @@ pub(crate) struct SnapshotSummary {
     pub(crate) id: String,
     /// restic's standard 8-hex-char short id, which is also the folder name.
     pub(crate) short_id: String,
+    /// The id of the repository it is in: what tells whether an operation on
+    /// a profile would meet this snapshot's lock, whatever the profile is
+    /// called or however it reaches the repository.
+    pub(crate) repository_id: String,
     pub(crate) profile: String,
     pub(crate) time: String,
     pub(crate) host: String,
@@ -34,17 +38,25 @@ pub(crate) struct SnapshotSummary {
     pub(crate) tags: Vec<String>,
 }
 
+/// True once the snapshot must no longer be served: its repository lock went
+/// unrefreshed for too long. Asked on every request and every read, so the
+/// snapshot leaves the share then and there, however busy its owner is.
+pub(crate) type Withdrawn = Arc<dyn Fn() -> bool + Send + Sync>;
+
 pub(crate) struct RootBacking {
     /// When this root was published, reported as every synthetic timestamp so
     /// a client sees the README change whenever the contents do.
     created: SystemTime,
     readme: Bytes,
+    /// What the README says once the snapshot is withdrawn.
+    empty_readme: Bytes,
     snapshot: Option<Folder>,
 }
 
 struct Folder {
     info: NodeInfo,
     backing: Arc<dyn Backing>,
+    withdrawn: Withdrawn,
 }
 
 /// Where a client path lands in the root.
@@ -62,27 +74,45 @@ impl RootBacking {
     }
 
     /// The README beside the snapshot's tree under its short-id folder.
-    pub(crate) fn with_snapshot(summary: &SnapshotSummary, backing: Arc<dyn Backing>) -> Self {
-        Self::build(Some((summary, backing)))
+    pub(crate) fn with_snapshot(
+        summary: &SnapshotSummary,
+        backing: Arc<dyn Backing>,
+        withdrawn: Withdrawn,
+    ) -> Self {
+        Self::build(Some((summary, backing, withdrawn)))
     }
 
-    fn build(snapshot: Option<(&SnapshotSummary, Arc<dyn Backing>)>) -> Self {
+    fn build(snapshot: Option<(&SnapshotSummary, Arc<dyn Backing>, Withdrawn)>) -> Self {
         let created = SystemTime::now();
+        let empty_readme = Bytes::from(readme_text(None));
         Self {
             created,
-            readme: Bytes::from(readme_text(snapshot.as_ref().map(|(s, _)| *s))),
-            snapshot: snapshot.map(|(summary, backing)| Folder {
+            readme: snapshot
+                .as_ref()
+                .map_or_else(|| empty_readme.clone(), |(s, _, _)| Bytes::from(readme_text(Some(s)))),
+            empty_readme,
+            snapshot: snapshot.map(|(summary, backing, withdrawn)| Folder {
                 info: NodeInfo::synthetic_dir(&summary.short_id, created),
                 backing,
+                withdrawn,
             }),
         }
+    }
+
+    /// The shared snapshot, unless there is none or it has been withdrawn.
+    fn folder(&self) -> Option<&Folder> {
+        self.snapshot.as_ref().filter(|folder| !(folder.withdrawn)())
+    }
+
+    fn readme(&self) -> &Bytes {
+        if self.folder().is_some() { &self.readme } else { &self.empty_readme }
     }
 
     fn readme_info(&self) -> NodeInfo {
         NodeInfo {
             name: README_NAME.to_string(),
             kind: NodeKind::File,
-            size: self.readme.len() as u64,
+            size: self.readme().len() as u64,
             mtime: self.created,
             atime: self.created,
             ctime: self.created,
@@ -100,8 +130,7 @@ impl RootBacking {
         if first.eq_ignore_ascii_case(README_NAME) {
             return rest.is_root().then_some(Located::Readme);
         }
-        self.snapshot
-            .as_ref()
+        self.folder()
             .filter(|folder| first.eq_ignore_ascii_case(&folder.info.name))
             .map(|folder| Located::Snapshot(folder, rest))
     }
@@ -120,7 +149,7 @@ impl Backing for RootBacking {
     fn list(&self, path: &SmbPath) -> Result<Vec<NodeInfo>, u32> {
         match self.locate(path).ok_or(status::OBJECT_PATH_NOT_FOUND)? {
             Located::Root => Ok(std::iter::once(self.readme_info())
-                .chain(self.snapshot.iter().map(|folder| folder.info.clone()))
+                .chain(self.folder().into_iter().map(|folder| folder.info.clone()))
                 .collect()),
             Located::Readme => Err(status::NOT_A_DIRECTORY),
             Located::Snapshot(folder, inner) => folder.backing.list(&inner),
@@ -132,24 +161,42 @@ impl Backing for RootBacking {
             // The root and the folder are the directories `stat` and `list`
             // report them to be; saying they do not exist contradicts that.
             Located::Root => Err(status::FILE_IS_A_DIRECTORY),
-            Located::Readme => Ok(Arc::new(Readme(self.readme.clone()))),
+            Located::Readme => Ok(Arc::new(Readme(self.readme().clone()))),
             Located::Snapshot(_, inner) if inner.is_root() => Err(status::FILE_IS_A_DIRECTORY),
-            Located::Snapshot(folder, inner) => folder.backing.open(&inner),
+            Located::Snapshot(folder, inner) => Ok(Arc::new(Guarded {
+                reader: folder.backing.open(&inner)?,
+                withdrawn: Arc::clone(&folder.withdrawn),
+            })),
         }
     }
 
     fn label(&self) -> &str {
-        self.snapshot
-            .as_ref()
+        self.folder()
             .map_or(EMPTY_LABEL, |folder| folder.backing.label())
     }
 
     fn total_size(&self) -> u64 {
         let snapshot = self
-            .snapshot
-            .as_ref()
+            .folder()
             .map_or(0, |folder| folder.backing.total_size());
-        snapshot.saturating_add(self.readme.len() as u64)
+        snapshot.saturating_add(self.readme().len() as u64)
+    }
+}
+
+/// A file opened from the snapshot, which stops reading once the snapshot is
+/// withdrawn — a file opened before then would otherwise go on reading from a
+/// repository no longer locked against prune.
+struct Guarded {
+    reader: Arc<dyn FileReader>,
+    withdrawn: Withdrawn,
+}
+
+impl FileReader for Guarded {
+    fn read_at(&self, offset: u64, len: u32) -> Result<Bytes, u32> {
+        if (self.withdrawn)() {
+            return Err(status::FILE_CLOSED);
+        }
+        self.reader.read_at(offset, len)
     }
 }
 
@@ -222,8 +269,10 @@ fn readme_text(snapshot: Option<&SnapshotSummary>) -> String {
          snapshots invalidates files still open from the previous one, and a\n\
          client may show a stale listing until it is refreshed.\n\n\
          While a snapshot is shared, wrustic holds restic's non-exclusive lock on\n\
-         its repository: backups keep working, while prune and forget wait until\n\
-         the snapshot is taken out of the share.\n\n\
+         its repository. Backups keep working, but restic prune and forget fail\n\
+         with a \"repository is already locked\" error (unless run with\n\
+         --retry-lock long enough): take the snapshot out of the share, then\n\
+         run them again.\n\n\
          This README.txt is rewritten whenever the share's contents change.\n",
     );
     text
@@ -233,6 +282,7 @@ fn readme_text(snapshot: Option<&SnapshotSummary>) -> String {
 mod tests {
     use super::*;
     use crate::smb::backing::test_support::MemBacking;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn p(s: &str) -> SmbPath {
         SmbPath::parse(s).expect("valid path")
@@ -251,6 +301,7 @@ mod tests {
         SnapshotSummary {
             id: "1a2b3c4d5e6f".to_string(),
             short_id: "1a2b3c4d".to_string(),
+            repository_id: "feedface".to_string(),
             profile: "laptop".to_string(),
             time: "2026-11-18 09:30:00".to_string(),
             host: "box".to_string(),
@@ -260,6 +311,11 @@ mod tests {
     }
 
     fn shared() -> RootBacking {
+        shared_until(Arc::new(AtomicBool::new(false)))
+    }
+
+    /// A shared root whose snapshot is withdrawn once `withdrawn` is set.
+    fn shared_until(withdrawn: Arc<AtomicBool>) -> RootBacking {
         RootBacking::with_snapshot(
             &summary(),
             Arc::new(
@@ -268,6 +324,7 @@ mod tests {
                     .with_file("docs\\a.txt", b"aaa")
                     .with_file("top.txt", b"t"),
             ),
+            Arc::new(move || withdrawn.load(Ordering::SeqCst)),
         )
     }
 
@@ -356,5 +413,30 @@ mod tests {
         assert!(text.contains("Tags:     (none)"), "{text}");
         assert!(text.contains("non-exclusive lock"), "{text}");
         assert!(!text.contains("No snapshot is shared"), "{text}");
+    }
+
+    // A withdrawn snapshot leaves the share on the next request, by itself:
+    // the folder goes from the listing, paths inside it stop resolving, a file
+    // already open stops reading, and the README says nothing is shared.
+    #[test]
+    fn a_withdrawn_snapshot_leaves_at_once_and_open_files_stop_reading() {
+        let withdrawn = Arc::new(AtomicBool::new(false));
+        let backing = shared_until(Arc::clone(&withdrawn));
+        let file = backing.open(&p(r"1a2b3c4d\docs\a.txt")).unwrap();
+        assert_eq!(&file.read_at(0, 3).unwrap()[..], b"aaa");
+
+        withdrawn.store(true, Ordering::SeqCst);
+
+        let names: Vec<String> = backing.list(&p("")).unwrap().into_iter().map(|n| n.name).collect();
+        assert_eq!(names, [README_NAME]);
+        assert_eq!(
+            backing.stat(&p(r"1a2b3c4d\top.txt")).err(),
+            Some(status::OBJECT_NAME_NOT_FOUND)
+        );
+        assert_eq!(file.read_at(0, 3).err(), Some(status::FILE_CLOSED));
+        let text = readme(&backing);
+        assert!(text.contains("No snapshot is shared"), "{text}");
+        assert_eq!(backing.total_size(), text.len() as u64);
+        assert_eq!(backing.label(), "wrustic");
     }
 }
