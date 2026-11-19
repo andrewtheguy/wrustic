@@ -32,7 +32,7 @@ and the vendored Wintun driver's provenance.
 
 - **Requirements.** Administrator rights (creating a network adapter always
   needs them) and two host routes, `169.254.255.1/32` and `169.254.255.2/32`,
-  for exactly as long as the share screen is open. `--smb-tun-ip <IPv4>` moves
+  for exactly as long as the SMB server is on. `--smb-tun-ip <IPv4>` moves
   the pair — the next address up goes on the adapter — and wrustic refuses to
   start the share if either exact address is already owned by the machine.
 - **The shipped driver.** `wintun-amd64.dll` (signed by WireGuard LLC) is

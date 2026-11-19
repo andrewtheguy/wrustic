@@ -48,7 +48,7 @@ main()
  └── while !app.quit { terminal.draw(render); dispatch }
      ├── async-ish screens (Loading, Verifying, OpeningSnapshot,
      │   LoadingDir, LoadingFileDetails, SnapshotDeleteContentsLoading,
-     │   SnapshotDeleting, SnapshotCompareLoading, SnapshotSmbStarting) —
+     │   SnapshotDeleting, SnapshotCompareLoading, SmbStarting, SmbLoading) —
      │   main.rs runs the blocking work synchronously and transitions the
      │   screen
      ├── Screen::PassphraseDerivingKey — runs scrypt synchronously
@@ -82,7 +82,11 @@ struct includes:
 - Snapshot browse state: `snapshots`, `repo_session`, `browse_stack`,
   `pending_descend` / `pending_file_lookup` / `pending_refresh_path`.
 - Share dialog: `share_target`, `share_handle`, `share_url`, etc.
-- SMB share: `smb_handle`, `smb_snapshot_id`, `smb_password`, `smb_error`.
+- SMB share: `smb_server` (the running `ShareServer`, which owns the shared
+  snapshot and its repository lock), `smb_password`, `smb_error`,
+  `smb_pending` (the snapshot `s` captured, kept for an unlock-and-retry),
+  `smb_return`, `smb_scroll`. The server outlives the screen: the main loop
+  calls `App::poll_smb` every pass and wakes once a second while it is on.
 - `help_overlay` — the `?` key list, drawn over the body of whichever screen
   is underneath.
 - Passphrase dialog: `passphrase_input`, `passphrase_confirm`,
@@ -150,12 +154,16 @@ synchronously on `Screen::PassphraseDerivingKey`.
 
 ## SMB server (`src/smb/` + the `smbanything_core` crate)
 
-A hand-rolled read-only SMB 2.1 server exporting one snapshot, started with `s`
-on the snapshot list — the only entry point there is. The server itself —
+A hand-rolled read-only SMB 2.1 server, turned on and off from one screen (`m`
+on the profile or snapshot list) and kept running across screens until it is
+turned off or wrustic quits. Its root is a `README.txt` beside at most one
+snapshot's short-id folder; `s` on the snapshot list swaps a snapshot in or
+out with no remount. The server itself —
 protocol, NTLMv2, signing, the tun transport, and the `local_server` loopback
 binder — lives in the shared `smbanything_core` crate; `src/smb/` holds the
-restic side: `SnapshotBacking`, restic's filename quoting (`name.rs`), and
-`start_snapshot_share`, which ties the server to the repository lock. Full
+restic side: `SnapshotBacking`, restic's filename quoting (`name.rs`), the
+README root (`root.rs`), and `ShareServer`, which ties the shared snapshot to
+the repository lock. Full
 treatment of the wrustic side in [smb.md](smb.md), of the protocol in
 smbanything's own docs. The architectural points:
 
@@ -163,9 +171,13 @@ smbanything's own docs. The architectural points:
   `share.rs`. Protocol handling is synchronous code calling into `rustic_core`,
   wrapped in `tokio::task::block_in_place`; that requires a runtime that can
   hand the reactor to another worker while one is parked on a backend fetch.
-- wrustic's `SmbHandle` wraps the crate's server handle together with the
-  repository lock, in that field order: drop stops the server before the lock
-  is released, and explicit `.stop()` joins first.
+- wrustic's `ShareServer` wraps the crate's server handle together with the
+  shared snapshot's repository lock, in that field order, and joins the server
+  thread in `Drop`: the server stops before the lock is released. Swapping
+  snapshots publishes the new root first — the crate's `load` returns only once
+  no handle can read the old contents — and only then releases the old lock.
+  The repository is opened afresh for every share rather than reused, since
+  an index loaded earlier knows nothing of packs written since.
 - Binds `127.0.0.1` and `[::1]` via `local_server::bind_localhost`, the same
   helper the HTTP share uses (both now from `smbanything_core`).
   `Bind::AllInterfaces` exists but is constructed only by the `dev smb-serve`
@@ -173,7 +185,7 @@ smbanything's own docs. The architectural points:
   Nothing here is encrypted, so that stays a harness affordance rather than a
   shipped option.
 - The port is fixed (`--smb-port`, default 4456), not ephemeral: a mount
-  outlives the screen that created it, so an fstab line has to keep resolving.
+  outlives any one run of the server, so an fstab line has to keep resolving.
   A clash therefore surfaces inline on the share screen, with the flag that
   fixes it named in the message.
 - `Backing` is the crate's trait; `SnapshotBacking` implements it over a

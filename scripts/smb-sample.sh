@@ -200,12 +200,19 @@ verify_mount() {
         //127.0.0.1/snap "$mountpoint" ||
         fail "mount failed; is ./scripts/smb-sample.sh serve running? (sudo dmesg | tail says more)"
 
+    # The share root holds README.txt beside the snapshot's folder, named with
+    # its 8-hex-char short id; the backed-up tree is inside that folder.
+    [[ -f "${mountpoint}/README.txt" ]] || fail "the share root has no README.txt"
+    local snapdir
+    snapdir="${mountpoint}/$(cut -c1-8 "$snapshot_file")"
+    [[ -d "$snapdir" ]] || fail "the share root has no folder for snapshot $(cut -c1-8 "$snapshot_file")"
+
     # The symlink is excluded: SMB2 without POSIX extensions cannot represent
     # one, so it arrives as an empty file. That is the documented limitation,
     # not a mismatch worth failing on.
     info "comparing every file against the source tree"
     diff \
-        <(cd "${mountpoint}${source_tree}" && find . -type f ! -name link-to-readme -exec sha256sum {} \; | sort) \
+        <(cd "${snapdir}${source_tree}" && find . -type f ! -name link-to-readme -exec sha256sum {} \; | sort) \
         <(cd "$source_tree" && find . -type f ! -name link-to-readme -exec sha256sum {} \; | sort) ||
         fail "mounted contents differ from the source tree"
     # Counts the compared set, not everything visible: the symlink shows up as a
@@ -214,11 +221,11 @@ verify_mount() {
     info "all $(find "$source_tree" -type f ! -name link-to-readme | wc -l) files are byte-identical"
 
     info "checking that writes are refused"
-    ! touch "${mountpoint}${source_tree}/should-not-exist" 2>/dev/null ||
+    ! touch "${snapdir}${source_tree}/should-not-exist" 2>/dev/null ||
         fail "a write succeeded on a read-only share"
-    ! mkdir "${mountpoint}${source_tree}/should-not-exist" 2>/dev/null ||
+    ! mkdir "${snapdir}${source_tree}/should-not-exist" 2>/dev/null ||
         fail "mkdir succeeded on a read-only share"
-    ! rm -f "${mountpoint}${source_tree}/docs/readme.txt" 2>/dev/null ||
+    ! rm -f "${snapdir}${source_tree}/docs/readme.txt" 2>/dev/null ||
         fail "delete succeeded on a read-only share"
     info "writes are refused through the mount"
 

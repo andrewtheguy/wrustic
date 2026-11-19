@@ -45,8 +45,14 @@ pub(crate) enum Screen {
     LoadingFileDetails,
     FileDetails,
     ShareUrl,
-    SnapshotSmbStarting,
-    SnapshotSmb,
+    // The one place the SMB share is turned on and off, showing the server,
+    // the shared snapshot and how to connect. Reached with `m` from the
+    // profile list and the snapshot list.
+    SmbShare,
+    // Drawn once, then the main loop binds the server.
+    SmbStarting,
+    // Drawn once, then the main loop opens the repository for `smb_pending`.
+    SmbLoading,
     SnapshotCompareSecond,
     SnapshotCompareLoading,
     SnapshotCompareResults,
@@ -76,6 +82,28 @@ pub(crate) enum UnlockReturn {
     Delete,
     Smb,
     TagEdit,
+}
+
+/// Where Esc on the SMB share screen goes: back to the list it was opened from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum SmbReturn {
+    #[default]
+    Home,
+    Snapshots,
+}
+
+/// A snapshot waiting to be put into the SMB share. Captured by `s` on the
+/// snapshot list and consumed by the main loop on `Screen::SmbLoading`; kept
+/// after a lock failure so `u` can remove stale locks and retry it.
+#[derive(Clone)]
+pub(crate) struct PendingShare {
+    pub(crate) profile_name: String,
+    pub(crate) profile: Profile,
+    pub(crate) snapshot_id: String,
+    /// Show the share screen once it is shared, rather than returning to the
+    /// snapshot list: set when sharing also turned the server on, since the
+    /// password and mount commands are new then.
+    pub(crate) show_share_screen: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -329,15 +357,23 @@ pub(crate) struct App {
     // the user on the Share screen instead of jumping to the global Error.
     pub(crate) share_error: Option<String>,
 
-    // SMB share of a whole snapshot, started with `s` on the Snapshots screen.
-    // The handle owns the listener thread; dropping it stops the server, which
-    // is what makes "leaving the screen stops it" hold even on an early return
-    // or a panic unwind. `smb_snapshot_id` is set before the server starts (the
-    // starting screen reads it), so it can be Some while the handle is None.
-    pub(crate) smb_handle: Option<smb::SmbHandle>,
-    pub(crate) smb_snapshot_id: Option<String>,
+    // The SMB share. The server is turned on and off on `Screen::SmbShare` and
+    // keeps running across screens until it is turned off or wrustic quits;
+    // `s` on the snapshot list puts one snapshot into it (or takes it out).
+    // Dropping the server stops it and then releases the shared snapshot's
+    // repository lock, so quitting, an early return or a panic unwind all
+    // leave nothing behind. The password lives exactly as long as the server.
+    pub(crate) smb_server: Option<smb::ShareServer>,
     pub(crate) smb_password: Option<String>,
+    // Inline error for the share screen: a failed start or share, or why a
+    // background check stopped the server or took the snapshot out.
     pub(crate) smb_error: Option<String>,
+    pub(crate) smb_pending: Option<PendingShare>,
+    pub(crate) smb_return: SmbReturn,
+    // First visible line of the share screen's connecting panel, and how far
+    // it can scroll at the last draw (set by the renderer).
+    pub(crate) smb_scroll: u16,
+    pub(crate) smb_scroll_max: u16,
     // Which flow the Unlocking screen was entered from, so the main loop
     // routes the outcome back there: the SMB share retries its operation on
     // success, the delete flow re-enters its confirmation; failures render
@@ -509,10 +545,13 @@ impl App {
             share_short_url: None,
             share_exp_unix: None,
             share_error: None,
-            smb_handle: None,
-            smb_snapshot_id: None,
+            smb_server: None,
             smb_password: None,
             smb_error: None,
+            smb_pending: None,
+            smb_return: SmbReturn::default(),
+            smb_scroll: 0,
+            smb_scroll_max: 0,
             unlock_return: UnlockReturn::default(),
             help_overlay: false,
             snapshot_info_overlay: false,
@@ -1340,131 +1379,267 @@ impl App {
         }
     }
 
-    // Stop the SMB server and clear everything the share screen displays.
-    // Called on every exit from that screen: the share is scoped to viewing it,
-    // exactly like the HTTP file share, so there is never a server running that
-    // the UI is not showing.
-    pub(crate) fn stop_smb_share(&mut self) {
-        if let Some(h) = self.smb_handle.take() {
-            h.stop();
+    // Open the share screen, remembering which list Esc goes back to.
+    pub(crate) fn open_smb_screen(&mut self, from: SmbReturn) {
+        self.smb_return = from;
+        self.smb_scroll = 0;
+        self.screen = Screen::SmbShare;
+    }
+
+    fn scroll_smb(&mut self, delta: i32) {
+        let target = i64::from(self.smb_scroll) + i64::from(delta);
+        self.smb_scroll = target.clamp(0, i64::from(self.smb_scroll_max)) as u16;
+    }
+
+    // Esc on the share screen. The server keeps running; only what the
+    // screen was saying about the last attempt is dropped.
+    fn leave_smb_screen(&mut self) {
+        self.smb_error = None;
+        self.smb_pending = None;
+        match self.smb_return {
+            SmbReturn::Home => self.enter_home(),
+            SmbReturn::Snapshots => self.screen = Screen::Snapshots,
         }
-        self.smb_snapshot_id = None;
+    }
+
+    // Turn the server off: stop it, release the shared snapshot's lock, and
+    // forget the password, which belonged to this run of the server.
+    pub(crate) fn disable_smb_server(&mut self) {
+        if let Some(server) = self.smb_server.take() {
+            server.stop();
+        }
         self.smb_password = None;
         self.smb_error = None;
+        self.smb_pending = None;
     }
 
-    // Enforces restic's refreshability rule while the share screen is up: a
-    // repo lock that went 22.5 minutes without a successful refresh may be
-    // removed as stale by any other process, after which a prune could delete
-    // data a mounted client is reading. Stopping the server is the only safe
-    // answer. Called by the main loop's once-a-second wakeup on the SMB
-    // screen.
-    pub(crate) fn poll_smb_lock(&mut self) {
-        if !self
-            .smb_handle
-            .as_ref()
-            .is_some_and(smb::SmbHandle::lock_poisoned)
-        {
-            return;
-        }
-        if let Some(h) = self.smb_handle.take() {
-            h.stop();
+    // Stop the server because a background check says it must, and say why —
+    // on the share screen, and in the footer of whatever screen is up, since
+    // the server runs while the user is elsewhere.
+    fn stop_smb_server_with(&mut self, why: String) {
+        if let Some(server) = self.smb_server.take() {
+            server.stop();
         }
         self.smb_password = None;
-        self.smb_error = Some(
-            "Server stopped: the repository lock could not be refreshed for over 22 \
-             minutes (backend unreachable?), so other restic processes may treat it \
-             as stale and remove it. Press Esc and share again once the repository \
-             is reachable."
-                .into(),
-        );
+        self.smb_pending = None;
+        self.smb_error = Some(why);
+        self.notice = Some("The SMB server stopped — m for why.".into());
     }
 
-    // Stops the share once refused logons reach the server's limit. Shares the
-    // once-a-second wakeup with `poll_smb_lock`.
-    //
-    // The server has already stopped accepting logons by the time this fires,
-    // so nothing is racing here; what remains is to release the repository lock
-    // and tell the user, since a share that silently refuses everyone is
-    // indistinguishable from one that is broken.
-    pub(crate) fn poll_smb_logons(&mut self) {
-        if !self
-            .smb_handle
-            .as_ref()
-            .is_some_and(smb::SmbHandle::logon_limit_reached)
-        {
-            return;
-        }
-        let Some(handle) = self.smb_handle.take() else {
+    // The shared snapshot as the snapshot list knows it: which profile's list,
+    // and the full id.
+    pub(crate) fn smb_shared(&self) -> Option<&smb::SnapshotSummary> {
+        self.smb_server.as_ref()?.shared()
+    }
+
+    // Whether a snapshot from the profile whose list is open is in the share.
+    // Its lock is restic's non-exclusive one, which every exclusive operation
+    // on that repository — delete, tag edit, prune — would trip over.
+    fn smb_shares_active_profile(&self) -> Option<String> {
+        let shared = self.smb_shared()?;
+        (self.active_profile_name.as_deref() == Some(shared.profile.as_str()))
+            .then(|| shared.short_id.clone())
+    }
+
+    // What an exclusive operation on the open profile says instead of tripping
+    // over the share's own lock. Worded to avoid restic's lock-error phrases:
+    // `u` (remove stale locks) cannot help with a lock this process holds.
+    fn smb_blocks(what: &str, short_id: &str) -> String {
+        format!(
+            "Snapshot {short_id} of this repository is shared over SMB, and while it is \
+             shared wrustic holds restic's non-exclusive lock on the repository, which \
+             {what} has to wait for.\n\nTake it out of the share first: s on that \
+             snapshot, or x on the SMB share screen (m)."
+        )
+    }
+
+    // `s` on the snapshot list: take the selected snapshot out of the share if
+    // it is the one shared, otherwise put it in, replacing whatever was shared
+    // — turning the server on first if it is off.
+    fn toggle_selected_snapshot_share(&mut self) {
+        let Some(id) = self.selected_snapshot_id() else {
             return;
         };
-        let attempts = handle.failed_logons();
-        handle.stop();
-        self.smb_password = None;
-        self.smb_error = Some(format!(
-            "Server stopped: {attempts} logons were refused with no successful one in \
-             between. A client replaying a password saved from an earlier run looks \
-             exactly like this — the share password is new every time — so clear the \
-             saved credential (Windows: cmdkey /delete:<server>) before sharing again. \
-             Press Esc and share again to get a fresh password."
-        ));
+        if let Some(short) = self.smb_shares_active_profile()
+            && self.smb_shared().is_some_and(|s| s.id == id)
+        {
+            if let Some(server) = self.smb_server.as_mut() {
+                server.unshare();
+            }
+            self.notice = Some(format!(
+                "Took snapshot {short} out of the SMB share; the server keeps running."
+            ));
+            return;
+        }
+        let (Some(profile_name), Some((_, profile))) = (
+            self.active_profile_name.clone(),
+            self.config.profile_at(self.loading_index),
+        ) else {
+            return;
+        };
+        let starting = self.smb_server.is_none();
+        self.smb_pending = Some(PendingShare {
+            profile_name,
+            profile: profile.clone(),
+            snapshot_id: id,
+            show_share_screen: starting,
+        });
+        self.smb_error = None;
+        self.smb_return = SmbReturn::Snapshots;
+        self.screen = if starting {
+            Screen::SmbStarting
+        } else {
+            Screen::SmbLoading
+        };
     }
 
-    // Start the SMB server for `smb_snapshot_id`. Called from the main loop
-    // once the "starting" screen has been drawn, because opening the repository
-    // reads the full index — seconds on a large remote repository — and doing
-    // that inside the key handler would freeze the TUI with no explanation.
+    // Enforces the server's stop conditions wherever the user is: the server
+    // runs across screens, so the main loop calls this on every pass and wakes
+    // at least once a second while the server is on.
+    //
+    // - Too many refused logons: the server has already stopped accepting
+    //   logons, so a share that silently refuses everyone is all that is left.
+    // - The packet tunnel fronting it went away: nothing reaches it any more.
+    // - restic's refreshability rule: a repository lock that went 22.5 minutes
+    //   without a successful refresh may be removed as stale by any other
+    //   process, after which a prune could delete data a mounted client is
+    //   reading. Only the snapshot has to go for that; the README stays.
+    pub(crate) fn poll_smb(&mut self) {
+        let Some(server) = self.smb_server.as_mut() else {
+            return;
+        };
+        if server.logon_limit_reached() {
+            let attempts = server.failed_logons();
+            self.stop_smb_server_with(format!(
+                "The server stopped: {attempts} logons were refused with no successful \
+                 one in between. A client replaying a password saved from an earlier run \
+                 looks exactly like this — the share password is new every time the \
+                 server is turned on — so clear the saved credential (Windows: cmdkey \
+                 /delete:<server>) before turning it on again with o."
+            ));
+            return;
+        }
+        if let Some(reason) = server.tun_stopped() {
+            self.stop_smb_server_with(format!("The server stopped: the packet tunnel went away ({reason})."));
+            return;
+        }
+        if server.lock_poisoned() {
+            let short = server
+                .shared()
+                .map(|s| s.short_id.clone())
+                .unwrap_or_default();
+            server.unshare();
+            self.smb_error = Some(format!(
+                "Snapshot {short} was taken out of the share: the repository lock could \
+                 not be refreshed for over 22 minutes (backend unreachable?), so other \
+                 restic processes may treat it as stale and remove it. The server keeps \
+                 running; share the snapshot again once the repository is reachable."
+            ));
+            self.notice = Some(format!("Snapshot {short} was taken out of the SMB share — m for why."));
+        }
+    }
+
+    // Turn the server on. Called from the main loop once the "starting" screen
+    // has been drawn: binding the tun transport creates a network adapter,
+    // which takes long enough to want a frame on screen first. Continues into
+    // sharing the pending snapshot, when `s` is what turned it on.
     //
     // Errors land inline on the share screen rather than the global Error
-    // screen, so a port clash or a bad passphrase leaves the user somewhere
-    // they can retry from.
-    pub(crate) fn start_smb_share(&mut self) {
-        self.screen = Screen::SnapshotSmb;
-        if self.smb_handle.is_some() {
-            return;
+    // screen, so a port clash leaves the user somewhere they can retry from.
+    pub(crate) fn start_smb_server(&mut self) {
+        if self.smb_server.is_none() {
+            let password = smb::random_password();
+            let credentials = smb::Credentials {
+                user: smb::DEFAULT_SHARE_USER.to_string(),
+                password: password.clone(),
+            };
+            // A fixed port (--smb-port), not an ephemeral one: a mount, an
+            // fstab line or a saved Windows drive mapping has to keep pointing
+            // somewhere across runs. The cost is that a second wrustic, or a
+            // manual test harness, collides here — which surfaces as an inline
+            // "address already in use".
+            let port = self.smb.port;
+            // With --smb-tun the share is fronted by a private tun adapter on
+            // port 445, and `port` becomes the ephemeral loopback socket behind
+            // it — which nothing outside this process ever connects to.
+            #[cfg(all(windows, feature = "smb-tun"))]
+            let bind = if self.smb.tun {
+                smb::Bind::Tun(smb::TunConfig {
+                    port: smb::STANDARD_SMB_PORT,
+                    addrs: self.smb.tun_addrs,
+                })
+            } else {
+                smb::Bind::Loopback
+            };
+            #[cfg(not(all(windows, feature = "smb-tun")))]
+            let bind = smb::Bind::Loopback;
+            match smb::ShareServer::start(port, bind, credentials) {
+                Ok(server) => {
+                    self.smb_server = Some(server);
+                    self.smb_password = Some(password);
+                    self.smb_error = None;
+                }
+                Err(e) => {
+                    self.smb_pending = None;
+                    self.smb_error = Some(smb_start_error(e, port));
+                    self.smb_scroll = 0;
+                    self.screen = Screen::SmbShare;
+                    return;
+                }
+            }
         }
-        let Some(snap_id) = self.smb_snapshot_id.clone() else {
-            self.smb_error = Some("No snapshot selected to share.".into());
-            return;
-        };
-        let Some((_, profile)) = self.config.profile_at(self.loading_index) else {
-            self.smb_error = Some("Selected profile no longer exists.".into());
-            return;
-        };
-        let profile = profile.clone();
-        let password = smb::random_password();
-        let credentials = smb::Credentials {
-            user: smb::DEFAULT_SHARE_USER.to_string(),
-            password: password.clone(),
-        };
-        // A fixed port (--smb-port), not an ephemeral one: the mount outlives
-        // any single run of this screen, so an fstab line or a saved Windows
-        // drive mapping has to keep pointing somewhere. The cost is that a
-        // second wrustic, or a manual test harness, collides here — which
-        // surfaces as an inline "address already in use".
-        let port = self.smb.port;
-        // With --smb-tun the share is fronted by a private tun adapter on port
-        // 445, and `port` becomes the ephemeral loopback socket behind it —
-        // which nothing outside this process ever connects to.
-        #[cfg(all(windows, feature = "smb-tun"))]
-        let bind = if self.smb.tun {
-            smb::Bind::Tun(smb::TunConfig {
-                port: smb::STANDARD_SMB_PORT,
-                addrs: self.smb.tun_addrs,
-            })
+        if self.smb_pending.is_some() {
+            self.screen = Screen::SmbLoading;
         } else {
-            smb::Bind::Loopback
+            self.smb_scroll = 0;
+            self.screen = Screen::SmbShare;
+        }
+    }
+
+    // Put `smb_pending` into the share. Called from the main loop once the
+    // "loading" screen has been drawn, because opening the repository reads
+    // the full index — seconds on a large remote repository — and doing that
+    // inside the key handler would freeze the TUI with no explanation.
+    //
+    // On success the user goes back to the snapshot list, with the footer
+    // saying what changed — or to the share screen, when sharing also turned
+    // the server on and the password and mount commands are new. A failure
+    // shows on the share screen, keeping the pending snapshot so a lock
+    // failure can be unlocked and retried with `u`; whatever was shared before
+    // stays shared.
+    pub(crate) fn load_pending_share(&mut self) {
+        let Some(pending) = self.smb_pending.clone() else {
+            self.screen = Screen::SmbShare;
+            return;
         };
-        #[cfg(not(all(windows, feature = "smb-tun")))]
-        let bind = smb::Bind::Loopback;
-        match smb::start_snapshot_share(port, &profile, &snap_id, bind, credentials) {
-            Ok(h) => {
-                self.smb_password = Some(password);
+        let Some(server) = self.smb_server.as_mut() else {
+            self.smb_pending = None;
+            self.smb_error = Some("The SMB server is off; turn it on with o and share again.".into());
+            self.screen = Screen::SmbShare;
+            return;
+        };
+        match server.share_snapshot(&pending.profile_name, &pending.profile, &pending.snapshot_id) {
+            Ok(()) => {
+                self.smb_pending = None;
                 self.smb_error = None;
-                self.smb_handle = Some(h);
+                if pending.show_share_screen {
+                    self.smb_scroll = 0;
+                    self.screen = Screen::SmbShare;
+                } else {
+                    let short = server
+                        .shared()
+                        .map(|s| s.short_id.clone())
+                        .unwrap_or_default();
+                    self.notice = Some(format!(
+                        "Sharing snapshot {short} in the SMB share, in folder {short} — m for details."
+                    ));
+                    self.screen = Screen::Snapshots;
+                }
             }
             Err(e) => {
-                self.smb_error = Some(smb_start_error(e, port));
+                self.smb_error = Some(format!("Sharing snapshot failed: {e:#}"));
+                self.smb_scroll = 0;
+                self.screen = Screen::SmbShare;
             }
         }
     }
@@ -1724,6 +1899,7 @@ impl App {
                     self.clear_creation_scratch();
                     self.screen = Screen::CreateProfileName;
                 }
+                KeyCode::Char('m') => self.open_smb_screen(SmbReturn::Home),
                 KeyCode::Enter if !self.config.profiles.is_empty() => self.activate_home_profile(),
                 KeyCode::Char('e') if !self.config.profiles.is_empty() => {
                     let idx = self
@@ -1789,6 +1965,20 @@ impl App {
                     self.filter_pending_kind = None;
                     self.screen = Screen::SnapshotFilterDim;
                 }
+                // Delete, prune and tag edits all need restic's exclusive lock,
+                // which this process's own SMB share would refuse them. Said up
+                // front rather than as a lock error offering `u`, which cannot
+                // remove a lock that is live.
+                KeyCode::Char(c @ ('d' | 'p' | 't'))
+                    if self.smb_shares_active_profile().is_some() =>
+                {
+                    let short = self.smb_shares_active_profile().unwrap_or_default();
+                    self.screen = match c {
+                        'd' => Screen::SnapshotDeleteError(Self::smb_blocks("deleting a snapshot", &short)),
+                        'p' => Screen::PruneError(Self::smb_blocks("prune", &short)),
+                        _ => Screen::SnapshotTagError(Self::smb_blocks("editing tags", &short)),
+                    };
+                }
                 KeyCode::Char('d') => {
                     let visible = self.visible_snapshot_indices();
                     if let Some(pos) = self.list_state.selected()
@@ -1823,14 +2013,8 @@ impl App {
                         self.copy("the snapshot ID", &id);
                     }
                 }
-                KeyCode::Char('s') => {
-                    if let Some(id) = self.selected_snapshot_id() {
-                        self.smb_snapshot_id = Some(id);
-                        self.smb_password = None;
-                        self.smb_error = None;
-                        self.screen = Screen::SnapshotSmbStarting;
-                    }
-                }
+                KeyCode::Char('s') => self.toggle_selected_snapshot_share(),
+                KeyCode::Char('m') => self.open_smb_screen(SmbReturn::Snapshots),
                 KeyCode::Char('c') => {
                     let visible = self.visible_snapshot_indices();
                     if visible.len() < 2 {
@@ -2250,23 +2434,38 @@ impl App {
                 _ => {}
             },
 
-            // Drawn once, then the main loop calls `start_smb_share`. No keys:
-            // opening the repository is a blocking call we are about to make,
-            // so there is nothing an input could affect.
-            Screen::SnapshotSmbStarting => {}
+            // Drawn once, then the main loop binds the server or opens the
+            // repository. No keys: both are blocking calls about to be made, so
+            // there is nothing an input could affect.
+            Screen::SmbStarting | Screen::SmbLoading => {}
 
-            Screen::SnapshotSmb => match key.code {
-                KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('q') => {
-                    self.stop_smb_share();
-                    self.screen = Screen::Snapshots;
+            Screen::SmbShare => match key.code {
+                KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('q') => self.leave_smb_screen(),
+                KeyCode::Char('o') => {
+                    if self.smb_server.is_some() {
+                        self.disable_smb_server();
+                        self.notice = Some("The SMB server is off.".into());
+                    } else {
+                        self.smb_pending = None;
+                        self.smb_error = None;
+                        self.screen = Screen::SmbStarting;
+                    }
                 }
-                // Offered only when starting failed on a lock conflict (the
-                // share's non-exclusive lock is blocked by an exclusive one).
-                // Mirrors the delete flow's `u`: remove stale locks natively,
-                // then retry; a live lock survives and fails the retry with
-                // the holder's details.
+                KeyCode::Char('x') => {
+                    if let Some(server) = self.smb_server.as_mut()
+                        && let Some(short) = server.shared().map(|s| s.short_id.clone())
+                    {
+                        server.unshare();
+                        self.notice = Some(format!("Took snapshot {short} out of the share."));
+                    }
+                }
+                // Offered only when sharing a snapshot failed on a lock
+                // conflict (its non-exclusive lock is blocked by an exclusive
+                // one). Mirrors the delete flow's `u`: remove stale locks
+                // natively, then retry; a live lock survives and fails the
+                // retry with the holder's details.
                 KeyCode::Char('u') | KeyCode::Char('U')
-                    if self.smb_handle.is_none()
+                    if self.smb_pending.is_some()
                         && self
                             .smb_error
                             .as_deref()
@@ -2282,13 +2481,19 @@ impl App {
                 }
                 KeyCode::Char('m') => {
                     if let Some(cmd) = self
-                        .smb_handle
+                        .smb_server
                         .as_ref()
-                        .map(|h| h.mount_commands().for_this_os().to_string())
+                        .map(|s| s.mount_commands().for_this_os().to_string())
                     {
                         self.copy("the mount command", &cmd);
                     }
                 }
+                KeyCode::Down | KeyCode::Char('j') => self.scroll_smb(1),
+                KeyCode::Up | KeyCode::Char('k') => self.scroll_smb(-1),
+                KeyCode::PageDown => self.scroll_smb(10),
+                KeyCode::PageUp => self.scroll_smb(-10),
+                KeyCode::Char('g') | KeyCode::Home => self.scroll_smb(i32::MIN / 2),
+                KeyCode::Char('G') | KeyCode::End => self.scroll_smb(i32::MAX / 2),
                 _ => {}
             },
 
@@ -2656,6 +2861,7 @@ impl App {
 
     fn handle_wheel(&mut self, down: bool) {
         match &self.screen {
+            Screen::SmbShare => self.scroll_smb(if down { 3 } else { -3 }),
             Screen::Home => {
                 if down {
                     self.profile_list_state.select_next();
@@ -3096,80 +3302,190 @@ mod tests {
         r
     }
 
-    #[test]
-    fn s_on_the_snapshot_list_targets_the_selected_snapshot() {
-        let mut app = boot_app_with_snapshots(vec![row_with_id("aaa"), row_with_id("bbb")]);
+    // A snapshot list open on profile "laptop", whose repository need not
+    // exist: only the tests that actually share something give it one.
+    fn boot_on_profile(snaps: Vec<SnapshotRow>, profile: Profile) -> TestApp {
+        let mut app = boot_app_with_snapshots(snaps);
+        app.config.profiles.insert("laptop".into(), profile);
+        app.active_profile_name = Some("laptop".into());
+        app.loading_index = 0;
+        // Ephemeral, so tests that turn the server on never collide.
+        app.smb.port = 0;
         app.screen = Screen::Snapshots;
+        app
+    }
+
+    fn missing_repo() -> Profile {
+        Profile::Local {
+            password: "pw".into(),
+            local_path: "tmp/wrustic-app-test-no-such-repo".into(),
+        }
+    }
+
+    const LOCK_ERROR: &str = "unable to create lock in backend: repository is already locked \
+                              exclusively by PID 1 on host by someone";
+
+    #[test]
+    fn s_with_the_server_off_turns_it_on_for_the_selected_snapshot() {
+        let mut app = boot_on_profile(vec![row_with_id("aaa"), row_with_id("bbb")], missing_repo());
         app.list_state.select(Some(1));
 
         press(&mut app, KeyCode::Char('s'));
 
-        // The key handler only captures the target; the main loop does the
-        // opening, so the repository is never touched here.
-        assert!(matches!(app.screen, Screen::SnapshotSmbStarting));
-        assert_eq!(app.smb_snapshot_id.as_deref(), Some("bbb"));
-        assert!(app.smb_handle.is_none());
+        // The key handler only captures the target; the main loop binds the
+        // server and opens the repository, so neither happens here.
+        assert!(matches!(app.screen, Screen::SmbStarting));
+        let pending = app.smb_pending.as_ref().expect("pending share");
+        assert_eq!(pending.snapshot_id, "bbb");
+        assert_eq!(pending.profile_name, "laptop");
+        assert!(pending.show_share_screen, "the password is new, so show it");
+        assert!(app.smb_server.is_none());
+        assert_eq!(app.smb_return, SmbReturn::Snapshots);
+    }
+
+    #[test]
+    fn s_with_the_server_on_goes_straight_to_sharing() {
+        let mut app = boot_on_profile(vec![row_with_id("aaa")], missing_repo());
+        app.start_smb_server();
+        assert!(app.smb_server.is_some(), "{:?}", app.smb_error);
+        app.screen = Screen::Snapshots;
+        app.list_state.select(Some(0));
+
+        press(&mut app, KeyCode::Char('s'));
+
+        assert!(matches!(app.screen, Screen::SmbLoading));
+        let pending = app.smb_pending.as_ref().expect("pending share");
+        assert!(!pending.show_share_screen, "the mount is unchanged; stay on the list");
     }
 
     #[test]
     fn s_picks_from_the_filtered_view_not_the_raw_list() {
-        let mut app = boot_app_with_snapshots(vec![
-            row_with_id("aaa"),
-            {
-                let mut r = row_with_id("bbb");
-                r.host = "server".into();
-                r
-            },
-            row_with_id("ccc"),
-        ]);
-        app.screen = Screen::Snapshots;
+        let mut app = boot_on_profile(
+            vec![
+                row_with_id("aaa"),
+                {
+                    let mut r = row_with_id("bbb");
+                    r.host = "server".into();
+                    r
+                },
+                row_with_id("ccc"),
+            ],
+            missing_repo(),
+        );
         // Hides row 1, so visible index 1 is the *third* snapshot.
         app.snapshot_filter = Some(SnapshotFilter::Host("laptop".into()));
         app.list_state.select(Some(1));
 
         press(&mut app, KeyCode::Char('s'));
 
-        assert_eq!(app.smb_snapshot_id.as_deref(), Some("ccc"));
+        assert_eq!(app.smb_pending.as_ref().map(|p| p.snapshot_id.as_str()), Some("ccc"));
     }
 
     #[test]
     fn s_with_nothing_selected_does_nothing() {
-        let mut app = boot_app_with_snapshots(vec![]);
-        app.screen = Screen::Snapshots;
+        let mut app = boot_on_profile(vec![], missing_repo());
         app.list_state.select(None);
 
         press(&mut app, KeyCode::Char('s'));
 
         assert!(matches!(app.screen, Screen::Snapshots));
-        assert!(app.smb_snapshot_id.is_none());
+        assert!(app.smb_pending.is_none());
     }
 
     #[test]
-    fn leaving_the_smb_screen_clears_the_share() {
-        let mut app = boot_app_with_snapshots(vec![row_with_id("aaa")]);
-        app.screen = Screen::SnapshotSmb;
-        app.smb_snapshot_id = Some("aaa".into());
-        app.smb_password = Some("hunter2".into());
+    fn m_opens_the_share_screen_and_esc_returns_where_it_came_from() {
+        let mut app = boot_on_profile(vec![row_with_id("aaa")], missing_repo());
+        press(&mut app, KeyCode::Char('m'));
+        assert!(matches!(app.screen, Screen::SmbShare));
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.screen, Screen::Snapshots));
+
+        app.screen = Screen::Home;
+        press(&mut app, KeyCode::Char('m'));
+        assert!(matches!(app.screen, Screen::SmbShare));
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.screen, Screen::Home));
+    }
+
+    #[test]
+    fn o_turns_the_server_on_and_off() {
+        let mut app = boot_on_profile(vec![], missing_repo());
+        app.open_smb_screen(SmbReturn::Home);
+
+        press(&mut app, KeyCode::Char('o'));
+        assert!(matches!(app.screen, Screen::SmbStarting));
+        app.start_smb_server();
+        assert!(matches!(app.screen, Screen::SmbShare));
+        assert!(app.smb_server.is_some(), "{:?}", app.smb_error);
+        assert!(app.smb_password.is_some());
+        assert!(app.smb_shared().is_none(), "turning it on shares nothing");
+
+        press(&mut app, KeyCode::Char('o'));
+        assert!(matches!(app.screen, Screen::SmbShare));
+        assert!(app.smb_server.is_none());
+        assert!(app.smb_password.is_none(), "the password must not outlive the server");
+    }
+
+    #[test]
+    fn leaving_the_share_screen_keeps_the_server_running() {
+        let mut app = boot_on_profile(vec![row_with_id("aaa")], missing_repo());
+        app.open_smb_screen(SmbReturn::Snapshots);
+        app.start_smb_server();
         app.smb_error = Some("boom".into());
 
         press(&mut app, KeyCode::Esc);
 
         assert!(matches!(app.screen, Screen::Snapshots));
-        assert!(app.smb_snapshot_id.is_none());
-        assert!(app.smb_password.is_none(), "the password must not outlive the server");
-        assert!(app.smb_error.is_none());
+        assert!(app.smb_server.is_some());
+        assert!(app.smb_password.is_some());
+        assert!(app.smb_error.is_none(), "the screen's message goes with the screen");
+    }
+
+    #[test]
+    fn a_port_clash_shows_on_the_share_screen() {
+        let mut app = boot_on_profile(vec![row_with_id("aaa")], missing_repo());
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        app.smb.port = taken.local_addr().expect("addr").port();
+        app.list_state.select(Some(0));
+        press(&mut app, KeyCode::Char('s'));
+
+        app.start_smb_server();
+
+        assert!(matches!(app.screen, Screen::SmbShare));
+        assert!(app.smb_server.is_none());
+        assert!(app.smb_pending.is_none(), "nothing to retry with `u`");
+        let err = app.smb_error.as_deref().expect("error");
+        assert!(err.contains("--smb-port"), "{err}");
+    }
+
+    #[test]
+    fn a_failed_share_keeps_the_server_and_the_target() {
+        let mut app = boot_on_profile(vec![row_with_id("aaa")], missing_repo());
+        app.list_state.select(Some(0));
+        press(&mut app, KeyCode::Char('s'));
+        app.start_smb_server();
+        assert!(matches!(app.screen, Screen::SmbLoading));
+
+        app.load_pending_share();
+
+        assert!(matches!(app.screen, Screen::SmbShare));
+        assert!(app.smb_server.is_some(), "a bad repository must not stop the server");
+        assert!(app.smb_shared().is_none());
+        assert!(app.smb_error.is_some());
+        assert_eq!(
+            app.smb_pending.as_ref().map(|p| p.snapshot_id.as_str()),
+            Some("aaa"),
+            "a retry after unlocking needs its target"
+        );
     }
 
     #[test]
     fn u_on_an_smb_lock_error_enters_the_unlock_flow() {
-        let mut app = boot_app_with_snapshots(vec![row_with_id("aaa")]);
-        app.screen = Screen::SnapshotSmb;
-        app.smb_snapshot_id = Some("aaa".into());
-        app.smb_error = Some(
-            "unable to create lock in backend: repository is already locked \
-             exclusively by PID 1 on host by someone"
-                .into(),
-        );
+        let mut app = boot_on_profile(vec![row_with_id("aaa")], missing_repo());
+        app.list_state.select(Some(0));
+        press(&mut app, KeyCode::Char('s'));
+        app.screen = Screen::SmbShare;
+        app.smb_error = Some(LOCK_ERROR.into());
 
         press(&mut app, KeyCode::Char('u'));
 
@@ -3179,10 +3495,89 @@ mod tests {
             UnlockReturn::Smb,
             "the main loop must route the outcome back to the SMB flow"
         );
-        assert_eq!(
-            app.smb_snapshot_id.as_deref(),
-            Some("aaa"),
-            "the retry after unlocking needs its target"
+        assert!(app.smb_pending.is_some(), "the retry after unlocking needs its target");
+    }
+
+    #[test]
+    fn u_on_a_non_lock_smb_error_does_nothing() {
+        let mut app = boot_on_profile(vec![row_with_id("aaa")], missing_repo());
+        app.list_state.select(Some(0));
+        press(&mut app, KeyCode::Char('s'));
+        app.screen = Screen::SmbShare;
+        app.smb_error = Some("binding 127.0.0.1:445: address already in use".into());
+
+        press(&mut app, KeyCode::Char('u'));
+
+        assert!(
+            matches!(app.screen, Screen::SmbShare),
+            "unlocking cannot fix a port clash, so `u` must not be wired"
+        );
+        assert_eq!(app.unlock_return, UnlockReturn::default());
+    }
+
+    #[test]
+    fn the_starting_and_loading_screens_ignore_keys() {
+        let mut app = boot_on_profile(vec![row_with_id("aaa")], missing_repo());
+        for screen in [Screen::SmbStarting, Screen::SmbLoading] {
+            let loading = matches!(screen, Screen::SmbLoading);
+            app.screen = screen;
+            for code in [KeyCode::Esc, KeyCode::Char('q'), KeyCode::Enter, KeyCode::Char('o')] {
+                press(&mut app, code);
+                assert_eq!(matches!(app.screen, Screen::SmbLoading), loading);
+                assert_eq!(matches!(app.screen, Screen::SmbStarting), !loading);
+            }
+        }
+    }
+
+    /// The whole loop against a real repository: `s` turns the server on and
+    /// shares the snapshot, the exclusive operations on that repository are
+    /// refused up front rather than tripping over the share's own lock, and
+    /// `s` on the same snapshot takes it out again with the server left on.
+    #[test]
+    fn s_shares_the_snapshot_and_s_again_takes_it_out() {
+        let _guard = crate::lock::test_acquire_guard();
+        let fixture = crate::testrepo::TestRepo::init("app-share");
+        let snap_id = fixture.backup(&[("a.txt", b"a\n")], &[]);
+        let mut app = boot_on_profile(vec![row_with_id(&snap_id)], fixture.profile().clone());
+        app.list_state.select(Some(0));
+
+        press(&mut app, KeyCode::Char('s'));
+        app.start_smb_server();
+        app.load_pending_share();
+
+        assert!(matches!(app.screen, Screen::SmbShare), "{:?}", app.smb_error);
+        let shared = app.smb_shared().expect("shared").clone();
+        assert_eq!(shared.id, snap_id);
+        assert_eq!(shared.profile, "laptop");
+        assert!(app.smb_pending.is_none());
+
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.screen, Screen::Snapshots));
+        for (key, blocked) in [('d', "deleting"), ('t', "editing tags"), ('p', "prune")] {
+            press(&mut app, KeyCode::Char(key));
+            let msg = match &app.screen {
+                Screen::SnapshotDeleteError(m) | Screen::SnapshotTagError(m) | Screen::PruneError(m) => {
+                    m.clone()
+                }
+                _ => panic!("`{key}` must be refused while the snapshot is shared"),
+            };
+            assert!(msg.contains(blocked) && msg.contains(&shared.short_id), "{msg}");
+            assert!(
+                !crate::lock::is_lock_error(&msg),
+                "`u` cannot remove this process's own live lock, so it must not be offered: {msg}"
+            );
+            press(&mut app, KeyCode::Enter);
+            assert!(matches!(app.screen, Screen::Snapshots));
+        }
+
+        press(&mut app, KeyCode::Char('s'));
+        assert!(matches!(app.screen, Screen::Snapshots));
+        assert!(app.smb_server.is_some(), "taking the snapshot out leaves the server on");
+        assert!(app.smb_shared().is_none());
+        assert!(
+            app.notice.as_deref().is_some_and(|n| n.contains("out of the SMB share")),
+            "{:?}",
+            app.notice
         );
     }
 
@@ -3296,35 +3691,6 @@ mod tests {
         assert_eq!(parse_tag_list(" , ,"), Vec::<String>::new());
         assert_eq!(parse_tag_list("a"), vec!["a"]);
         assert_eq!(parse_tag_list(" a , b ,, a ,c "), vec!["a", "b", "c"]);
-    }
-
-    #[test]
-    fn u_on_a_non_lock_smb_error_does_nothing() {
-        let mut app = boot_app_with_snapshots(vec![row_with_id("aaa")]);
-        app.screen = Screen::SnapshotSmb;
-        app.smb_snapshot_id = Some("aaa".into());
-        app.smb_error = Some("binding 127.0.0.1:445: address already in use".into());
-
-        press(&mut app, KeyCode::Char('u'));
-
-        assert!(
-            matches!(app.screen, Screen::SnapshotSmb),
-            "unlocking cannot fix a port clash, so `u` must not be wired"
-        );
-        assert_eq!(app.unlock_return, UnlockReturn::default());
-    }
-
-    #[test]
-    fn the_starting_screen_ignores_keys() {
-        let mut app = boot_app_with_snapshots(vec![row_with_id("aaa")]);
-        app.screen = Screen::SnapshotSmbStarting;
-        app.smb_snapshot_id = Some("aaa".into());
-
-        for code in [KeyCode::Esc, KeyCode::Char('q'), KeyCode::Enter] {
-            press(&mut app, code);
-            assert!(matches!(app.screen, Screen::SnapshotSmbStarting));
-        }
-        assert_eq!(app.smb_snapshot_id.as_deref(), Some("aaa"));
     }
 
     #[test]

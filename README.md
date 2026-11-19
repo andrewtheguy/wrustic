@@ -32,12 +32,15 @@ exactly which workflows that means.
   stale locks are removed automatically before the run via restic's own
   `unlock`
 - **File sharing**: one-time signed download URLs served from localhost
-- **Snapshot sharing over SMB** (`s` on the snapshot list): mount a whole
-  snapshot read-only from Linux, macOS, or Windows 11 24H2+. The SMB 2.1
-  protocol and transport are the
+- **Snapshot sharing over SMB**: mount a read-only share once from Linux,
+  macOS, or Windows 11 24H2+, then swap snapshots in and out without a remount.
+  `m` opens the one screen that turns the server on or off and shows the
+  password and mount commands; `s` on the snapshot list puts that snapshot in
+  the share (or takes it out), in a short-id folder beside a `README.txt` that
+  says what is shared. The SMB 2.1 protocol and transport are the
   [smbanything](https://github.com/andrewtheguy/smbanything) project's
   `smbanything_core` crate; wrustic supplies the restic snapshot backing and
-  ties the server's lifetime to the repository lock. Bound to localhost, with
+  holds the repository lock for as long as a snapshot is shared. Bound to localhost, with
   NTLMv2 authentication and signing. Files mount `0444` and directories `0555` on Linux and macOS,
   and on every client opening a file for execute is refused — a share is for
   browsing a snapshot, not restoring from one; see
@@ -223,7 +226,7 @@ before 11 24H2. It needs administrator rights to create the adapter and the
 wintun driver (`wintun-amd64.dll`) next to the wrustic executable — the
 Windows installer ships it there; a source build copies it from
 `vendor/wintun/`. It leaves the host's own file sharing untouched, and while
-a share is open two link-local `/32` host routes point at the tun — no subnet
+the server is on two link-local `/32` host routes point at the tun — no subnet
 is claimed. `--smb-tun-ip <IPv4>` moves them.
 
 `--no-restic-cache` turns off restic's on-disk cache for the restic
