@@ -50,6 +50,7 @@ pub(crate) fn help_rows(screen: &Screen) -> Option<&'static [(&'static str, &'st
             ("n", "new profile"),
             ("e", "edit the selected profile"),
             ("d", "delete the selected profile"),
+            ("m", "SMB share: turn it on or off, see how to connect"),
             ("q", "quit"),
         ],
         Screen::Snapshots => &[
@@ -59,7 +60,8 @@ pub(crate) fn help_rows(screen: &Screen) -> Option<&'static [(&'static str, &'st
             ("Enter", "browse this snapshot's files"),
             ("i", "show this snapshot's full details (untruncated paths)"),
             ("y", "copy this snapshot's full ID to the clipboard"),
-            ("s", "share this snapshot as a read-only SMB mount"),
+            ("s", "share this snapshot over SMB, replacing the one shared (again to take it out)"),
+            ("m", "SMB share: turn it on or off, see how to connect"),
             ("c", "compare this snapshot against another"),
             ("f", "filter the list by host, tag or path"),
             ("d", "delete this snapshot (no prune)"),
@@ -83,6 +85,17 @@ pub(crate) fn help_rows(screen: &Screen) -> Option<&'static [(&'static str, &'st
             ("g", "back to the top"),
             ("s", "share this one file over HTTP (expiring signed URL)"),
             ("Esc / Backspace / q", "back to the directory listing"),
+        ],
+        Screen::SmbShare => &[
+            ("o", "turn the SMB server on or off"),
+            ("x", "take the shared snapshot out of the share"),
+            ("y", "copy the share password"),
+            ("m", "copy the mount command for this OS"),
+            ("u", "after a lock error: remove stale locks and retry"),
+            ("Up/Dn", "scroll"),
+            ("PgUp/PgDn", "page"),
+            ("g / G", "jump to the top / bottom"),
+            ("Esc / Backspace / q", "back (the server keeps running)"),
         ],
         _ => return None,
     })
@@ -229,10 +242,65 @@ fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
         Some(name) => format!("wrustic — profile: {name}"),
         None => "wrustic".to_string(),
     };
-    let para = Paragraph::new(text)
+    // The server runs whichever screen is up, so every screen says so: a
+    // server serving something the UI is not showing is the thing to avoid.
+    // The key is named only where `m` opens the share screen.
+    let width = usize::from(area.width.saturating_sub(2));
+    let status = app.smb_server.as_ref().map(|server| {
+        let key = if matches!(app.screen, Screen::Home | Screen::Snapshots) {
+            " (m)"
+        } else {
+            ""
+        };
+        let shared = server.shared().map(|s| s.short_id.as_str());
+        let long = match shared {
+            Some(short) => format!("   SMB on, sharing {short}{key}"),
+            None => format!("   SMB on, nothing shared{key}"),
+        };
+        // Too narrow for even that: the short form still says the server
+        // is on and what it shares.
+        if Line::raw(long.as_str()).width() <= width {
+            long
+        } else {
+            match shared {
+                Some(short) => format!(" SMB {short}"),
+                None => " SMB on".to_string(),
+            }
+        }
+    });
+    // A long profile name gives way first, so the status stays visible.
+    // Measured in terminal columns, not chars: a wide character takes two.
+    let room = width.saturating_sub(status.as_deref().map_or(0, |s| Line::raw(s).width()));
+    let mut spans = vec![Span::raw(fit_columns(text, room))];
+    if let Some(status) = status {
+        spans.push(Span::styled(status, Style::new().fg(Color::Green)));
+    }
+    let para = Paragraph::new(Line::from(spans))
         .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
         .block(Block::default().borders(Borders::ALL));
     frame.render_widget(para, area);
+}
+
+/// `text` cut to `room` terminal columns, ending in '…' when cut. Measured in
+/// columns, not chars: a wide character takes two.
+fn fit_columns(text: String, room: usize) -> String {
+    if Line::raw(text.as_str()).width() <= room {
+        return text;
+    }
+    if room == 0 {
+        return String::new();
+    }
+    let mut cut = String::new();
+    let mut used = 1; // the '…'
+    for c in text.chars() {
+        used += Span::raw(c.to_string()).width();
+        if used > room {
+            break;
+        }
+        cut.push(c);
+    }
+    cut.push('…');
+    cut
 }
 
 fn render_bottom_bar(frame: &mut Frame, app: &App, area: Rect) {
@@ -298,9 +366,9 @@ fn footer_text(screen: &Screen, keychain_enabled: bool) -> &'static str {
         // These footers list only what a first-time user needs to get moving;
         // `?` opens the full key list, which is what keeps them from growing
         // past the width of a terminal again.
-        Screen::Home => "Enter open  n new  e edit  d delete  ? keys  q quit",
+        Screen::Home => "Enter open  n new  e edit  d delete  m SMB share  ? keys  q quit",
         Screen::Snapshots => {
-            "Enter browse  i info  s share  c compare  f filter  d delete  t tags  p prune  r reload  ? keys  q/Esc back"
+            "Enter browse  i info  s share  m SMB  c compare  f filter  d delete  t tags  p prune  r reload  ? keys  q/Esc back"
         }
         Screen::SnapshotFilterDim => "Up/Dn move  PgUp/PgDn page  Enter pick  Esc back",
         Screen::SnapshotFilterValue => {
@@ -331,9 +399,10 @@ fn footer_text(screen: &Screen, keychain_enabled: bool) -> &'static str {
             "s share  Up/Dn scroll  ? keys  Esc/Backspace/q back"
         }
         Screen::ShareUrl => "y copy short URL  l copy long URL  Esc/Backspace/q back (stops the server)",
-        Screen::SnapshotSmbStarting => "starting the SMB server…",
-        Screen::SnapshotSmb => {
-            "y copy password  m copy mount command  Esc/Backspace/q back (stops the server)"
+        Screen::SmbStarting => "starting the SMB server…",
+        Screen::SmbLoading => "opening the repository…",
+        Screen::SmbShare => {
+            "o server on/off  x unshare  y copy password  m copy mount  Up/Dn scroll  ? keys  Esc/Backspace/q back"
         }
         Screen::PassphraseInstancePrompt => "type  Enter submit  Esc quit",
         Screen::PassphraseSetup => if keychain_enabled {
@@ -534,16 +603,27 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
         Screen::SnapshotContents => render_snapshot_contents(frame, app, area),
         Screen::FileDetails => render_file_details(frame, app, area),
         Screen::ShareUrl => render_share_url(frame, app, area),
-        Screen::SnapshotSmbStarting => {
-            let para = Paragraph::new(
-                "Opening the repository and starting the SMB server…\n\n\
-                 Reading the index, which can take a moment on a large repository.",
-            )
-            .wrap(Wrap { trim: false })
-            .block(Block::bordered().title("Share over SMB"));
+        Screen::SmbStarting => {
+            let para = Paragraph::new("Starting the SMB server…")
+                .wrap(Wrap { trim: false })
+                .block(Block::bordered().title("SMB share"));
             frame.render_widget(para, area);
         }
-        Screen::SnapshotSmb => render_snapshot_smb(frame, app, area),
+        Screen::SmbLoading => {
+            let snap = app
+                .smb_pending
+                .as_ref()
+                .map(|p| short_snap_id(&p.snapshot_id).to_string())
+                .unwrap_or_default();
+            let para = Paragraph::new(format!(
+                "Opening the repository to share snapshot {snap}…\n\n\
+                 Reading the index, which can take a moment on a large repository.",
+            ))
+            .wrap(Wrap { trim: false })
+            .block(Block::bordered().title("SMB share"));
+            frame.render_widget(para, area);
+        }
+        Screen::SmbShare => render_smb_share(frame, app, area),
         Screen::PassphraseInstancePrompt => {
             let banner = format!(
                 "No config found at {}. Setting up a new instance.",
@@ -858,9 +938,25 @@ fn render_snapshots(frame: &mut Frame, app: &mut App, area: Rect) {
         ),
     };
 
+    // The open repository's snapshot in the SMB share, if any: its ID shows in
+    // green, and the title names it even when the list is filtered past it.
+    let shared = app.smb_shared_here().map(|s| s.id.clone());
+    let title = match &shared {
+        Some(id) => format!("{title} · {} shared over SMB", short_snap_id(id)),
+        None => title,
+    };
+
     record_list_area(app, area);
     app.list_header_rows = 1;
-    render_snapshot_picker(frame, area, &title, &app.snapshots, &visible, &mut app.list_state);
+    render_snapshot_picker(
+        frame,
+        area,
+        &title,
+        &app.snapshots,
+        &visible,
+        shared.as_deref(),
+        &mut app.list_state,
+    );
 }
 
 // Shared picker rendering for the Snapshots screen and the two compare-flow
@@ -872,6 +968,7 @@ fn render_snapshot_picker(
     title: &str,
     snapshots: &[crate::repo::SnapshotRow],
     visible: &[usize],
+    smb_shared: Option<&str>,
     state: &mut TableState,
 ) {
     let rows: Vec<Row> = visible
@@ -884,8 +981,14 @@ fn render_snapshot_picker(
                 format!("[{}]", s.tags.join(","))
             };
             let size = s.size.map(human_size).unwrap_or_else(|| "-".to_string());
+            let id = if smb_shared == Some(s.id.as_str()) {
+                Cell::from(short_snap_id(&s.id))
+                    .style(Style::new().fg(Color::Green).add_modifier(Modifier::BOLD))
+            } else {
+                Cell::from(short_snap_id(&s.id))
+            };
             Row::new([
-                Cell::from(short_snap_id(&s.id)),
+                id,
                 Cell::from(s.time.as_str()),
                 Cell::from(s.host.as_str()),
                 Cell::from(tags),
@@ -939,6 +1042,7 @@ fn render_compare_second(frame: &mut Frame, app: &mut App, area: Rect) {
         &title,
         &app.snapshots,
         &visible,
+        None,
         &mut app.compare_picker_state,
     );
 }
@@ -1449,117 +1553,296 @@ fn render_share_url(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(para, area);
 }
 
-fn render_snapshot_smb(frame: &mut Frame, app: &mut App, area: Rect) {
-    let snap = app
-        .smb_snapshot_id
-        .as_deref()
-        .map(short_snap_id)
-        .unwrap_or("(none)");
-    let title = format!("Share over SMB — snapshot {snap}");
+// The one place the SMB share is run from, laid out like smbanything's: the
+// server and its credentials, what is shared, any problem, and how to
+// connect. Every panel is sized to the text it holds, wrapping included, and
+// the last one fills whatever room is left. When they do not all fit, the body
+// scrolls as a whole, so a long path or error never pushes the mount commands
+// out of reach.
+fn render_smb_share(frame: &mut Frame, app: &mut App, area: Rect) {
+    let panel = |lines: Vec<Line<'static>>, title: String, border: Color| {
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::bordered().title(title).border_style(Style::new().fg(border)))
+    };
+    let mut panels = vec![panel(smb_server_lines(app), " SMB server ".into(), Color::Reset)];
+    let shared = smb_shared_lines(app);
+    if !shared.is_empty() {
+        panels.push(panel(shared, " Shared snapshot ".into(), Color::Reset));
+    }
+    let problem = smb_problem_lines(app);
+    if !problem.is_empty() {
+        panels.push(panel(problem, " Problem ".into(), Color::Red));
+    }
+    let connecting = smb_connecting_lines(app);
 
-    let mut lines = String::new();
-    match (app.smb_handle.as_ref(), app.smb_password.as_deref()) {
-        (Some(h), Some(pw)) => {
-            let user = crate::smb::DEFAULT_SHARE_USER;
-            // Not `h.port()`: with the tun transport that is the private
-            // loopback socket the proxy talks to, and printing it would send
-            // the reader to an endpoint no mount command should ever name.
-            let host = h.mount().host();
-            let port = h.mount().port();
-            lines.push_str(&format!(
-                "Server: listening on {host}:{port}  (read-only, this machine only)\n"
-            ));
-            // Keyed on the transport actually in use, not on the port number:
-            // `--smb-port 445` reaches 445 without a tun anywhere (on platforms
-            // where that bind succeeds), and claiming a private adapter exists
-            // when none does would be simply wrong. The addresses come from
-            // `--smb-tun-ip` rather than a hardcoded default.
-            if app.smb.tun {
-                lines.push_str(&format!(
-                    "Tun:    private adapter, standard SMB port. The machine's own file \
-                     sharing is untouched; {}/32 and {}/32 route here until this screen closes.\n",
-                    app.smb.tun_addrs.virtual_ip(),
-                    app.smb.tun_addrs.adapter_ip()
-                ));
-            }
-            lines.push_str(
-                "Lock:   holding restic's non-exclusive repository lock — concurrent \
-                 backups keep working; prune/forget are blocked until this screen \
-                 closes.\n\n",
-            );
-            lines.push_str(&format!("Username: {user}\n"));
-            lines.push_str(&format!("Password: {pw}\n"));
-            // Every command below prompts for the password rather than taking
-            // it as an argument. A password on a command line is readable by
-            // every process on the machine for as long as the command runs, and
-            // stays in shell history — or console history on Windows — long
-            // after. Type in the one shown above when asked.
-            lines.push_str("\nMount it with (each prompts for the password above):\n\n");
-            let cmds = h.mount_commands();
-            lines.push_str(&format!("  Linux    {}\n\n", cmds.linux));
-            lines.push_str(&format!(
-                "  macOS    Finder → Go → Connect to Server (Cmd+K), then enter:\n\
-                 \x20          {}\n\n",
-                cmds.macos
-            ));
-            lines.push_str(&format!("  Windows  {}\n", cmds.windows));
-            if h.on_standard_port() {
-                // A UNC path works in Explorer's address bar and in any
-                // program that takes one, not only as a mapped drive letter.
-                lines.push_str(&format!(
-                    "           Or paste {} straight into Explorer's address bar.\n",
-                    cmds.unc
-                ));
-            } else {
-                // A custom port is reachable only as a mapped drive, and only
-                // from 24H2 or newer — two separate limits, both lifted by
-                // serving the standard port, so --smb-tun is not just the
-                // older-Windows fallback.
-                lines.push_str(&format!(
-                    "           A mapped drive is the only way in: no UNC path can carry a \
-                     port, so {} on its own goes to 445 and never reaches this share.\n",
-                    h.unc()
-                ));
-                lines.push_str(
-                    "           /TCPPORT: also needs Windows 11 24H2 or newer. Starting \
-                     wrustic with --smb-tun serves the standard port instead — a UNC path \
-                     Explorer accepts, and the only way in from older builds.\n",
-                );
-            }
-        }
-        _ => {
-            lines.push_str("Server: not running\n");
+    // Measured by the paragraph's own wrapping at the width it renders at:
+    // `line_count` wraps at the width it is given and adds the block's border
+    // rows itself.
+    let inner_width = area.width.saturating_sub(2);
+    let height = |p: &Paragraph| u16::try_from(p.line_count(inner_width)).unwrap_or(u16::MAX);
+    let mut heights: Vec<u16> = panels.iter().map(height).collect();
+    let above = heights.iter().fold(0u16, |sum, h| sum.saturating_add(*h));
+    let connecting_height = height(&panel(connecting.clone(), String::new(), Color::Reset))
+        .max(area.height.saturating_sub(above));
+    heights.push(connecting_height);
+    let total = above.saturating_add(connecting_height);
+
+    app.smb_scroll_max = total.saturating_sub(area.height);
+    app.smb_scroll = app.smb_scroll.min(app.smb_scroll_max);
+    panels.push(panel(connecting, " Connecting ".into(), Color::Reset));
+
+    // Laid out at full height off screen, then the visible window copied in.
+    let canvas_area = Rect::new(0, 0, area.width, total);
+    let mut canvas = ratatui::buffer::Buffer::empty(canvas_area);
+    let mut y = 0u16;
+    for (paragraph, h) in panels.into_iter().zip(heights) {
+        ratatui::widgets::Widget::render(paragraph, Rect::new(0, y, area.width, h), &mut canvas);
+        y = y.saturating_add(h);
+    }
+    let buf = frame.buffer_mut();
+    for row in 0..area.height.min(total - app.smb_scroll) {
+        for col in 0..area.width {
+            buf[(area.x + col, area.y + row)] = canvas[(col, app.smb_scroll + row)].clone();
         }
     }
-
-    if let Some(err) = &app.smb_error {
-        lines.push_str(&format!("\nError: {err}\n"));
-        // The share needs restic's non-exclusive lock; an exclusive holder
-        // (prune, forget — possibly one that crashed) blocks it. `u` mirrors
-        // the delete flow: stale locks are removed, live ones survive.
-        if app.smb_handle.is_none() && crate::lock::is_lock_error(err) {
-            lines.push_str(
-                "\nPress u to remove stale locks and retry. A lock held by a live \
-                 process is left alone (the retry reports its holder).\n",
+    // On the bottom row, which is always on screen, whatever has scrolled.
+    let hidden = app.smb_scroll_max - app.smb_scroll;
+    if hidden > 0 && area.height > 0 {
+        let hint = match hidden {
+            1 => " 1 more line below ".to_string(),
+            n => format!(" {n} more lines below "),
+        };
+        let hint_width = u16::try_from(hint.chars().count()).unwrap_or(u16::MAX);
+        if hint_width + 2 <= area.width {
+            buf.set_string(
+                area.right() - hint_width - 1,
+                area.bottom() - 1,
+                hint,
+                Style::new().fg(Color::Yellow),
             );
         }
     }
-
-    lines.push_str(
-        "\nEvery client authenticates and authenticated session messages are signed. \
-         Writes are refused at the protocol level, and so is opening a file for execute — \
-         this is a way to browse a snapshot rather than to restore one. The Linux mount \
-         options above additionally display files as 0444 and directories as 0555; a \
-         Finder mount shows the client's default modes, but the server refuses writes \
-         either way. Leaving this screen stops the server, and any mount still using it.",
-    );
-
-    let para = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .block(Block::bordered().title(title));
     record_list_area(app, area);
-    frame.render_widget(para, area);
 }
+
+fn smb_server_lines(app: &App) -> Vec<Line<'static>> {
+    let Some(server) = app.smb_server.as_ref() else {
+        return vec![Line::from(vec![
+            Span::raw("Status:   "),
+            Span::styled("off", Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw("  — press o to turn it on"),
+        ])];
+    };
+    // Not `server.port()`: with the tun transport that is the private loopback
+    // socket the proxy talks to, and printing it would send the reader to an
+    // endpoint no mount command should ever name.
+    let host = server.mount().host();
+    let port = server.mount().port();
+    let mut lines = vec![Line::from(vec![
+        Span::raw("Status:   "),
+        Span::styled(
+            format!("on — listening on {host}:{port}"),
+            Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  (read-only, this machine only)"),
+    ])];
+    // Keyed on the transport actually in use, not on the port number:
+    // `--smb-port 445` reaches 445 without a tun anywhere (on platforms where
+    // that bind succeeds), and claiming a private adapter exists when none
+    // does would be simply wrong. The addresses come from `--smb-tun-ip`
+    // rather than a hardcoded default.
+    if app.smb.tun {
+        lines.push(Line::from(format!(
+            "Tun:      private adapter, standard SMB port. The machine's own file sharing is \
+             untouched; {}/32 and {}/32 route here until the server is turned off.",
+            app.smb.tun_addrs.virtual_ip(),
+            app.smb.tun_addrs.adapter_ip()
+        )));
+    }
+    lines.push(Line::from(format!("Username: {}", crate::smb::DEFAULT_SHARE_USER)));
+    if let Some(pw) = app.smb_password.as_deref() {
+        lines.push(Line::from(format!(
+            "Password: {pw}  (new each time the server is turned on)"
+        )));
+    }
+    lines
+}
+
+fn smb_shared_lines(app: &App) -> Vec<Line<'static>> {
+    let Some(server) = app.smb_server.as_ref() else {
+        return Vec::new();
+    };
+    let Some(s) = server.shared() else {
+        return vec![
+            Line::styled("Nothing", Style::new().fg(Color::Yellow)),
+            Line::from(
+                "The share holds only README.txt. Press s on a snapshot in a profile's snapshot \
+                 list to put it in the share, in a folder named by its short id.",
+            ),
+        ];
+    };
+    let tags = if s.tags.is_empty() {
+        String::new()
+    } else {
+        format!("  [{}]", s.tags.join(","))
+    };
+    vec![
+        Line::from(vec![
+            Span::styled(
+                s.short_id.clone(),
+                Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!("  {}  {}  profile {}{tags}", s.time, s.host, s.profile)),
+        ]),
+        Line::from(format!("Paths:  {}", s.paths.join(", "))),
+        Line::from(format!(
+            "Folder: {}  (beside README.txt at the root of the share)",
+            s.short_id
+        )),
+        Line::from(
+            "Lock:   holding restic's non-exclusive lock on this repository. Backups keep \
+             working, but restic prune and forget fail with a \"repository is already \
+             locked\" error (unless run with --retry-lock long enough), and wrustic refuses \
+             delete, tag edits and prune: take the snapshot out of the share (s on it again, \
+             or x here), then run them again.",
+        ),
+    ]
+}
+
+fn smb_problem_lines(app: &App) -> Vec<Line<'static>> {
+    let red = Style::new().fg(Color::Red);
+    // A background removal and a pending share's failure can both stand: the
+    // first is about the snapshot that was shared, the second about the one
+    // being shared now.
+    let mut lines: Vec<Line> = app
+        .smb_unshared
+        .iter()
+        .flat_map(|why| why.lines())
+        .map(|l| Line::styled(l.to_string(), red))
+        .collect();
+    let Some(err) = app.smb_error.as_deref() else {
+        return lines;
+    };
+    if !lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    lines.extend(err.lines().map(|l| Line::styled(l.to_string(), red)));
+    // Sharing needs restic's non-exclusive lock; an exclusive holder (prune,
+    // forget — possibly one that crashed) blocks it. `u` mirrors the delete
+    // flow: stale locks are removed, live ones survive.
+    if app.smb_pending.is_some() && crate::lock::is_lock_error(err) {
+        lines.push(Line::from(""));
+        lines.push(Line::from(
+            "Press u to remove stale locks and retry. A lock held by a live process is left \
+             alone (the retry reports its holder).",
+        ));
+    }
+    lines
+}
+
+fn smb_connecting_lines(app: &App) -> Vec<Line<'static>> {
+    let heading = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let command = Style::new().fg(Color::White);
+    let note = Style::new().fg(Color::Gray);
+    let mut lines: Vec<Line> = Vec::new();
+    let Some(server) = app.smb_server.as_ref() else {
+        lines.push(Line::styled(
+            "Turn the server on with o for a password and the mount commands for Linux, macOS \
+             and Windows. It runs until it is turned off here or wrustic quits, whichever \
+             screen you are on.",
+            note,
+        ));
+        lines.push(Line::from(""));
+        lines.push(Line::styled(
+            "The share's root always holds README.txt. Press s on a snapshot in a profile's \
+             snapshot list and it appears beside the README in a folder named by its short id; \
+             s on another snapshot replaces it, and s on the same one again takes it out. Mount \
+             the share once — switching snapshots needs no remount.",
+            note,
+        ));
+        lines.push(Line::from(""));
+        lines.push(Line::styled(SMB_READ_ONLY_NOTE, note));
+        return lines;
+    };
+
+    // Always the share itself, never a snapshot's folder: the mount outlives
+    // any one snapshot, and a shared snapshot simply appears inside it.
+    lines.push(Line::styled(
+        "These mount the share itself. A shared snapshot appears inside it under its own \
+         short-id folder, so sharing another needs no remount.",
+        note,
+    ));
+    lines.push(Line::from(""));
+    // Every command below prompts for the password rather than taking it as an
+    // argument. A password on a command line is readable by every process on
+    // the machine for as long as the command runs, and stays in shell history
+    // — or console history on Windows — long after.
+    lines.push(Line::styled("Mount it with (each prompts for the password above):", note));
+    lines.push(Line::from(""));
+
+    let cmds = server.mount_commands();
+    lines.push(Line::styled("Linux", heading));
+    lines.push(Line::styled(format!("  {}", cmds.linux), command));
+    lines.push(Line::from(""));
+
+    lines.push(Line::styled("macOS", heading));
+    lines.push(Line::styled("  Finder → Go → Connect to Server (Cmd+K), then enter:", note));
+    lines.push(Line::styled(format!("  {}", cmds.macos), command));
+    if !server.on_standard_port() {
+        // Finder asks for the share list on the standard port only, so on any
+        // other port the full path is the only way in.
+        lines.push(Line::styled(
+            "  Enter the whole path: Finder only lists a server's shares on port 445.",
+            note,
+        ));
+    }
+    lines.push(Line::from(""));
+
+    lines.push(Line::styled("Windows", heading));
+    lines.push(Line::styled(format!("  {}", cmds.windows), command));
+    if server.on_standard_port() {
+        // A UNC path works in Explorer's address bar and in any program that
+        // takes one, not only as a mapped drive letter.
+        lines.push(Line::styled(
+            format!("  Or paste {} straight into Explorer's address bar.", cmds.unc),
+            note,
+        ));
+    } else {
+        // A custom port is reachable only as a mapped drive, and only from
+        // 24H2 or newer — two separate limits, both lifted by serving the
+        // standard port, so --smb-tun is not just the older-Windows fallback.
+        lines.push(Line::styled(
+            format!(
+                "  A mapped drive is the only way in: no UNC path can carry a port, so {} on \
+                 its own goes to 445 and never reaches this share.",
+                cmds.unc
+            ),
+            note,
+        ));
+        lines.push(Line::styled(
+            "  /TCPPORT: also needs Windows 11 24H2 or newer. Starting wrustic with --smb-tun \
+             serves the standard port instead — a UNC path Explorer accepts, and the only way \
+             in from older builds.",
+            note,
+        ));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::styled(SMB_READ_ONLY_NOTE, note));
+    lines.push(Line::from(""));
+    lines.push(Line::styled(
+        "Turning the server off (o), or quitting wrustic, breaks every mount using it.",
+        note,
+    ));
+    lines
+}
+
+const SMB_READ_ONLY_NOTE: &str = "Every client authenticates and authenticated session \
+    messages are signed. Writes are refused at the protocol level, and so is opening a file \
+    for execute — this is a way to browse a snapshot rather than to restore one. The Linux \
+    mount options additionally display files as 0444 and directories as 0555; a Finder mount \
+    shows the client's default modes, but the server refuses writes either way. Nothing is \
+    encrypted: signing stops tampering, not reading.";
 
 // Truncate a path for a title — keep the tail since the basename is usually
 // the most identifying piece. Returns the full path if it already fits.
@@ -1738,7 +2021,7 @@ fn render_snapshot_delete_confirm(frame: &mut Frame, app: &mut App, area: Rect) 
 
 #[cfg(test)]
 mod tests {
-    use super::{Rect, Screen, footer_text, help_popup_rect, help_rows, human_size, short_path};
+    use super::{Rect, Screen, fit_columns, footer_text, help_popup_rect, help_rows, human_size, short_path};
 
     /// The screens these checks cover. `Screen` has no way to enumerate itself,
     /// so this is by hand: a screen added later is not checked until it is added
@@ -1750,8 +2033,9 @@ mod tests {
             Screen::SnapshotContents,
             Screen::FileDetails,
             Screen::ShareUrl,
-            Screen::SnapshotSmb,
-            Screen::SnapshotSmbStarting,
+            Screen::SmbShare,
+            Screen::SmbStarting,
+            Screen::SmbLoading,
             Screen::SnapshotFilterDim,
             Screen::SnapshotFilterValue,
             Screen::SnapshotDeleteConfirm,
@@ -1765,6 +2049,17 @@ mod tests {
             Screen::ConfirmDelete,
             Screen::Error(String::new()),
         ]
+    }
+
+    #[test]
+    fn a_cut_label_fits_its_columns_with_wide_characters() {
+        let width = |s: &str| ratatui::text::Line::raw(s).width();
+        assert_eq!(fit_columns("short".into(), 10), "short");
+        let cut = fit_columns("wrustic — profile: 日本語のプロファイル".into(), 24);
+        assert!(width(&cut) <= 24, "{cut:?} is {} columns", width(&cut));
+        assert!(cut.ends_with('…') && cut.contains("日本"), "{cut:?}");
+        assert_eq!(fit_columns("日本".into(), 2), "…", "a wide char that does not fit is dropped whole");
+        assert_eq!(fit_columns("abc".into(), 0), "");
     }
 
     /// "q / Esc" in the help and "q/Esc" in the footer are the same binding.

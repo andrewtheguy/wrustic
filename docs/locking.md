@@ -194,7 +194,7 @@ both tools:
   restic can itself retag the rewritten snapshot).
 
 **Long-running reads — non-exclusive lock (implemented):** the snapshot
-SMB share (`smb::start_snapshot_share`). Reads take no lock in wrustic's
+SMB share (`smb::ShareServer::share_snapshot`). Reads take no lock in wrustic's
 other flows because they are short and restic tolerates concurrent
 readers, but a share can stay mounted for hours, and "snapshots are
 immutable" only holds while nothing prunes — so the share does what
@@ -203,8 +203,10 @@ non-exclusive lock for its lifetime, refreshed every 5 minutes. The
 acquisition order in `repo::open_indexed_full_shared_lock` is open →
 lock → load index, restic's order, so the served index can never
 reference packs a concurrent prune deleted. Concurrent backups coexist;
-prune/forget get "repository is already locked" until the share screen
-closes. rustic's own webdav/mount is lock-free (rustic_core cannot even
+prune/forget get "repository is already locked" until the snapshot leaves
+the share. The lock belongs to the shared snapshot, not the SMB server: a
+server with nothing shared holds no lock, and swapping in another snapshot
+acquires the new lock before releasing the old. rustic's own webdav/mount is lock-free (rustic_core cannot even
 address `locks/`) and was deliberately not followed here — lock-free
 serving is exactly what breaks coexistence with restic.
 
@@ -213,11 +215,15 @@ restic's refreshability-abort rule (`refreshabilityTimeout`,
 `internal/repository/lock.go`): if the lock has not been successfully
 refreshed for 22.5 min (StaleLockTimeout − 1.5 × refresh interval),
 `RepoLock::poisoned()` latches true — other processes are about to judge
-the lock stale and may remove it — and the TUI (which polls once a second
-while the share screen is up) stops the SMB server rather than serve
-unlocked. Poisoning is a latch: a refresh that succeeds after the timeout
-was observed does not resurrect trust, since an unlock + prune may have
-happened in the gap.
+the lock stale and may remove it. The share itself asks on every request and
+every read (`RepoLock::health()`, a probe that does not own the lock), so the
+snapshot's folder leaves the share and its open files stop reading at once,
+however busy the TUI is; the README stays. The TUI then catches up (it polls
+once a second while the SMB server is on, whatever screen is up), releases
+the lock and says why. Poisoning is a latch, set by whichever comes first —
+the check, or the refresher when a refresh succeeds after the timeout ran
+out — so a refresh ending an outage nobody was watching does not resurrect
+trust either: an unlock + prune may have happened in the gap.
 
 **Tier 3 — stays on the restic CLI indefinitely:** prune, repair index,
 migrate. Prune is technically possible under an exclusive lock, but
@@ -375,17 +381,21 @@ the dev profile only.
    details are surfaced without spawning restic. restic's own in-process
    check at startup remains the authoritative gate against races.
 3. **SMB share under a non-exclusive lock** — DONE. The snapshot SMB
-   server holds the lock `restic mount` takes for as long as the share
-   runs (see "Long-running reads" above). This brought the
+   server holds the lock `restic mount` takes for as long as a snapshot
+   is shared (see "Long-running reads" above). This brought the
    refreshability-abort rule with it: `RepoLock::poisoned()` implements
-   restic's 22.5-minute cutoff, the main loop polls it once a second on
-   the share screen and tears the server down when it trips. Verified
+   restic's 22.5-minute cutoff; the share checks it on every request, and
+   the main loop polls it once a second while the server is on to release
+   the lock and report it. Verified
    live against restic 0.19.1: `restic forget` is blocked by the share's
    lock with the ordinary "already locked" message naming our PID,
    `restic snapshots` coexists, and `restic unlock` leaves the fresh lock
    in place (and its SIGHUP probe doesn't kill the process). On a lock
-   conflict at share start, the share screen offers `u` — native
-   stale-lock removal, then retry.
+   conflict when sharing a snapshot, the share screen offers `u` — native
+   stale-lock removal, then retry. wrustic's own delete, tag edit and prune
+   on a repository with a shared snapshot are refused up front — matched by
+   the repository's own id, whatever profile reaches it — since `u` cannot
+   remove a lock this process holds live.
 4. **Prune through the harness** — DONE. The TUI's prune action runs
    `restic prune` via `restic::run_unsticking_locks_streaming`: version
    detection first (restic ≥ 0.19, the bundled `restic/restic(.exe)` under

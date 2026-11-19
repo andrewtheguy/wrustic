@@ -16,6 +16,15 @@ use tokio::sync::mpsc;
 use crate::config::Profile;
 use crate::lock;
 
+/// A repository's snapshots, newest first, and the id of the repository
+/// they came from.
+pub(crate) struct SnapshotList {
+    /// The repository's own id (its config file's), the same whichever
+    /// profile, URL or path reaches it.
+    pub(crate) repository_id: String,
+    pub(crate) rows: Vec<SnapshotRow>,
+}
+
 pub(crate) struct SnapshotRow {
     pub(crate) id: String,
     pub(crate) time: String,
@@ -222,7 +231,7 @@ pub(crate) fn verify_profile(profile: &Profile) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn load_snapshots(profile: &Profile) -> Result<Vec<SnapshotRow>> {
+pub(crate) fn load_snapshots(profile: &Profile) -> Result<SnapshotList> {
     let backends = build_backends(profile)?;
     let repo = Repository::new(&RepositoryOptions::default(), &backends)?
         .open(&Credentials::password(profile.password()))?;
@@ -230,7 +239,7 @@ pub(crate) fn load_snapshots(profile: &Profile) -> Result<Vec<SnapshotRow>> {
     let mut snaps = repo.get_all_snapshots()?;
     snaps.sort_by(|a, b| b.time.cmp(&a.time));
 
-    Ok(snaps
+    let rows = snaps
         .into_iter()
         .map(|s| SnapshotRow {
             // `SnapshotId`'s Display impl yields the 8-char short id; `.to_hex()`
@@ -242,7 +251,16 @@ pub(crate) fn load_snapshots(profile: &Profile) -> Result<Vec<SnapshotRow>> {
             size: s.summary.as_ref().map(|summary| summary.total_bytes_processed),
             paths: s.paths.iter().cloned().collect(),
         })
-        .collect())
+        .collect();
+    Ok(SnapshotList {
+        repository_id: repository_id(&repo),
+        rows,
+    })
+}
+
+/// See [`SnapshotList::repository_id`].
+pub(crate) fn repository_id<S: rustic_core::Open>(repo: &Repository<S>) -> String {
+    repo.config().id.to_hex().as_str().to_string()
 }
 
 pub(crate) fn open_indexed(profile: &Profile) -> Result<Repository<IndexedIdsStatus>> {
@@ -1058,7 +1076,7 @@ mod tests {
             "the failed acquisition must clean up after itself, leaving only the planted lock"
         );
         assert_eq!(
-            load_snapshots(fixture.profile()).expect("list snapshots").len(),
+            load_snapshots(fixture.profile()).expect("list snapshots").rows.len(),
             1,
             "the snapshot must survive the blocked delete"
         );
@@ -1069,6 +1087,7 @@ mod tests {
         assert!(
             load_snapshots(fixture.profile())
                 .expect("list snapshots")
+                .rows
                 .is_empty()
         );
         assert_eq!(
@@ -1095,7 +1114,7 @@ mod tests {
             "a blocked tag edit must not have written the rewritten snapshot"
         );
         assert_eq!(fixture.lock_count(), 1, "only the planted lock may remain");
-        let snapshots = load_snapshots(fixture.profile()).expect("list snapshots");
+        let snapshots = load_snapshots(fixture.profile()).expect("list snapshots").rows;
         assert_eq!(snapshots.len(), 1);
         assert_eq!(
             snapshots[0].tags,
@@ -1107,7 +1126,7 @@ mod tests {
         let new_id = edit_snapshot_tags(fixture.profile(), &snap_id, &["fresh".into()])
             .expect("tag edit once unlocked")
             .expect("tags changed, so the snapshot is rewritten");
-        let snapshots = load_snapshots(fixture.profile()).expect("list snapshots");
+        let snapshots = load_snapshots(fixture.profile()).expect("list snapshots").rows;
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].id, new_id);
         assert_eq!(snapshots[0].tags, vec!["fresh".to_string()]);
@@ -1196,7 +1215,7 @@ mod tests {
         crate::restic::run(&profile, &["backup", source.to_str().unwrap(), "--json"])
             .expect("restic backup");
 
-        let snapshots = load_snapshots(&profile).expect("list snapshots");
+        let snapshots = load_snapshots(&profile).expect("list snapshots").rows;
         assert_eq!(snapshots.len(), 1);
         let snap_id = snapshots[0].id.clone();
 
@@ -1243,7 +1262,7 @@ mod tests {
         // Native delete under the exclusive lock; snapshot must be gone for
         // both rustic and restic afterwards.
         delete_snapshot(&profile, &snap_id).expect("native delete");
-        assert!(load_snapshots(&profile).expect("list after delete").is_empty());
+        assert!(load_snapshots(&profile).expect("list after delete").rows.is_empty());
         let restic_list = crate::restic::run(&profile, &["snapshots", "--json"])
             .expect("restic snapshots");
         let listed: serde_json::Value =
@@ -1295,7 +1314,7 @@ mod tests {
         )
         .expect("restic backup");
 
-        let snapshots = load_snapshots(&profile).expect("list snapshots");
+        let snapshots = load_snapshots(&profile).expect("list snapshots").rows;
         assert_eq!(snapshots.len(), 1);
         let snap_id = snapshots[0].id.clone();
         // rustic models tags as a BTreeSet, so wrustic's view is sorted even
@@ -1330,7 +1349,7 @@ mod tests {
             edit_snapshot_tags(&profile, &snap_id, &["old".into(), "keep".into()])
                 .expect("no-op edit");
         assert!(unchanged.is_none());
-        assert_eq!(load_snapshots(&profile).unwrap()[0].id, snap_id);
+        assert_eq!(load_snapshots(&profile).unwrap().rows[0].id, snap_id);
 
         // The real edit.
         let new_id = edit_snapshot_tags(&profile, &snap_id, &["new".into(), "keep".into()])
@@ -1357,7 +1376,7 @@ mod tests {
         assert_eq!(snap["original"], serde_json::json!(snap_id));
 
         // wrustic's native reader agrees (sorted view of the same set).
-        let after = load_snapshots(&profile).expect("list after edit");
+        let after = load_snapshots(&profile).expect("list after edit").rows;
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].id, new_id);
         assert_eq!(after[0].tags, vec!["keep", "new"]);
@@ -1388,7 +1407,7 @@ mod tests {
         };
 
         verify_profile(&profile).expect("verify Silo profile");
-        let snapshots = load_snapshots(&profile).expect("list Silo snapshots");
+        let snapshots = load_snapshots(&profile).expect("list Silo snapshots").rows;
         let snapshot = snapshots.first().expect("seeded Silo snapshot");
         let previous = snapshots.get(1).expect("second seeded Silo snapshot");
         assert!(snapshot.tags.iter().any(|tag| tag == "silo-e2e-second"));

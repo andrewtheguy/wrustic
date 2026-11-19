@@ -93,14 +93,14 @@ Options:
                               is created on first run without asking.
   -p, --port <N>              Localhost port for the file-share dialog.
                               Default: 7834.
-      --smb-port <N>          Localhost port for the snapshot SMB share ('s' on
-                              the snapshot list). Default: 4456. Mounting needs
-                              a client that can be pointed at a non-standard
-                              port: Linux (-o port=), macOS, and Windows 11 24H2
-                              or newer (/TCPPORT:). On Windows a custom port
-                              mounts as a drive letter only, since no UNC path
-                              can carry one; earlier builds cannot reach it at
-                              all. --smb-tun answers both.
+      --smb-port <N>          Localhost port for the snapshot SMB share ('m' on
+                              the profile or snapshot list). Default: 4456.
+                              Mounting needs a client that can be pointed at a
+                              non-standard port: Linux (-o port=), macOS, and
+                              Windows 11 24H2 or newer (/TCPPORT:). On Windows
+                              a custom port mounts as a drive letter only,
+                              since no UNC path can carry one; earlier builds
+                              cannot reach it at all. --smb-tun answers both.
       --smb-tun               Serve the snapshot share on the standard SMB port
                               (445) over a private tun adapter, so it mounts as
                               a plain UNC path (\\\\169.254.255.1\\snap) and works
@@ -112,7 +112,7 @@ Options:
                               adapter, and the wintun driver (wintun-amd64.dll)
                               next to the wrustic executable — the Windows
                               installer ships it there. The host's own file
-                              sharing is left untouched. While a share is open,
+                              sharing is left untouched. While the server is on,
                               two /32 host routes point at the tun — no subnet
                               is claimed. Windows only, and only in builds
                               compiled with --features smb-tun.

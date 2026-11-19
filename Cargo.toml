@@ -1,6 +1,6 @@
 [package]
 name = "wrustic"
-version = "0.0.71"
+version = "0.0.72"
 edition = "2024"
 
 [dependencies]
@@ -36,7 +36,9 @@ smbanything_core = { git = "https://github.com/andrewtheguy/smbanything.git", ta
 # blocking client, and the async client behind the S3 backend's opendal
 # transport. Same features rustic_backend already compiles reqwest with.
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
-ratatui = "0.30.0"
+# Paragraph::line_count, so a panel is sized by the same wrapping that
+# renders it.
+ratatui = { version = "0.30.0", features = ["unstable-rendered-line-info"] }
 # Hidden-input passphrase prompt for `wrustic env` when neither the env var
 # nor the keychain has the passphrase. Talks to the controlling terminal
 # directly (/dev/tty, CONIN$), so the prompt works while stdout is captured.

@@ -1,8 +1,8 @@
 # SMB snapshot sharing
 
-wrustic can export one snapshot as a read-only SMB share, so a whole backup
-mounts as a filesystem instead of being browsed a file at a time. Press `s` on
-the snapshot list.
+wrustic runs a read-only SMB share that one snapshot at a time can be put
+into, so a whole backup mounts as a filesystem instead of being browsed a file
+at a time. Press `s` on the snapshot list.
 
 The SMB 2.1 server itself lives in the shared `smbanything_core` crate
 (the [smbanything](https://github.com/andrewtheguy/smbanything) project) —
@@ -11,33 +11,58 @@ writes refused), share enumeration, module map and trace format are documented
 in its [docs/smb.md](https://github.com/andrewtheguy/smbanything/blob/main/docs/smb.md).
 What lives in this repository (`src/smb/`) is the restic-specific side:
 `backing.rs` (the `SnapshotBacking` that walks repository trees), `name.rs`
-(restic's filename quoting, below), and `start_snapshot_share`, which ties the
-server's lifetime to restic's repository lock.
+(restic's filename quoting, below), `root.rs` (the share root: a README beside
+the shared snapshot's folder), and `ShareServer`, which ties a shared snapshot
+to restic's repository lock.
 
-At the repository level the share is not lock-free: "immutable" only holds
-while nothing prunes the repo, so for its whole lifetime the share holds
-restic's non-exclusive lock — the same one `restic mount` takes. Concurrent
-backups keep working; a concurrent `restic prune`/`forget` is refused with
-restic's ordinary "repository is already locked" error until the share screen
-closes, and conversely a running prune stops the share from starting (the
-share screen then offers `u` to remove stale locks and retry). If the lock
-cannot be refreshed for 22.5 minutes (restic's refreshability rule — e.g.
-the backend became unreachable), the server shuts itself down rather than
-keep serving a repo other processes may now treat as unlocked. Details in
+At the repository level a shared snapshot is not lock-free: "immutable" only
+holds while nothing prunes the repo, so for as long as a snapshot is in the
+share wrustic holds restic's non-exclusive lock on its repository — the same one
+`restic mount` takes. The lock belongs to the snapshot, not the server: a
+server sharing nothing locks nothing, and taking the snapshot out (or sharing
+one from another repository) releases it. Concurrent backups keep working; a
+concurrent `restic prune`/`forget` is refused with restic's ordinary
+"repository is already locked" error until the snapshot leaves the share, and
+conversely a running prune stops a snapshot from being shared (the share screen
+then offers `u` to remove stale locks and retry). wrustic's own delete, tag
+edit and prune on that repository — whichever profile reaches it — are refused
+up front while one of its snapshots is shared. If the lock cannot be refreshed
+for 22.5 minutes (restic's refreshability rule — e.g. the backend became
+unreachable), the share takes the snapshot out by itself on its next request,
+and files open from it stop reading, rather than serve a repo other processes
+may now treat as unlocked; the server and its README stay up. Details in
 [locking.md](locking.md).
 
 ## Using it
 
-`s` on the snapshot list starts a server on `127.0.0.1:4456` and shows the
-username, the generated password, and ready mount instructions for each platform.
-Leaving the screen stops the server (releasing the repository lock) and breaks
-any mount using it. `--smb-port <N>` picks a different port.
+The share is run from one screen, `m` on the profile list or the snapshot list,
+the same layout as smbanything's: the server's status, username and password;
+the shared snapshot, if any; and ready mount instructions for each platform
+(scroll with Up/Dn, PgUp/PgDn). `o` there turns the server on or off, `x` takes
+the shared snapshot out, and `y`/`m` copy the password and this OS's mount
+command. Leaving the screen leaves the server running; the top bar says
+`SMB on` on every screen while it is. The server runs until it is turned off or
+wrustic quits, either of which breaks every mount using it, and its password is
+new each time it is turned on. By default it listens on `127.0.0.1:4456`, which
+the examples on this page use; `--smb-port <N>` picks a different port. With
+[`--smb-tun`](smb-tun.md) it is reached at the tun adapter's address on the
+standard port instead — use the mount commands the share screen shows, which
+always name the endpoint actually in use.
 
-The share root contains a single directory named with the snapshot's short id
-— restic's standard 8-hex-char form, so the name pastes straight into restic
-commands — and the snapshot's tree lives inside it. The share name and mount
-commands stay fixed (`\\127.0.0.1\snap`, fstab-safe), while the mount's
-contents, and anything copied out of it, say which snapshot they came from.
+The share root always holds a `README.txt`. With nothing shared it says so;
+with a snapshot shared it names the full snapshot id, profile, time, host,
+paths and tags, and it is rewritten whenever the contents change. `s` on a
+snapshot in the snapshot list puts it in the share — turning the server on
+first if it is off, and then showing the share screen, since the password is
+new — in a directory beside the README named with its short id: restic's
+standard 8-hex-char form, so the name pastes straight into restic commands.
+`s` on another snapshot replaces it, and `s` on the shared one again takes it
+out; the list marks the shared snapshot's id in green. The share name and
+mount commands stay fixed while the server runs (`\\127.0.0.1\snap` with the
+default transport; fstab-safe), so mount the share once: switching snapshots
+needs no remount, while the folder name — and anything copied out of it — says
+which snapshot the files came from. Files still open from a replaced snapshot
+stop reading, and a client may show a stale listing until it refreshes.
 
 ## Mounting
 
@@ -127,7 +152,7 @@ local networking workaround, not something this project sets up or supports.
   without POSIX extensions has only "file" and "directory", and restic stores no
   content for a symlink, so the target is not reachable through the share.
   Regular files and directories round-trip exactly.
-- **One snapshot per server.** The share is bound at startup.
+- **One snapshot at a time.** Sharing another replaces it.
 - **A filename SMB2 cannot express is listed with its offending characters
   replaced by U+FFFD, and cannot be opened.** SMB2 filenames carry no path
   separator; macOS filenames may contain a backslash. Substituting is not
@@ -161,10 +186,11 @@ unquoted, so both occur, and neither can be told from the other without looking.
 
 ## Testing against a real client
 
-The TUI share dies when you leave the screen, which is right for a feature and
-useless for validating against macOS or Windows — you need the server up while
-you walk over to another machine. `scripts/smb-sample.sh` is that harness, and
-it builds its own fixture, so this works on a fresh clone:
+The TUI share binds this machine only and needs a configured profile, which
+makes it awkward for validating against macOS or Windows — you need a server
+reachable from another machine, up unattended while you walk over to it.
+`scripts/smb-sample.sh` is that harness, and it builds its own fixture, so this
+works on a fresh clone:
 
 ```sh
 ./scripts/smb-sample.sh seed            # build a sample tree, back it up
@@ -215,5 +241,6 @@ once per listing that contains it, that a name had to be altered to be put on
 the wire at all.
 
 When the whole-server logon limit trips (1000 refusals with no success in
-between), the share screen reports it and releases the repository lock on its
-next poll.
+between), wrustic stops the server on its next poll (releasing the shared
+snapshot's repository lock), flags it in the footer of whatever screen is up,
+and says why on the share screen.

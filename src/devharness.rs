@@ -103,9 +103,10 @@ fn harness_seconds(default: u64) -> u64 {
 }
 
 /// Serve a real restic snapshot, for validating the `SnapshotBacking` path
-/// against a live client. This is the cross-platform harness: the TUI's share
-/// dies when you leave the screen, and mounting from macOS or Windows needs a
-/// server that stays up while you walk over to another machine.
+/// against a live client with no TUI in the way. This is the cross-platform
+/// harness: it serves the same README-plus-snapshot-folder root the TUI does,
+/// can bind every interface (the TUI never does), and stays up unattended while
+/// you walk over to another machine.
 ///
 /// Driven by environment variables so it needs no wrustic config, and so no
 /// password ever reaches argv:
@@ -141,20 +142,25 @@ fn smb_serve() -> Result<()> {
     let bind_all = matches!(bind, Bind::AllInterfaces);
     let password = std::env::var("WRUSTIC_SMB_SHARE_PASSWORD")
         .unwrap_or_else(|_| DEFAULT_HARNESS_PASSWORD.to_string());
-    let handle = crate::smb::start_snapshot_share(
+    let mut handle = crate::smb::ShareServer::start(
         port,
-        &profile,
-        &snapshot,
         bind,
         Credentials {
             user: DEFAULT_SHARE_USER.to_string(),
             password: password.clone(),
         },
     )
-    .context("snapshot share starts")?;
+    .context("SMB server starts")?;
+    handle
+        .share_snapshot("harness", &profile, &snapshot)
+        .context("snapshot is shared")?;
+    let folder = handle
+        .shared()
+        .map(|s| s.short_id.clone())
+        .unwrap_or_default();
     let host = if bind_all { "<this-host>" } else { "127.0.0.1" };
     let port = handle.port();
-    eprintln!("serving snapshot {snapshot} on {host}:{port} for {secs}s");
+    eprintln!("serving snapshot {snapshot} on {host}:{port} for {secs}s, in folder {folder}");
     eprintln!();
     eprintln!("  username  {DEFAULT_SHARE_USER}");
     eprintln!("  password  {password}");

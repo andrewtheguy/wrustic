@@ -415,6 +415,9 @@ fn run(
     let mut events = Events::default();
 
     while !app.quit {
+        // Every pass, not only the idle wakeup below: the busy screens (a
+        // prune of another repository, say) `continue` before reaching it.
+        app.poll_smb();
         terminal.draw(|f| render(f, &mut app))?;
 
         if matches!(app.screen, Screen::Loading) {
@@ -424,8 +427,9 @@ fn run(
                 continue;
             };
             match load_snapshots(profile) {
-                Ok(snaps) => {
-                    app.snapshots = snaps;
+                Ok(list) => {
+                    app.snapshots = list.rows;
+                    app.snapshots_repository_id = Some(list.repository_id);
                     let len = app.visible_snapshot_indices().len();
                     if len > 0 {
                         let idx = app
@@ -440,17 +444,25 @@ fn run(
                     app.screen = Screen::Snapshots;
                 }
                 Err(e) => {
+                    app.snapshots_repository_id = None;
                     app.screen = Screen::Error(format!("{e:#}"));
                 }
             }
             continue;
         }
 
-        // Drawn as "starting…" on the pass above; opening the repository reads
+        // Drawn as "starting…" on the pass above: binding the tun transport
+        // creates a network adapter, which takes a moment.
+        if matches!(app.screen, Screen::SmbStarting) {
+            app.start_smb_server();
+            continue;
+        }
+
+        // Drawn as "sharing…" on the pass above; opening the repository reads
         // the full index, which is slow enough on a large remote repository to
         // look like a hang if the frame were not already on screen.
-        if matches!(app.screen, Screen::SnapshotSmbStarting) {
-            app.start_smb_share();
+        if matches!(app.screen, Screen::SmbLoading) {
+            app.load_pending_share();
             continue;
         }
 
@@ -608,23 +620,37 @@ fn run(
             // the SMB share retries its operation (a lock conflict is why `u`
             // was offered), the delete flow re-enters its confirmation.
             let return_to = std::mem::take(&mut app.unlock_return);
-            let idx = app.loading_index;
-            let Some((_, profile)) = app.config.profile_at(idx) else {
+            // The SMB retry is for the snapshot `s` captured, whose profile need
+            // not be the list open now: the share screen is reachable from the
+            // profile list too.
+            let profile = match return_to {
+                // `poll_smb` stopping the server on this pass drops the pending
+                // share and records why; there is nothing left to retry.
+                UnlockReturn::Smb if app.smb_pending.is_none() => {
+                    app.screen = Screen::SmbShare;
+                    continue;
+                }
+                UnlockReturn::Smb => app.smb_pending.as_ref().map(|p| p.profile.clone()),
+                UnlockReturn::Delete | UnlockReturn::TagEdit => {
+                    app.config.profile_at(app.loading_index).map(|(_, p)| p.clone())
+                }
+            };
+            let Some(profile) = profile else {
                 let msg = "Selected profile no longer exists.".to_string();
                 app.screen = match return_to {
                     UnlockReturn::Smb => {
                         app.smb_error = Some(msg);
-                        Screen::SnapshotSmb
+                        Screen::SmbShare
                     }
                     UnlockReturn::Delete => Screen::SnapshotDeleteError(msg),
                     UnlockReturn::TagEdit => Screen::SnapshotTagError(msg),
                 };
                 continue;
             };
-            match unlock(profile) {
+            match unlock(&profile) {
                 Ok(_removed) => {
                     app.screen = match return_to {
-                        UnlockReturn::Smb => Screen::SnapshotSmbStarting,
+                        UnlockReturn::Smb => Screen::SmbLoading,
                         // Redo the same edit; target and tags survived the
                         // error screen.
                         UnlockReturn::TagEdit => Screen::SnapshotTagSaving,
@@ -647,7 +673,7 @@ fn run(
                     app.screen = match return_to {
                         UnlockReturn::Smb => {
                             app.smb_error = Some(msg);
-                            Screen::SnapshotSmb
+                            Screen::SmbShare
                         }
                         UnlockReturn::Delete => Screen::SnapshotDeleteError(msg),
                         UnlockReturn::TagEdit => Screen::SnapshotTagError(msg),
@@ -843,25 +869,42 @@ fn run(
             continue;
         }
 
-        // A running SMB share holds a repo lock that refreshes on a background
-        // thread; instead of blocking on input indefinitely, wake once a
-        // second to enforce restic's refreshability rule — an unrefreshable
-        // lock means the server must stop before other processes remove the
-        // lock as stale and a prune deletes data mid-read.
-        if matches!(app.screen, Screen::SnapshotSmb) && app.smb_handle.is_some() {
-            if events.poll(std::time::Duration::from_secs(1))? {
-                match events.read()? {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
-                    Event::Mouse(m) => app.handle_mouse(m),
-                    Event::Paste(text) => app.handle_paste(&text),
-                    _ => {}
+        // The SMB server runs across screens, and what it shares holds a repo
+        // lock that refreshes on a background thread; instead of blocking on
+        // input indefinitely, wake once a second so `poll_smb` can act on
+        // restic's refreshability rule — the share already stops serving a
+        // snapshot whose lock went unrefreshed, and this releases the lock and
+        // says so — and on the server's own stop conditions. Like the idle
+        // loop below, it redraws only for input that can change the screen or
+        // when `poll_smb` acted, not on every quiet wakeup.
+        if app.smb_server.is_some() {
+            loop {
+                let mut redraw = false;
+                if events.poll(std::time::Duration::from_secs(1))? {
+                    redraw = match events.read()? {
+                        Event::Key(key) if key.kind == KeyEventKind::Press => {
+                            app.handle_key(key);
+                            true
+                        }
+                        Event::Mouse(m) => {
+                            app.handle_mouse(m);
+                            true
+                        }
+                        Event::Paste(text) => {
+                            app.handle_paste(&text);
+                            true
+                        }
+                        Event::Resize(_, _) => true,
+                        _ => false,
+                    };
+                }
+                // After every wakeup, not just the timeout: a steady stream of
+                // events (scrolling, focus churn) would otherwise starve the
+                // poison check for as long as it kept arriving.
+                if app.poll_smb() || redraw {
+                    break;
                 }
             }
-            // After every wakeup, not just the timeout: a steady stream of
-            // events (scrolling, focus/resize churn) would otherwise starve
-            // the poison check for as long as it kept arriving.
-            app.poll_smb_lock();
-            app.poll_smb_logons();
             continue;
         }
 
