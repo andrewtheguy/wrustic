@@ -874,20 +874,37 @@ fn run(
         // input indefinitely, wake once a second so `poll_smb` can act on
         // restic's refreshability rule — the share already stops serving a
         // snapshot whose lock went unrefreshed, and this releases the lock and
-        // says so — and on the server's own stop conditions.
+        // says so — and on the server's own stop conditions. Like the idle
+        // loop below, it redraws only for input that can change the screen or
+        // when `poll_smb` acted, not on every quiet wakeup.
         if app.smb_server.is_some() {
-            if events.poll(std::time::Duration::from_secs(1))? {
-                match events.read()? {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
-                    Event::Mouse(m) => app.handle_mouse(m),
-                    Event::Paste(text) => app.handle_paste(&text),
-                    _ => {}
+            loop {
+                let mut redraw = false;
+                if events.poll(std::time::Duration::from_secs(1))? {
+                    redraw = match events.read()? {
+                        Event::Key(key) if key.kind == KeyEventKind::Press => {
+                            app.handle_key(key);
+                            true
+                        }
+                        Event::Mouse(m) => {
+                            app.handle_mouse(m);
+                            true
+                        }
+                        Event::Paste(text) => {
+                            app.handle_paste(&text);
+                            true
+                        }
+                        Event::Resize(_, _) => true,
+                        _ => false,
+                    };
+                }
+                // After every wakeup, not just the timeout: a steady stream of
+                // events (scrolling, focus churn) would otherwise starve the
+                // poison check for as long as it kept arriving.
+                if app.poll_smb() || redraw {
+                    break;
                 }
             }
-            // After every wakeup, not just the timeout: a steady stream of
-            // events (scrolling, focus/resize churn) would otherwise starve
-            // the poison check for as long as it kept arriving.
-            app.poll_smb();
             continue;
         }
 

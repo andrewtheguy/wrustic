@@ -1519,9 +1519,10 @@ impl App {
     //   without a successful refresh may be removed as stale by any other
     //   process, after which a prune could delete data a mounted client is
     //   reading. Only the snapshot has to go for that; the README stays.
-    pub(crate) fn poll_smb(&mut self) {
+    /// Whether it changed anything on screen.
+    pub(crate) fn poll_smb(&mut self) -> bool {
         let Some(server) = self.smb_server.as_mut() else {
-            return;
+            return false;
         };
         if server.logon_limit_reached() {
             let attempts = server.failed_logons();
@@ -1532,11 +1533,11 @@ impl App {
                  server is turned on — so clear the saved credential (Windows: cmdkey \
                  /delete:<server>) before turning it on again with o."
             ));
-            return;
+            return true;
         }
         if let Some(reason) = server.tun_stopped() {
             self.stop_smb_server_with(format!("The server stopped: the packet tunnel went away ({reason})."));
-            return;
+            return true;
         }
         if server.lock_poisoned() {
             let short = server
@@ -1551,7 +1552,9 @@ impl App {
                  running; share the snapshot again once the repository is reachable."
             ));
             self.notice = Some(format!("Snapshot {short} was taken out of the SMB share — m for why."));
+            return true;
         }
+        false
     }
 
     // Turn the server on. Called from the main loop once the "starting" screen

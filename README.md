@@ -41,8 +41,9 @@ exactly which workflows that means.
   [smbanything](https://github.com/andrewtheguy/smbanything) project's
   `smbanything_core` crate; wrustic supplies the restic snapshot backing and
   holds the repository lock for as long as a snapshot is shared. Bound to localhost, with
-  NTLMv2 authentication and signing. Files mount `0444` and directories `0555` on Linux and macOS,
-  and on every client opening a file for execute is refused — a share is for
+  NTLMv2 authentication and signing. The server refuses every write, and on
+  every client opening a file for execute; the Linux mount command also sets
+  files to `0444` and directories to `0555` — a share is for
   browsing a snapshot, not restoring from one; see
   [`docs/smb.md`](docs/smb.md). On Windows, `--smb-tun` serves the standard SMB
   port over a private adapter, which is both the only way to get a real UNC path

@@ -245,28 +245,33 @@ fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
     // The server runs whichever screen is up, so every screen says so: a
     // server serving something the UI is not showing is the thing to avoid.
     // The key is named only where `m` opens the share screen.
+    let width = usize::from(area.width.saturating_sub(2));
     let status = app.smb_server.as_ref().map(|server| {
         let key = if matches!(app.screen, Screen::Home | Screen::Snapshots) {
             " (m)"
         } else {
             ""
         };
-        match server.shared() {
-            Some(s) => format!("   SMB on, sharing {}{key}", s.short_id),
+        let shared = server.shared().map(|s| s.short_id.as_str());
+        let long = match shared {
+            Some(short) => format!("   SMB on, sharing {short}{key}"),
             None => format!("   SMB on, nothing shared{key}"),
+        };
+        // Too narrow for even that: the short form still says the server
+        // is on and what it shares.
+        if Line::raw(long.as_str()).width() <= width {
+            long
+        } else {
+            match shared {
+                Some(short) => format!(" SMB {short}"),
+                None => " SMB on".to_string(),
+            }
         }
     });
     // A long profile name gives way first, so the status stays visible.
-    let width = usize::from(area.width.saturating_sub(2));
-    let room = width.saturating_sub(status.as_deref().map_or(0, |s| s.chars().count()));
-    let text = if text.chars().count() > room {
-        let mut cut: String = text.chars().take(room.saturating_sub(1)).collect();
-        cut.push('…');
-        cut
-    } else {
-        text
-    };
-    let mut spans = vec![Span::raw(text)];
+    // Measured in terminal columns, not chars: a wide character takes two.
+    let room = width.saturating_sub(status.as_deref().map_or(0, |s| Line::raw(s).width()));
+    let mut spans = vec![Span::raw(fit_columns(text, room))];
     if let Some(status) = status {
         spans.push(Span::styled(status, Style::new().fg(Color::Green)));
     }
@@ -274,6 +279,28 @@ fn render_top_bar(frame: &mut Frame, app: &App, area: Rect) {
         .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
         .block(Block::default().borders(Borders::ALL));
     frame.render_widget(para, area);
+}
+
+/// `text` cut to `room` terminal columns, ending in '…' when cut. Measured in
+/// columns, not chars: a wide character takes two.
+fn fit_columns(text: String, room: usize) -> String {
+    if Line::raw(text.as_str()).width() <= room {
+        return text;
+    }
+    if room == 0 {
+        return String::new();
+    }
+    let mut cut = String::new();
+    let mut used = 1; // the '…'
+    for c in text.chars() {
+        used += Span::raw(c.to_string()).width();
+        if used > room {
+            break;
+        }
+        cut.push(c);
+    }
+    cut.push('…');
+    cut
 }
 
 fn render_bottom_bar(frame: &mut Frame, app: &App, area: Rect) {
@@ -1994,7 +2021,7 @@ fn render_snapshot_delete_confirm(frame: &mut Frame, app: &mut App, area: Rect) 
 
 #[cfg(test)]
 mod tests {
-    use super::{Rect, Screen, footer_text, help_popup_rect, help_rows, human_size, short_path};
+    use super::{Rect, Screen, fit_columns, footer_text, help_popup_rect, help_rows, human_size, short_path};
 
     /// The screens these checks cover. `Screen` has no way to enumerate itself,
     /// so this is by hand: a screen added later is not checked until it is added
@@ -2022,6 +2049,17 @@ mod tests {
             Screen::ConfirmDelete,
             Screen::Error(String::new()),
         ]
+    }
+
+    #[test]
+    fn a_cut_label_fits_its_columns_with_wide_characters() {
+        let width = |s: &str| ratatui::text::Line::raw(s).width();
+        assert_eq!(fit_columns("short".into(), 10), "short");
+        let cut = fit_columns("wrustic — profile: 日本語のプロファイル".into(), 24);
+        assert!(width(&cut) <= 24, "{cut:?} is {} columns", width(&cut));
+        assert!(cut.ends_with('…') && cut.contains("日本"), "{cut:?}");
+        assert_eq!(fit_columns("日本".into(), 2), "…", "a wide char that does not fit is dropped whole");
+        assert_eq!(fit_columns("abc".into(), 0), "");
     }
 
     /// "q / Esc" in the help and "q/Esc" in the footer are the same binding.
