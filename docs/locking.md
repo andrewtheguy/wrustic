@@ -109,7 +109,9 @@ Restic's own table above *is* the safety map. Tiered by lock type, with
 each operation's implementation status (see Phases below for the history).
 Implemented today: **forget / delete snapshots** (`repo::delete_snapshot`,
 the TUI delete flow), **tag edits** (`repo::edit_snapshot_tags`,
-the TUI's `t` action — see "Native tag edits" below), the **snapshot SMB
+the TUI's `t` action — see "Native tag edits" below), **snapshot merge**
+(`repo::merge_snapshots`, the TUI's `M` action — see "Native snapshot
+merge" below), the **snapshot SMB
 share** (a long-running *read* under the same non-exclusive lock
 `restic mount` takes — see "Long-running reads" below), and — outside
 these tables because it takes no lock — **unlock** (`repo::unlock`,
@@ -125,6 +127,7 @@ spawn harness (Tier 3 below).
 | backup | `Repository::backup` | not planned — stays on the restic CLI | pure append: packs → index → snapshot, the ordering the design doc requires for concurrent-append safety |
 | copy into repo | `Repository::copy` (dest side) | not planned | append-only |
 | key add | `Repository::add_key` | not planned | writes one new key file |
+| merge snapshots | `Repository::merge_trees` + a wrustic-written snapshot file | **implemented** — `repo::merge_snapshots` (phase 6) | pure append: tree packs → index → snapshot; reads no file content and deletes nothing |
 
 **Tier 2 — exclusive lock (blocks restic while held; fully safe):**
 
@@ -158,7 +161,11 @@ both tools:
   id if not already set ("retain the original snapshot id over all tag
   changes"); the **new snapshot file is written first, then the old one
   deleted** (restic's `SaveSnapshot` → `RemoveUnpacked` order), so there
-  is never a moment where the snapshot doesn't exist. Between those two
+  is never a moment where the snapshot doesn't exist. The write is one
+  request, and one that reports an error is looked for in the repository
+  before the edit gives up (`lock::write_unpacked`): a new file the
+  server stored without answering is the new snapshot, not a duplicate
+  left beside the old one. Between those two
   steps wrustic re-reads the new file through rustic_core's decrypt path
   and compares it byte-for-byte — an envelope bug aborts before anything
   is deleted. Snapshot files are not indexed, so nothing else needs
@@ -192,6 +199,396 @@ both tools:
   `live_native_tag_edit_interop_with_restic` (restic sees the new tags,
   `excludes` intact, `original` set; `restic check --read-data` passes;
   restic can itself retag the rewritten snapshot).
+
+**Native snapshot merge (implemented — phase 6, `repo::merge_snapshots`,
+the TUI's `M` on the snapshot list):** two snapshots become one new
+snapshot holding the files of both — the way to add a file or directory to
+an existing snapshot without reading the rest of it again: back up only
+the addition, then merge. It is a tool for special cases like that one,
+not a step of ordinary backups. A regular `restic backup` of the whole
+path set already yields a complete snapshot and stores nothing twice, and
+nothing about it calls for a merge; merging two full backups of one
+directory is possible but rarely what is wanted, since the result is the
+union — a file deleted between the two is back in it. restic has no merge
+command, so unlike every
+other native write there is no restic behaviour to mirror, only restic's
+rules to stay inside. That is also why this one is in scope while
+description edits are not: a description is a *field* restic cannot keep,
+whereas a merge is an *operation* restic lacks whose result is ordinary
+restic-format data — trees, an index entry, a snapshot file — that restic
+lists, restores, checks, forgets and prunes like any other.
+
+- **Lock: non-exclusive**, the one `restic backup` takes, because a merge
+  is the same kind of write — it adds tree packs, index files and one
+  snapshot, and removes or rewrites nothing. So it runs alongside running
+  backups and alongside wrustic's own SMB share (no up-front refusal like
+  delete, tag edit and prune get), while forget, prune and tag edits block
+  it and are blocked by it. A merge that also deleted its sources would
+  need the exclusive lock; it deliberately does not — the sources stay, and
+  `d` removes them afterwards.
+- **Order**: open → lock → load the index → resolve both snapshots, the
+  same as the SMB share, so nothing the merge reads can be pruned
+  underneath it. Writing follows restic's append order — `merge_trees`
+  finishes its packs and index before it returns, and the snapshot file is
+  written last — so the snapshot never names a blob that is not indexed.
+  `RepoLock::poisoned()` is checked between the two: a lock that went
+  unrefreshed past restic's cutoff means a prune may have run, and the
+  snapshot is then not written (the orphaned trees go with the next prune).
+  That check alone would come too late for what `merge_trees` itself
+  writes: it stores packs, then the index files naming them, and returns
+  only when done — a prune that got in after the lock was lost deletes
+  packs no index names yet, and the index written afterwards names
+  deleted packs. So the repository is opened on gated backends
+  (`lock::gate_writes`): every write rustic_core makes is refused once the
+  lock is poisoned, and a file whose write returned after the lock went
+  bad is removed again and the write reported as failed, which fails
+  `merge_trees`. What stays was written under a lock that had been healthy
+  all along. Three more things the gate is for:
+  - *Ending the writes.* rustic_core's packer stores packs on threads it
+    waits for only when it finishes normally; after an error return they
+    may still be writing a pack and the index entry for it. So the gate is
+    closed (`WriteGate::close`) as soon as `merge_trees` returns, and by a
+    guard on every other way out: closing waits for the writes under way
+    and refuses any that follow, and only then is the lock given up.
+  - *Saying what could not be taken back.* A write that reports an error
+    may have been stored all the same, so with the lock lost the file is
+    removed either way; and a removal that fails counts as done only if a
+    listing shows the file is not there. An index file that is still
+    there is named in the merge's error instead of the usual "the next
+    prune removes the trees" — it may name packs a prune deleted, and has
+    to be removed by hand. (A stale index entry does not spread by
+    itself: checked against restic 0.19.1, whose prune rebuilt the index
+    without an entry for an unused pack that no longer existed.)
+  - *Not giving up on an index a server may still store.* A REST or S3
+    server can store a file after its write was reported as failed (see
+    the snapshot write below). For a pack that is waste the next prune
+    collects. An index that turns up after a prune names packs that are
+    gone. So once an attempt at an index is open — it failed in a way
+    that leaves the server free to complete it — a failure is not passed
+    on at once: the gate reads the index back and counts it as stored if
+    it is what was written. A refusal after an open attempt is what
+    rest-server answers once that attempt has arrived, and reading the
+    index back shows it. If the index is not there and the latest answer
+    was a refusal, the failure is passed on — a server that says no goes
+    on saying it; otherwise the index is written again, five seconds
+    apart, until it is stored, refused, the lock is lost, or the merge
+    is stopped (Ctrl+C). An index given up with an attempt still open is
+    named in the merge's error like one that could not be removed.
+    Which failures leave an attempt open is the backend's to say
+    (`repo::data_write_can_land_later`): none of a local repository's,
+    and of a server's all but its own refusal.
+  - *One request per attempt.* That count holds only if every attempt is
+    the gate's own. Both remote backends retry a request by themselves —
+    rustic_backend's REST backend, and opendal's retry layer under the S3
+    one — and report only the last attempt: a refusal can then stand for
+    a write whose first attempt the server still holds, and so can a
+    success
+    (`rustic_rest_write_hides_an_open_attempt_unless_it_makes_only_one`,
+    `s3_backend::tests::a_write_is_one_put_and_reports_that_puts_outcome`).
+    So the gate writes everything but packs through the same repository
+    opened without retries (`RequestPolicy::ONE_ATTEMPT`), where a call
+    is one request and its outcome that request's, and does the trying
+    again itself. Packs keep the backend's retries: one that arrives late
+    is waste. The lock backends make one request per write for the same
+    reason (`LockBackend::write`), the S3 one through an operator without
+    the retry layer.
+  The lock is checked once more when the snapshot write has returned
+  (`RepoLock::write_unpacked_while_held`), because the write itself can
+  outlast the lock: restic gets out of this by cancelling the backend
+  request when its lock goes bad, and wrustic's backends cannot be
+  cancelled, nor do they bound a write to the 7.5 minutes that separate a
+  poisoned lock from a stale one — a local write blocks as long as the
+  filesystem does, S3 has a stall timeout but no total, only
+  REST gives up after 30 seconds. A lock still healthy after the write
+  was refreshed in time throughout (poisoning latches), so no prune can
+  have started before the snapshot existed; a poisoned one means the
+  snapshot may name pruned trees, and it is removed again and the merge
+  reported as failed. The snapshot's name is the hash of what is written,
+  so it is known before the write, and a write that reports an error is
+  treated as possibly stored — a timeout after the server committed —
+  whatever the lock's health. It is checked against the repository
+  first: a snapshot that is there as written, under a healthy lock, is
+  published and reported as that; one that is not is written again,
+  since a write that then succeeds settles it whatever became of the
+  earlier ones.
+  How often it is written again depends on what a failed write leaves
+  behind. A server that has taken a write in full stores it whether or
+  not the client is still waiting: rest-server reads the body and goes
+  on to sync and rename without looking at the connection again, and
+  answers a removal sent in between with success, there being nothing to
+  remove yet. No call from the client cancels such a write or waits for
+  it, so for the REST and S3 backends a failed write followed by a
+  successful removal can still be published later
+  (`LockBackend::failed_write_can_land_later`; false for a local
+  repository, where the write is this process's own system calls).
+  Giving up on such a write would release the lock with the write still
+  to come: a prune could then delete the merged trees, and the snapshot
+  that turns up afterwards would name them. Under the lock a late write
+  does no harm, so a write that failed without the server's answer is
+  not given up on while the lock is healthy — the merge checks the
+  repository and writes again, five seconds apart, until the snapshot is
+  stored or the lock is lost (the lock is asked again right before each
+  attempt, so none starts under a lost one). With the repository out of
+  reach that is the 22.5 minutes the lock takes to turn bad.
+  A failure that is final ends the attempts once a second one has been
+  made and the snapshot is not in the repository, with the file removed
+  and the error passed on, naming it. That is any failure of a local
+  write, and a server's own no (`lock::server_refused`): an HTTP answer
+  in the 400s or 507. A
+  server that refuses the snapshot goes on refusing it while the lock is
+  refreshed without trouble, and must not keep the merge and its lock. A
+  timeout, a broken connection or an answer in the 500s is no refusal:
+  the first two leave open what the server did with a body it had, and a
+  proxy answers 502 or 504 for a server still at work. On S3 the line is
+  the one opendal draws between errors worth trying again — no answer,
+  429, 499, 500, 502, 503, 504 — and the rest: it has a kind of its own
+  for few answers and files a full disk or a rejected request under the
+  same kind as a broken connection, so the kind does not tell
+  (`s3_backend::tests::every_answer_that_turns_a_put_down_is_a_refusal`).
+  A refusal ends the attempts after one that may still land, too:
+  waiting would not get a refused write stored, and the repository has
+  been looked at first, since the refusal can be about the earlier write
+  having arrived. The earlier attempt is then still open, and the error
+  says so.
+  That leaves a write that keeps failing without an answer while the
+  lock stays healthy, which nothing would end. No request a client can
+  send completes, cancels or fences a write a server holds — rest-server
+  never looks at the connection again once it has the body, and restic's
+  own retry of a failed save is in the same position — so there is no
+  point at which giving up becomes safe by itself, and a retry limit
+  would only pick an arbitrary one. The merge therefore runs on a worker
+  thread, the merging screen shows which file is being retried, and
+  Ctrl+C stops it (`lock::WriteRetries`): no write is begun after that
+  and none is tried again, while one under way is waited for. The reads
+  of the source and merged trees ask for the stop as well; `merge_trees`
+  itself reads on until it has a write to make. The app going away while
+  the worker runs — the terminal gone, an error out of the main loop —
+  does the same and waits for the worker, so the process does not exit
+  under a merge with its lock in place and a write in flight.
+  Where the attempts end with one of them still open — the lock lost, a
+  refusal, or the merge stopped — the write is abandoned unsettled, and
+  the error
+  does not pretend otherwise: it says the snapshot may still turn up and
+  is to be removed if it does — it would by then name trees that a prune
+  is free to delete. The same goes for a snapshot removed again because
+  it did not read back as written.
+  A merge that succeeds can leave an attempt open as well: an earlier
+  one still held by the server after a later one stored the file, the
+  snapshot or an index. Every attempt writes the same file under the
+  same name, so it changes nothing when it lands — unless the file was
+  removed in the meantime, which it then brings back: the snapshot file
+  after the merged snapshot was deleted, an index file after a prune.
+  Keeping the merged snapshot does not guard the index: a prune rewrites
+  index files and repacks packs whether or not a snapshot still uses
+  what is in them, so the index that comes back can name packs that are
+  gone.
+  That cannot be prevented from here either, so it is said: the notice
+  after such a merge says that a late write is possible and points here.
+  A merge that fails after storing an index that way says it in its
+  error — its packs are what the next prune removes.
+  Until the server has had time to finish what it took, put off pruning
+  and anything else that rewrites the index (`restic prune`, `forget
+  --prune`, `repair index`), and deleting the merged snapshot. A `restic
+  check` that comes out clean settles nothing if it ran after such a
+  prune and before the request arrived: run it again later. Where it
+  reports that the index names packs missing from the repository,
+  `restic repair index` rebuilds the index from the packs that are
+  there.
+- **Trees** go through rustic_core's `Repository::merge_trees`: entries are
+  matched by path from the root, an entry only one snapshot has is taken
+  as is, directories are merged recursively, and where the same path
+  differs the entry with the newer mtime wins (`last_modified_node`). No
+  file content is read or stored again.
+- **The snapshot file is wrustic's own**, written through the same
+  unpacked-file envelope as a tag edit and read back through rustic_core
+  before the call returns — a snapshot that cannot be read back, or does
+  not read back as written, is removed again, and the error says whether
+  the removal worked. rustic_core's `merge_snapshots` is not used: it
+  stamps the *merging* machine's hostname and user, and keeps nested paths
+  apart (`/data` + `/data/extra`), and restic picks a backup's parent by
+  exact hostname and path set — so the next `restic backup /data` would
+  not find the merged snapshot and would read every file again. The file
+  is built field by field in restic's layout
+  (`repo::merged_snapshot_json`):
+  - `username`, `uid`, `gid` — the newest source's, copied as stored.
+  - `hostname` — the sources' own when they share one, which is what lets
+    that host's next backup find the merged snapshot. Sources of several
+    hosts get a name made of all of them, sorted and joined with `+`
+    (`repo::merged_hostname`; a source without a hostname counts as
+    `unknown`, and if a source really is called that, the merged
+    snapshot gets no hostname rather than that host's own): such a merge
+    holds another machine's files, and a backup
+    that took it for its parent would compare its own files against
+    those. The name shows in restic and wrustic where the snapshot came
+    from, and is nobody's, so neither host's backups look for it. That is
+    a convention, not a barrier — `restic backup --host alpha+beta` on
+    the same paths does take the merge for its parent, as does a backup
+    whose `--group-by` leaves the host out. Leaving the hostname out
+    altogether would close the first of those (every backup has some
+    hostname; restic 0.19.1 records the machine's own for an empty
+    `--host`), and was passed over because the snapshot would then show
+    no host anywhere. So restic's choice of a parent — the latest
+    snapshot with the backup's host and exact path set, unless
+    `--parent`, `--force` or another `--group-by` changes that — falls
+    on the merged snapshot for sources of one host only.
+  - `time` — the newest source's plus one nanosecond, in the same UTC
+    offset (`repo::just_after`). The merged snapshot is as recent as its
+    newest data, and has to be strictly the latest: restic takes the latest
+    matching snapshot as a backup's parent and leaves a tie to chance, and
+    the newest source matches as well whenever its paths are the merged
+    ones (two backups of one directory). With the source's own time, the
+    next backup sometimes picked the source and read again what only the
+    merge held.
+  - `paths` — every source's paths, with a path that lies inside another
+    folded into it (`repo::merged_paths`; whole components, Unix and
+    Windows separators), which is what makes the path set that of a
+    backup of the outer directory. A path is folded only where the trees
+    are laid out as the paths say (`repo::tree_holds_path`): restic
+    stores a target given as a relative path under that relative path
+    while recording its absolute one (`cd /data && restic backup extra`
+    records `/data/extra` and stores `/extra`; checked against restic
+    0.19.1), so its files were not merged into the directory its path
+    names. Such a path is listed beside the other, and the merged
+    snapshot does not pass for a backup of the one directory. The same
+    goes for every path of a source whose tree holds anything outside
+    its paths (`repo::tree_keeps_to_paths`) — a merge that kept such a
+    path apart is one: its `/extra` at the root is no part of `/data`,
+    whatever `/data/extra` leads to. Names in a
+    tree are compared as restic means them, with its quoting undone, and
+    a network share is one directory under its whole name
+    (`\\nas\share`), as restic stores a volume. The
+    confirmation screen shows the folded set from the paths alone — the
+    trees are read only under the lock — and says next to it that a
+    nested path may stay.
+  - `tags` — the union.
+  - `program_version` — `wrustic <version>`.
+  - `summary` — the fields restic and rustic_core share, totals being
+    those of the merged tree.
+  - `parent`, `original`, `excludes` — left out. They describe one backup
+    run, and the merged snapshot is the product of several.
+- **Metadata is best effort: what `merge_trees` cannot keep is left out
+  and reported.** `merge_trees` reads every directory of every source into
+  rustic_core's typed `Node` and writes it back from there, and that type
+  has no field for restic's `generic_attributes` (Windows creation time,
+  file attributes, security descriptors) — the tree-level twin of the
+  `excludes` problem that made tag edits a raw-JSON rewrite. rustic_core
+  offers no way to write a tree blob except through that type, so the
+  merge cannot be made lossless the same way. It goes ahead: everything
+  the type does hold (names, content, sizes, times, modes, owners, links,
+  extended attributes) is carried over, and **a merged snapshot of
+  restic-on-Windows backups has no Windows attributes** — a restore from
+  it brings back the files without them. The sources keep theirs, and the
+  merge does not delete the sources. So that this is never silent, every
+  tree the sources reach is read raw and each node round-tripped through
+  the typed `Node` (`repo::scan_source_trees`); the fields that
+  held something and do not come back are returned with the new snapshot's
+  id, and the TUI names them in its notice. The check is the round trip
+  itself rather than a list of field names, so it stays right when
+  rustic_core learns a field.
+- **Two things `merge_trees` gets wrong for restic are refused**, each
+  before any snapshot is written and with the paths named. Neither can be
+  put right from here — that would mean writing tree blobs, which
+  rustic_core offers no way to do — and neither shows in the sources
+  alone, since it depends on which entries meet in the merged tree. So the
+  merged tree is read back and checked (`repo::merged_tree_defect`), which
+  takes a second repository handle with a fresh index and is therefore
+  done only when the scan of the sources found what makes it possible: a
+  quoted name, or a file with more than one link.
+  - *Order.* restic keeps a directory's entries sorted by name and relies
+    on it. It stores a name as Go's `strconv.Quote` writes it, so a name
+    with a quote, a backslash, a control character or bytes that are not
+    UTF-8 is stored quoted — and `merge_trees` merges two directories in
+    the order of the stored form, which is not the order of the names
+    (`"a` sorts before `A`, the stored `\"a` after it). Directories restic
+    wrote are then not in the order the merge assumes: an entry both
+    sources hold comes out twice, the older copy last, and a restore
+    writes the older over the newer — or the entries come out in an order
+    restic does not keep. `restic check` accepts both. The merge is
+    refused when a merged directory is not strictly in restic's order.
+  - *Hardlinks.* restic rebuilds hardlinks on restore from each file's
+    recorded device and inode: of the files with more than one link that
+    share the pair it writes the first, and it makes every other file with
+    that pair a hardlink to it, whatever link count that file records
+    itself. `merge_trees` passes the pair on untouched, which is right
+    within a source and usually right across them — but two sources can
+    record one pair on different content: an inode rewritten or reused
+    between the two backups under another path (a directory renamed and a
+    file in it changed in place is enough; so is a file that lost its
+    other link, was moved and rewritten), or two filesystems that were
+    given the same device number. restic restores such a merged snapshot
+    with every one of those files holding the first one's bytes. The
+    merge is refused when a file's content differs from that of a
+    multi-link file with its device and inode — or its permissions,
+    owner (by number and by name), modification time or extended
+    attributes (as a set, whatever order they are listed in) do: restic
+    links the
+    paths and then puts each one's recorded metadata back, and an inode
+    has one of each, so of two that differ only the last applied
+    survives. Change times are not compared, since no restore sets
+    them, and neither are access times, which restic does put back but
+    does not record alike for the links of one file: they are its
+    modification time unless the backup ran with `--with-atime`, and
+    then reading one link moves the time the next is recorded with,
+    wherever restic cannot open the file without touching it (a file
+    of another owner, any file outside Linux). A `--with-atime` backup
+    of `/usr/bin` by restic 0.19.1 recorded two access times for four
+    of its seven hardlinked files; restoring it keeps one of each, as
+    restoring a merge does, and holding the merge to more would refuse
+    snapshots restic wrote. Two backups of one
+    directory with a hardlinked file changed in between differ in the
+    sources and merge fine, both links coming from the newer.
+    Files of different sources that share the pair and agree in all of
+    this are merged as they are, and restic restores them as hardlinks
+    of one file. That is right when they are one file, seen by two
+    backups — a link added since the first, a `--link-dest` generation
+    backed up on its own — and wrong for two files that only look like
+    it: copies on a cloned filesystem, say, where numbers, bytes and
+    times all match. The restore then has every byte and attribute
+    right and one inode where there were two, which shows when one of
+    them is changed in place. A snapshot does not record enough to tell
+    the two cases apart, and refusing what cannot be proven would
+    refuse the first; keeping them apart takes separate identities per
+    source (docs/roadmap.md, "Lossless snapshot merge").
+    Between hosts there is no first case: the device and inode numbers
+    of one machine say nothing about another's, and two machines set up
+    alike hand out the same ones. So when the sources' hostnames differ,
+    a group of files restic would link has to be one that a single
+    source records as it is — every path of it, under that device and
+    inode — and a group made of two sources' files is refused
+    (`repo::cross_host_link_defect`).
+- **How much is rewritten depends on the timezone.** rustic_core renders
+  node times with the local zone's offset. Where that is what the trees
+  already hold, a directory only one source has serializes back to the
+  same bytes and its blob is reused, so only the directories both sources
+  pass through are written. Where it is not — snapshots from a machine in
+  another zone, or wrustic running in UTC, which rustic_core writes as
+  `+00:00` where restic writes `Z` — every directory of every source is
+  written again: the same instants, a full second copy of the directory
+  metadata (never of file content). Correct either way, and restic reads
+  both; it is a cost, and the reason a merge reads every directory.
+
+Verified live end to end: `live_native_merge_interop_with_restic` (restic
+backs up a directory and then one new subdirectory of it; after the merge
+restic lists the merged snapshot under the directory's path alone, with
+the newer source's time and host and both tags, walks every file of both
+through it, and passes `check --read-data`; the next `restic backup` of
+the directory names the merged snapshot as its parent and finds nothing
+new or changed), `live_native_merge_restores_hardlinks_with_restic`
+(`restic restore` of a merged snapshot brings back the hardlink groups of
+both sources as separate groups with their own bytes; the renamed-and-
+rewritten pair, which restic restores as four links to one file when
+merged regardless, and the file that fell to one link before it was moved
+and rewritten are refused before a snapshot is written — the trees the
+attempt stored stay unreferenced, for the next prune to reclaim) and
+`live_native_merge_quoted_names_and_parent_with_restic` (a directory
+holding `"a` and `A` merged with a later backup of `A` is refused; `"a`
+and `b`, which sort one way either way, merge and restore byte for byte;
+after two backups of one directory are merged, restic lists the merged
+snapshot as strictly the latest and takes it as the next backup's parent;
+a merge of one directory's backups as two hosts is listed as `alpha+beta`,
+the next backup as either host takes that host's own last backup, and a
+backup with an empty `--host` gets the machine's name and does not take
+it either).
 
 **Long-running reads — non-exclusive lock (implemented):** the snapshot
 SMB share (`smb::ShareServer::share_snapshot`). Reads take no lock in wrustic's
@@ -316,6 +713,50 @@ write rather than midway through, and the lock count afterwards proves both
 that a failed acquisition cleans up after itself and that a successful
 operation releases on return.
 
+`merge_snapshots_combines_trees_under_the_shared_lock` is the same idea
+turned around for the one native write that must take the *non-exclusive*
+lock: a planted **exclusive** lock has to block the merge with the
+repository fingerprint unchanged — a merge that took no lock would sail
+past it — and a planted non-exclusive one has to let it through, which a
+merge that asked for the exclusive lock would trip over. It goes on to
+check the result: every file of both sources, each conflict won by the
+newer mtime whichever snapshot it came from, nothing that existed before
+changed or removed. `app::tests::a_merge_runs_while_a_snapshot_of_the_repository_is_shared`
+runs it against the SMB share's real lock.
+`lock::tests::a_file_whose_write_outlasted_the_lock_is_taken_back` covers
+the publication rule: a write that only returns once the lock has gone
+unrefreshed past the cutoff comes back as an error with the file removed,
+and an already poisoned lock writes nothing.
+`lock::tests::gated_writes_stop_when_the_lock_is_lost` does the same for
+what rustic_core writes through the gate: an index whose write outlasted
+the lock does not stay, and nothing is written after it.
+`a_failed_write_past_the_lock_is_reconciled`,
+`a_write_reported_as_failed_but_stored_counts_as_published`,
+`a_failed_write_the_server_still_holds_is_retried_while_the_lock_holds`,
+`a_write_the_server_refuses_is_given_up`,
+`an_index_write_the_server_may_still_complete_is_not_given_up` and
+`an_index_that_could_not_be_taken_back_is_reported` cover a write that
+reports failure for a file it stored, one the server is still holding —
+retried under a healthy lock until the file is there, and reported as
+possibly still to come once the lock is lost or the retrying stopped —
+one the server refuses, which ends the attempts and reports any that is
+still open
+(`only_the_servers_no_counts_as_a_refusal`,
+`rest_write_that_timed_out_is_stored_after_its_removal`,
+`rustic_rest_write_hides_an_open_attempt_unless_it_makes_only_one`,
+`s3_backend::tests::a_write_is_one_put_and_reports_that_puts_outcome` and
+`s3_backend::tests::every_answer_that_turns_a_put_down_is_a_refusal`
+show what the real backends' errors count as, against servers that hold
+a write and store it after the client has given up, and
+`the_gate_writes_all_but_packs_through_the_backend_that_does_not_retry`
+that the attempts counted are all there are), a removal that
+fails, and
+`closing_the_gate_waits_for_writes_and_refuses_later_ones` that the gate
+does not close over a write under way. These tests lose the lock at a
+point they choose (`LockHealth::expire_for_tests`, inside the backend's
+write) on a lock with restic's real timing, so a slow scheduler cannot
+lose it for them early.
+
 `shared_open_holds_the_append_lock_for_the_handle_lifetime` covers the other
 direction: the guard `open_indexed_full_shared_lock` hands back is held for
 as long as the repository handle lives, tolerates a second append lock, and
@@ -419,6 +860,14 @@ the dev profile only.
    edits are out of scope (rustic-only field, not restic-preservable).
    Native backup / copy / key management, formerly this phase, were
    dropped from the plan — the restic CLI keeps them.
+
+6. **Native snapshot merge** — DONE (`repo::merge_snapshots`, the TUI's
+   `M` on the snapshot list; see "Native snapshot merge" above for the
+   full design). The first native write under the *non-exclusive* lock,
+   and the first with no restic command behind it. The backup that
+   produces the snapshot to merge in stays on the restic CLI; the two are
+   independent — nothing is lost if the merge never runs. A lock conflict
+   offers `u` and retries the same merge.
 
 Non-goals: native backup, copy, and key management (the restic CLI
 keeps them; the Tier 1 rows above remain as the safety map should that

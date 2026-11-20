@@ -16,6 +16,7 @@ screen). Everything else wrustic does at runtime is native:
 | All reads (snapshot list, tree browsing, diff, file view/share, filters) | `rustic_core` |
 | Snapshot delete | native, under the restic-compatible repo lock (`repo::delete_snapshot`) |
 | Tag edits (`t` on the snapshot list) | native, under the same exclusive lock (`repo::edit_snapshot_tags`, lossless raw-JSON rewrite) |
+| Snapshot merge (`M` on the snapshot list) | native, under restic's non-exclusive lock (`repo::merge_snapshots`); restic has no merge command |
 | Unlock / stale-lock removal (`u` shortcut) | native (`repo::unlock`) |
 | Prune | **restic CLI**, via the spawn harness in `src/restic.rs` |
 
@@ -56,7 +57,20 @@ These stay on a user-run `restic` (>= 0.19), outside wrustic — wrustic
 itself will never run them:
 
 - `restic init` — creating a new repository
-- `restic backup` — creating snapshots
+- `restic backup` — creating snapshots. That is the whole of an ordinary
+  backup flow; the merge is for special cases such as adding content to an
+  existing snapshot, and there too the backup is restic's: back up only
+  the new file or directory, then merge the two in wrustic. The two
+  backups have to use one layout: the merge lines files up by their path
+  in the snapshot's tree alone, whatever host or tags the snapshots share.
+  restic stores a target given as an absolute path under that path, so
+  with `restic backup /data` as the base, the addition is
+  `restic backup /data/extra`: the directory in its place inside the base,
+  not a copy of it somewhere else. A target given as a relative path is
+  stored under the relative path instead (`cd /data && restic backup
+  extra` holds `/extra/…`, while the snapshot's `paths` say
+  `/data/extra`); `restic ls <snapshot>` shows where a snapshot's files
+  are
 - maintenance beyond prune: `repair`, `migrate`, key management
 
 Description edits are not planned — `description` is a rustic-only
@@ -74,8 +88,8 @@ plan — they stay on the restic CLI indefinitely.
   not consulted.
 - The live interop tests in `src/repo.rs` use `restic::run` for `init`,
   `backup`, `forget`, `unlock`, `snapshots --json`,
-  `check --read-data --json`, and `tag` to prove the native lock, delete,
-  and tag-edit paths are compatible with real restic.
+  `check --read-data --json`, `ls --json`, and `tag` to prove the native
+  lock, delete, tag-edit, and merge paths are compatible with real restic.
 - The live test in `src/restic.rs` exercises the harness itself end to
   end (stdin password channel, the native pre-spawn lock check that
   unlocks stale locks before running a restic command, and the streaming

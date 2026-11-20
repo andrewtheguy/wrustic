@@ -10,8 +10,8 @@ A read-oriented terminal UI for restic backup repositories. It opens a
 repo, lists snapshots, lets you walk the file tree, inspect file details,
 diff two snapshots, and download a single file via a localhost signed URL.
 Its write surface is deliberately small: snapshot deletion, tag edits,
-and stale-lock removal are native; prune shells out to `restic prune`
-(details below).
+snapshot merge, and stale-lock removal are native; prune shells out to
+`restic prune` (details below).
 
 **Scope: single-user, single-device.** wrustic is a personal tool — one
 person, one machine (or one account on a shared box that they fully own).
@@ -24,8 +24,9 @@ flat `App` struct.
 
 It is intentionally **not** a restic replacement:
 - Reads go through `rustic_core` directly (no subprocess).
-- The native write operations wrustic exposes (snapshot delete and tag
-  edits) are guarded by restic-compatible repository locks
+- The native write operations wrustic exposes (snapshot delete, tag
+  edits and snapshot merge) are guarded by restic-compatible repository
+  locks
   (docs/locking.md) so they coexist safely with concurrent restic
   processes; stale-lock removal (`repo::unlock`) is native too but
   deliberately takes no lock — like `restic unlock`, it only removes
@@ -67,7 +68,7 @@ on a multi-thread one (it needs `block_in_place`, see below).
 
 `Screen` (in `app.rs`) is the discriminator for what's on screen. It's
 about three dozen variants spanning first-run, profile CRUD, snapshot list,
-snapshot delete/compare flows, tree browsing, file details, share dialog,
+snapshot delete/compare/merge flows, tree browsing, file details, share dialog,
 and passphrase dialog. Every screen is rendered by a corresponding
 `render_<screen>` function in `ui.rs`.
 
@@ -214,6 +215,39 @@ smbanything's own docs. The architectural points:
   (`Repository::delete_snapshots`) under an exclusive restic-compatible
   repository lock. Full 64-char hex ids are enforced so a prefix can never
   match the wrong snapshot.
+- `edit_snapshot_tags(profile, id, tags)` — native tag edit under the same
+  exclusive lock, as a raw-JSON rewrite of the snapshot file so restic
+  fields rustic_core does not model survive.
+- `merge_snapshots(profile, ids, retries)` — merges snapshots into a new
+  one under restic's *non-exclusive* lock (it only adds files):
+  rustic_core's `merge_trees` for the directory trees, then a snapshot
+  file wrustic writes itself, built to qualify under restic's parent rule
+  — the latest snapshot with the backup's host and exact path set, absent
+  `--parent`, `--force` or another `--group-by`: the sources' host, their
+  paths with nested ones folded, a time just after the newest source's.
+  Qualifying is not being chosen: restic takes the newest match there is
+  when the backup runs, so a snapshot of that host and path set taken
+  after the newest source wins over the merged one. That holds for sources of one host
+  whose files are where their paths say; sources of two hosts give a
+  snapshot named for both, which neither host's backups take for their
+  parent, and a path whose tree is laid out otherwise (a relative-path
+  backup) is not folded. The source snapshots are kept. Metadata is best
+  effort: the returned `MergeOutcome` names the node fields `merge_trees`
+  could not carry over (restic's Windows attributes), for the notice the
+  TUI shows. Refused when the merged tree would put one hardlink identity
+  on different content or metadata, link files of two hosts' snapshots to
+  each other, or list a directory out of restic's order, which restic
+  restores wrong. rustic_core's writes go through `lock::gate_writes`, so
+  no write is begun once the lock is lost or after the gate has closed.
+  That is about attempts, not about what a server does with one it
+  already has: a request that was sent can still be stored after the
+  merge has returned and given up its lock (docs/locking.md). It runs on
+  a worker thread (the main loop polls it, as for
+  prune): a write a server may still complete is retried for as long as
+  the lock holds, and `retries` (`lock::WriteRetries`) is how the TUI
+  shows that and how Ctrl+C ends it. `App`'s drop stops a merge still
+  running and waits for the worker, so an error out of the main loop
+  does not exit the process under it.
 - `unlock(profile)` — native stale-lock removal, offered with `u` on the
   delete-error screen when `lock::is_lock_error()` matches the failure.
   Only locks that are provably dead are removed (older than restic's

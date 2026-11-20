@@ -37,6 +37,13 @@ use crate::repo::{CONNECT_TIMEOUT, RequestPolicy};
 /// and lock backends so both speak to the same place the same way: the same
 /// connect and stall timeouts as the REST backend, over wrustic's own reqwest
 /// client (opendal's default client has neither).
+///
+/// With retries, opendal sends a request again that failed without the
+/// server's answer and reports only the last attempt — its error, or its
+/// success. Either way nothing says that an earlier attempt is still with the
+/// server, which can go on to store it. A policy of no retries leaves the
+/// retry layer out, so that each call is one request and its outcome that
+/// request's own ([`RequestPolicy::ONE_ATTEMPT`]).
 fn build_operator(
     endpoint: &str,
     bucket: &str,
@@ -64,10 +71,13 @@ fn build_operator(
     let context = OperationContext::new()
         .with_http_transport(HttpTransporter::new(ReqwestTransport::new(client)));
 
-    let operator = opendal::Operator::new(builder)
+    let mut operator = opendal::Operator::new(builder)
         .context("creating the S3 backend")?
-        .with_context(context)
-        .layer(RetryLayer::new().with_max_times(policy.retries).with_jitter());
+        .with_context(context);
+    if policy.retries > 0 {
+        operator =
+            operator.layer(RetryLayer::new().with_max_times(policy.retries).with_jitter());
+    }
 
     let _guard = runtime().enter();
     Operator::new(operator).context("creating the blocking S3 backend")
@@ -75,6 +85,8 @@ fn build_operator(
 
 pub(crate) struct S3LockBackend {
     operator: Operator,
+    // For `write`, which `LockBackend` wants to be a single request.
+    one_attempt: Operator,
     dir: String,
 }
 
@@ -88,17 +100,13 @@ impl S3LockBackend {
         secret_key: &str,
         dir: &str,
     ) -> Result<Self> {
+        let operator = |policy| {
+            build_operator(endpoint, bucket, region, root, access_key, secret_key, policy)
+                .with_context(|| format!("creating the S3 {dir} backend"))
+        };
         Ok(Self {
-            operator: build_operator(
-                endpoint,
-                bucket,
-                region,
-                root,
-                access_key,
-                secret_key,
-                RequestPolicy::STANDARD,
-            )
-            .with_context(|| format!("creating the S3 {dir} backend"))?,
+            operator: operator(RequestPolicy::STANDARD)?,
+            one_attempt: operator(RequestPolicy::ONE_ATTEMPT)?,
             dir: dir.to_string(),
         })
     }
@@ -137,9 +145,9 @@ impl LockBackend for S3LockBackend {
     }
 
     fn write(&self, name: &str, data: &[u8]) -> Result<()> {
-        self.operator
+        self.one_attempt
             .write(&self.key(name), data.to_vec())
-            .map_err(|err| anyhow!("writing S3 {}: {err}", self.key(name)))?;
+            .with_context(|| format!("writing S3 {}", self.key(name)))?;
         Ok(())
     }
 
@@ -149,6 +157,10 @@ impl LockBackend for S3LockBackend {
             Err(err) if err.kind() == opendal::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(anyhow!("removing S3 {}: {err}", self.key(name))),
         }
+    }
+
+    fn failed_write_can_land_later(&self, error: &anyhow::Error) -> bool {
+        !crate::lock::server_refused(crate::lock::as_std_error(error))
     }
 }
 
@@ -186,12 +198,10 @@ impl S3DataBackend {
         secret_key: &str,
         policy: RequestPolicy,
     ) -> Result<Self> {
-        Ok(Self {
-            operator: build_operator(
-                endpoint, bucket, region, root, access_key, secret_key, policy,
-            )
-            .context("creating the S3 data backend")?,
-        })
+        let operator =
+            build_operator(endpoint, bucket, region, root, access_key, secret_key, policy)
+                .context("creating the S3 data backend")?;
+        Ok(Self { operator })
     }
 
     /// Repo-relative object key for a file — restic's on-disk layout:
@@ -353,6 +363,224 @@ mod tests {
             S3DataBackend::path(FileType::Snapshot, &id),
             "snapshots/03dc1178e4e54f69beaf35dd9d4256a5a600e9fa3452b9db80bd649938923e67"
         );
+    }
+
+    // A stand-in for S3 that takes PUTs: with `hold_first` it has the first
+    // one in full and sits on it until released — a server stuck storing —
+    // and answers every other one with the given status line and S3 error
+    // code; without, it answers them all that way.
+    struct PutMock {
+        endpoint: String,
+        state: std::sync::Arc<(std::sync::Mutex<PutState>, std::sync::Condvar)>,
+    }
+
+    const ACCESS_DENIED: (&str, &str) = ("403 Forbidden", "AccessDenied");
+
+    #[derive(Default)]
+    struct PutState {
+        puts: usize,
+        held: bool,
+        released: bool,
+        stored: bool,
+    }
+
+    impl PutMock {
+        fn start(hold_first: bool, (status, code): (&'static str, &'static str)) -> Self {
+            use std::io::{BufRead, BufReader, Read, Write};
+            use std::sync::Arc;
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let state: Arc<(std::sync::Mutex<PutState>, std::sync::Condvar)> = Arc::default();
+            let shared = Arc::clone(&state);
+            std::thread::spawn(move || {
+                for conn in listener.incoming() {
+                    let Ok(stream) = conn else { return };
+                    let state = Arc::clone(&shared);
+                    std::thread::spawn(move || -> std::io::Result<()> {
+                        let mut writer = stream.try_clone()?;
+                        let mut reader = BufReader::new(stream);
+                        loop {
+                            let mut line = String::new();
+                            if reader.read_line(&mut line)? == 0 {
+                                return Ok(());
+                            }
+                            let is_put = line.starts_with("PUT ");
+                            let mut len = 0_usize;
+                            loop {
+                                let mut header = String::new();
+                                let _ = reader.read_line(&mut header)?;
+                                let header = header.trim_end().to_ascii_lowercase();
+                                if header.is_empty() {
+                                    break;
+                                }
+                                if let Some(value) = header.strip_prefix("content-length:") {
+                                    len = value.trim().parse().unwrap_or(0);
+                                }
+                            }
+                            let mut body = vec![0_u8; len];
+                            reader.read_exact(&mut body)?;
+
+                            let first = {
+                                let mut put = state.0.lock().unwrap();
+                                if is_put {
+                                    put.puts += 1;
+                                }
+                                is_put && hold_first && put.puts == 1
+                            };
+                            let response = if first {
+                                let mut put = state.0.lock().unwrap();
+                                put.held = true;
+                                state.1.notify_all();
+                                let mut put = state.1.wait_while(put, |put| !put.released).unwrap();
+                                put.stored = true;
+                                state.1.notify_all();
+                                "HTTP/1.1 200 OK\r\nETag: \"etag\"\r\nContent-Length: 0\r\n\r\n"
+                                    .to_string()
+                            } else {
+                                let xml = format!(
+                                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error>\
+                                     <Code>{code}</Code><Message>no</Message></Error>"
+                                );
+                                format!(
+                                    "HTTP/1.1 {status}\r\nContent-Type: application/xml\r\n\
+                                     Content-Length: {}\r\n\r\n{xml}",
+                                    xml.len()
+                                )
+                            };
+                            writer.write_all(response.as_bytes())?;
+                            writer.flush()?;
+                        }
+                    });
+                }
+            });
+            Self { endpoint, state }
+        }
+
+        // An impatient client, so that a held PUT fails soon.
+        const IMPATIENT: std::time::Duration = std::time::Duration::from_millis(500);
+
+        fn operator(&self, retries: usize) -> Operator {
+            let policy = RequestPolicy { retries, read_timeout: Self::IMPATIENT };
+            build_operator(&self.endpoint, "bucket", "us-east-1", "", "key", "secret", policy)
+                .expect("an operator for the mock")
+        }
+
+        fn backend(&self) -> S3LockBackend {
+            S3LockBackend {
+                operator: self.operator(2),
+                one_attempt: self.operator(RequestPolicy::ONE_ATTEMPT.retries),
+                dir: "snapshots".into(),
+            }
+        }
+
+        fn puts(&self) -> usize {
+            self.state.0.lock().unwrap().puts
+        }
+
+        fn release(&self) {
+            self.state.0.lock().unwrap().released = true;
+            self.state.1.notify_all();
+        }
+
+        fn wait_for(&self, what: impl Fn(&PutState) -> bool) {
+            let (state, timed_out) = self
+                .state
+                .1
+                .wait_timeout_while(
+                    self.state.0.lock().unwrap(),
+                    std::time::Duration::from_secs(20),
+                    |put| !what(put),
+                )
+                .unwrap();
+            assert!(!timed_out.timed_out(), "the mock did not get there");
+            drop(state);
+        }
+    }
+
+    // A write is one PUT, and its outcome that PUT's own: what lets the lock
+    // module count the attempts a server may still complete. With opendal's
+    // retries a PUT that got no answer is sent again and only the last
+    // attempt reported — AccessDenied here, with the first PUT at the server,
+    // which goes on to store it.
+    #[test]
+    fn a_write_is_one_put_and_reports_that_puts_outcome() {
+        let refused = |error: &anyhow::Error| {
+            crate::lock::server_refused(crate::lock::as_std_error(error))
+        };
+        let id: Id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            .parse()
+            .unwrap();
+
+        // What a retrying operator makes of it.
+        let mock = PutMock::start(true, ACCESS_DENIED);
+        let err = mock.operator(2).write("snapshots/aaaa", "late").expect_err("refused");
+        assert_eq!(err.kind(), opendal::ErrorKind::PermissionDenied, "{err}");
+        assert_eq!(mock.puts(), 2, "the refusal is a second PUT's");
+        mock.release();
+
+        let mock = PutMock::start(true, ACCESS_DENIED);
+        let backend = mock.backend();
+        let err = backend.write("aaaa", b"late").expect_err("no answer in time");
+        assert!(!refused(&err), "{err:#}");
+        assert!(backend.failed_write_can_land_later(&err), "{err:#}");
+        mock.wait_for(|put| put.held);
+        assert_eq!(mock.puts(), 1, "not sent again");
+        let err = backend.write("aaaa", b"late").expect_err("refused");
+        assert!(refused(&err), "{err:#}");
+        assert!(!backend.failed_write_can_land_later(&err), "{err:#}");
+        assert_eq!(mock.puts(), 2);
+        // The first PUT had arrived in full, and is stored once the server
+        // gets on with it.
+        mock.release();
+        mock.wait_for(|put| put.stored);
+
+        // The same through rustic_core's backend, which the index goes by
+        // (`repo::merge_snapshots` builds it with `RequestPolicy::ONE_ATTEMPT`
+        // for that).
+        let mock = PutMock::start(true, ACCESS_DENIED);
+        let data = S3DataBackend { operator: mock.operator(RequestPolicy::ONE_ATTEMPT.retries) };
+        let err = data
+            .write_bytes(FileType::Index, &id, false, Bytes::from_static(b"late").into())
+            .expect_err("no answer in time");
+        assert!(!crate::lock::server_refused(&*err), "{err}");
+        mock.wait_for(|put| put.held);
+        assert_eq!(mock.puts(), 1, "not sent again");
+        mock.release();
+    }
+
+    // Any answer that turns the PUT down is a refusal, not only the two
+    // opendal has a kind of its own for: it files a full disk or a request
+    // the server rejects under `Unexpected`, like the failures that say
+    // nothing. What tells them apart is that it marks the latter temporary.
+    #[test]
+    fn every_answer_that_turns_a_put_down_is_a_refusal() {
+        let refused = |answer: (&'static str, &'static str)| {
+            let mock = PutMock::start(false, answer);
+            let backend = mock.backend();
+            let err = backend.write("aaaa", b"never").expect_err("not stored");
+            assert_eq!(mock.puts(), 1, "{answer:?}");
+            let refused = crate::lock::server_refused(crate::lock::as_std_error(&err));
+            assert_eq!(refused, !backend.failed_write_can_land_later(&err), "{answer:?}");
+            refused
+        };
+        for answer in [
+            ACCESS_DENIED,
+            ("404 Not Found", "NoSuchBucket"),
+            ("400 Bad Request", "EntityTooLarge"),
+            ("405 Method Not Allowed", "MethodNotAllowed"),
+            ("507 Insufficient Storage", "XMinioStorageFull"),
+        ] {
+            assert!(refused(answer), "{answer:?}");
+        }
+        // A proxy answers these for a server that is still at work.
+        for answer in [
+            ("502 Bad Gateway", "BadGateway"),
+            ("503 Service Unavailable", "SlowDown"),
+            ("504 Gateway Timeout", "GatewayTimeout"),
+        ] {
+            assert!(!refused(answer), "{answer:?}");
+        }
     }
 
     // Live: the full ReadBackend + WriteBackend surface against a real Silo

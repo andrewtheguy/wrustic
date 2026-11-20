@@ -66,6 +66,7 @@ pub(crate) fn help_rows(screen: &Screen) -> Option<&'static [(&'static str, &'st
             ("f", "filter the list by host, tag or path"),
             ("d", "delete this snapshot (no prune)"),
             ("t", "edit this snapshot's tags"),
+            ("M", "merge with another snapshot (to add content to one)"),
             ("p", "prune the repository"),
             ("r", "reload the snapshot list"),
             ("q / Esc", "back to the profile list"),
@@ -421,6 +422,17 @@ fn footer_text(screen: &Screen, keychain_enabled: bool) -> &'static str {
             "Up/Dn move  PgUp/PgDn page  g/G top/bottom  Enter pick SECOND  a toggle related/all  Esc cancel"
         }
         Screen::SnapshotCompareResults => "Up/Dn move  PgUp/PgDn page  g/G top/bottom  q/Esc back",
+        Screen::SnapshotMergeSecond => {
+            "Up/Dn move  PgUp/PgDn page  g/G top/bottom  Enter pick the snapshot to merge with  Esc cancel"
+        }
+        Screen::SnapshotMergeConfirm => "y merge  Backspace pick another  n/Esc cancel",
+        Screen::SnapshotMergeError(msg) => {
+            if crate::lock::is_lock_error(msg) {
+                "u remove stale locks and retry  any other key to continue"
+            } else {
+                "any key to continue"
+            }
+        }
         Screen::OpeningSnapshot
         | Screen::LoadingDir
         | Screen::LoadingFileDetails
@@ -431,6 +443,7 @@ fn footer_text(screen: &Screen, keychain_enabled: bool) -> &'static str {
         | Screen::SnapshotTagSaving
         | Screen::Unlocking
         | Screen::SnapshotCompareLoading => "working…",
+        Screen::SnapshotMerging => "merging — Ctrl+C stop, other keys disabled",
         Screen::PruneConfirm => "y start prune  n/Esc cancel",
         Screen::PruneRunning => "running restic prune — Ctrl+C cancel (safe), other keys disabled",
         Screen::PruneDone(_) => "Up/Dn scroll  PgUp/PgDn page  g/G top/bottom  q/Esc back",
@@ -654,6 +667,24 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
         Screen::SnapshotCompareSecond => render_compare_second(frame, app, area),
         Screen::SnapshotCompareLoading => render_compare_loading(frame, app, area),
         Screen::SnapshotCompareResults => render_compare_results(frame, app, area),
+        Screen::SnapshotMergeSecond => render_merge_second(frame, app, area),
+        Screen::SnapshotMergeConfirm => render_merge_confirm(frame, app, area),
+        Screen::SnapshotMerging => render_merging(frame, app, area),
+        Screen::SnapshotMergeError(msg) => {
+            let body = if crate::lock::is_lock_error(msg) {
+                format!(
+                    "{msg}\n\nPress u to remove stale repository locks (live locks are \
+                     kept) and retry, or any other key to return to the snapshot list."
+                )
+            } else {
+                format!("{msg}\n\nPress any key to return to the snapshot list.")
+            };
+            let para = Paragraph::new(body)
+                .style(Style::new().fg(Color::Red))
+                .wrap(Wrap { trim: false })
+                .block(Block::bordered().title("Merge failed"));
+            frame.render_widget(para, area);
+        }
         Screen::PruneConfirm => render_prune_confirm(frame, app, area),
         Screen::PruneRunning => render_prune_running(frame, app, area),
         Screen::PruneDone(report) => {
@@ -1047,6 +1078,136 @@ fn render_compare_second(frame: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
+fn render_merge_second(frame: &mut Frame, app: &mut App, area: Rect) {
+    let visible = app.merge_second_visible_indices();
+    let first_short = app.merge_first_id.as_deref().map(short_snap_id).unwrap_or("?");
+    let title = format!(
+        "Merge {first_short}.. — pick the snapshot to merge with it ({})",
+        visible.len()
+    );
+    record_list_area(app, area);
+    app.list_header_rows = 1;
+    render_snapshot_picker(
+        frame,
+        area,
+        &title,
+        &app.snapshots,
+        &visible,
+        None,
+        &mut app.merge_picker_state,
+    );
+}
+
+// What a merge does that the user has to know before saying yes. Shown in a
+// block of its own that is laid out first, so it stays whole however much the
+// snapshots above it have to say and however small the terminal is.
+const MERGE_CONSEQUENCES: [&str; 4] = [
+    "Entries are combined by path; where both hold one, the later-modified wins.",
+    "Windows-only metadata (creation time, file attributes, security descriptors) \
+     is not carried into the new snapshot.",
+    "Both snapshots are kept; delete them (d) once the merged one replaces them.",
+    "Only directory listings are written, under restic's non-exclusive lock.",
+];
+
+// What the merge will do, before it does it: the two sources, and the identity
+// the new snapshot gets (repo::merged_snapshot_json decides it; this shows the
+// same choice from the rows the list already holds). The keys are in the
+// footer.
+fn render_merge_confirm(frame: &mut Frame, app: &App, area: Rect) {
+    const TITLE: &str = "Merge these two snapshots into a new one?";
+    let Some((newer, older)) = app.merge_rows() else {
+        let para = Paragraph::new("The snapshots picked for the merge are no longer listed.")
+            .block(Block::bordered().title(TITLE));
+        frame.render_widget(para, area);
+        return;
+    };
+
+    let consequences = Paragraph::new(
+        MERGE_CONSEQUENCES
+            .iter()
+            .map(|text| Line::raw(format!("• {text}")))
+            .collect::<Vec<_>>(),
+    )
+    .wrap(Wrap { trim: false })
+    .block(Block::bordered().title("What the merge does"));
+    let inner_width = area.width.saturating_sub(2);
+    let consequences_height =
+        u16::try_from(consequences.line_count(inner_width)).unwrap_or(u16::MAX);
+    let [sources_area, consequences_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(consequences_height)])
+            .areas(area);
+    frame.render_widget(consequences, consequences_area);
+
+    // One line per fact, cut rather than wrapped: a snapshot with many paths
+    // must not push the lines after it out of the block.
+    let room = usize::from(inner_width);
+    let describe = |label: &str, s: &crate::repo::SnapshotRow| {
+        let tags = if s.tags.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", s.tags.join(","))
+        };
+        [
+            format!(" {label}  {}  {}  {}{tags}", short_snap_id(&s.id), s.time, s.host),
+            format!("        {}", s.paths.join(", ")),
+        ]
+    };
+    let all_paths: Vec<&str> = newer
+        .paths
+        .iter()
+        .chain(&older.paths)
+        .map(String::as_str)
+        .collect();
+    let tags: std::collections::BTreeSet<&str> = newer
+        .tags
+        .iter()
+        .chain(&older.tags)
+        .map(String::as_str)
+        .collect();
+    let tags = if tags.is_empty() {
+        "(none)".to_string()
+    } else {
+        tags.into_iter().collect::<Vec<_>>().join(", ")
+    };
+    let mut lines: Vec<String> = Vec::new();
+    lines.extend(describe("newer", newer));
+    lines.extend(describe("older", older));
+    lines.push(String::new());
+    // Sources of one host keep it; a merge across hosts gets a name made of
+    // both (repo::merged_hostname), which neither host's backups look for.
+    let host = crate::repo::merged_hostname(&[newer.host.as_str(), older.host.as_str()])
+        .unwrap_or_else(|| "(none)".to_string());
+    let host_note = if newer.host == older.host { "" } else { "  (two hosts: parent of neither)" };
+    lines.push(" The new snapshot takes its time from the newer one, and".to_string());
+    lines.push(format!("   host   {host}{host_note}"));
+    // As the paths say. A backup of a relative path is not laid out that
+    // way, which only reading its tree shows: the merge then keeps its path
+    // apart (repo::merged_paths). So where a path is left out here as lying
+    // under another, the line says that it may stay — after the list, which
+    // is cut short to leave it room.
+    let paths = crate::repo::merged_paths(&all_paths, &Default::default());
+    let distinct: std::collections::BTreeSet<&str> = all_paths.iter().copied().collect();
+    let nested_note = if paths.len() < distinct.len() {
+        "  (nested ones too, if backed up relative)"
+    } else {
+        ""
+    };
+    let paths = fit_columns(
+        format!("   paths  {}", paths.join(", ")),
+        room.saturating_sub(nested_note.len()),
+    );
+    lines.push(format!("{paths}{nested_note}"));
+    lines.push(format!("   tags   {tags}"));
+    let sources = Paragraph::new(
+        lines
+            .into_iter()
+            .map(|line| Line::raw(fit_columns(line, room)))
+            .collect::<Vec<_>>(),
+    )
+    .block(Block::bordered().title(TITLE));
+    frame.render_widget(sources, sources_area);
+}
+
 fn render_compare_loading(frame: &mut Frame, app: &App, area: Rect) {
     let first = app.compare_first_id.as_deref().map(short_snap_id).unwrap_or("?");
     let second = app.compare_second_id.as_deref().map(short_snap_id).unwrap_or("?");
@@ -1142,6 +1303,49 @@ fn render_prune_confirm(frame: &mut Frame, app: &App, area: Rect) {
     let para = Paragraph::new(body)
         .wrap(Wrap { trim: false })
         .block(Block::bordered().title("Prune repository"));
+    frame.render_widget(para, area);
+}
+
+fn render_merging(frame: &mut Frame, app: &App, area: Rect) {
+    const FRAMES: [char; 4] = ['|', '/', '-', '\\'];
+    let elapsed = app.merge_started.map(|t| t.elapsed()).unwrap_or_default();
+    let spinner = FRAMES[(elapsed.as_millis() / 150) as usize % FRAMES.len()];
+    let secs = elapsed.as_secs();
+    let mut body = format!(
+        "{spinner} Merging the two snapshots under restic's non-exclusive repository lock…  \
+         elapsed {}m{:02}s\n\n\
+         Reading every directory of both, which can take a while on large snapshots.\n\n",
+        secs / 60,
+        secs % 60
+    );
+    // A write being retried (lock::WriteRetries): say why the merge is still
+    // going, since nothing else on the screen moves.
+    if let Some(what) = app.merge_retries.as_ref().and_then(|retries| retries.waiting_on()) {
+        body.push_str(&format!(
+            "Writing {what} failed in a way that leaves open whether the server still stores \
+             it. Giving up would release the lock with that write to come, so it is tried \
+             again for as long as the lock holds.\n\n"
+        ));
+    }
+    if app.merge_stop_requested {
+        // Not "waiting for the write": a stop is only seen at a write or
+        // between reads, and `merge_trees` reads on until it has one to make.
+        // Nor "nothing more is written": a request already sent is not
+        // called back, and the server may store it even after it timed out.
+        body.push_str(
+            "Stopping — no new write is begun; one already sent may still be stored. The \
+             merge ends when the step under way returns…",
+        );
+    } else {
+        body.push_str(
+            "Ctrl+C stops the merge: no new write is begun and no failed one is tried again, \
+             though one already sent may still be stored. The sources are not touched either \
+             way.",
+        );
+    }
+    let para = Paragraph::new(body)
+        .wrap(Wrap { trim: false })
+        .block(Block::bordered().title("Merging snapshots"));
     frame.render_widget(para, area);
 }
 
@@ -2043,6 +2247,9 @@ mod tests {
             Screen::SnapshotTagError(String::new()),
             Screen::SnapshotCompareSecond,
             Screen::SnapshotCompareResults,
+            Screen::SnapshotMergeSecond,
+            Screen::SnapshotMergeConfirm,
+            Screen::SnapshotMergeError(String::new()),
             Screen::PruneConfirm,
             Screen::BackendChoice,
             Screen::Password,

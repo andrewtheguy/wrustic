@@ -5,7 +5,7 @@ repositories, built on [`rustic_core`](https://crates.io/crates/rustic_core)
 and [`ratatui`](https://crates.io/crates/ratatui).
 
 `wrustic` is read-mostly by design: reads are native via `rustic_core`, and
-the write operations it exposes (snapshot delete, tag edits) are native too,
+the write operations it exposes (snapshot delete, tag edits, snapshot merge) are native too,
 guarded by restic-compatible repository locks (docs/locking.md). Stale-lock
 removal is also native, but takes no lock itself — like `restic unlock`, it
 only deletes lock files that are provably stale. Prune shells out to
@@ -25,6 +25,46 @@ exactly which workflows that means.
 - **Snapshot deletion**, native and guarded by a restic-compatible exclusive
   repository lock; when the repo is locked, `u` on the error screen removes
   stale locks (live ones are kept) and retries
+- **Snapshot merge** (`M` on the snapshot list), for special cases such as
+  adding content to an existing snapshot — not a step of ordinary backups,
+  where every `restic backup` already yields a complete snapshot. Back up just
+  a new file or directory with restic, then merge it into the earlier snapshot
+  without reading the rest again: the result is a new snapshot holding the
+  files of both. The two backups have to agree on where things are inside
+  the snapshot: the merge lines files up by their path in the snapshot's tree
+  alone — matching hosts or tags do not. For a target given to restic as an
+  absolute path that is the filesystem path, so back up the addition from its
+  place inside the base: `restic backup /data` as the base, then
+  `restic backup /data/extra` for the addition, not a copy of `extra`
+  somewhere else. A target given as a relative path is stored under that
+  relative path instead — `cd /data && restic backup extra` holds its files
+  under `/extra`, though the snapshot lists `/data/extra` — so check with
+  `restic ls <snapshot>` where a snapshot's files are. Only directory
+  listings are written, the two source
+  snapshots are kept, and it runs under restic's non-exclusive lock alongside
+  running backups. restic itself has no merge; the result is an ordinary
+  snapshot restic reads, and restic chooses it as the parent of the next
+  `restic backup` by its usual rule: the latest snapshot with the backup's
+  host and exactly its paths, unless `--parent`, `--force` or another
+  `--group-by` says otherwise. The merged snapshot is made to qualify —
+  it has the sources' host, their paths with a nested one folded into the
+  directory that holds it, and a time just after the newer source's — when
+  both sources are one host's and their files are where their paths say; a
+  snapshot of that host and those paths taken later than the newer source
+  is the latest instead. A
+  merge of two hosts' snapshots is named for both (`alpha+beta`), which
+  neither host's backups look for, and the path of a relative-path backup is
+  listed apart, not folded. Metadata is
+  kept as far as the merge can: a merged snapshot of backups restic took on
+  Windows is without their Windows attributes (creation time, file attributes,
+  security descriptors), which the sources keep. A merge restic would restore
+  wrong is refused: the two snapshots record one hardlinked inode with
+  different content, permissions, owner, modification time or extended
+  attributes, snapshots of two hosts would have their files hardlinked to
+  each other, or a directory of both holds names with quotes or backslashes
+  that the merge cannot keep in restic's order (docs/locking.md). The merge
+  runs in the background of the TUI; a write the server may still complete
+  is retried while the lock holds, and Ctrl+C stops it
 - **Prune** (`p` on the snapshot list): reclaim the space deleted snapshots
   left behind — runs `restic prune` (restic >= 0.19, the one the installers
   bundle and only that one) with live progress and safe Ctrl+C
@@ -374,8 +414,8 @@ is where the installers put their pinned restic, tucked into a
 subdirectory so it never rides onto PATH — and nothing else: a missing one
 is an error, never a fall back to a `restic` on PATH. Everything else
 is native: `rustic_core` reads the on-disk repository format, and the
-native write operations wrustic exposes (snapshot delete, tag edits) hold
-restic-compatible repository locks, so they coexist safely with
+native write operations wrustic exposes (snapshot delete, tag edits,
+snapshot merge) hold restic-compatible repository locks, so they coexist safely with
 concurrent restic processes; stale-lock removal takes no lock — like
 `restic unlock`, it only deletes lock files that are provably stale.
 [`docs/restic-usage.md`](docs/restic-usage.md) is the per-workflow overview
