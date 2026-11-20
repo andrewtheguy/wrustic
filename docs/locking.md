@@ -224,6 +224,18 @@ lists, restores, checks, forgets and prunes like any other.
   `RepoLock::poisoned()` is checked between the two: a lock that went
   unrefreshed past restic's cutoff means a prune may have run, and the
   snapshot is then not written (the orphaned trees go with the next prune).
+  And it is checked once more when the snapshot write has returned
+  (`RepoLock::write_unpacked_while_held`), because the write itself can
+  outlast the lock: restic gets out of this by cancelling the backend
+  request when its lock goes bad, and wrustic's backends cannot be
+  cancelled, nor do they bound a write to the 7.5 minutes that separate a
+  poisoned lock from a stale one — a local write blocks as long as the
+  filesystem does, S3 has a stall timeout and retries but no total, only
+  REST gives up after 30 seconds. A lock still healthy after the write
+  was refreshed in time throughout (poisoning latches), so no prune can
+  have started before the snapshot existed; a poisoned one means the
+  snapshot may name pruned trees, and it is removed again and the merge
+  reported as failed.
 - **Trees** go through rustic_core's `Repository::merge_trees`: entries are
   matched by path from the root, an entry only one snapshot has is taken
   as is, directories are merged recursively, and where the same path
@@ -263,11 +275,31 @@ lists, restores, checks, forgets and prunes like any other.
   it brings back the files without them. The sources keep theirs, and the
   merge does not delete the sources. So that this is never silent, every
   tree the sources reach is read raw and each node round-tripped through
-  the typed `Node` (`repo::node_fields_the_merge_drops`); the fields that
+  the typed `Node` (`repo::scan_source_trees`); the fields that
   held something and do not come back are returned with the new snapshot's
   id, and the TUI names them in its notice. The check is the round trip
   itself rather than a list of field names, so it stays right when
   rustic_core learns a field.
+- **Hardlinks are carried as recorded, and a merge that would restore
+  them wrong is refused.** restic rebuilds hardlinks on restore from each
+  file's recorded device and inode: of the files with more than one link
+  that share the pair, it writes the first and links the rest to it.
+  `merge_trees` passes the pair on untouched, which is right within a
+  source and usually right across them — but two sources can record one
+  pair on different content: an inode rewritten or reused between the two
+  backups under another path (a directory renamed and a file in it
+  changed in place is enough), or two filesystems that were given the same
+  device number. restic restores such a merged snapshot with every one of
+  those files holding the first one's bytes. Giving the files separate
+  identities would mean writing tree blobs rustic_core has no way to
+  write, so the merge refuses instead, naming the two paths, before any
+  snapshot is written. The test is on the merged tree
+  (`repo::HardlinkGroups`: same device and inode, more than one link,
+  different content), since which entries meet there depends on who won
+  each path — two backups of one directory with a hardlinked file changed
+  in between differ in the sources and merge fine. Reading the merged
+  tree needs a second repository handle with a fresh index, so it only
+  happens when the scan of the sources found such a pair at all.
 - **How much is rewritten depends on the timezone.** rustic_core renders
   node times with the local zone's offset. Where that is what the trees
   already hold, a directory only one source has serializes back to the
@@ -285,7 +317,11 @@ restic lists the merged snapshot under the directory's path alone, with
 the newer source's time and host and both tags, walks every file of both
 through it, and passes `check --read-data`; the next `restic backup` of
 the directory names the merged snapshot as its parent and finds nothing
-new or changed).
+new or changed) and `live_native_merge_restores_hardlinks_with_restic`
+(`restic restore` of a merged snapshot brings back the hardlink groups of
+both sources as separate groups with their own bytes; the renamed-and-
+rewritten pair, which restic restores as four links to one file when
+merged regardless, is refused with nothing written).
 
 **Long-running reads — non-exclusive lock (implemented):** the snapshot
 SMB share (`smb::ShareServer::share_snapshot`). Reads take no lock in wrustic's
@@ -420,6 +456,10 @@ check the result: every file of both sources, each conflict won by the
 newer mtime whichever snapshot it came from, nothing that existed before
 changed or removed. `app::tests::a_merge_runs_while_a_snapshot_of_the_repository_is_shared`
 runs it against the SMB share's real lock.
+`lock::tests::a_file_whose_write_outlasted_the_lock_is_taken_back` covers
+the publication rule: a write that only returns once the lock has gone
+unrefreshed past the cutoff comes back as an error with the file removed,
+and an already poisoned lock writes nothing.
 
 `shared_open_holds_the_append_lock_for_the_handle_lifetime` covers the other
 direction: the guard `open_indexed_full_shared_lock` hands back is held for

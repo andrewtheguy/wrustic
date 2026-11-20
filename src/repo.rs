@@ -520,7 +520,7 @@ fn retag_snapshot_json(raw: &[u8], old_id: &str, new_tags: &[String]) -> Result<
 /// everything restic stores (`generic_attributes`, the Windows metadata).
 /// Metadata is kept as far as that type goes: what it cannot hold is left
 /// out of the merged snapshot, and the sources, which still carry it, are
-/// scanned so the caller can say so ([`node_fields_the_merge_drops`]).
+/// scanned so the caller can say so ([`scan_source_trees`]).
 ///
 /// The snapshot file is written by wrustic, not by rustic_core's
 /// `merge_snapshots`: that one stamps the merging machine's hostname and
@@ -571,7 +571,7 @@ pub(crate) fn merge_snapshots(profile: &Profile, snapshot_ids: &[String]) -> Res
     }
     let newest = newest.map(|(i, _)| i).unwrap_or(0);
 
-    let dropped_node_fields = node_fields_the_merge_drops(&trees, |id| {
+    let scan = scan_source_trees(&trees, |id| {
         Ok(repo.cat_blob(BlobType::Tree, id.to_hex().as_str())?)
     })?;
 
@@ -579,6 +579,37 @@ pub(crate) fn merge_snapshots(profile: &Profile, snapshot_ids: &[String]) -> Res
     let mut summary = SnapshotSummary::default();
     let tree = repo.merge_trees(&trees, &last_modified_node, &mut summary)?;
     let finished = rustic_core::jiff::Timestamp::now();
+
+    // `merge_trees` copies each entry's hardlink identity (device and inode)
+    // through as recorded, and restic restores every file of one identity as
+    // a link to the first. That is wrong where the sources put one identity
+    // on different content — an inode reused or rewritten between the two
+    // backups, or two filesystems that got the same device number. Whether
+    // the merged tree really holds such a pair depends on which entry won
+    // each path, so it is the merged tree that is asked, and only when the
+    // sources make it possible: this handle's index predates the trees just
+    // written, hence the second one.
+    if scan.hardlinks.clash.is_some() {
+        let merged = open_indexed_full(profile)?;
+        let mut links = HardlinkGroups::default();
+        visit_raw_nodes(
+            &[tree],
+            |id| Ok(merged.cat_blob(BlobType::Tree, id.to_hex().as_str())?),
+            |dir, node| {
+                links.add(dir, node);
+                Ok(())
+            },
+        )?;
+        if let Some((first, second)) = links.clash {
+            bail!(
+                "these snapshots cannot be merged: `{first}` and `{second}` are recorded as \
+                 hardlinks of one file (the same device and inode) but hold different content, \
+                 and restic would restore both with the content of one. No snapshot was \
+                 written; nothing refers to the trees the attempt wrote, and the next prune \
+                 removes them"
+            );
+        }
+    }
 
     // restic's abort-if-unrefreshable rule: a lock that went unrefreshed for
     // too long may already have been removed as stale, after which a prune
@@ -608,7 +639,11 @@ pub(crate) fn merge_snapshots(profile: &Profile, snapshot_ids: &[String]) -> Res
     }
 
     let snapshots = lock::snapshot_backend_for_profile(profile)?;
-    let new_id = lock::write_unpacked(snapshots.as_ref(), &crypto, &json)?;
+    // Published through the lock, which takes the snapshot back if it turns
+    // out to have gone bad while the write was under way: until the snapshot
+    // exists nothing refers to the merged trees, and a prune that got in
+    // would have removed them.
+    let new_id = repo_lock.write_unpacked_while_held(snapshots.as_ref(), &crypto, &json)?;
     // Same proof the tag edit asks for: an independent reader decodes our
     // envelope to exactly the JSON we meant to store.
     let readback = repo
@@ -620,7 +655,7 @@ pub(crate) fn merge_snapshots(profile: &Profile, snapshot_ids: &[String]) -> Res
     }
     Ok(MergeOutcome {
         snapshot_id: new_id,
-        dropped_node_fields: dropped_node_fields.into_iter().collect(),
+        dropped_node_fields: scan.dropped_node_fields.into_iter().collect(),
     })
 }
 
@@ -630,28 +665,57 @@ pub(crate) struct MergeOutcome {
     /// The new snapshot's id.
     pub(crate) snapshot_id: String,
     /// Tree-node fields the sources hold and the merged snapshot does not
-    /// ([`node_fields_the_merge_drops`]), sorted; empty when nothing was lost.
+    /// ([`scan_source_trees`]), sorted; empty when nothing was lost.
     pub(crate) dropped_node_fields: Vec<String>,
 }
 
-/// The node metadata a merge of these trees leaves behind, by field name.
-///
-/// `Repository::merge_trees` reads every directory of every source into
-/// rustic_core's typed `Node` and writes it back from there, and a field that
-/// type does not model is not in the merged snapshot — as of rustic_core 0.14
-/// that is restic's `generic_attributes` (Windows creation time, file
-/// attributes and security descriptors). The merge goes ahead regardless;
-/// this is how it knows what to report. Every tree the sources reach is read
-/// raw through `read_tree` and each node checked
-/// ([`unpreserved_node_fields`]).
-fn node_fields_the_merge_drops<B: AsRef<[u8]>>(
+/// What a merge has to know about its sources before it runs.
+#[derive(Default)]
+struct SourceScan {
+    /// The node metadata the merge leaves behind, by field name.
+    ///
+    /// `Repository::merge_trees` reads every directory of every source into
+    /// rustic_core's typed `Node` and writes it back from there, and a field
+    /// that type does not model is not in the merged snapshot — as of
+    /// rustic_core 0.14 that is restic's `generic_attributes` (Windows
+    /// creation time, file attributes and security descriptors). The merge
+    /// goes ahead regardless; this is how it knows what to report
+    /// ([`unpreserved_node_fields`]).
+    dropped_node_fields: std::collections::BTreeSet<String>,
+    /// The hardlink groups of all sources taken together. A clash here means
+    /// the merged tree may hold one, depending on which entries win.
+    hardlinks: HardlinkGroups,
+}
+
+/// Reads every tree the sources reach, raw, through `read_tree`.
+fn scan_source_trees<B: AsRef<[u8]>>(
     roots: &[TreeId],
     read_tree: impl Fn(&TreeId) -> Result<B>,
-) -> Result<std::collections::BTreeSet<String>> {
-    let mut dropped = std::collections::BTreeSet::new();
-    let mut seen: std::collections::HashSet<TreeId> = roots.iter().copied().collect();
-    let mut pending: Vec<TreeId> = seen.iter().copied().collect();
-    while let Some(id) = pending.pop() {
+) -> Result<SourceScan> {
+    let mut scan = SourceScan::default();
+    visit_raw_nodes(roots, read_tree, |dir, node| {
+        scan.dropped_node_fields.extend(unpreserved_node_fields(node)?);
+        scan.hardlinks.add(dir, node);
+        Ok(())
+    })?;
+    Ok(scan)
+}
+
+/// Calls `visit` with every node of every tree reachable from `roots`, as the
+/// raw JSON restic reads, and the path of the directory holding it. A tree
+/// reached more than once is read and visited once, under the first path.
+fn visit_raw_nodes<B: AsRef<[u8]>>(
+    roots: &[TreeId],
+    read_tree: impl Fn(&TreeId) -> Result<B>,
+    mut visit: impl FnMut(&str, &serde_json::Value) -> Result<()>,
+) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    let mut pending: Vec<(TreeId, String)> = roots
+        .iter()
+        .filter(|id| seen.insert(**id))
+        .map(|id| (*id, String::new()))
+        .collect();
+    while let Some((id, dir)) = pending.pop() {
         let hex = id.to_hex();
         let raw = read_tree(&id)?;
         let tree: serde_json::Value = serde_json::from_slice(raw.as_ref())
@@ -662,18 +726,59 @@ fn node_fields_the_merge_drops<B: AsRef<[u8]>>(
             Some(_) => bail!("tree {} has a `nodes` entry that is not a list", hex.as_str()),
         };
         for node in nodes {
-            dropped.extend(unpreserved_node_fields(node)?);
+            visit(&dir, node)?;
             if let Some(subtree) = node.get("subtree").and_then(|s| s.as_str()) {
                 let subtree: TreeId = subtree
                     .parse()
                     .map_err(|e| anyhow!("tree {} names a bad subtree id: {e}", hex.as_str()))?;
                 if seen.insert(subtree) {
-                    pending.push(subtree);
+                    let name = node.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                    pending.push((subtree, format!("{dir}/{name}")));
                 }
             }
         }
     }
-    Ok(dropped)
+    Ok(())
+}
+
+/// Hardlink groups as restic's restorer forms them: every file with more than
+/// one link belongs to the group of its device and inode, and a restore
+/// writes the first file of a group and links the others to it. A group
+/// whose files do not all hold the same content is therefore restored wrong —
+/// the `clash`, as the paths of the two files that first showed it.
+#[derive(Default)]
+struct HardlinkGroups {
+    // (device, inode) → the content and path of the first file seen with it.
+    first: std::collections::HashMap<(u64, u64), (serde_json::Value, String)>,
+    clash: Option<(String, String)>,
+}
+
+impl HardlinkGroups {
+    fn add(&mut self, dir: &str, node: &serde_json::Value) {
+        let number = |key: &str| node.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0);
+        let is_file = node.get("type").and_then(|t| t.as_str()) == Some("file");
+        if self.clash.is_some() || !is_file || number("links") < 2 {
+            return;
+        }
+        let name = node.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+        let path = format!("{dir}/{name}");
+        // An empty file is `null` to restic and `[]` to rustic_core.
+        let content = match node.get("content") {
+            Some(content) if !content.is_null() => content.clone(),
+            _ => serde_json::Value::Array(Vec::new()),
+        };
+        match self.first.entry((number("device_id"), number("inode"))) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                let _ = slot.insert((content, path));
+            }
+            std::collections::hash_map::Entry::Occupied(slot) => {
+                let (first_content, first_path) = slot.get();
+                if *first_content != content {
+                    self.clash = Some((first_path.clone(), path));
+                }
+            }
+        }
+    }
 }
 
 /// The fields of one raw tree node that would not survive a round trip
@@ -1677,9 +1782,11 @@ mod tests {
             Ok(serde_json::to_vec(tree)?)
         };
 
-        let dropped = node_fields_the_merge_drops(&[first, second], read_tree).expect("scan");
+        let dropped = |roots: &[TreeId]| {
+            scan_source_trees(roots, read_tree).map(|scan| scan.dropped_node_fields)
+        };
         assert_eq!(
-            dropped.into_iter().collect::<Vec<_>>(),
+            dropped(&[first, second]).expect("scan").into_iter().collect::<Vec<_>>(),
             ["a_field_of_the_future", "generic_attributes"]
         );
         let mut read = reads.borrow().clone();
@@ -1687,9 +1794,126 @@ mod tests {
         assert_eq!(read, [first, second, shared, deep, deeper], "each tree is read once");
 
         // Nothing to report where every field survives.
-        assert!(node_fields_the_merge_drops(&[first], read_tree).expect("scan").is_empty());
+        assert!(dropped(&[first]).expect("scan").is_empty());
         // A tree that cannot be read is an error, not "nothing lost".
-        assert!(node_fields_the_merge_drops(&[id(9)], read_tree).is_err());
+        assert!(dropped(&[id(9)]).is_err());
+    }
+
+    // restic restores every multi-link file of one device and inode as a link
+    // to the first, so the only thing that makes a group wrong is two of its
+    // files holding different content. Everything else has to pass: links of
+    // one file, the same inode number on another device, files with a single
+    // link, directories (whose link count is not about hardlinks).
+    #[test]
+    fn hardlink_groups_clash_on_one_identity_with_different_content() {
+        let node = |name: &str, kind: &str, links: u64, device: u64, inode: u64, content: &str| {
+            serde_json::json!({
+                "name": name, "type": kind, "links": links, "device_id": device,
+                "inode": inode, "content": [content],
+            })
+        };
+        let mut groups = HardlinkGroups::default();
+        groups.add("/one", &node("p", "file", 2, 1, 7, "aa"));
+        groups.add("/one", &node("q", "file", 2, 1, 7, "aa"));
+        groups.add("/other-disk", &node("p", "file", 2, 2, 7, "bb"));
+        groups.add("/one", &node("single", "file", 1, 1, 7, "cc"));
+        groups.add("/one", &node("dir", "dir", 2, 1, 7, "dd"));
+        // An empty file: `null` from restic, `[]` from rustic_core.
+        let mut empty = node("e1", "file", 2, 1, 8, "");
+        empty["content"] = serde_json::Value::Null;
+        groups.add("/one", &empty);
+        empty["content"] = serde_json::json!([]);
+        groups.add("/one", &empty);
+        assert!(groups.clash.is_none(), "{:?}", groups.clash);
+
+        groups.add("/two", &node("p", "file", 2, 1, 7, "ee"));
+        assert_eq!(groups.clash, Some(("/one/p".to_string(), "/two/p".to_string())));
+    }
+
+    // One hardlink identity on different content, the way it happens for
+    // real: a directory of hardlinked files is renamed and a file rewritten in
+    // place between two backups, so both snapshots record the same inode with
+    // different content, at different paths. Merged as they are, restic would
+    // restore all four files as links to one (see
+    // `live_native_merge_restores_hardlinks_with_restic`), so the merge must
+    // refuse — and leave no snapshot behind.
+    #[cfg(unix)]
+    #[test]
+    fn merge_refuses_one_hardlink_identity_on_different_content() {
+        let _guard = lock::test_acquire_guard();
+        let fixture = TestRepo::init("merge-hardlink-clash");
+        let source = fixture.source_path();
+
+        std::fs::create_dir_all(source.join("one")).unwrap();
+        std::fs::write(source.join("one/p"), b"old\n").unwrap();
+        std::fs::hard_link(source.join("one/p"), source.join("one/q")).unwrap();
+        let first = fixture.backup(&[], &["one"]);
+
+        std::fs::rename(source.join("one"), source.join("two")).unwrap();
+        // Rewritten in place: still the inode `two/q` links to.
+        std::fs::write(source.join("two/p"), b"new content\n").unwrap();
+        let second = fixture.backup(&[], &["two"]);
+
+        let err = merge_snapshots(fixture.profile(), &[first, second])
+            .expect_err("a merge restic would restore wrong must be refused");
+        let message = format!("{err:#}");
+        assert!(message.contains("hardlinks of one file"), "{message}");
+        assert!(message.contains("/one/") && message.contains("/two/"), "{message}");
+        assert!(!lock::is_lock_error(&message), "unlocking would not help: {message}");
+        assert_eq!(
+            load_snapshots(fixture.profile()).expect("list snapshots").rows.len(),
+            2,
+            "no merged snapshot may have been written"
+        );
+        assert_eq!(fixture.lock_count(), 0, "the refused merge must release its lock");
+    }
+
+    // The same identity on different content in the *sources* is not yet a
+    // clash in the merged tree: two backups of one directory, with a
+    // hardlinked file rewritten in between, differ exactly like that, and the
+    // merge takes both links from the newer backup. That must go through,
+    // with the hardlink group intact.
+    #[cfg(unix)]
+    #[test]
+    fn merge_keeps_a_hardlink_group_both_sources_hold_at_different_times() {
+        let _guard = lock::test_acquire_guard();
+        let fixture = TestRepo::init("merge-hardlink-kept");
+        let source = fixture.source_path();
+
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("a"), b"old\n").unwrap();
+        std::fs::hard_link(source.join("a"), source.join("b")).unwrap();
+        set_mtime(&source.join("a"), 3600);
+        let first = fixture.backup(&[], &["one"]);
+        let second = fixture.backup(&[("a", b"new content\n")], &["two"]);
+
+        let merged = merge_snapshots(fixture.profile(), &[first, second])
+            .expect("the merged tree holds one consistent group")
+            .snapshot_id;
+        let root = snapshot_root_tree(
+            &open_indexed(fixture.profile()).expect("open the repository"),
+            &merged,
+        )
+        .expect("merged root");
+        let repo = open_indexed_full(fixture.profile()).expect("open with the full index");
+        let mut links = HardlinkGroups::default();
+        let mut sizes = Vec::new();
+        visit_raw_nodes(
+            &[root],
+            |id| Ok(repo.cat_blob(BlobType::Tree, id.to_hex().as_str())?),
+            |dir, node| {
+                if node["type"] == "file" {
+                    assert_eq!(node["links"], 2, "{node}");
+                    sizes.push(node["size"].as_u64());
+                }
+                links.add(dir, node);
+                Ok(())
+            },
+        )
+        .expect("walk the merged tree");
+        assert_eq!(sizes, [Some(12), Some(12)], "both links hold the newer content");
+        assert!(links.clash.is_none());
+        assert_eq!(links.first.len(), 1, "the two files are one hardlink group");
     }
 
     fn set_mtime(path: &std::path::Path, secs_ago: u64) {
@@ -2233,6 +2457,105 @@ mod tests {
             .find(|s| s["id"] == summary["snapshot_id"])
             .expect("the new snapshot is listed");
         assert_eq!(latest["parent"], serde_json::json!(merged));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // Hardlinks through the merge, judged by what restic restores. restic
+    // rebuilds them from each file's recorded device and inode, which the merge
+    // passes on as it finds them: groups from different sources must come back
+    // as the separate groups they were, with their own bytes — and the pair of
+    // snapshots that put one inode on different content (a directory renamed
+    // and a file rewritten in place between the backups), which restic would
+    // restore as four links to one file, must not merge at all.
+    // Marked #[ignore]; run with `cargo test -- --ignored` (needs a restic
+    // copied to target/debug/deps/restic/, the harness's only lookup).
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn live_native_merge_restores_hardlinks_with_restic() {
+        use std::os::unix::fs::MetadataExt;
+        let _guard = lock::test_acquire_guard();
+
+        let root =
+            std::path::PathBuf::from("tmp").join(format!("merge-links-it-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("source/data/links")).unwrap();
+        std::fs::create_dir_all(root.join("source/clash/one")).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+        let (data, clash) = (root.join("source/data"), root.join("source/clash"));
+
+        let profile = Profile::Local {
+            password: "pw".into(),
+            local_path: root.join("repo").to_string_lossy().into_owned(),
+        };
+        crate::restic::run(&profile, &["init", "--json"]).expect("restic init");
+        let backup = |path: &std::path::Path, tag: &str| {
+            crate::restic::run(&profile, &["backup", path.to_str().unwrap(), "--tag", tag, "--json"])
+                .unwrap_or_else(|e| panic!("restic backup of {}: {e:#}", path.display()));
+        };
+        let snapshot_tagged = |tag: &str| {
+            load_snapshots(&profile)
+                .expect("list snapshots")
+                .rows
+                .into_iter()
+                .find(|row| row.tags == [tag])
+                .unwrap_or_else(|| panic!("no snapshot tagged {tag}"))
+                .id
+        };
+
+        // Two sources, a hardlink group in each.
+        std::fs::write(data.join("links/a"), b"linked\n").unwrap();
+        std::fs::hard_link(data.join("links/a"), data.join("links/b")).unwrap();
+        std::fs::write(data.join("plain"), b"plain\n").unwrap();
+        backup(&data, "base");
+        std::fs::create_dir_all(data.join("extra")).unwrap();
+        std::fs::write(data.join("extra/x"), b"extra\n").unwrap();
+        std::fs::hard_link(data.join("extra/x"), data.join("extra/y")).unwrap();
+        backup(&data.join("extra"), "added");
+
+        let merged = merge_snapshots(&profile, &[snapshot_tagged("base"), snapshot_tagged("added")])
+            .expect("native merge")
+            .snapshot_id;
+        let target = root.join("restored");
+        crate::restic::run(
+            &profile,
+            &["restore", &merged, "--target", target.to_str().unwrap(), "--json"],
+        )
+        .expect("restic restore of the merged snapshot");
+        let restored = target.join(data.strip_prefix("/").unwrap());
+        let file = |name: &str| {
+            let path = restored.join(name);
+            let meta = std::fs::metadata(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
+            (std::fs::read(&path).unwrap(), meta.ino(), meta.nlink())
+        };
+        let (a, b, x, y, plain) =
+            (file("links/a"), file("links/b"), file("extra/x"), file("extra/y"), file("plain"));
+        assert_eq!((a.0.as_slice(), a.2), (b"linked\n".as_slice(), 2));
+        assert_eq!(a, b, "links/a and links/b are one file again");
+        assert_eq!((x.0.as_slice(), x.2), (b"extra\n".as_slice(), 2));
+        assert_eq!(x, y, "extra/x and extra/y are one file again");
+        assert_ne!(a.1, x.1, "the two groups stay apart");
+        assert_eq!((plain.0.as_slice(), plain.2), (b"plain\n".as_slice(), 1));
+
+        // One inode, two contents, two paths.
+        std::fs::write(clash.join("one/p"), b"old\n").unwrap();
+        std::fs::hard_link(clash.join("one/p"), clash.join("one/q")).unwrap();
+        backup(&clash.join("one"), "clash-one");
+        std::fs::rename(clash.join("one"), clash.join("two")).unwrap();
+        std::fs::write(clash.join("two/p"), b"new content\n").unwrap();
+        backup(&clash.join("two"), "clash-two");
+
+        let before = load_snapshots(&profile).expect("list snapshots").rows.len();
+        let err = merge_snapshots(
+            &profile,
+            &[snapshot_tagged("clash-one"), snapshot_tagged("clash-two")],
+        )
+        .expect_err("restic would restore this merge with the wrong bytes");
+        assert!(format!("{err:#}").contains("hardlinks of one file"), "{err:#}");
+        assert_eq!(load_snapshots(&profile).expect("list snapshots").rows.len(), before);
+        crate::restic::run(&profile, &["check", "--read-data", "--json"])
+            .expect("restic check after the refused merge");
 
         std::fs::remove_dir_all(&root).ok();
     }

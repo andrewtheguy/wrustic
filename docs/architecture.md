@@ -224,7 +224,9 @@ smbanything's own docs. The architectural points:
   writes itself so restic finds it as the parent of the next backup. The
   source snapshots are kept. Metadata is best effort: the returned
   `MergeOutcome` names the node fields `merge_trees` could not carry over
-  (restic's Windows attributes), for the notice the TUI shows.
+  (restic's Windows attributes), for the notice the TUI shows. Refused
+  when the merged tree would put one hardlink identity on different
+  content, which restic restores wrong.
 - `unlock(profile)` — native stale-lock removal, offered with `u` on the
   delete-error screen when `lock::is_lock_error()` matches the failure.
   Only locks that are provably dead are removed (older than restic's

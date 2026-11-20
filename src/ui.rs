@@ -1106,29 +1106,59 @@ fn render_merge_second(frame: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
+// What a merge does that the user has to know before saying yes. Shown in a
+// block of its own that is laid out first, so it stays whole however much the
+// snapshots above it have to say and however small the terminal is.
+const MERGE_CONSEQUENCES: [&str; 4] = [
+    "Entries are combined by path; where both hold one, the later-modified wins.",
+    "Windows-only metadata (creation time, file attributes, security descriptors) \
+     is not carried into the new snapshot.",
+    "Both snapshots are kept; delete them (d) once the merged one replaces them.",
+    "Only directory listings are written, under restic's non-exclusive lock.",
+];
+
 // What the merge will do, before it does it: the two sources, and the identity
 // the new snapshot gets (repo::merged_snapshot_json decides it; this shows the
-// same choice from the rows the list already holds).
+// same choice from the rows the list already holds). The keys are in the
+// footer.
 fn render_merge_confirm(frame: &mut Frame, app: &App, area: Rect) {
+    const TITLE: &str = "Merge these two snapshots into a new one?";
     let Some((newer, older)) = app.merge_rows() else {
         let para = Paragraph::new("The snapshots picked for the merge are no longer listed.")
-            .block(Block::bordered().title("Merge snapshots"));
+            .block(Block::bordered().title(TITLE));
         frame.render_widget(para, area);
         return;
     };
-    let describe = |s: &crate::repo::SnapshotRow| {
+
+    let consequences = Paragraph::new(
+        MERGE_CONSEQUENCES
+            .iter()
+            .map(|text| Line::raw(format!("• {text}")))
+            .collect::<Vec<_>>(),
+    )
+    .wrap(Wrap { trim: false })
+    .block(Block::bordered().title("What the merge does"));
+    let inner_width = area.width.saturating_sub(2);
+    let consequences_height =
+        u16::try_from(consequences.line_count(inner_width)).unwrap_or(u16::MAX);
+    let [sources_area, consequences_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(consequences_height)])
+            .areas(area);
+    frame.render_widget(consequences, consequences_area);
+
+    // One line per fact, cut rather than wrapped: a snapshot with many paths
+    // must not push the lines after it out of the block.
+    let room = usize::from(inner_width);
+    let describe = |label: &str, s: &crate::repo::SnapshotRow| {
         let tags = if s.tags.is_empty() {
             String::new()
         } else {
             format!("  [{}]", s.tags.join(","))
         };
-        format!(
-            "  {}  {}  {}{tags}\n            {}",
-            short_snap_id(&s.id),
-            s.time,
-            s.host,
-            s.paths.join(", "),
-        )
+        [
+            format!(" {label}  {}  {}  {}{tags}", short_snap_id(&s.id), s.time, s.host),
+            format!("        {}", s.paths.join(", ")),
+        ]
     };
     let all_paths: Vec<&str> = newer
         .paths
@@ -1147,32 +1177,21 @@ fn render_merge_confirm(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         tags.into_iter().collect::<Vec<_>>().join(", ")
     };
-    let body = format!(
-        "Merge these two snapshots into a new one?\n\n\
-         {}\n{}\n\n\
-         The new snapshot will carry\n\
-         \x20 time   {}  (the newer one's)\n\
-         \x20 host   {}  (the newer one's)\n\
-         \x20 paths  {}\n\
-         \x20 tags   {tags}\n\n\
-         Files and directories of both are combined by path. Where both hold the same \
-         path, the entry modified later wins. Metadata is kept as far as the merge can: \
-         what restic stores only on Windows (creation time, file attributes, security \
-         descriptors) is not carried into the new snapshot.\n\n\
-         Only directory listings are written — no file content is read or stored again. \
-         Both snapshots are kept; delete them afterwards (d) if the merged one replaces \
-         them. Runs under restic's non-exclusive lock, alongside running backups.\n\n\
-         y/Enter merge   Backspace pick another   n/Esc cancel",
-        describe(newer),
-        describe(older),
-        newer.time,
-        newer.host,
-        crate::repo::merged_paths(&all_paths).join(", "),
-    );
-    let para = Paragraph::new(body)
-        .wrap(Wrap { trim: false })
-        .block(Block::bordered().title("Merge snapshots"));
-    frame.render_widget(para, area);
+    let mut lines: Vec<String> = Vec::new();
+    lines.extend(describe("newer", newer));
+    lines.extend(describe("older", older));
+    lines.push(String::new());
+    lines.push(" The new snapshot takes its time and host from the newer one, and".to_string());
+    lines.push(format!("   paths  {}", crate::repo::merged_paths(&all_paths).join(", ")));
+    lines.push(format!("   tags   {tags}"));
+    let sources = Paragraph::new(
+        lines
+            .into_iter()
+            .map(|line| Line::raw(fit_columns(line, room)))
+            .collect::<Vec<_>>(),
+    )
+    .block(Block::bordered().title(TITLE));
+    frame.render_widget(sources, sources_area);
 }
 
 fn render_compare_loading(frame: &mut Frame, app: &App, area: Rect) {

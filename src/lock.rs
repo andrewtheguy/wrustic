@@ -619,6 +619,46 @@ impl RepoLock {
         }
     }
 
+    /// [`write_unpacked`] for a file that is only sound if this lock held
+    /// until it was stored — a snapshot naming blobs nothing else refers to
+    /// yet, which a prune deletes once the lock is out of its way.
+    ///
+    /// Checking [`Self::poisoned`] beforehand is not enough for that, because
+    /// no backend bounds the write to the 7.5 minutes a lock stays valid for
+    /// others after it turns poisoned: a local write blocks for as long as
+    /// the filesystem does, the S3 one has a stall timeout and retries but no
+    /// total, and only REST gives up after 30 seconds. None can be cancelled
+    /// from another thread either. So the lock is asked again once the write
+    /// returned: still healthy means it was refreshed in time all the way
+    /// through (poisoning latches), so no prune can have started before the
+    /// file existed. Poisoned means that is no longer known, and the file is
+    /// removed again rather than reported as written.
+    pub(crate) fn write_unpacked_while_held(
+        &self,
+        backend: &dyn LockBackend,
+        crypto: &RepoCrypto,
+        plain: &[u8],
+    ) -> Result<String> {
+        if self.poisoned() {
+            bail!("the repository lock could not be refreshed in time; nothing was written");
+        }
+        let name = write_unpacked(backend, crypto, plain)?;
+        if self.poisoned() {
+            let cleanup = match backend.remove(&name) {
+                Ok(()) => "it was removed again".to_string(),
+                Err(e) => format!(
+                    "and removing it failed ({e:#}) — it may refer to data a prune has \
+                     deleted, so check the repository and remove it"
+                ),
+            };
+            bail!(
+                "the repository lock could not be refreshed while {name} was being written, so \
+                 it cannot be trusted; {cleanup}"
+            );
+        }
+        Ok(name)
+    }
+
     // restic's acquisition protocol: write our lock, wait 200 ms, then check
     // again — if a conflicting lock appeared concurrently, back off by
     // removing our own lock and failing.
@@ -1290,6 +1330,58 @@ mod tests {
 
         drop(lock);
         assert_eq!(backend.count(), 0);
+    }
+
+    // A file that depends on the lock, written by a backend that takes longer
+    // than the lock lasts: the write itself succeeds, so only asking the lock
+    // again afterwards can tell that the file may already point at pruned
+    // data. It must come back as an error with the file gone — and a lock
+    // that is already bad must not get as far as writing.
+    #[test]
+    fn a_file_whose_write_outlasted_the_lock_is_taken_back() {
+        let _guard = test_acquire_guard();
+        let locks = MemLockBackend::new();
+        let crypto = test_crypto(true);
+        let lock = RepoLock::acquire_exclusive_with_refresh_interval(
+            Arc::clone(&locks) as Arc<dyn LockBackend>,
+            crypto.clone(),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+
+        let files = MemLockBackend::new();
+        let name = lock
+            .write_unpacked_while_held(files.as_ref(), &crypto, b"{\"kept\":true}")
+            .expect("a healthy lock publishes");
+        assert!(files.read(&name).unwrap().is_some());
+
+        // From here no refresh succeeds, and the next write does not return
+        // until the lock has gone bad over it.
+        locks.fail_writes.store(true, Ordering::SeqCst);
+        let health = lock.health();
+        files.set_write_hook(Box::new(move |_| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !health.poisoned() {
+                assert!(std::time::Instant::now() < deadline, "lock never became poisoned");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }));
+        let err = lock
+            .write_unpacked_while_held(files.as_ref(), &crypto, b"{\"kept\":false}")
+            .expect_err("a write that outlasted the lock must not count as written");
+        assert!(format!("{err:#}").contains("removed again"), "{err:#}");
+        assert_eq!(files.count(), 1, "only the file written under the healthy lock remains");
+        assert!(files.read(&name).unwrap().is_some());
+
+        let err = lock
+            .write_unpacked_while_held(files.as_ref(), &crypto, b"{\"late\":true}")
+            .expect_err("a poisoned lock must not publish at all");
+        assert!(format!("{err:#}").contains("nothing was written"), "{err:#}");
+        assert_eq!(files.count(), 1);
+
+        locks.fail_writes.store(false, Ordering::SeqCst);
+        drop(lock);
+        assert_eq!(locks.count(), 0);
     }
 
     // The same outage with nobody asking until it is over: a holder busy

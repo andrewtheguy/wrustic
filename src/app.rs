@@ -3902,6 +3902,67 @@ mod tests {
         assert!(app.merge_first_id.is_none());
     }
 
+    fn screen_text(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                .expect("test terminal");
+        terminal.draw(|frame| crate::ui::render(frame, app)).expect("draw");
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    // The confirmation is the last thing read before a merge runs, so what it
+    // says about the consequences has to be on the screen in full — on an
+    // 80×24 terminal, and with snapshots that have far more to list than fits.
+    #[test]
+    fn merge_confirmation_shows_every_consequence_on_an_80x24_terminal() {
+        let snapshot = |id: &str, time: &str, tags: &[&str], paths: &[&str]| {
+            let mut r = row("fileserver-01.example.internal", tags, paths);
+            r.id = id.repeat(16);
+            r.time = time.into();
+            r
+        };
+        let many: Vec<String> =
+            (0..40).map(|i| format!("/srv/projects/department-{i:02}/shared-documents")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        for (case, older_paths) in
+            [("ordinary", vec!["/srv/data"]), ("forty long paths", many)]
+        {
+            let mut app = boot_app_with_snapshots(vec![
+                snapshot("abcd", "2026-11-20 06:50:55", &["added", "weekly"], &["/srv/data/extra"]),
+                snapshot("1234", "2026-11-19 22:05:10", &["base", "nightly"], &older_paths),
+            ]);
+            app.screen = Screen::Snapshots;
+            app.list_state.select(Some(1));
+            press(&mut app, KeyCode::Char('M'));
+            press(&mut app, KeyCode::Enter);
+            assert!(matches!(app.screen, Screen::SnapshotMergeConfirm));
+
+            let lines = screen_text(&mut app, 80, 24);
+            // Wrapped lines rejoined, without the borders between them.
+            let text = lines
+                .iter()
+                .map(|line| line.trim_matches(|c: char| c == '│' || c.is_whitespace()))
+                .collect::<Vec<_>>()
+                .join(" ");
+            for consequence in [
+                "Entries are combined by path; where both hold one, the later-modified wins.",
+                "Windows-only metadata (creation time, file attributes, security descriptors) \
+                 is not carried into the new snapshot.",
+                "Both snapshots are kept; delete them (d) once the merged one replaces them.",
+                "Only directory listings are written, under restic's non-exclusive lock.",
+            ] {
+                assert!(text.contains(consequence), "{case}: `{consequence}` missing:\n{lines:#?}");
+            }
+            for shown in ["abcdabcd", "12341234", "tags   added, base, nightly, weekly", "y merge"]
+            {
+                assert!(text.contains(shown), "{case}: `{shown}` missing:\n{lines:#?}");
+            }
+        }
+    }
+
     #[test]
     fn shift_m_needs_a_second_snapshot() {
         let mut app = boot_app_with_snapshots(vec![row_with_id("aaa")]);

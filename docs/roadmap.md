@@ -34,13 +34,15 @@
   lock that docs/locking.md so far keeps on the restic CLI
 - Lossless snapshot merge. The merge goes through rustic_core's typed tree
   nodes, so the merged snapshot is without what that type cannot hold
-  (restic's Windows `generic_attributes`), and it rewrites every
-  directory when the trees were written in another timezone
-  (docs/locking.md, "Native snapshot merge"). Merging the tree JSON itself
-  would lift both limits and write only the directories the sources
-  share, but rustic_core has no public way to store a tree blob, so it
-  means wrustic writing pack and index files itself — the same trade the
-  lock module made for its envelope, at a larger size
+  (restic's Windows `generic_attributes`), it rewrites every directory
+  when the trees were written in another timezone, and it has to refuse
+  sources that record one hardlink identity on different content, where
+  giving the files separate identities would do (docs/locking.md, "Native
+  snapshot merge"). Merging the tree JSON itself would lift all three
+  limits and write only the directories the sources share, but
+  rustic_core has no public way to store a tree blob, so it means wrustic
+  writing pack and index files itself — the same trade the lock module
+  made for its envelope, at a larger size
 - Read-only "index of" browser over HTTP: walk a snapshot's tree in a web
   browser and download files, served by the existing local file-share
   server. Where it starts is still to be decided — the snapshot list, or a

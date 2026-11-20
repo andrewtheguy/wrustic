@@ -35,7 +35,9 @@ exactly which workflows that means.
   its parent. Metadata is kept as far as the merge can: a merged snapshot
   of backups restic took on Windows is without their Windows attributes
   (creation time, file attributes, security descriptors), which the
-  sources keep (docs/locking.md)
+  sources keep. A merge restic would restore wrong — the two snapshots
+  record one hardlinked inode with different content — is refused
+  (docs/locking.md)
 - **Prune** (`p` on the snapshot list): reclaim the space deleted snapshots
   left behind — runs `restic prune` (restic >= 0.19, the one the installers
   bundle and only that one) with live progress and safe Ctrl+C
