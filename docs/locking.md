@@ -271,23 +271,33 @@ lists, restores, checks, forgets and prunes like any other.
   treated as possibly stored — a timeout after the server committed —
   whatever the lock's health. It is checked against the repository
   first: a snapshot that is there as written, under a healthy lock, is
-  published and reported as that; one that is not is written once more,
+  published and reported as that; one that is not is written again,
   since a write that then succeeds settles it whatever became of the
-  first. Only if that fails too, or the lock is lost, is the file
-  removed and the error passed on, naming the file.
-  A removal cannot settle everything, though, and the error does not
-  pretend it does. A server that has taken a write in full stores it
-  whether or not the client is still waiting: rest-server reads the
-  body and goes on to sync and rename without looking at the connection
-  again, and answers a removal sent in between with success, there being
-  nothing to remove yet. No call from the client cancels such a write or
-  waits for it, so for the REST and S3 backends a failed write followed
-  by a successful removal can still be published later
+  earlier ones.
+  How often it is written again depends on what a failed write leaves
+  behind. A server that has taken a write in full stores it whether or
+  not the client is still waiting: rest-server reads the body and goes
+  on to sync and rename without looking at the connection again, and
+  answers a removal sent in between with success, there being nothing to
+  remove yet. No call from the client cancels such a write or waits for
+  it, so for the REST and S3 backends a failed write followed by a
+  successful removal can still be published later
   (`LockBackend::failed_write_can_land_later`; false for a local
-  repository, where the write is this process's own system calls). In
-  that case the error says the snapshot may still turn up and is to be
-  removed if it does — it would by then name trees that a prune is free
-  to delete.
+  repository, where the write is this process's own system calls).
+  Giving up on such a write would release the lock with the write still
+  to come: a prune could then delete the merged trees, and the snapshot
+  that turns up afterwards would name them. Under the lock a late write
+  does no harm, so for these backends the merge does not give up while
+  the lock is healthy — it checks the repository and writes again, five
+  seconds apart, until the snapshot is stored or the lock is lost. With
+  the repository out of reach that is the 22.5 minutes the lock takes to
+  turn bad, during which the merge screen stays up. A local repository
+  gets one more attempt, and then the file is removed and the error
+  passed on, naming it.
+  Only with the lock lost is the write abandoned unsettled, and the
+  error does not pretend otherwise: it says the snapshot may still turn
+  up and is to be removed if it does — it would by then name trees that
+  a prune is free to delete.
 - **Trees** go through rustic_core's `Repository::merge_trees`: entries are
   matched by path from the root, an entry only one snapshot has is taken
   as is, directories are merged recursively, and where the same path
@@ -398,9 +408,17 @@ lists, restores, checks, forgets and prunes like any other.
     links the
     paths and then puts each one's recorded metadata back, and an inode
     has one of each, so of two that differ only the last applied
-    survives. Access and change times are not compared: restic reads the
-    links of one file at different moments, and restores neither as
-    recorded. Two backups of one
+    survives. Change times are not compared, since no restore sets
+    them, and neither are access times, which restic does put back but
+    does not record alike for the links of one file: they are its
+    modification time unless the backup ran with `--with-atime`, and
+    then reading one link moves the time the next is recorded with,
+    wherever restic cannot open the file without touching it (a file
+    of another owner, any file outside Linux). A `--with-atime` backup
+    of `/usr/bin` by restic 0.19.1 recorded two access times for four
+    of its seven hardlinked files; restoring it keeps one of each, as
+    restoring a merge does, and holding the merge to more would refuse
+    snapshots restic wrote. Two backups of one
     directory with a hardlinked file changed in between differ in the
     sources and merge fine, both links coming from the newer.
 - **How much is rewritten depends on the timezone.** rustic_core renders
@@ -579,12 +597,14 @@ what rustic_core writes through the gate: an index whose write outlasted
 the lock does not stay, and nothing is written after it.
 `a_failed_write_past_the_lock_is_reconciled`,
 `a_write_reported_as_failed_but_stored_counts_as_published`,
-`a_failed_write_the_server_still_holds_is_not_reported_as_gone` and
+`a_failed_write_the_server_still_holds_is_retried_while_the_lock_holds` and
 `an_index_that_could_not_be_taken_back_is_reported` cover a write that
-reports failure for a file it stored, one the server stores only after
-its removal (`rest_write_that_timed_out_is_stored_after_its_removal`
-shows the real REST client meeting exactly that), a removal that fails,
-and
+reports failure for a file it stored, one the server is still holding —
+retried under a healthy lock until the file is there, and reported as
+possibly still to come once the lock is lost
+(`rest_write_that_timed_out_is_stored_after_its_removal` shows the real
+REST client meeting a write stored after its removal), a removal that
+fails, and
 `closing_the_gate_waits_for_writes_and_refuses_later_ones` that the gate
 does not close over a write under way. These tests lose the lock at a
 point they choose (`LockHealth::expire_for_tests`, inside the backend's

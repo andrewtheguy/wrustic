@@ -39,6 +39,10 @@ use sha2::{Digest, Sha256};
 const WAIT_BEFORE_LOCK_CHECK: Duration = Duration::from_millis(200);
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const STALE_TIMEOUT_SECS: i64 = 30 * 60;
+// Between attempts to store a file that a backend keeps failing to write
+// (`RepoLock::write_unpacked_while_held`).
+const WRITE_RETRY_PAUSE: Duration =
+    if cfg!(test) { Duration::from_millis(2) } else { Duration::from_secs(5) };
 
 // restic's refreshability rule (`internal/repository/lock.go`
 // refreshabilityTimeout): when a lock has not been successfully refreshed for
@@ -670,12 +674,22 @@ impl RepoLock {
     /// after the server committed). So an error is checked against the
     /// repository before it is believed. A file that is there as written,
     /// under a healthy lock, is published, and is reported as that; one that
-    /// is not is written once more, because a write that then succeeds
-    /// settles the matter whatever became of the first. Only when that fails
-    /// too, or the lock is lost, is the file removed and the error passed on.
+    /// is not is written again, because a write that then succeeds settles
+    /// the matter whatever became of the earlier ones.
     ///
-    /// Even then the removal proves nothing for a backend whose failed
-    /// writes can still land ([`LockBackend::failed_write_can_land_later`]):
+    /// How often depends on what a failure leaves behind. A backend whose
+    /// write is over once it returned gets one more attempt, and then the
+    /// file is removed and the error passed on. For one whose failed writes
+    /// can still land ([`LockBackend::failed_write_can_land_later`]) there is
+    /// no giving up while the lock holds: returning drops the lock, a prune
+    /// can then delete the blobs the file names, and the write the server
+    /// was still holding publishes a file pointing at nothing. Under the
+    /// lock a late write is harmless, so the attempts go on, checking the
+    /// repository before each, until the file is stored or the lock is
+    /// lost — with the repository out of reach that is the 22.5 minutes
+    /// the lock takes to turn bad.
+    ///
+    /// Once the lock is lost the removal proves nothing for such a backend:
     /// it cannot be ordered after a write the server is still holding, and
     /// the error says so instead of claiming the file is gone. The name is
     /// known beforehand — it is the hash of what is written — and is in
@@ -694,12 +708,19 @@ impl RepoLock {
         let mut written = backend.write(&name, &sealed);
         let mut stored = written.is_ok();
         let a_write_failed = written.is_err();
-        if !stored && !self.poisoned() {
+        let settled_on_return = !backend.failed_write_can_land_later();
+        let mut retried = false;
+        while !stored && !self.poisoned() {
             stored = is_stored();
-            if !stored {
-                written = backend.write(&name, &sealed);
-                stored = written.is_ok() || is_stored();
+            if stored || (settled_on_return && retried) {
+                break;
             }
+            if retried {
+                std::thread::sleep(WRITE_RETRY_PAUSE);
+            }
+            retried = true;
+            written = backend.write(&name, &sealed);
+            stored = written.is_ok();
         }
         let lost = self.poisoned();
         if stored && !lost {
@@ -1351,6 +1372,27 @@ mod tests {
         }
     }
 
+    // A backend whose write is over once it has returned, as a local
+    // repository's is.
+    struct Synchronous(Arc<MemLockBackend>);
+    impl LockBackend for Synchronous {
+        fn list(&self) -> Result<Vec<(String, u64)>> {
+            self.0.list()
+        }
+        fn read(&self, name: &str) -> Result<Option<Vec<u8>>> {
+            self.0.read(name)
+        }
+        fn write(&self, name: &str, data: &[u8]) -> Result<()> {
+            self.0.write(name, data)
+        }
+        fn remove(&self, name: &str) -> Result<()> {
+            self.0.remove(name)
+        }
+        fn failed_write_can_land_later(&self) -> bool {
+            false
+        }
+    }
+
     fn test_crypto(compress: bool) -> RepoCrypto {
         let mut key = AeadKey::default();
         for (i, b) in key.iter_mut().enumerate() {
@@ -1776,12 +1818,13 @@ mod tests {
         assert!(!message.contains("removed again"), "{message}");
         drop(lock);
 
-        // Under a healthy lock a failed write is just that, named.
+        // Under a healthy lock, on a backend that is done with a write once
+        // it returned, a failed write is just that, named.
         let (_locks, lock) = steady_lock(&crypto);
         let files = MemLockBackend::new();
         files.fail_writes.store(true, Ordering::SeqCst);
         let err = lock
-            .write_unpacked_while_held(files.as_ref(), &crypto, b"{\"n\":3}")
+            .write_unpacked_while_held(&Synchronous(Arc::clone(&files)), &crypto, b"{\"n\":3}")
             .expect_err("the write failed");
         let message = format!("{err:#}");
         assert!(message.contains("injected write failure"), "{message}");
@@ -1809,12 +1852,12 @@ mod tests {
         assert!(files.read(&name).unwrap().is_some());
         assert!(!lock.poisoned(), "the lock was healthy throughout");
 
-        // Not stored the first time: the second attempt settles it.
+        // Not stored the first times: the attempts go on until one settles
+        // it, the backend being one whose failed writes can still land.
         let files = MemLockBackend::new();
         files.fail_writes.store(true, Ordering::SeqCst);
         let recovering = Arc::clone(&files);
-        // `read` is what the publication does between its two attempts; the
-        // backend comes back for the second.
+        // The backend comes back for the fourth attempt.
         let attempts = Arc::new(AtomicUsize::new(0));
         struct Recovers(Arc<MemLockBackend>, Arc<AtomicUsize>);
         impl LockBackend for Recovers {
@@ -1825,7 +1868,7 @@ mod tests {
                 self.0.read(name)
             }
             fn write(&self, name: &str, data: &[u8]) -> Result<()> {
-                if self.1.fetch_add(1, Ordering::SeqCst) == 1 {
+                if self.1.fetch_add(1, Ordering::SeqCst) == 3 {
                     self.0.fail_writes.store(false, Ordering::SeqCst);
                 }
                 self.0.write(name, data)
@@ -1836,8 +1879,8 @@ mod tests {
         }
         let name = lock
             .write_unpacked_while_held(&Recovers(recovering, Arc::clone(&attempts)), &crypto, b"{\"n\":2}")
-            .expect("the second attempt succeeds");
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+            .expect("the fourth attempt succeeds");
+        assert_eq!(attempts.load(Ordering::SeqCst), 4);
         assert!(files.read(&name).unwrap().is_some());
 
         // A write that succeeds is still just that, in one attempt.
@@ -1851,22 +1894,61 @@ mod tests {
 
     // What a removal cannot settle. A server that has taken a write in full
     // stores it whether or not the client is still waiting, and answers a
-    // removal sent meanwhile with success: nothing is there yet. So a failed
-    // write followed by a successful removal can still be published later,
-    // and the error must say that rather than that the file is gone.
+    // removal sent meanwhile with success: nothing is there yet. Giving up
+    // on such a write hands the lock back with the write still to come, so
+    // while the lock holds the attempts go on until the file is there; and
+    // once it is lost, the error must say the file can still be published
+    // rather than that it is gone.
     #[test]
-    fn a_failed_write_the_server_still_holds_is_not_reported_as_gone() {
+    fn a_failed_write_the_server_still_holds_is_retried_while_the_lock_holds() {
+        fn wait_for_attempts(files: &MemLockBackend, attempts: usize) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while files.held.lock().unwrap().len() < attempts {
+                assert!(std::time::Instant::now() < deadline, "the write was not retried");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
         let _guard = test_acquire_guard();
         let crypto = test_crypto(true);
-        let (_locks, lock) = steady_lock(&crypto);
 
+        // Every attempt times out with the server holding it. The lock is
+        // healthy, so the publication does not return; when the server gets
+        // round to storing the file, it is found and reported as published.
+        let (_locks, lock) = steady_lock(&crypto);
         let files = MemLockBackend::new();
         files.hold_writes.store(true, Ordering::SeqCst);
-        let err = lock
-            .write_unpacked_while_held(files.as_ref(), &crypto, b"{\"n\":1}")
-            .expect_err("both attempts timed out");
+        let name = std::thread::scope(|scope| {
+            let publication = scope
+                .spawn(|| lock.write_unpacked_while_held(files.as_ref(), &crypto, b"{\"n\":1}"));
+            wait_for_attempts(&files, 3);
+            assert!(!publication.is_finished(), "no giving up under a healthy lock");
+            assert_eq!(files.count(), 0, "nothing is stored yet");
+            files.complete_held_writes();
+            publication.join().expect("the publication panicked")
+        })
+        .expect("the file is there, under a lock that held throughout");
+        assert!(files.read(&name).unwrap().is_some());
+        assert!(!lock.poisoned());
+        drop(lock);
+
+        // The same, and the lock is lost before the server stores anything:
+        // only now is the ambiguous error due.
+        let (_locks, lock) = steady_lock(&crypto);
+        let files = MemLockBackend::new();
+        files.hold_writes.store(true, Ordering::SeqCst);
+        let err = std::thread::scope(|scope| {
+            let publication = scope
+                .spawn(|| lock.write_unpacked_while_held(files.as_ref(), &crypto, b"{\"n\":1}"));
+            wait_for_attempts(&files, 3);
+            assert!(!publication.is_finished(), "no giving up under a healthy lock");
+            lock.health().expire_for_tests();
+            publication.join().expect("the publication panicked")
+        })
+        .expect_err("the lock was lost with the write unsettled");
         let message = format!("{err:#}");
         assert_eq!(files.count(), 0, "nothing is stored yet, and the removal found nothing");
+        assert!(message.contains("could not be refreshed"), "{message}");
         assert!(message.contains("can still complete a write"), "{message}");
         assert!(message.contains("turns up later"), "{message}");
         assert!(!message.contains("it is not in the repository ("), "{message}");
@@ -1876,11 +1958,18 @@ mod tests {
         files.complete_held_writes();
         let published = files.list().unwrap().remove(0).0;
         assert!(message.contains(&published), "the error must name the file: {message}");
+        drop(lock);
 
         // A backend whose writes are its own system calls has nothing under
-        // way once the write returned, and may say the file is gone.
-        struct Synchronous(Arc<MemLockBackend>);
-        impl LockBackend for Synchronous {
+        // way once the write returned: one more attempt, and it may say the
+        // file is gone.
+        let (_locks, lock) = steady_lock(&crypto);
+        let files = MemLockBackend::new();
+        files.fail_writes.store(true, Ordering::SeqCst);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&attempts);
+        struct Counted(Synchronous, Arc<AtomicUsize>);
+        impl LockBackend for Counted {
             fn list(&self) -> Result<Vec<(String, u64)>> {
                 self.0.list()
             }
@@ -1888,21 +1977,25 @@ mod tests {
                 self.0.read(name)
             }
             fn write(&self, name: &str, data: &[u8]) -> Result<()> {
+                let _ = self.1.fetch_add(1, Ordering::SeqCst);
                 self.0.write(name, data)
             }
             fn remove(&self, name: &str) -> Result<()> {
                 self.0.remove(name)
             }
             fn failed_write_can_land_later(&self) -> bool {
-                false
+                self.0.failed_write_can_land_later()
             }
         }
-        let files = MemLockBackend::new();
-        files.fail_writes.store(true, Ordering::SeqCst);
         let err = lock
-            .write_unpacked_while_held(&Synchronous(Arc::clone(&files)), &crypto, b"{\"n\":2}")
+            .write_unpacked_while_held(
+                &Counted(Synchronous(Arc::clone(&files)), counter),
+                &crypto,
+                b"{\"n\":2}",
+            )
             .expect_err("the write failed");
         let message = format!("{err:#}");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert!(message.contains("it is not in the repository ("), "{message}");
         assert!(!message.contains("turns up later"), "{message}");
         assert!(!LocalLockBackend::new("tmp", "snapshots").failed_write_can_land_later());

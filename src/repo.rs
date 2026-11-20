@@ -833,9 +833,12 @@ struct RawFile {
     content: serde_json::Value,
     /// What a restore puts back on a path besides its content, by the name
     /// to call it: an inode has one of each, so links of one file agree on
-    /// all of them. Access and change times are left out — restic reads the
-    /// links of one file at different moments, and neither is restored as
-    /// recorded anyway.
+    /// all of them. Change times are left out because no restore sets them.
+    /// Access times are left out although restic restores them: it does not
+    /// record them alike for the links of one file. Under `--with-atime`,
+    /// reading one link moves the time the next is recorded with wherever
+    /// restic cannot open the file without touching it, so one snapshot of
+    /// its own holds links that differ, and comparing would refuse those.
     metadata: [(&'static str, serde_json::Value); 4],
 }
 
@@ -2288,9 +2291,10 @@ mod tests {
                 {"name": "user.y", "value": "eQ=="},
             ],
         });
-        // What does not make two links differ: the times restic does not
-        // put back, the same instant in another offset, and nothing written
-        // two ways.
+        // What does not make two links differ: the change time, which no
+        // restore sets, the access time, which restic records differently
+        // for the links of one file, the same instant in another offset,
+        // and nothing written two ways.
         let mut same = recorded.clone();
         same["atime"] = serde_json::json!("2026-11-21T00:00:00Z");
         same["ctime"] = serde_json::json!("2026-11-21T00:00:00Z");

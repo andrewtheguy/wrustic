@@ -672,7 +672,9 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
         Screen::SnapshotMerging => {
             let para = Paragraph::new(
                 "Merging the two snapshots under restic's non-exclusive repository lock…\n\n\
-                 Reading every directory of both, which can take a while on large snapshots.",
+                 Reading every directory of both, which can take a while on large snapshots. \
+                 If the repository cannot be reached when the new snapshot is written, the \
+                 write is tried again for as long as the lock holds.",
             )
             .wrap(Wrap { trim: false })
             .block(Block::bordered().title("Merging snapshots"));
