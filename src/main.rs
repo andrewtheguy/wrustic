@@ -40,7 +40,7 @@ use crate::cli::{parse_cli, usage};
 use crate::config::{ConfigLock, Paths};
 use crate::repo::{
     ContentRow, delete_snapshot, diff_snapshots, edit_snapshot_tags, get_file_details, list_tree,
-    load_snapshots,
+    load_snapshots, merge_snapshots,
     open_indexed, preview_snapshot_contents, snapshot_delete_info, snapshot_root_tree,
     unlock, verify_profile,
 };
@@ -430,12 +430,20 @@ fn run(
                 Ok(list) => {
                     app.snapshots = list.rows;
                     app.snapshots_repository_id = Some(list.repository_id);
-                    let len = app.visible_snapshot_indices().len();
+                    let visible = app.visible_snapshot_indices();
+                    let len = visible.len();
+                    // A snapshot to land on by id — the one a merge just
+                    // created — wins over the remembered row; an active
+                    // filter may hide it, and then the row is the fallback.
+                    let by_id = app.post_reload_select_id.take().and_then(|id| {
+                        visible.iter().position(|&abs| app.snapshots[abs].id == id)
+                    });
                     if len > 0 {
-                        let idx = app
-                            .post_delete_select
-                            .map(|i| i.min(len - 1))
-                            .unwrap_or(0);
+                        let idx = by_id.unwrap_or_else(|| {
+                            app.post_delete_select
+                                .map(|i| i.min(len - 1))
+                                .unwrap_or(0)
+                        });
                         app.list_state.select(Some(idx));
                     } else {
                         app.list_state.select(None);
@@ -445,6 +453,7 @@ fn run(
                 }
                 Err(e) => {
                     app.snapshots_repository_id = None;
+                    app.post_reload_select_id = None;
                     app.screen = Screen::Error(format!("{e:#}"));
                 }
             }
@@ -615,6 +624,42 @@ fn run(
             continue;
         }
 
+        if matches!(app.screen, Screen::SnapshotMerging) {
+            let (Some(first), Some(second)) =
+                (app.merge_first_id.clone(), app.merge_second_id.clone())
+            else {
+                app.screen = Screen::SnapshotMergeError("No snapshots selected to merge.".into());
+                continue;
+            };
+            let idx = app.loading_index;
+            let Some((_, profile)) = app.config.profile_at(idx) else {
+                app.screen =
+                    Screen::SnapshotMergeError("Selected profile no longer exists.".into());
+                continue;
+            };
+            match merge_snapshots(profile, &[first, second]) {
+                // Reload the list with the cursor on the new snapshot, and say
+                // what happened to the two it came from.
+                Ok(new_id) => {
+                    app.clear_merge_scratch();
+                    app.notice = Some(format!(
+                        "Merged into new snapshot {} — both source snapshots were kept.",
+                        &new_id[..new_id.len().min(8)]
+                    ));
+                    app.post_delete_select = app.list_state.selected();
+                    app.post_reload_select_id = Some(new_id);
+                    app.snapshots.clear();
+                    app.screen = Screen::Loading;
+                }
+                // Keep both ids so an `unlock`-and-retry from the error screen
+                // redoes the same merge.
+                Err(e) => {
+                    app.screen = Screen::SnapshotMergeError(format!("{e:#}"));
+                }
+            }
+            continue;
+        }
+
         if matches!(app.screen, Screen::Unlocking) {
             // Which flow asked for the unlock decides where its outcome goes:
             // the SMB share retries its operation (a lock conflict is why `u`
@@ -631,7 +676,7 @@ fn run(
                     continue;
                 }
                 UnlockReturn::Smb => app.smb_pending.as_ref().map(|p| p.profile.clone()),
-                UnlockReturn::Delete | UnlockReturn::TagEdit => {
+                UnlockReturn::Delete | UnlockReturn::TagEdit | UnlockReturn::Merge => {
                     app.config.profile_at(app.loading_index).map(|(_, p)| p.clone())
                 }
             };
@@ -644,6 +689,7 @@ fn run(
                     }
                     UnlockReturn::Delete => Screen::SnapshotDeleteError(msg),
                     UnlockReturn::TagEdit => Screen::SnapshotTagError(msg),
+                    UnlockReturn::Merge => Screen::SnapshotMergeError(msg),
                 };
                 continue;
             };
@@ -654,6 +700,8 @@ fn run(
                         // Redo the same edit; target and tags survived the
                         // error screen.
                         UnlockReturn::TagEdit => Screen::SnapshotTagSaving,
+                        // Likewise: both ids survived the error screen.
+                        UnlockReturn::Merge => Screen::SnapshotMerging,
                         // Re-enter the delete flow so details/preview are
                         // rebuilt and the confirmation is asked again; without
                         // a pending target there is nothing to retry, so just
@@ -677,6 +725,7 @@ fn run(
                         }
                         UnlockReturn::Delete => Screen::SnapshotDeleteError(msg),
                         UnlockReturn::TagEdit => Screen::SnapshotTagError(msg),
+                        UnlockReturn::Merge => Screen::SnapshotMergeError(msg),
                     };
                 }
             }

@@ -10,8 +10,8 @@ A read-oriented terminal UI for restic backup repositories. It opens a
 repo, lists snapshots, lets you walk the file tree, inspect file details,
 diff two snapshots, and download a single file via a localhost signed URL.
 Its write surface is deliberately small: snapshot deletion, tag edits,
-and stale-lock removal are native; prune shells out to `restic prune`
-(details below).
+snapshot merge, and stale-lock removal are native; prune shells out to
+`restic prune` (details below).
 
 **Scope: single-user, single-device.** wrustic is a personal tool — one
 person, one machine (or one account on a shared box that they fully own).
@@ -24,8 +24,9 @@ flat `App` struct.
 
 It is intentionally **not** a restic replacement:
 - Reads go through `rustic_core` directly (no subprocess).
-- The native write operations wrustic exposes (snapshot delete and tag
-  edits) are guarded by restic-compatible repository locks
+- The native write operations wrustic exposes (snapshot delete, tag
+  edits and snapshot merge) are guarded by restic-compatible repository
+  locks
   (docs/locking.md) so they coexist safely with concurrent restic
   processes; stale-lock removal (`repo::unlock`) is native too but
   deliberately takes no lock — like `restic unlock`, it only removes
@@ -67,7 +68,7 @@ on a multi-thread one (it needs `block_in_place`, see below).
 
 `Screen` (in `app.rs`) is the discriminator for what's on screen. It's
 about three dozen variants spanning first-run, profile CRUD, snapshot list,
-snapshot delete/compare flows, tree browsing, file details, share dialog,
+snapshot delete/compare/merge flows, tree browsing, file details, share dialog,
 and passphrase dialog. Every screen is rendered by a corresponding
 `render_<screen>` function in `ui.rs`.
 
@@ -214,6 +215,15 @@ smbanything's own docs. The architectural points:
   (`Repository::delete_snapshots`) under an exclusive restic-compatible
   repository lock. Full 64-char hex ids are enforced so a prefix can never
   match the wrong snapshot.
+- `edit_snapshot_tags(profile, id, tags)` — native tag edit under the same
+  exclusive lock, as a raw-JSON rewrite of the snapshot file so restic
+  fields rustic_core does not model survive.
+- `merge_snapshots(profile, ids)` — merges snapshots into a new one under
+  restic's *non-exclusive* lock (it only adds files): rustic_core's
+  `merge_trees` for the directory trees, after a scan that refuses the
+  merge if a node carries a field that call would drop, then a snapshot
+  file wrustic writes itself so restic finds it as the parent of the next
+  backup. The source snapshots are kept.
 - `unlock(profile)` — native stale-lock removal, offered with `u` on the
   delete-error screen when `lock::is_lock_error()` matches the failure.
   Only locks that are provably dead are removed (older than restic's

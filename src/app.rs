@@ -56,6 +56,12 @@ pub(crate) enum Screen {
     SnapshotCompareSecond,
     SnapshotCompareLoading,
     SnapshotCompareResults,
+    // The native merge (repo::merge_snapshots): pick the second snapshot,
+    // confirm, then the main loop runs it on `SnapshotMerging`.
+    SnapshotMergeSecond,
+    SnapshotMergeConfirm,
+    SnapshotMerging,
+    SnapshotMergeError(String),
     PruneConfirm,
     PruneRunning,
     PruneDone(String),
@@ -82,6 +88,7 @@ pub(crate) enum UnlockReturn {
     Delete,
     Smb,
     TagEdit,
+    Merge,
 }
 
 /// Where Esc on the SMB share screen goes: back to the list it was opened from.
@@ -420,6 +427,17 @@ pub(crate) struct App {
     pub(crate) compare_results: Option<(DiffSummary, Vec<DiffChange>)>,
     pub(crate) compare_results_state: TableState,
 
+    // Native merge (repo::merge_snapshots): the snapshot `M` was pressed on,
+    // the one picked to merge with it, and the picker's cursor. Both ids are
+    // kept while the error screen is up so an unlock-and-retry redoes the
+    // same merge.
+    pub(crate) merge_first_id: Option<String>,
+    pub(crate) merge_second_id: Option<String>,
+    pub(crate) merge_picker_state: TableState,
+    // A snapshot to put the cursor on once the list has been reloaded — the
+    // one a merge just created. Takes precedence over `post_delete_select`.
+    pub(crate) post_reload_select_id: Option<String>,
+
     // Prune runs `restic prune` on a worker thread so the TUI stays alive
     // (redraws, elapsed clock) during an operation that can take minutes.
     // `prune_rx` is the completion channel: Some while a prune is in flight
@@ -583,6 +601,10 @@ impl App {
             compare_picker_state: TableState::default(),
             compare_results: None,
             compare_results_state: TableState::default(),
+            merge_first_id: None,
+            merge_second_id: None,
+            merge_picker_state: TableState::default(),
+            post_reload_select_id: None,
             prune_rx: None,
             prune_started: None,
             prune_scroll: 0,
@@ -1162,6 +1184,36 @@ impl App {
             .collect()
     }
 
+    pub(crate) fn clear_merge_scratch(&mut self) {
+        self.merge_first_id = None;
+        self.merge_second_id = None;
+        self.merge_picker_state = TableState::default();
+    }
+
+    // Indices into `self.snapshots` for step 2 of the merge flow: everything
+    // the active filter shows except the snapshot `M` was pressed on. Unlike
+    // the compare picker there is no "related only" narrowing — merging is
+    // for snapshots of *different* paths as much as of the same one.
+    pub(crate) fn merge_second_visible_indices(&self) -> Vec<usize> {
+        let first = self.merge_first_id.as_deref();
+        self.visible_snapshot_indices()
+            .into_iter()
+            .filter(|&i| Some(self.snapshots[i].id.as_str()) != first)
+            .collect()
+    }
+
+    // The two snapshots of the pending merge, newer first, as the list knows
+    // them. `self.snapshots` is sorted newest first, so the lower index is the
+    // newer one — the one the merged snapshot takes its time and host from.
+    pub(crate) fn merge_rows(&self) -> Option<(&SnapshotRow, &SnapshotRow)> {
+        let index_of = |id: &Option<String>| {
+            let id = id.as_deref()?;
+            self.snapshots.iter().position(|s| s.id == id)
+        };
+        let (a, b) = (index_of(&self.merge_first_id)?, index_of(&self.merge_second_id)?);
+        Some((&self.snapshots[a.min(b)], &self.snapshots[a.max(b)]))
+    }
+
     fn begin_delete_flow(&mut self, snapshot_id: String) {
         self.delete_target = Some(snapshot_id);
         self.delete_show_json = false;
@@ -1223,6 +1275,17 @@ impl App {
         {
             self.compare_second_id = Some(s.id.clone());
             self.screen = Screen::SnapshotCompareLoading;
+        }
+    }
+
+    fn activate_merge_second(&mut self) {
+        let visible = self.merge_second_visible_indices();
+        if let Some(pos) = self.merge_picker_state.selected()
+            && let Some(&abs) = visible.get(pos)
+            && let Some(s) = self.snapshots.get(abs)
+        {
+            self.merge_second_id = Some(s.id.clone());
+            self.screen = Screen::SnapshotMergeConfirm;
         }
     }
 
@@ -2055,8 +2118,84 @@ impl App {
                     }
                     self.screen = Screen::SnapshotCompareSecond;
                 }
+                // No SMB-share guard, unlike d/t/p above: a merge only adds
+                // files, so it takes restic's non-exclusive lock — the same
+                // one the share holds.
+                KeyCode::Char('M') => {
+                    let Some(id) = self.selected_snapshot_id() else {
+                        return;
+                    };
+                    self.clear_merge_scratch();
+                    self.merge_first_id = Some(id);
+                    if self.merge_second_visible_indices().is_empty() {
+                        self.clear_merge_scratch();
+                        return;
+                    }
+                    self.merge_picker_state.select(Some(0));
+                    self.screen = Screen::SnapshotMergeSecond;
+                }
                 _ => {}
             },
+
+            Screen::SnapshotMergeSecond => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.clear_merge_scratch();
+                    self.screen = Screen::Snapshots;
+                }
+                KeyCode::Down => self.merge_picker_state.select_next(),
+                KeyCode::Up => self.merge_picker_state.select_previous(),
+                KeyCode::Home | KeyCode::Char('g') => {
+                    self.merge_picker_state.select(Some(0));
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    let visible = self.merge_second_visible_indices();
+                    if !visible.is_empty() {
+                        self.merge_picker_state.select(Some(visible.len() - 1));
+                    }
+                }
+                KeyCode::PageDown => {
+                    let step = self.page_step();
+                    let len = self.merge_second_visible_indices().len();
+                    page_select(&mut self.merge_picker_state, len, true, step);
+                }
+                KeyCode::PageUp => {
+                    let step = self.page_step();
+                    let len = self.merge_second_visible_indices().len();
+                    page_select(&mut self.merge_picker_state, len, false, step);
+                }
+                KeyCode::Enter => self.activate_merge_second(),
+                _ => {}
+            },
+
+            Screen::SnapshotMergeConfirm => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.screen = Screen::SnapshotMerging;
+                }
+                // Back to the picker, cursor where it was: the first snapshot
+                // is still the one wanted, only the second was mispicked.
+                KeyCode::Backspace => {
+                    self.merge_second_id = None;
+                    self.screen = Screen::SnapshotMergeSecond;
+                }
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.clear_merge_scratch();
+                    self.screen = Screen::Snapshots;
+                }
+                _ => {}
+            },
+
+            Screen::SnapshotMergeError(msg) => {
+                // Mirrors SnapshotTagError: `u` is only wired up for lock
+                // failures; anything else just dismisses.
+                let offer_unlock = crate::lock::is_lock_error(msg);
+                if offer_unlock && matches!(key.code, KeyCode::Char('u') | KeyCode::Char('U')) {
+                    self.unlock_return = UnlockReturn::Merge;
+                    self.screen = Screen::Unlocking;
+                } else {
+                    self.clear_merge_scratch();
+                    self.screen = Screen::Snapshots;
+                }
+            }
 
             Screen::SnapshotCompareSecond => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
@@ -2392,6 +2531,7 @@ impl App {
             | Screen::SnapshotDeleting
             | Screen::SnapshotDeleteLoading
             | Screen::SnapshotTagSaving
+            | Screen::SnapshotMerging
             | Screen::Unlocking
             | Screen::SnapshotCompareLoading => {}
 
@@ -2824,6 +2964,15 @@ impl App {
                     self.activate_compare_second();
                 }
             }
+            Screen::SnapshotMergeSecond => {
+                let len = self.merge_second_visible_indices().len();
+                if let Some(idx) =
+                    click_to_index(area, self.merge_picker_state.offset(), len, row, col, hdr)
+                {
+                    self.merge_picker_state.select(Some(idx));
+                    self.activate_merge_second();
+                }
+            }
             Screen::SnapshotCompareResults => {
                 let len = self
                     .compare_results
@@ -2917,6 +3066,13 @@ impl App {
                     self.compare_picker_state.select_next();
                 } else {
                     self.compare_picker_state.select_previous();
+                }
+            }
+            Screen::SnapshotMergeSecond => {
+                if down {
+                    self.merge_picker_state.select_next();
+                } else {
+                    self.merge_picker_state.select_previous();
                 }
             }
             Screen::SnapshotCompareResults => {
@@ -3715,6 +3871,174 @@ mod tests {
         assert!(matches!(app.screen, Screen::Snapshots), "u must not unlock here");
         assert!(app.tag_edit_target.is_none());
         assert!(app.tag_edit_pending.is_none());
+    }
+
+    fn three_snapshots() -> TestApp {
+        let mut app = boot_app_with_snapshots(vec![
+            row_with_id("aaa"),
+            row_with_id("bbb"),
+            row_with_id("ccc"),
+        ]);
+        app.screen = Screen::Snapshots;
+        app.list_state.select(Some(1));
+        app
+    }
+
+    #[test]
+    fn shift_m_opens_a_picker_of_every_other_snapshot() {
+        let mut app = three_snapshots();
+
+        press(&mut app, KeyCode::Char('M'));
+
+        assert!(matches!(app.screen, Screen::SnapshotMergeSecond));
+        assert_eq!(app.merge_first_id.as_deref(), Some("bbb"));
+        assert!(app.merge_second_id.is_none());
+        // The snapshot M was pressed on is not offered as its own partner.
+        assert_eq!(app.merge_second_visible_indices(), vec![0, 2]);
+        assert_eq!(app.merge_picker_state.selected(), Some(0));
+
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.screen, Screen::Snapshots));
+        assert!(app.merge_first_id.is_none());
+    }
+
+    #[test]
+    fn shift_m_needs_a_second_snapshot() {
+        let mut app = boot_app_with_snapshots(vec![row_with_id("aaa")]);
+        app.screen = Screen::Snapshots;
+        app.list_state.select(Some(0));
+
+        press(&mut app, KeyCode::Char('M'));
+
+        assert!(matches!(app.screen, Screen::Snapshots));
+        assert!(app.merge_first_id.is_none());
+    }
+
+    #[test]
+    fn merge_is_confirmed_before_it_is_handed_to_the_main_loop() {
+        let mut app = three_snapshots();
+        press(&mut app, KeyCode::Char('M'));
+        press(&mut app, KeyCode::Down);
+
+        press(&mut app, KeyCode::Enter);
+
+        // Picking only records the pair; nothing runs until `y`.
+        assert!(matches!(app.screen, Screen::SnapshotMergeConfirm));
+        assert_eq!(app.merge_first_id.as_deref(), Some("bbb"));
+        assert_eq!(app.merge_second_id.as_deref(), Some("ccc"));
+        // Newer first: the list is sorted newest first, so the lower row.
+        let (newer, older) = app.merge_rows().expect("both rows are listed");
+        assert_eq!((newer.id.as_str(), older.id.as_str()), ("bbb", "ccc"));
+
+        // Backspace: the second pick was wrong, the first still stands.
+        press(&mut app, KeyCode::Backspace);
+        assert!(matches!(app.screen, Screen::SnapshotMergeSecond));
+        assert_eq!(app.merge_first_id.as_deref(), Some("bbb"));
+        assert!(app.merge_second_id.is_none());
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.merge_second_id.as_deref(), Some("aaa"));
+        let (newer, older) = app.merge_rows().expect("both rows are listed");
+        assert_eq!((newer.id.as_str(), older.id.as_str()), ("aaa", "bbb"));
+
+        press(&mut app, KeyCode::Char('y'));
+        assert!(matches!(app.screen, Screen::SnapshotMerging));
+        assert_eq!(app.merge_first_id.as_deref(), Some("bbb"));
+        assert_eq!(app.merge_second_id.as_deref(), Some("aaa"));
+    }
+
+    #[test]
+    fn merge_confirmation_esc_cancels_and_clears_the_scratch() {
+        let mut app = three_snapshots();
+        press(&mut app, KeyCode::Char('M'));
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.screen, Screen::SnapshotMergeConfirm));
+
+        press(&mut app, KeyCode::Esc);
+
+        assert!(matches!(app.screen, Screen::Snapshots));
+        assert!(app.merge_first_id.is_none());
+        assert!(app.merge_second_id.is_none());
+    }
+
+    #[test]
+    fn u_on_a_merge_lock_error_retries_the_same_merge_after_unlocking() {
+        let mut app = three_snapshots();
+        app.screen = Screen::SnapshotMergeError(
+            "unable to create lock in backend: repository is already locked \
+             exclusively by PID 1 on host by someone"
+                .into(),
+        );
+        app.merge_first_id = Some("aaa".into());
+        app.merge_second_id = Some("bbb".into());
+
+        press(&mut app, KeyCode::Char('u'));
+
+        assert!(matches!(app.screen, Screen::Unlocking));
+        assert_eq!(
+            app.unlock_return,
+            UnlockReturn::Merge,
+            "the main loop must retry the merge after unlocking"
+        );
+        assert_eq!(app.merge_first_id.as_deref(), Some("aaa"));
+        assert_eq!(app.merge_second_id.as_deref(), Some("bbb"));
+    }
+
+    #[test]
+    fn non_lock_merge_error_dismisses_without_offering_unlock() {
+        let mut app = three_snapshots();
+        app.screen = Screen::SnapshotMergeError("these snapshots cannot be merged".into());
+        app.merge_first_id = Some("aaa".into());
+        app.merge_second_id = Some("bbb".into());
+
+        press(&mut app, KeyCode::Char('u'));
+
+        assert!(matches!(app.screen, Screen::Snapshots), "u must not unlock here");
+        assert!(app.merge_first_id.is_none());
+        assert!(app.merge_second_id.is_none());
+    }
+
+    /// Unlike delete, tag edits and prune, a merge is not refused while a
+    /// snapshot of the repository is shared over SMB: it only adds files, so
+    /// it asks for the same non-exclusive lock the share holds. Proven against
+    /// a real repository with the share's lock actually in place.
+    #[test]
+    fn a_merge_runs_while_a_snapshot_of_the_repository_is_shared() {
+        let _guard = crate::lock::test_acquire_guard();
+        let fixture = crate::testrepo::TestRepo::init("app-merge-share");
+        fixture.backup(&[("a.txt", b"a\n")], &[]);
+        std::fs::remove_file(fixture.source_path().join("a.txt")).unwrap();
+        fixture.backup(&[("b.txt", b"b\n")], &[]);
+        let list = crate::repo::load_snapshots(fixture.profile()).expect("list snapshots");
+        let mut app = boot_on_profile(list.rows, fixture.profile().clone());
+        app.snapshots_repository_id = Some(list.repository_id);
+        app.list_state.select(Some(0));
+
+        press(&mut app, KeyCode::Char('s'));
+        app.start_smb_server();
+        app.load_pending_share();
+        assert!(matches!(app.screen, Screen::SmbShare), "{:?}", app.smb_error);
+        assert!(app.smb_shared_here().is_some());
+        press(&mut app, KeyCode::Esc);
+
+        press(&mut app, KeyCode::Char('M'));
+        assert!(matches!(app.screen, Screen::SnapshotMergeSecond), "M must not be refused");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('y'));
+        assert!(matches!(app.screen, Screen::SnapshotMerging));
+
+        // What the main loop does on this screen.
+        let ids = [
+            app.merge_first_id.clone().expect("first id"),
+            app.merge_second_id.clone().expect("second id"),
+        ];
+        crate::repo::merge_snapshots(fixture.profile(), &ids)
+            .expect("the merge must run alongside the share's lock");
+        assert_eq!(
+            crate::repo::load_snapshots(fixture.profile()).expect("list snapshots").rows.len(),
+            3
+        );
+        assert!(app.smb_shared_here().is_some(), "the share is untouched");
     }
 
     #[test]

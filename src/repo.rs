@@ -6,10 +6,10 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use rustic_backend::BackendOptions;
-use rustic_core::repofile::{Node, NodeType};
+use rustic_core::repofile::{BlobType, Node, NodeType, SnapshotFile, SnapshotSummary};
 use rustic_core::{
     Credentials, FileType, IndexedFull, IndexedFullStatus, IndexedIdsStatus, Repository,
-    RepositoryOptions, RepositoryBackends, TreeId,
+    RepositoryOptions, RepositoryBackends, TreeId, last_modified_node,
 };
 use tokio::sync::mpsc;
 
@@ -494,6 +494,330 @@ fn retag_snapshot_json(raw: &[u8], old_id: &str, new_tags: &[String]) -> Result<
         let _ = obj.insert("original".into(), serde_json::Value::String(old_id.to_string()));
     }
     Ok(Some(serde_json::to_vec(&value).context("serializing snapshot JSON")?))
+}
+
+/// Merges snapshots into one new snapshot natively (docs/locking.md, "Native
+/// snapshot merge") and returns the new snapshot's id. restic has no merge
+/// command, so this is the one write wrustic offers that restic itself cannot
+/// do — but everything it writes is plain restic-format data.
+///
+/// The directory trees are merged by path from the root: an entry only one
+/// snapshot has is taken as is, directories are merged recursively, and where
+/// the same path differs the entry with the newer mtime wins. Only tree blobs
+/// are written (no file content is read or stored again), then one snapshot
+/// file. Nothing is deleted or rewritten: the source snapshots stay.
+///
+/// That makes it a pure append, so it holds the lock restic takes for one —
+/// the **non-exclusive** lock of `restic backup`. It coexists with running
+/// backups and with wrustic's own SMB share, and is blocked by (and blocks)
+/// everything exclusive: forget, prune, tag edits. The order is restic's:
+/// open → lock → load the index → resolve the snapshots, so nothing read can
+/// be deleted underneath, and tree packs → index → snapshot when writing, so
+/// the snapshot never refers to a blob that is not indexed yet.
+///
+/// The trees go through `Repository::merge_trees`, which round-trips every
+/// node through rustic_core's typed `Node` — and that type does not model
+/// everything restic stores (`generic_attributes`, the Windows metadata).
+/// Rather than drop such fields silently, the sources are scanned first and
+/// the merge refused if any node carries one (see
+/// [`ensure_merge_keeps_every_node_field`]).
+///
+/// The snapshot file is written by wrustic, not by rustic_core's
+/// `merge_snapshots`: that one stamps the merging machine's hostname and
+/// keeps nested paths apart, either of which stops `restic backup` from
+/// finding the merged snapshot as its parent (see [`merged_snapshot_json`]).
+pub(crate) fn merge_snapshots(profile: &Profile, snapshot_ids: &[String]) -> Result<String> {
+    for id in snapshot_ids {
+        ensure_full_snapshot_id(id)?;
+    }
+    let distinct: std::collections::BTreeSet<String> =
+        snapshot_ids.iter().map(|id| id.to_ascii_lowercase()).collect();
+    if distinct.len() < 2 || distinct.len() != snapshot_ids.len() {
+        bail!("a merge needs at least two different snapshots");
+    }
+
+    let backends = build_backends(profile)?;
+    let repo = Repository::new(&RepositoryOptions::default(), &backends)?
+        .open(&Credentials::password(profile.password()))?;
+    let crypto = lock::RepoCrypto::from_repo(&repo)?;
+    let repo_lock =
+        lock::RepoLock::acquire_shared(lock::backend_for_profile(profile)?, crypto.clone())?;
+    // The full index, not the ids-only one: the pre-merge scan reads raw tree
+    // blobs, which rustic_core only offers on a fully indexed repository.
+    let repo = repo.to_indexed()?;
+
+    // Resolve the ids under the lock, like every other native write: the rows
+    // the TUI shows were read lock-free.
+    let mut sources = Vec::with_capacity(snapshot_ids.len());
+    let mut trees = Vec::with_capacity(snapshot_ids.len());
+    let mut newest: Option<(usize, rustic_core::jiff::Timestamp)> = None;
+    for (i, id) in snapshot_ids.iter().enumerate() {
+        let raw = repo.cat_file(FileType::Snapshot, id).map_err(|e| {
+            anyhow!("reading snapshot {id}: {e} (deleted or retagged concurrently?)")
+        })?;
+        let typed: SnapshotFile = serde_json::from_slice(&raw)
+            .with_context(|| format!("parsing snapshot {id}"))?;
+        let time = typed.time.timestamp();
+        // Strictly newer only, so equal times keep the earlier-listed source.
+        if newest.is_none_or(|(_, t)| time > t) {
+            newest = Some((i, time));
+        }
+        trees.push(typed.tree);
+        sources.push(
+            serde_json::from_slice::<serde_json::Value>(&raw)
+                .with_context(|| format!("parsing snapshot {id}"))?,
+        );
+    }
+    let newest = newest.map(|(i, _)| i).unwrap_or(0);
+
+    ensure_merge_keeps_every_node_field(&repo, &trees)?;
+
+    let started = rustic_core::jiff::Timestamp::now();
+    let mut summary = SnapshotSummary::default();
+    let tree = repo.merge_trees(&trees, &last_modified_node, &mut summary)?;
+    let finished = rustic_core::jiff::Timestamp::now();
+
+    // restic's abort-if-unrefreshable rule: a lock that went unrefreshed for
+    // too long may already have been removed as stale, after which a prune
+    // could have run — the merged tree may refer to blobs that are gone.
+    if repo_lock.poisoned() {
+        bail!(
+            "the repository lock could not be refreshed in time, so the merge was abandoned \
+             before writing its snapshot; nothing refers to the trees it wrote, and the next \
+             prune removes them"
+        );
+    }
+
+    let json = merged_snapshot_json(
+        &sources,
+        newest,
+        tree.to_hex().as_str(),
+        &summary,
+        &started.to_string(),
+        &finished.to_string(),
+    )?;
+    // Before anything is stored: the snapshot must be one rustic_core reads
+    // back as pointing at the merged tree.
+    let check: SnapshotFile =
+        serde_json::from_slice(&json).context("the merged snapshot does not parse")?;
+    if check.tree != tree {
+        bail!("the merged snapshot does not point at the merged tree");
+    }
+
+    let snapshots = lock::snapshot_backend_for_profile(profile)?;
+    let new_id = lock::write_unpacked(snapshots.as_ref(), &crypto, &json)?;
+    // Same proof the tag edit asks for: an independent reader decodes our
+    // envelope to exactly the JSON we meant to store.
+    let readback = repo
+        .cat_file(FileType::Snapshot, &new_id)
+        .map_err(|e| anyhow!("verifying merged snapshot {new_id}: {e}"))?;
+    if readback.as_ref() != json.as_slice() {
+        let _ = snapshots.remove(&new_id);
+        bail!("merged snapshot {new_id} did not read back as written; it was removed again");
+    }
+    Ok(new_id)
+}
+
+/// Refuses a merge that would lose node metadata.
+///
+/// `Repository::merge_trees` re-serializes every node of every directory it
+/// rewrites from rustic_core's typed `Node`, and a field that type does not
+/// model is simply gone afterwards — as of rustic_core 0.14 that is restic's
+/// `generic_attributes` (Windows creation time, file attributes and security
+/// descriptors). Which directories get rewritten is not knowable up front
+/// either: at least every one the sources share, and all of them when the
+/// trees were written in another timezone, because rustic_core renders node
+/// times in the local one. So every tree the sources reach is read raw and
+/// each node checked ([`unpreserved_node_fields`]) before anything is written.
+fn ensure_merge_keeps_every_node_field<S: IndexedFull>(
+    repo: &Repository<S>,
+    roots: &[TreeId],
+) -> Result<()> {
+    let mut seen: std::collections::HashSet<TreeId> = roots.iter().copied().collect();
+    let mut pending: Vec<TreeId> = seen.iter().copied().collect();
+    while let Some(id) = pending.pop() {
+        let hex = id.to_hex();
+        let raw = repo.cat_blob(BlobType::Tree, hex.as_str())?;
+        let tree: serde_json::Value = serde_json::from_slice(&raw)
+            .with_context(|| format!("parsing tree {}", hex.as_str()))?;
+        let nodes = match tree.get("nodes") {
+            None | Some(serde_json::Value::Null) => continue,
+            Some(serde_json::Value::Array(nodes)) => nodes,
+            Some(_) => bail!("tree {} has a `nodes` entry that is not a list", hex.as_str()),
+        };
+        for node in nodes {
+            let lost = unpreserved_node_fields(node)?;
+            if !lost.is_empty() {
+                let name = node.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                bail!(
+                    "these snapshots cannot be merged without losing metadata: `{name}` \
+                     carries {}, which the merge cannot preserve (restic stores Windows \
+                     attributes there). Nothing was written.",
+                    lost.iter().map(|f| format!("`{f}`")).collect::<Vec<_>>().join(", ")
+                );
+            }
+            if let Some(subtree) = node.get("subtree").and_then(|s| s.as_str()) {
+                let subtree: TreeId = subtree
+                    .parse()
+                    .map_err(|e| anyhow!("tree {} names a bad subtree id: {e}", hex.as_str()))?;
+                if seen.insert(subtree) {
+                    pending.push(subtree);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The fields of one raw tree node that would not survive a round trip
+/// through rustic_core's typed `Node`. Found by doing the round trip rather
+/// than from a list of field names, so it stays right when rustic_core learns
+/// a field. A field the round trip leaves out is only a loss when it held
+/// something: restic and rustic_core differ in which empty values they write.
+fn unpreserved_node_fields(raw: &serde_json::Value) -> Result<Vec<String>> {
+    let fields = raw
+        .as_object()
+        .ok_or_else(|| anyhow!("tree node is not a JSON object"))?;
+    let typed: Node = serde_json::from_value(raw.clone()).context("parsing a tree node")?;
+    let kept = serde_json::to_value(&typed).context("re-serializing a tree node")?;
+    Ok(fields
+        .iter()
+        .filter(|(key, value)| kept.get(key.as_str()).is_none() && !json_is_empty(value))
+        .map(|(key, _)| key.clone())
+        .collect())
+}
+
+fn json_is_empty(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => true,
+        serde_json::Value::Bool(b) => !b,
+        serde_json::Value::Number(n) => n.as_f64() == Some(0.0),
+        serde_json::Value::String(s) => s.is_empty(),
+        serde_json::Value::Array(a) => a.is_empty(),
+        serde_json::Value::Object(o) => o.is_empty(),
+    }
+}
+
+/// The merged snapshot's file, built field by field in restic's layout
+/// (`internal/data/snapshot.go`) rather than copied from a source: a snapshot
+/// that is the product of several describes none of their backup runs, so
+/// `parent`, `original` and `excludes` are left out.
+///
+/// What it does carry is chosen so restic treats it as the latest backup of
+/// what it contains — `restic backup` picks its parent by exact hostname and
+/// path set:
+///
+/// - `time`, `hostname`, `username`, `uid`, `gid` come from the newest
+///   source (`newest` indexes `sources`), copied as stored.
+/// - `paths` is every source's paths with nested ones folded into their
+///   ancestor ([`merged_paths`]).
+/// - `tags` is the union.
+/// - `summary` holds the fields restic and rustic_core share; the totals are
+///   those of the merged tree.
+fn merged_snapshot_json(
+    sources: &[serde_json::Value],
+    newest: usize,
+    tree: &str,
+    summary: &SnapshotSummary,
+    started: &str,
+    finished: &str,
+) -> Result<Vec<u8>> {
+    use serde_json::{Value, json};
+
+    let newest = sources
+        .get(newest)
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("the newest source snapshot is not a JSON object"))?;
+    let strings = |key: &str| -> Result<Vec<&str>> {
+        let mut out = Vec::new();
+        for source in sources {
+            match source.get(key) {
+                None | Some(Value::Null) => {}
+                Some(Value::Array(items)) => {
+                    for item in items {
+                        out.push(item.as_str().ok_or_else(|| {
+                            anyhow!("snapshot `{key}` holds something that is not a string: {item}")
+                        })?);
+                    }
+                }
+                Some(other) => bail!("snapshot `{key}` is not a list: {other}"),
+            }
+        }
+        Ok(out)
+    };
+
+    let mut snapshot = serde_json::Map::new();
+    let time = newest
+        .get("time")
+        .ok_or_else(|| anyhow!("the newest source snapshot has no `time`"))?;
+    let _ = snapshot.insert("time".into(), time.clone());
+    let _ = snapshot.insert("tree".into(), json!(tree));
+    let _ = snapshot.insert("paths".into(), json!(merged_paths(&strings("paths")?)));
+    for key in ["hostname", "username", "uid", "gid"] {
+        if let Some(value) = newest.get(key) {
+            let _ = snapshot.insert(key.into(), value.clone());
+        }
+    }
+    let tags: std::collections::BTreeSet<&str> = strings("tags")?.into_iter().collect();
+    // restic's `omitempty`: no tags means no key.
+    if !tags.is_empty() {
+        let _ = snapshot.insert("tags".into(), json!(tags));
+    }
+    let _ = snapshot.insert(
+        "program_version".into(),
+        json!(concat!("wrustic ", env!("CARGO_PKG_VERSION"))),
+    );
+    let _ = snapshot.insert(
+        "summary".into(),
+        json!({
+            "backup_start": started,
+            "backup_end": finished,
+            "files_new": summary.files_new,
+            "files_changed": summary.files_changed,
+            "files_unmodified": summary.files_unmodified,
+            "dirs_new": summary.dirs_new,
+            "dirs_changed": summary.dirs_changed,
+            "dirs_unmodified": summary.dirs_unmodified,
+            "data_blobs": summary.data_blobs,
+            "tree_blobs": summary.tree_blobs,
+            "data_added": summary.data_added,
+            "data_added_packed": summary.data_added_packed,
+            "total_files_processed": summary.total_files_processed,
+            "total_bytes_processed": summary.total_bytes_processed,
+        }),
+    );
+    serde_json::to_vec(&Value::Object(snapshot)).context("serializing the merged snapshot")
+}
+
+/// The path set of a merged snapshot: every source path, sorted, without
+/// duplicates, and without any path that lies inside another one — a backup
+/// of `/data` already covers `/data/extra`. Folding those is what lets a later
+/// `restic backup /data` recognize the merged snapshot as its parent; restic
+/// compares path sets exactly.
+pub(crate) fn merged_paths(paths: &[&str]) -> Vec<String> {
+    let set: std::collections::BTreeSet<&str> = paths.iter().copied().collect();
+    set.iter()
+        .filter(|path| !set.iter().any(|other| path_is_inside(path, other)))
+        .map(|path| path.to_string())
+        .collect()
+}
+
+/// Whether `path` lies strictly inside `ancestor`, compared by whole
+/// components. A restic path that starts with `/` is a Unix one, where `\` is
+/// an ordinary filename character; anything else is a Windows path
+/// (`C:\Users\x`), which separates with either.
+fn path_is_inside(path: &str, ancestor: &str) -> bool {
+    fn components(path: &str) -> Vec<&str> {
+        let unix = path.starts_with('/');
+        path.split(|c: char| c == '/' || (!unix && c == '\\'))
+            .filter(|part| !part.is_empty())
+            .collect()
+    }
+    if path.starts_with('/') != ancestor.starts_with('/') {
+        return false;
+    }
+    let (path, ancestor) = (components(path), components(ancestor));
+    path.len() > ancestor.len() && path[..ancestor.len()] == ancestor[..]
 }
 
 /// Backend + crypto pair for talking to the repo's `locks/` natively —
@@ -1025,8 +1349,10 @@ mod tests {
 
     // ---- Lock coverage of the native writes -------------------------------
     //
-    // Every native write must take the *exclusive* lock before it touches
-    // anything (docs/locking.md, Tier 2). The tests below plant a live
+    // Every native write that removes or rewrites something must take the
+    // *exclusive* lock before it touches anything (docs/locking.md, Tier 2;
+    // the merge, which only adds, takes the shared one and has its own test
+    // further down). The tests below plant a live
     // *shared* lock first — the lock a concurrent `restic backup` or a
     // running SMB share holds. A shared lock never blocks another shared
     // acquisition (proven by lock::tests::
@@ -1135,6 +1461,328 @@ mod tests {
             0,
             "the tag edit must release its lock when it returns"
         );
+    }
+
+    // ---- Native snapshot merge --------------------------------------------
+
+    #[test]
+    fn merged_paths_fold_nested_paths_into_their_ancestor() {
+        assert_eq!(merged_paths(&["/data", "/data/extra"]), ["/data"]);
+        assert_eq!(merged_paths(&["/data/extra/deep", "/data"]), ["/data"]);
+        assert_eq!(
+            merged_paths(&["/mnt/usb/extra", "/data"]),
+            ["/data", "/mnt/usb/extra"],
+            "unrelated paths are both kept, sorted"
+        );
+        assert_eq!(merged_paths(&["/data", "/data"]), ["/data"]);
+        assert_eq!(merged_paths(&["/x", "/"]), ["/"]);
+        // Whole components, not string prefixes.
+        assert_eq!(merged_paths(&["/data", "/database"]), ["/data", "/database"]);
+        // A backslash is an ordinary character in a Unix name…
+        assert_eq!(merged_paths(&["/a", "/a\\b"]), ["/a", "/a\\b"]);
+        // …and a separator in a Windows path.
+        assert_eq!(
+            merged_paths(&["C:\\Users\\me\\Docs", "C:\\Users\\me"]),
+            ["C:\\Users\\me"]
+        );
+        assert_eq!(
+            merged_paths(&["C:\\Users\\me", "D:\\Users\\me\\Docs"]),
+            ["C:\\Users\\me", "D:\\Users\\me\\Docs"]
+        );
+        assert!(merged_paths(&[]).is_empty());
+    }
+
+    fn summary_for_tests() -> SnapshotSummary {
+        let mut summary = SnapshotSummary::default();
+        summary.total_files_processed = 17;
+        summary.total_bytes_processed = 195;
+        summary.files_unmodified = 17;
+        summary.dirs_changed = 9;
+        summary.tree_blobs = 9;
+        summary
+    }
+
+    #[test]
+    fn merged_snapshot_takes_identity_from_the_newest_source() {
+        // Source 0 is restic's layout with everything a backup run records;
+        // source 1 is the newer one.
+        let older: serde_json::Value = serde_json::from_str(RESTIC_SNAPSHOT).unwrap();
+        let newer = serde_json::json!({
+            "time": "2026-09-01T08:00:00.5+02:00",
+            "parent": "22",
+            "tree": "33",
+            "paths": ["/home/it3/extra", "/mnt/usb"],
+            "hostname": "laptop",
+            "username": "root",
+            "excludes": ["*.tmp"],
+            "tags": ["keep", "added"],
+            "original": "44",
+            "program_version": "restic 0.19.1",
+        });
+        let tree = "ab".repeat(32);
+        let out = merged_snapshot_json(
+            &[older, newer],
+            1,
+            &tree,
+            &summary_for_tests(),
+            "2026-11-20T10:00:00Z",
+            "2026-11-20T10:00:01Z",
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        // restic's field order; the newer source has no uid/gid, so neither
+        // does the result — and nothing that describes a single backup run
+        // (parent, excludes, original) is carried over.
+        assert_eq!(
+            keys,
+            ["time", "tree", "paths", "hostname", "username", "tags", "program_version", "summary"]
+        );
+        assert_eq!(v["time"], "2026-09-01T08:00:00.5+02:00", "copied as stored");
+        assert_eq!(v["tree"], serde_json::json!(tree));
+        assert_eq!(v["hostname"], "laptop");
+        assert_eq!(v["username"], "root");
+        assert_eq!(
+            v["paths"],
+            serde_json::json!(["/home/it3", "/mnt/usb"]),
+            "the nested path folds into the older source's"
+        );
+        assert_eq!(v["tags"], serde_json::json!(["added", "keep", "old"]));
+        assert_eq!(
+            v["program_version"],
+            serde_json::json!(concat!("wrustic ", env!("CARGO_PKG_VERSION")))
+        );
+        assert_eq!(v["summary"]["total_files_processed"], 17);
+        assert_eq!(v["summary"]["total_bytes_processed"], 195);
+        assert_eq!(v["summary"]["backup_start"], "2026-11-20T10:00:00Z");
+        // Only the fields restic's summary has.
+        assert!(v["summary"].get("command").is_none());
+        assert!(v["summary"].get("total_dirs_processed").is_none());
+
+        // rustic_core reads it back as a snapshot of the merged tree.
+        let typed: SnapshotFile = serde_json::from_slice(&out).unwrap();
+        assert_eq!(typed.tree.to_hex().as_str(), tree);
+        assert_eq!(typed.hostname, "laptop");
+    }
+
+    #[test]
+    fn merged_snapshot_without_tags_has_no_tags_key() {
+        let a = serde_json::json!({"time": "2026-01-01T00:00:00Z", "tree": "11", "paths": ["/a"], "uid": 0, "gid": 0});
+        let b = serde_json::json!({"time": "2025-01-01T00:00:00Z", "tree": "22", "paths": ["/b"], "tags": null});
+        let out = merged_snapshot_json(&[a, b], 0, &"cd".repeat(32), &summary_for_tests(), "s", "e")
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(v.get("tags").is_none(), "restic's omitempty");
+        assert!(v.get("hostname").is_none());
+        // Present on the newest source, so kept — zero or not.
+        assert_eq!(v["uid"], 0);
+        assert_eq!(v["gid"], 0);
+        assert_eq!(v["paths"], serde_json::json!(["/a", "/b"]));
+    }
+
+    #[test]
+    fn merged_snapshot_rejects_malformed_sources() {
+        let ok = serde_json::json!({"time": "2026-01-01T00:00:00Z", "paths": ["/a"]});
+        let summary = summary_for_tests();
+        let tree = "cd".repeat(32);
+        let bad_paths = serde_json::json!({"time": "2026-01-01T00:00:00Z", "paths": "/a"});
+        assert!(merged_snapshot_json(&[ok.clone(), bad_paths], 0, &tree, &summary, "s", "e").is_err());
+        let bad_tag = serde_json::json!({"time": "2026-01-01T00:00:00Z", "paths": ["/a"], "tags": [1]});
+        assert!(merged_snapshot_json(&[ok.clone(), bad_tag], 0, &tree, &summary, "s", "e").is_err());
+        let no_time = serde_json::json!({"paths": ["/a"]});
+        assert!(merged_snapshot_json(&[no_time, ok.clone()], 0, &tree, &summary, "s", "e").is_err());
+        assert!(merged_snapshot_json(&[ok], 3, &tree, &summary, "s", "e").is_err());
+    }
+
+    #[test]
+    fn node_fields_the_merge_would_drop_are_found() {
+        // A file node as restic 0.19 writes it on Linux: several fields
+        // rustic_core spells differently or always writes, none of them lost.
+        let linux = serde_json::json!({
+            "name": "a.txt", "type": "file", "mode": 420,
+            "mtime": "2026-11-20T06:50:55.1-08:00", "atime": "2026-11-20T06:50:55.1-08:00",
+            "ctime": "2026-11-20T06:50:55.1-08:00", "uid": 1000, "gid": 1000,
+            "user": "debian", "group": "debian", "inode": 4242, "device_id": 2049,
+            "size": 6, "links": 1,
+            "extended_attributes": [{"name": "user.x", "value": "eA=="}],
+            "content": ["aa00000000000000000000000000000000000000000000000000000000000000"],
+        });
+        assert!(unpreserved_node_fields(&linux).unwrap().is_empty());
+
+        let symlink = serde_json::json!({
+            "name": "l", "type": "symlink", "mode": 134218239, "uid": 0, "gid": 0,
+            "mtime": "2026-11-20T06:50:55Z", "linktarget": "a.txt", "content": null,
+        });
+        assert!(unpreserved_node_fields(&symlink).unwrap().is_empty());
+
+        // restic on Windows: metadata rustic_core's node has no place for.
+        let mut windows = linux.clone();
+        windows["generic_attributes"] = serde_json::json!({
+            "windows.creation_time": "AAAA", "windows.file_attributes": 32,
+        });
+        assert_eq!(unpreserved_node_fields(&windows).unwrap(), ["generic_attributes"]);
+
+        // Left out by the round trip, but empty: nothing is lost.
+        let mut empty = linux.clone();
+        empty["generic_attributes"] = serde_json::json!({});
+        empty["error"] = serde_json::json!("");
+        assert!(unpreserved_node_fields(&empty).unwrap().is_empty());
+
+        assert!(unpreserved_node_fields(&serde_json::json!([])).is_err());
+    }
+
+    fn set_mtime(path: &std::path::Path, secs_ago: u64) {
+        let when = std::time::SystemTime::now() - Duration::from_secs(secs_ago);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .and_then(|f| f.set_modified(when))
+            .expect("set fixture mtime");
+    }
+
+    // The merge end to end on an in-process repository, and its lock: the
+    // non-exclusive one, proven from both sides. An *exclusive* lock held by
+    // someone else — a running prune, forget or tag edit — must block it
+    // before anything is written, which a merge that took no lock at all would
+    // sail past. A *shared* one — a running backup, or wrustic's own SMB
+    // share — must not, which a merge that asked for the exclusive lock would
+    // trip over.
+    #[test]
+    fn merge_snapshots_combines_trees_under_the_shared_lock() {
+        let _guard = lock::test_acquire_guard();
+        let fixture = TestRepo::init("merge");
+        let source = fixture.source_path();
+
+        // First snapshot: a.txt, sub/x.txt, and the older side of two conflicts.
+        let first = fixture.backup(
+            &[
+                ("a.txt", b"only in the first\n"),
+                ("sub/x.txt", b"x\n"),
+                ("newer-in-second.txt", b"old\n"),
+                ("newer-in-first.txt", b"the first one wins\n"),
+            ],
+            &["one", "both"],
+        );
+        set_mtime(&source.join("newer-in-second.txt"), 3600);
+        set_mtime(&source.join("newer-in-first.txt"), 60);
+        let first_again = fixture.backup(&[], &["one", "both"]);
+        // The first backup predates the mtimes set above; merge from the one
+        // that recorded them.
+        delete_snapshot(fixture.profile(), &first).expect("drop the pre-mtime snapshot");
+        let first = first_again;
+
+        // Second snapshot: neither a.txt nor sub/x.txt, but b.txt, sub/y.txt
+        // and the other side of both conflicts.
+        std::fs::remove_file(source.join("a.txt")).unwrap();
+        std::fs::remove_file(source.join("sub/x.txt")).unwrap();
+        let second = fixture.backup(
+            &[
+                ("b.txt", b"only in the second\n"),
+                ("sub/y.txt", b"y\n"),
+                ("newer-in-second.txt", b"the second one wins\n"),
+                ("newer-in-first.txt", b"old\n"),
+            ],
+            &["two", "both"],
+        );
+        set_mtime(&source.join("newer-in-second.txt"), 30);
+        set_mtime(&source.join("newer-in-first.txt"), 7200);
+        let second_again = fixture.backup(&[], &["two", "both"]);
+        delete_snapshot(fixture.profile(), &second).expect("drop the pre-mtime snapshot");
+        let second = second_again;
+
+        let ids = [first.clone(), second.clone()];
+        let before = fixture.fingerprint().expect("fingerprint the repository");
+
+        // Refused without two different snapshots, before any lock is taken.
+        assert!(merge_snapshots(fixture.profile(), std::slice::from_ref(&first)).is_err());
+        assert!(merge_snapshots(fixture.profile(), &[first.clone(), first.clone()]).is_err());
+
+        // Blocked by an exclusive lock, having written nothing.
+        let exclusive =
+            lock::RepoLock::acquire_exclusive(fixture.lock_backend(), fixture.crypto())
+                .expect("plant an exclusive lock");
+        let err = merge_snapshots(fixture.profile(), &ids)
+            .expect_err("a merge must not run while an exclusive lock is held");
+        assert_lock_conflict(&err);
+        assert_eq!(
+            fixture.fingerprint().expect("fingerprint the repository"),
+            before,
+            "a blocked merge must not have written anything"
+        );
+        assert_eq!(fixture.lock_count(), 1, "only the planted lock may remain");
+        drop(exclusive);
+
+        // Coexists with a shared lock.
+        let shared = plant_shared_lock(&fixture);
+        let merged = merge_snapshots(fixture.profile(), &ids)
+            .expect("a merge runs alongside a shared lock");
+        assert_eq!(fixture.lock_count(), 1, "the merge must release its own lock");
+        drop(shared);
+
+        // Nothing was removed or rewritten: every file from before is intact.
+        let after = fixture.fingerprint().expect("fingerprint the repository");
+        for entry in &before {
+            assert!(after.contains(entry), "{} changed or vanished", entry.0);
+        }
+
+        // Three snapshots now; the merged one takes its identity from the
+        // newer source and the union of the tags.
+        let rows = load_snapshots(fixture.profile()).expect("list snapshots").rows;
+        assert_eq!(rows.len(), 3, "both sources are kept");
+        let row = |id: &str| rows.iter().find(|r| r.id == id).expect("snapshot listed");
+        let (m, newer) = (row(&merged), row(&second));
+        assert_eq!(m.time, newer.time);
+        assert_eq!(m.host, newer.host);
+        assert_eq!(m.paths, newer.paths, "both sources back up the same path");
+        assert_eq!(m.tags, ["both", "one", "two"]);
+
+        // The merged tree: everything from both, the newer mtime winning each
+        // conflict whichever snapshot it came from.
+        let repo = open_indexed(fixture.profile()).expect("open the repository");
+        let preview = preview_snapshot_contents(&repo, &merged, 1000).expect("walk merged tree");
+        let size_of = |suffix: &str| {
+            preview
+                .entries
+                .iter()
+                .find(|e| e.path.ends_with(suffix))
+                .unwrap_or_else(|| panic!("{suffix} missing from the merged snapshot"))
+                .size
+        };
+        assert_eq!(size_of("/a.txt"), 18);
+        assert_eq!(size_of("/b.txt"), 19);
+        assert_eq!(size_of("/sub/x.txt"), 2);
+        assert_eq!(size_of("/sub/y.txt"), 2);
+        assert_eq!(size_of("/newer-in-second.txt"), 20, "the second snapshot's copy is newer");
+        assert_eq!(size_of("/newer-in-first.txt"), 19, "the first snapshot's copy is newer");
+        assert_eq!(m.size, Some(18 + 19 + 2 + 2 + 20 + 19), "the summary totals the merged tree");
+
+        // The file content is reachable through the merged tree.
+        let full = open_indexed_full(fixture.profile()).expect("open with the full index");
+        let mut dir = snapshot_root_tree(&repo, &merged).expect("merged root");
+        let source_abs = std::fs::canonicalize(&source).unwrap();
+        for part in source_abs.components().filter_map(|c| match c {
+            std::path::Component::Normal(p) => Some(p.to_string_lossy().into_owned()),
+            _ => None,
+        }) {
+            dir = full
+                .get_tree(&dir)
+                .expect("read directory")
+                .nodes
+                .into_iter()
+                .find(|n| n.name().to_string_lossy() == part)
+                .and_then(|n| n.subtree)
+                .unwrap_or_else(|| panic!("{part} missing on the way to the source directory"));
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let dump = std::thread::spawn(move || {
+            stream_file_content(&full, dir, "newer-in-second.txt", &tx)
+        });
+        let mut bytes = Vec::new();
+        while let Some(chunk) = rx.blocking_recv() {
+            bytes.extend_from_slice(&chunk.expect("file chunk"));
+        }
+        dump.join().expect("dump thread").expect("stream merged file");
+        assert_eq!(bytes, b"the second one wins\n");
     }
 
     // The other direction: the shared lock long-running reads take. Unlike
@@ -1387,6 +2035,136 @@ mod tests {
             .expect("restic check");
         crate::restic::run(&profile, &["tag", "--add", "more", &new_id, "--json"])
             .expect("restic tag on our rewritten snapshot");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // End-to-end interop for the native merge, which restic has no command
+    // for: what matters is that restic treats the result as an ordinary
+    // snapshot. restic backs up a directory and then, separately, one new
+    // subdirectory of it; wrustic merges the two; restic must then list the
+    // merged snapshot with the folded path set, read every file through it,
+    // find the repository healthy — and pick the merged snapshot as the parent
+    // of the next backup of the directory, with nothing left to read again.
+    // Marked #[ignore]; run with `cargo test -- --ignored` (needs a restic
+    // copied to target/debug/deps/restic/, the harness's only lookup).
+    #[test]
+    #[ignore]
+    fn live_native_merge_interop_with_restic() {
+        let _guard = lock::test_acquire_guard();
+
+        let root =
+            std::path::PathBuf::from("tmp").join(format!("merge-it-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("source/data/docs")).unwrap();
+        // restic records absolute paths; the tree and `paths` are compared
+        // against this below.
+        let data = std::fs::canonicalize(root.join("source/data")).unwrap();
+        std::fs::write(data.join("docs/a.txt"), b"a\n").unwrap();
+        std::fs::write(data.join("keep.txt"), b"keep\n").unwrap();
+        std::fs::write(data.join("skip.o"), b"object file").unwrap();
+        let data_str = data.to_str().unwrap();
+
+        let profile = Profile::Local {
+            password: "pw".into(),
+            local_path: root.join("repo").to_string_lossy().into_owned(),
+        };
+        crate::restic::run(&profile, &["init", "--json"]).expect("restic init");
+        crate::restic::run(
+            &profile,
+            &["backup", data_str, "--tag", "base", "--exclude", "*.o", "--json"],
+        )
+        .expect("restic backup of the directory");
+
+        // The addition: a new subdirectory, backed up on its own.
+        let extra = data.join("extra");
+        std::fs::create_dir_all(extra.join("sub")).unwrap();
+        std::fs::write(extra.join("n.txt"), b"new\n").unwrap();
+        std::fs::write(extra.join("sub/n2.txt"), b"newer\n").unwrap();
+        crate::restic::run(
+            &profile,
+            &["backup", extra.to_str().unwrap(), "--tag", "added", "--json"],
+        )
+        .expect("restic backup of the new subdirectory");
+
+        // Newest first: the addition, then the base.
+        let rows = load_snapshots(&profile).expect("list snapshots").rows;
+        assert_eq!(rows.len(), 2);
+        let (added, base) = (&rows[0], &rows[1]);
+        assert_eq!(base.paths, [data_str]);
+
+        let merged = merge_snapshots(&profile, &[base.id.clone(), added.id.clone()])
+            .expect("native merge");
+
+        let restic_snapshots = || -> Vec<serde_json::Value> {
+            let out = crate::restic::run(&profile, &["snapshots", "--json"])
+                .expect("restic snapshots");
+            serde_json::from_slice(&out).expect("restic snapshots json")
+        };
+        let listed = restic_snapshots();
+        assert_eq!(listed.len(), 3, "both sources are kept");
+        let by_id = |id: &str| {
+            listed
+                .iter()
+                .find(|s| s["id"] == serde_json::json!(id))
+                .unwrap_or_else(|| panic!("restic does not list {id}"))
+        };
+        let (m, newer) = (by_id(&merged), by_id(&added.id));
+        assert_eq!(
+            m["paths"],
+            serde_json::json!([data_str]),
+            "the subdirectory's path folds into the directory's"
+        );
+        assert_eq!(m["time"], newer["time"]);
+        assert_eq!(m["hostname"], newer["hostname"]);
+        assert_eq!(m["username"], newer["username"]);
+        assert_eq!(m["tags"], serde_json::json!(["added", "base"]));
+        for single_run_field in ["parent", "original", "excludes"] {
+            assert!(m.get(single_run_field).is_none(), "{single_run_field} must not be set");
+        }
+        assert!(m["program_version"].as_str().is_some_and(|v| v.starts_with("wrustic ")));
+        assert_eq!(m["summary"]["total_files_processed"], 4);
+
+        crate::restic::run(&profile, &["check", "--read-data", "--json"])
+            .expect("restic check after the merge");
+
+        // restic walks the merged tree: every file of both sources, at its
+        // real path, and still without the excluded one.
+        let ls = crate::restic::run(&profile, &["ls", &merged, "--json"]).expect("restic ls");
+        let ls_paths: Vec<String> = String::from_utf8(ls)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter_map(|v| v.get("path").and_then(|p| p.as_str()).map(str::to_string))
+            .collect();
+        for file in ["docs/a.txt", "keep.txt", "extra/n.txt", "extra/sub/n2.txt"] {
+            let want = format!("{data_str}/{file}");
+            assert!(ls_paths.contains(&want), "{want} missing from restic ls: {ls_paths:?}");
+        }
+        assert!(!ls_paths.iter().any(|p| p.ends_with("skip.o")));
+
+        // The point of writing the snapshot file ourselves: the next backup of
+        // the directory takes the merged snapshot as its parent and finds
+        // every file — the new subdirectory's included — unmodified.
+        let out = crate::restic::run(
+            &profile,
+            &["backup", data_str, "--tag", "base", "--exclude", "*.o", "--json"],
+        )
+        .expect("restic backup after the merge");
+        let summary = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|v| v["message_type"] == "summary")
+            .expect("restic backup summary");
+        assert_eq!(summary["files_new"], 0, "{summary}");
+        assert_eq!(summary["files_changed"], 0, "{summary}");
+        assert_eq!(summary["files_unmodified"], 4, "{summary}");
+        let latest = restic_snapshots()
+            .into_iter()
+            .find(|s| s["id"] == summary["snapshot_id"])
+            .expect("the new snapshot is listed");
+        assert_eq!(latest["parent"], serde_json::json!(merged));
 
         std::fs::remove_dir_all(&root).ok();
     }

@@ -66,6 +66,7 @@ pub(crate) fn help_rows(screen: &Screen) -> Option<&'static [(&'static str, &'st
             ("f", "filter the list by host, tag or path"),
             ("d", "delete this snapshot (no prune)"),
             ("t", "edit this snapshot's tags"),
+            ("M", "merge this snapshot with another into a new one"),
             ("p", "prune the repository"),
             ("r", "reload the snapshot list"),
             ("q / Esc", "back to the profile list"),
@@ -421,6 +422,17 @@ fn footer_text(screen: &Screen, keychain_enabled: bool) -> &'static str {
             "Up/Dn move  PgUp/PgDn page  g/G top/bottom  Enter pick SECOND  a toggle related/all  Esc cancel"
         }
         Screen::SnapshotCompareResults => "Up/Dn move  PgUp/PgDn page  g/G top/bottom  q/Esc back",
+        Screen::SnapshotMergeSecond => {
+            "Up/Dn move  PgUp/PgDn page  g/G top/bottom  Enter pick the snapshot to merge with  Esc cancel"
+        }
+        Screen::SnapshotMergeConfirm => "y merge  Backspace pick another  n/Esc cancel",
+        Screen::SnapshotMergeError(msg) => {
+            if crate::lock::is_lock_error(msg) {
+                "u remove stale locks and retry  any other key to continue"
+            } else {
+                "any key to continue"
+            }
+        }
         Screen::OpeningSnapshot
         | Screen::LoadingDir
         | Screen::LoadingFileDetails
@@ -429,6 +441,7 @@ fn footer_text(screen: &Screen, keychain_enabled: bool) -> &'static str {
         | Screen::SnapshotDeleting
         | Screen::SnapshotDeleteLoading
         | Screen::SnapshotTagSaving
+        | Screen::SnapshotMerging
         | Screen::Unlocking
         | Screen::SnapshotCompareLoading => "working…",
         Screen::PruneConfirm => "y start prune  n/Esc cancel",
@@ -654,6 +667,32 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
         Screen::SnapshotCompareSecond => render_compare_second(frame, app, area),
         Screen::SnapshotCompareLoading => render_compare_loading(frame, app, area),
         Screen::SnapshotCompareResults => render_compare_results(frame, app, area),
+        Screen::SnapshotMergeSecond => render_merge_second(frame, app, area),
+        Screen::SnapshotMergeConfirm => render_merge_confirm(frame, app, area),
+        Screen::SnapshotMerging => {
+            let para = Paragraph::new(
+                "Merging the two snapshots under restic's non-exclusive repository lock…\n\n\
+                 Reading every directory of both, which can take a while on large snapshots.",
+            )
+            .wrap(Wrap { trim: false })
+            .block(Block::bordered().title("Merging snapshots"));
+            frame.render_widget(para, area);
+        }
+        Screen::SnapshotMergeError(msg) => {
+            let body = if crate::lock::is_lock_error(msg) {
+                format!(
+                    "{msg}\n\nPress u to remove stale repository locks (live locks are \
+                     kept) and retry, or any other key to return to the snapshot list."
+                )
+            } else {
+                format!("{msg}\n\nPress any key to return to the snapshot list.")
+            };
+            let para = Paragraph::new(body)
+                .style(Style::new().fg(Color::Red))
+                .wrap(Wrap { trim: false })
+                .block(Block::bordered().title("Merge failed"));
+            frame.render_widget(para, area);
+        }
         Screen::PruneConfirm => render_prune_confirm(frame, app, area),
         Screen::PruneRunning => render_prune_running(frame, app, area),
         Screen::PruneDone(report) => {
@@ -1045,6 +1084,93 @@ fn render_compare_second(frame: &mut Frame, app: &mut App, area: Rect) {
         None,
         &mut app.compare_picker_state,
     );
+}
+
+fn render_merge_second(frame: &mut Frame, app: &mut App, area: Rect) {
+    let visible = app.merge_second_visible_indices();
+    let first_short = app.merge_first_id.as_deref().map(short_snap_id).unwrap_or("?");
+    let title = format!(
+        "Merge {first_short}.. — pick the snapshot to merge with it ({})",
+        visible.len()
+    );
+    record_list_area(app, area);
+    app.list_header_rows = 1;
+    render_snapshot_picker(
+        frame,
+        area,
+        &title,
+        &app.snapshots,
+        &visible,
+        None,
+        &mut app.merge_picker_state,
+    );
+}
+
+// What the merge will do, before it does it: the two sources, and the identity
+// the new snapshot gets (repo::merged_snapshot_json decides it; this shows the
+// same choice from the rows the list already holds).
+fn render_merge_confirm(frame: &mut Frame, app: &App, area: Rect) {
+    let Some((newer, older)) = app.merge_rows() else {
+        let para = Paragraph::new("The snapshots picked for the merge are no longer listed.")
+            .block(Block::bordered().title("Merge snapshots"));
+        frame.render_widget(para, area);
+        return;
+    };
+    let describe = |s: &crate::repo::SnapshotRow| {
+        let tags = if s.tags.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", s.tags.join(","))
+        };
+        format!(
+            "  {}  {}  {}{tags}\n            {}",
+            short_snap_id(&s.id),
+            s.time,
+            s.host,
+            s.paths.join(", "),
+        )
+    };
+    let all_paths: Vec<&str> = newer
+        .paths
+        .iter()
+        .chain(&older.paths)
+        .map(String::as_str)
+        .collect();
+    let tags: std::collections::BTreeSet<&str> = newer
+        .tags
+        .iter()
+        .chain(&older.tags)
+        .map(String::as_str)
+        .collect();
+    let tags = if tags.is_empty() {
+        "(none)".to_string()
+    } else {
+        tags.into_iter().collect::<Vec<_>>().join(", ")
+    };
+    let body = format!(
+        "Merge these two snapshots into a new one?\n\n\
+         {}\n{}\n\n\
+         The new snapshot will carry\n\
+         \x20 time   {}  (the newer one's)\n\
+         \x20 host   {}  (the newer one's)\n\
+         \x20 paths  {}\n\
+         \x20 tags   {tags}\n\n\
+         Files and directories of both are combined by path. Where both hold the same \
+         path, the entry modified later wins.\n\n\
+         Only directory listings are written — no file content is read or stored again. \
+         Both snapshots are kept; delete them afterwards (d) if the merged one replaces \
+         them. Runs under restic's non-exclusive lock, alongside running backups.\n\n\
+         y/Enter merge   Backspace pick another   n/Esc cancel",
+        describe(newer),
+        describe(older),
+        newer.time,
+        newer.host,
+        crate::repo::merged_paths(&all_paths).join(", "),
+    );
+    let para = Paragraph::new(body)
+        .wrap(Wrap { trim: false })
+        .block(Block::bordered().title("Merge snapshots"));
+    frame.render_widget(para, area);
 }
 
 fn render_compare_loading(frame: &mut Frame, app: &App, area: Rect) {
@@ -2043,6 +2169,9 @@ mod tests {
             Screen::SnapshotTagError(String::new()),
             Screen::SnapshotCompareSecond,
             Screen::SnapshotCompareResults,
+            Screen::SnapshotMergeSecond,
+            Screen::SnapshotMergeConfirm,
+            Screen::SnapshotMergeError(String::new()),
             Screen::PruneConfirm,
             Screen::BackendChoice,
             Screen::Password,

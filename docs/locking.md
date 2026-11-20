@@ -109,7 +109,9 @@ Restic's own table above *is* the safety map. Tiered by lock type, with
 each operation's implementation status (see Phases below for the history).
 Implemented today: **forget / delete snapshots** (`repo::delete_snapshot`,
 the TUI delete flow), **tag edits** (`repo::edit_snapshot_tags`,
-the TUI's `t` action — see "Native tag edits" below), the **snapshot SMB
+the TUI's `t` action — see "Native tag edits" below), **snapshot merge**
+(`repo::merge_snapshots`, the TUI's `M` action — see "Native snapshot
+merge" below), the **snapshot SMB
 share** (a long-running *read* under the same non-exclusive lock
 `restic mount` takes — see "Long-running reads" below), and — outside
 these tables because it takes no lock — **unlock** (`repo::unlock`,
@@ -125,6 +127,7 @@ spawn harness (Tier 3 below).
 | backup | `Repository::backup` | not planned — stays on the restic CLI | pure append: packs → index → snapshot, the ordering the design doc requires for concurrent-append safety |
 | copy into repo | `Repository::copy` (dest side) | not planned | append-only |
 | key add | `Repository::add_key` | not planned | writes one new key file |
+| merge snapshots | `Repository::merge_trees` + a wrustic-written snapshot file | **implemented** — `repo::merge_snapshots` (phase 6) | pure append: tree packs → index → snapshot; reads no file content and deletes nothing |
 
 **Tier 2 — exclusive lock (blocks restic while held; fully safe):**
 
@@ -192,6 +195,92 @@ both tools:
   `live_native_tag_edit_interop_with_restic` (restic sees the new tags,
   `excludes` intact, `original` set; `restic check --read-data` passes;
   restic can itself retag the rewritten snapshot).
+
+**Native snapshot merge (implemented — phase 6, `repo::merge_snapshots`,
+the TUI's `M` on the snapshot list):** two snapshots become one new
+snapshot holding the files of both — the way to add a file or directory to
+an existing snapshot without reading the rest of it again: back up only
+the addition, then merge. restic has no merge command, so unlike every
+other native write there is no restic behaviour to mirror, only restic's
+rules to stay inside. That is also why this one is in scope while
+description edits are not: a description is a *field* restic cannot keep,
+whereas a merge is an *operation* restic lacks whose result is ordinary
+restic-format data — trees, an index entry, a snapshot file — that restic
+lists, restores, checks, forgets and prunes like any other.
+
+- **Lock: non-exclusive**, the one `restic backup` takes, because a merge
+  is the same kind of write — it adds tree packs, index files and one
+  snapshot, and removes or rewrites nothing. So it runs alongside running
+  backups and alongside wrustic's own SMB share (no up-front refusal like
+  delete, tag edit and prune get), while forget, prune and tag edits block
+  it and are blocked by it. A merge that also deleted its sources would
+  need the exclusive lock; it deliberately does not — the sources stay, and
+  `d` removes them afterwards.
+- **Order**: open → lock → load the index → resolve both snapshots, the
+  same as the SMB share, so nothing the merge reads can be pruned
+  underneath it. Writing follows restic's append order — `merge_trees`
+  finishes its packs and index before it returns, and the snapshot file is
+  written last — so the snapshot never names a blob that is not indexed.
+  `RepoLock::poisoned()` is checked between the two: a lock that went
+  unrefreshed past restic's cutoff means a prune may have run, and the
+  snapshot is then not written (the orphaned trees go with the next prune).
+- **Trees** go through rustic_core's `Repository::merge_trees`: entries are
+  matched by path from the root, an entry only one snapshot has is taken
+  as is, directories are merged recursively, and where the same path
+  differs the entry with the newer mtime wins (`last_modified_node`). No
+  file content is read or stored again.
+- **The snapshot file is wrustic's own**, written through the same
+  unpacked-file envelope as a tag edit and read back through rustic_core
+  before the call returns. rustic_core's `merge_snapshots` is not used: it
+  stamps the *merging* machine's hostname and user, and keeps nested paths
+  apart (`/data` + `/data/extra`), and restic picks a backup's parent by
+  exact hostname and path set — so the next `restic backup /data` would
+  not find the merged snapshot and would read every file again. The file
+  is built field by field in restic's layout
+  (`repo::merged_snapshot_json`):
+  - `time`, `hostname`, `username`, `uid`, `gid` — the newest source's,
+    copied as stored. The merged snapshot is as recent as its newest data.
+  - `paths` — every source's paths, with a path that lies inside another
+    folded into it (`repo::merged_paths`; whole components, Unix and
+    Windows separators).
+  - `tags` — the union.
+  - `program_version` — `wrustic <version>`.
+  - `summary` — the fields restic and rustic_core share, totals being
+    those of the merged tree.
+  - `parent`, `original`, `excludes` — left out. They describe one backup
+    run, and the merged snapshot is the product of several.
+- **What `merge_trees` cannot keep, and the check that guards it.**
+  `merge_trees` re-serializes every node of every directory it rewrites
+  from rustic_core's typed `Node`, which has no field for restic's
+  `generic_attributes` (Windows creation time, file attributes, security
+  descriptors) — the tree-level twin of the `excludes` problem that made
+  tag edits a raw-JSON rewrite. rustic_core offers no way to write a tree
+  blob except through that type, so the merge cannot be made lossless the
+  same way; instead it refuses. Before anything is written, every tree
+  the sources reach is read raw and each node round-tripped through the
+  typed `Node` (`repo::unpreserved_node_fields`); a field that held
+  something and does not come back fails the merge with the entry and the
+  field named. The check is the round trip itself rather than a list of
+  field names, so it stays right when rustic_core learns a field.
+  **Snapshots taken by restic on Windows therefore do not merge.**
+- **How much is rewritten depends on the timezone.** rustic_core renders
+  node times with the local zone's offset. Where that is what the trees
+  already hold, a directory only one source has serializes back to the
+  same bytes and its blob is reused, so only the directories both sources
+  pass through are written. Where it is not — snapshots from a machine in
+  another zone, or wrustic running in UTC, which rustic_core writes as
+  `+00:00` where restic writes `Z` — every directory of every source is
+  written again: the same instants, a full second copy of the directory
+  metadata (never of file content). Correct either way, and restic reads
+  both; it is a cost, and the reason a merge reads every directory.
+
+Verified live end to end: `live_native_merge_interop_with_restic` (restic
+backs up a directory and then one new subdirectory of it; after the merge
+restic lists the merged snapshot under the directory's path alone, with
+the newer source's time and host and both tags, walks every file of both
+through it, and passes `check --read-data`; the next `restic backup` of
+the directory names the merged snapshot as its parent and finds nothing
+new or changed).
 
 **Long-running reads — non-exclusive lock (implemented):** the snapshot
 SMB share (`smb::ShareServer::share_snapshot`). Reads take no lock in wrustic's
@@ -316,6 +405,17 @@ write rather than midway through, and the lock count afterwards proves both
 that a failed acquisition cleans up after itself and that a successful
 operation releases on return.
 
+`merge_snapshots_combines_trees_under_the_shared_lock` is the same idea
+turned around for the one native write that must take the *non-exclusive*
+lock: a planted **exclusive** lock has to block the merge with the
+repository fingerprint unchanged — a merge that took no lock would sail
+past it — and a planted non-exclusive one has to let it through, which a
+merge that asked for the exclusive lock would trip over. It goes on to
+check the result: every file of both sources, each conflict won by the
+newer mtime whichever snapshot it came from, nothing that existed before
+changed or removed. `app::tests::a_merge_runs_while_a_snapshot_of_the_repository_is_shared`
+runs it against the SMB share's real lock.
+
 `shared_open_holds_the_append_lock_for_the_handle_lifetime` covers the other
 direction: the guard `open_indexed_full_shared_lock` hands back is held for
 as long as the repository handle lives, tolerates a second append lock, and
@@ -419,6 +519,14 @@ the dev profile only.
    edits are out of scope (rustic-only field, not restic-preservable).
    Native backup / copy / key management, formerly this phase, were
    dropped from the plan — the restic CLI keeps them.
+
+6. **Native snapshot merge** — DONE (`repo::merge_snapshots`, the TUI's
+   `M` on the snapshot list; see "Native snapshot merge" above for the
+   full design). The first native write under the *non-exclusive* lock,
+   and the first with no restic command behind it. The backup that
+   produces the snapshot to merge in stays on the restic CLI; the two are
+   independent — nothing is lost if the merge never runs. A lock conflict
+   offers `u` and retries the same merge.
 
 Non-goals: native backup, copy, and key management (the restic CLI
 keeps them; the Tier 1 rows above remain as the safety map should that

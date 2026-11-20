@@ -5,7 +5,7 @@ repositories, built on [`rustic_core`](https://crates.io/crates/rustic_core)
 and [`ratatui`](https://crates.io/crates/ratatui).
 
 `wrustic` is read-mostly by design: reads are native via `rustic_core`, and
-the write operations it exposes (snapshot delete, tag edits) are native too,
+the write operations it exposes (snapshot delete, tag edits, snapshot merge) are native too,
 guarded by restic-compatible repository locks (docs/locking.md). Stale-lock
 removal is also native, but takes no lock itself — like `restic unlock`, it
 only deletes lock files that are provably stale. Prune shells out to
@@ -25,6 +25,15 @@ exactly which workflows that means.
 - **Snapshot deletion**, native and guarded by a restic-compatible exclusive
   repository lock; when the repo is locked, `u` on the error screen removes
   stale locks (live ones are kept) and retries
+- **Snapshot merge** (`M` on the snapshot list): combine two snapshots into
+  a new one holding the files of both — back up just a new file or
+  directory with restic, then merge it into the earlier snapshot without
+  reading the rest again. Only directory listings are written, the two
+  source snapshots are kept, and it runs under restic's non-exclusive lock
+  alongside running backups. restic itself has no merge; the result is an
+  ordinary snapshot restic reads, and the next `restic backup` uses it as
+  its parent. Snapshots restic took on Windows are refused rather than
+  merged with their Windows attributes lost (docs/locking.md)
 - **Prune** (`p` on the snapshot list): reclaim the space deleted snapshots
   left behind — runs `restic prune` (restic >= 0.19, the one the installers
   bundle and only that one) with live progress and safe Ctrl+C
@@ -374,8 +383,8 @@ is where the installers put their pinned restic, tucked into a
 subdirectory so it never rides onto PATH — and nothing else: a missing one
 is an error, never a fall back to a `restic` on PATH. Everything else
 is native: `rustic_core` reads the on-disk repository format, and the
-native write operations wrustic exposes (snapshot delete, tag edits) hold
-restic-compatible repository locks, so they coexist safely with
+native write operations wrustic exposes (snapshot delete, tag edits,
+snapshot merge) hold restic-compatible repository locks, so they coexist safely with
 concurrent restic processes; stale-lock removal takes no lock — like
 `restic unlock`, it only deletes lock files that are provably stale.
 [`docs/restic-usage.md`](docs/restic-usage.md) is the per-workflow overview
