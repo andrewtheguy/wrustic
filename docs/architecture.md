@@ -221,11 +221,13 @@ smbanything's own docs. The architectural points:
 - `merge_snapshots(profile, ids, retries)` — merges snapshots into a new
   one under restic's *non-exclusive* lock (it only adds files):
   rustic_core's `merge_trees` for the directory trees, then a snapshot
-  file wrustic writes itself, built so that restic's parent rule — the
-  latest snapshot with the backup's host and exact path set, absent
-  `--parent`, `--force` or another `--group-by` — picks it for the next
-  backup: the sources' host, their paths with nested ones folded, a time
-  just after the newest source's. That holds for sources of one host
+  file wrustic writes itself, built to qualify under restic's parent rule
+  — the latest snapshot with the backup's host and exact path set, absent
+  `--parent`, `--force` or another `--group-by`: the sources' host, their
+  paths with nested ones folded, a time just after the newest source's.
+  Qualifying is not being chosen: restic takes the newest match there is
+  when the backup runs, so a snapshot of that host and path set taken
+  after the newest source wins over the merged one. That holds for sources of one host
   whose files are where their paths say; sources of two hosts give a
   snapshot named for both, which neither host's backups take for their
   parent, and a path whose tree is laid out otherwise (a relative-path
@@ -236,8 +238,11 @@ smbanything's own docs. The architectural points:
   on different content or metadata, link files of two hosts' snapshots to
   each other, or list a directory out of restic's order, which restic
   restores wrong. rustic_core's writes go through `lock::gate_writes`, so
-  nothing is written once the lock is lost or after the merge has
-  returned. It runs on a worker thread (the main loop polls it, as for
+  no write is begun once the lock is lost or after the gate has closed.
+  That is about attempts, not about what a server does with one it
+  already has: a request that was sent can still be stored after the
+  merge has returned and given up its lock (docs/locking.md). It runs on
+  a worker thread (the main loop polls it, as for
   prune): a write a server may still complete is retried for as long as
   the lock holds, and `retries` (`lock::WriteRetries`) is how the TUI
   shows that and how Ctrl+C ends it. `App`'s drop stops a merge still

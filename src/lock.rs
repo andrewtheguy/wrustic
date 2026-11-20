@@ -813,13 +813,14 @@ impl RepoLock {
         plain: &[u8],
         retries: &WriteRetries,
     ) -> Result<Published> {
+        let (name, sealed) = seal_named(crypto, plain)?;
+        // Asked last, with nothing left to do before the write but begin it.
         if self.poisoned() {
             bail!("the repository lock could not be refreshed in time; nothing was written");
         }
         if retries.stopped() {
             bail!("the operation was stopped; nothing was written");
         }
-        let (name, sealed) = seal_named(crypto, plain)?;
         let is_stored = || matches!(backend.read(&name), Ok(Some(found)) if found == sealed);
         let lands_later = |written: &Result<()>| {
             matches!(written, Err(e) if backend.failed_write_can_land_later(e))
@@ -1376,13 +1377,24 @@ fn write_lock(backend: &dyn LockBackend, crypto: &RepoCrypto, data: &LockData) -
 /// Seals a payload as an unpacked repo file (the encoding restic uses for
 /// locks, snapshots, index, …) and writes it under its content-addressed
 /// name — the SHA-256 hex of the ciphertext. Returns the name.
+///
+/// A write is one request ([`LockBackend::write`]), and one that reports an
+/// error may have been stored all the same — the answer lost after the server
+/// committed. So a failure is checked against the repository before it is
+/// passed on: a file that is there as written was written. Otherwise a tag
+/// edit would stop with the rewritten snapshot beside the old one, and a lock
+/// would be left behind by an acquisition that reported failure.
 pub(crate) fn write_unpacked(
     backend: &dyn LockBackend,
     crypto: &RepoCrypto,
     plain: &[u8],
 ) -> Result<String> {
     let (name, sealed) = seal_named(crypto, plain)?;
-    backend.write(&name, &sealed)?;
+    if let Err(e) = backend.write(&name, &sealed)
+        && !matches!(backend.read(&name), Ok(Some(found)) if found == sealed)
+    {
+        return Err(e);
+    }
     Ok(name)
 }
 
@@ -1685,6 +1697,40 @@ mod tests {
         fn failed_write_can_land_later(&self, _error: &anyhow::Error) -> bool {
             false
         }
+    }
+
+    // Polls until `ready`, for up to ten seconds, and says whether it got
+    // there. For a test that waits on a thread it has to release: it must
+    // release and join the thread before asserting anything, or a failed
+    // assertion leaves the scope waiting for a thread nothing will end.
+    fn reached(ready: impl Fn() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !ready() {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        true
+    }
+
+    // The tag edit and the lock files go by `write_unpacked`, which makes one
+    // request: a write the server stored and then failed to answer must be
+    // found, not reported as failed with the file left where it is.
+    #[test]
+    fn write_unpacked_counts_a_file_a_failed_write_stored() {
+        let crypto = test_crypto(true);
+        let files = MemLockBackend::new();
+        files.report_write_failure.store(true, Ordering::SeqCst);
+        let name = write_unpacked(files.as_ref(), &crypto, b"{\"n\":1}").expect("it is there");
+        assert!(files.read(&name).unwrap().is_some());
+        assert_eq!(files.write_calls.load(Ordering::SeqCst), 1);
+
+        // Not stored: the failure stands.
+        let files = MemLockBackend::new();
+        files.fail_writes.store(true, Ordering::SeqCst);
+        let _ = write_unpacked(files.as_ref(), &crypto, b"{\"n\":1}").expect_err("failed");
+        assert_eq!(files.count(), 0);
     }
 
     // A publication nobody watches.
@@ -2244,12 +2290,8 @@ mod tests {
     // rather than that it is gone.
     #[test]
     fn a_failed_write_the_server_still_holds_is_retried_while_the_lock_holds() {
-        fn wait_for_attempts(files: &MemLockBackend, attempts: usize) {
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            while files.held.lock().unwrap().len() < attempts {
-                assert!(std::time::Instant::now() < deadline, "the write was not retried");
-                std::thread::sleep(Duration::from_millis(1));
-            }
+        fn retried(files: &MemLockBackend, attempts: usize) -> bool {
+            reached(|| files.held.lock().unwrap().len() >= attempts)
         }
 
         let _guard = test_acquire_guard();
@@ -2264,11 +2306,14 @@ mod tests {
         let published = std::thread::scope(|scope| {
             let publication = scope
                 .spawn(|| publish(&lock, files.as_ref(), &crypto, b"{\"n\":1}"));
-            wait_for_attempts(&files, 3);
-            assert!(!publication.is_finished(), "no giving up under a healthy lock");
-            assert_eq!(files.count(), 0, "nothing is stored yet");
+            let retried = retried(&files, 3);
+            let (running, stored) = (!publication.is_finished(), files.count());
             files.complete_held_writes();
-            publication.join().expect("the publication panicked")
+            let outcome = publication.join().expect("the publication panicked");
+            assert!(retried, "the write was not retried");
+            assert!(running, "no giving up under a healthy lock");
+            assert_eq!(stored, 0, "nothing is stored yet");
+            outcome
         })
         .expect("the file is there, under a lock that held throughout");
         assert!(published.attempt_still_open, "one held write stored it; the others are out");
@@ -2285,10 +2330,13 @@ mod tests {
         let err = std::thread::scope(|scope| {
             let publication = scope
                 .spawn(|| publish(&lock, files.as_ref(), &crypto, b"{\"n\":1}"));
-            wait_for_attempts(&files, 3);
-            assert!(!publication.is_finished(), "no giving up under a healthy lock");
+            let retried = retried(&files, 3);
+            let running = !publication.is_finished();
             lock.health().expire_for_tests();
-            publication.join().expect("the publication panicked")
+            let outcome = publication.join().expect("the publication panicked");
+            assert!(retried, "the write was not retried");
+            assert!(running, "no giving up under a healthy lock");
+            outcome
         })
         .expect_err("the lock was lost with the write unsettled");
         let message = format!("{err:#}");
@@ -2351,22 +2399,17 @@ mod tests {
         // A refusal after an attempt the server may still be holding ends
         // them as well — waiting would not get a refused write stored — but
         // that attempt is still open, and the error says so.
-        let wait_for = |what: &dyn Fn() -> bool| {
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            while !what() {
-                assert!(std::time::Instant::now() < deadline, "the publication made no progress");
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        };
         let (_locks, lock) = steady_lock(&crypto);
         let files = MemLockBackend::new();
         files.hold_writes.store(true, Ordering::SeqCst);
         let err = std::thread::scope(|scope| {
             let publication =
                 scope.spawn(|| publish(&lock, files.as_ref(), &crypto, b"{\"n\":2}"));
-            wait_for(&|| !files.held.lock().unwrap().is_empty());
+            let held = reached(|| !files.held.lock().unwrap().is_empty());
             files.refuse_writes.store(true, Ordering::SeqCst);
-            publication.join().expect("the publication panicked")
+            let outcome = publication.join().expect("the publication panicked");
+            assert!(held, "the publication made no progress");
+            outcome
         })
         .expect_err("the server refuses");
         let message = format!("{err:#}");
@@ -2424,11 +2467,14 @@ mod tests {
             let publication = scope.spawn(|| {
                 lock.write_unpacked_while_held(files.as_ref(), &crypto, b"{\"n\":5}", &retries)
             });
-            wait_for(&|| files.held.lock().unwrap().len() >= 3);
-            assert!(!publication.is_finished(), "no giving up under a healthy lock");
-            assert!(retries.waiting_on().is_some_and(|what| what.starts_with("snapshot ")));
+            let retried = reached(|| files.held.lock().unwrap().len() >= 3);
+            let (running, waiting_on) = (!publication.is_finished(), retries.waiting_on());
             retries.stop();
-            publication.join().expect("the publication panicked")
+            let outcome = publication.join().expect("the publication panicked");
+            assert!(retried, "the write was not retried");
+            assert!(running, "no giving up under a healthy lock");
+            assert!(waiting_on.is_some_and(|what| what.starts_with("snapshot ")));
+            outcome
         })
         .expect_err("stopped");
         let message = format!("{err:#}");
@@ -2824,15 +2870,14 @@ mod tests {
         gated.data.drop_writes.store(true, Ordering::SeqCst);
         let err = std::thread::scope(|scope| {
             let writer = scope.spawn(|| gated.write(FileType::Index, 3));
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            while gated.write_calls() < 4 {
-                assert!(std::time::Instant::now() < deadline, "the write was not retried");
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            assert!(!writer.is_finished(), "no giving up under a healthy lock");
-            assert_eq!(gated.retries.waiting_on(), Some(index_3.clone()));
+            let retried = reached(|| gated.write_calls() >= 4);
+            let (running, waiting_on) = (!writer.is_finished(), gated.retries.waiting_on());
             gated.retries.stop();
-            writer.join().expect("the writer panicked")
+            let outcome = writer.join().expect("the writer panicked");
+            assert!(retried, "the write was not retried");
+            assert!(running, "no giving up under a healthy lock");
+            assert_eq!(waiting_on, Some(index_3.clone()));
+            outcome
         })
         .expect_err("stopped");
         assert!(format!("{err}").contains("injected write failure"), "{err}");

@@ -161,7 +161,11 @@ both tools:
   id if not already set ("retain the original snapshot id over all tag
   changes"); the **new snapshot file is written first, then the old one
   deleted** (restic's `SaveSnapshot` → `RemoveUnpacked` order), so there
-  is never a moment where the snapshot doesn't exist. Between those two
+  is never a moment where the snapshot doesn't exist. The write is one
+  request, and one that reports an error is looked for in the repository
+  before the edit gives up (`lock::write_unpacked`): a new file the
+  server stored without answering is the new snapshot, not a duplicate
+  left beside the old one. Between those two
   steps wrustic re-reads the new file through rustic_core's decrypt path
   and compares it byte-for-byte — an envelope bug aborts before anything
   is deleted. Snapshot files are not indexed, so nothing else needs
@@ -372,16 +376,24 @@ lists, restores, checks, forgets and prunes like any other.
   one still held by the server after a later one stored the file, the
   snapshot or an index. Every attempt writes the same file under the
   same name, so it changes nothing when it lands — unless the file was
-  removed in the meantime (the merged snapshot deleted, the repository
-  pruned), which it then brings back, naming what the prune removed.
+  removed in the meantime, which it then brings back: the snapshot file
+  after the merged snapshot was deleted, an index file after a prune.
+  Keeping the merged snapshot does not guard the index: a prune rewrites
+  index files and repacks packs whether or not a snapshot still uses
+  what is in them, so the index that comes back can name packs that are
+  gone.
   That cannot be prevented from here either, so it is said: the notice
-  after such a merge reads "A late write is possible" and points here.
+  after such a merge says that a late write is possible and points here.
   A merge that fails after storing an index that way says it in its
-  error — its packs are what the next prune removes, and a late copy of
-  the index would name them: run `restic check` after that prune.
-  Until the server has had time to finish what it took, leave the merged
-  snapshot in place, or run `restic check` after deleting and pruning
-  it.
+  error — its packs are what the next prune removes.
+  Until the server has had time to finish what it took, put off pruning
+  and anything else that rewrites the index (`restic prune`, `forget
+  --prune`, `repair index`), and deleting the merged snapshot. A `restic
+  check` that comes out clean settles nothing if it ran after such a
+  prune and before the request arrived: run it again later. Where it
+  reports that the index names packs missing from the repository,
+  `restic repair index` rebuilds the index from the packs that are
+  there.
 - **Trees** go through rustic_core's `Repository::merge_trees`: entries are
   matched by path from the root, an entry only one snapshot has is taken
   as is, directories are merged recursively, and where the same path
@@ -437,8 +449,14 @@ lists, restores, checks, forgets and prunes like any other.
     records `/data/extra` and stores `/extra`; checked against restic
     0.19.1), so its files were not merged into the directory its path
     names. Such a path is listed beside the other, and the merged
-    snapshot does not pass for a backup of the one directory. Names in a
-    tree are compared as restic means them, with its quoting undone. The
+    snapshot does not pass for a backup of the one directory. The same
+    goes for every path of a source whose tree holds anything outside
+    its paths (`repo::tree_keeps_to_paths`) — a merge that kept such a
+    path apart is one: its `/extra` at the root is no part of `/data`,
+    whatever `/data/extra` leads to. Names in a
+    tree are compared as restic means them, with its quoting undone, and
+    a network share is one directory under its whole name
+    (`\\nas\share`), as restic stores a volume. The
     confirmation screen shows the folded set from the paths alone — the
     trees are read only under the lock — and says next to it that a
     nested path may stay.

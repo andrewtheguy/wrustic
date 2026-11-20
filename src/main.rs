@@ -1079,26 +1079,27 @@ fn open_and_walk(
 
 // The one-line notice after a merge. The merge keeps metadata as far as it
 // can; where the sources held node fields it could not carry over
-// (`MergeOutcome::dropped_node_fields`), they are named here, ahead of
-// anything a narrow terminal would cut off. A merge that stored a file while
-// another write of it may still arrive (`MergeOutcome::attempt_still_open`)
-// says so, and where to read what that means.
+// (`MergeOutcome::dropped_node_fields`), they are named here. A merge that
+// stored a file while another write of it may still arrive
+// (`MergeOutcome::attempt_still_open`) says so, and where to read what that
+// means. With both to say, the notice is worded to fit an 80-column bar with
+// both on it, the late write first: it is the one to act on, and what a
+// longer list of fields runs into is the edge, not the warning.
 fn merge_notice(new_id: &str, dropped_node_fields: &[String], attempt_still_open: bool) -> String {
     let short = &new_id[..new_id.len().min(8)];
-    if dropped_node_fields.is_empty() && !attempt_still_open {
-        return format!("Merged into new snapshot {short} — both source snapshots were kept.");
-    }
-    let mut notice = format!("Merged into {short}, sources kept.");
-    if !dropped_node_fields.is_empty() {
-        notice.push_str(&format!(" Not carried over: {}", dropped_node_fields.join(", ")));
-        if attempt_still_open {
-            notice.push('.');
+    let dropped = dropped_node_fields.join(", ");
+    match (dropped_node_fields.is_empty(), attempt_still_open) {
+        (true, false) => {
+            format!("Merged into new snapshot {short} — both source snapshots were kept.")
+        }
+        (false, false) => format!("Merged into {short}, sources kept. Not carried over: {dropped}"),
+        (true, true) => {
+            format!("Merged into {short}, sources kept. A late write is possible: docs/locking.md")
+        }
+        (false, true) => {
+            format!("Merged {short}. Late write possible: docs/locking.md. Lost {dropped}")
         }
     }
-    if attempt_still_open {
-        notice.push_str(" A late write is possible: docs/locking.md");
-    }
-    notice
 }
 
 // Prepend a synthetic `..` row and pick a default selection: the first real
@@ -1145,12 +1146,14 @@ mod tests {
             "Merged into 01234567, sources kept. A late write is possible: docs/locking.md"
         );
         assert!(open.chars().count() <= 78, "must fit an 80-column bottom bar");
-        // What was lost comes first; the pointer is what a narrow bar cuts.
+        // Both at once still fit, the late write ahead of what a longer
+        // list of fields would push past the edge.
+        let both = merge_notice(id, &["generic_attributes".to_string()], true);
         assert_eq!(
-            merge_notice(id, &["generic_attributes".to_string()], true),
-            "Merged into 01234567, sources kept. Not carried over: generic_attributes. A late \
-             write is possible: docs/locking.md"
+            both,
+            "Merged 01234567. Late write possible: docs/locking.md. Lost generic_attributes"
         );
+        assert!(both.chars().count() <= 78, "must fit an 80-column bottom bar");
     }
 
     fn coalesce(first: Event, queued: Vec<Event>) -> (Event, Option<Event>) {

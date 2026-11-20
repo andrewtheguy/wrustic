@@ -46,10 +46,12 @@ exactly which workflows that means.
   snapshot restic reads, and restic chooses it as the parent of the next
   `restic backup` by its usual rule: the latest snapshot with the backup's
   host and exactly its paths, unless `--parent`, `--force` or another
-  `--group-by` says otherwise. The merged snapshot is made to be that one —
+  `--group-by` says otherwise. The merged snapshot is made to qualify —
   it has the sources' host, their paths with a nested one folded into the
   directory that holds it, and a time just after the newer source's — when
-  both sources are one host's and their files are where their paths say. A
+  both sources are one host's and their files are where their paths say; a
+  snapshot of that host and those paths taken later than the newer source
+  is the latest instead. A
   merge of two hosts' snapshots is named for both (`alpha+beta`), which
   neither host's backups look for, and the path of a relative-path backup is
   listed apart, not folded. Metadata is

@@ -567,8 +567,8 @@ pub(crate) fn merge_snapshots(
             anyhow!(
                 "{e:#} — also: an index file this merge stored may be written again by a \
                  request the server still holds. If a prune removes the merge's packs before \
-                 it arrives, it names packs that are gone: run `restic check` after the next \
-                 prune (docs/locking.md)"
+                 it arrives, it names packs that are gone: give the server time before the \
+                 next prune, and run `restic check` after it (docs/locking.md)"
             )
         } else {
             e
@@ -718,13 +718,21 @@ fn merge_through_gate(
     // The source paths whose files are not where the path says: see
     // `merged_paths`.
     let mut misplaced_paths = std::collections::BTreeSet::new();
+    let read_tree = |id: &TreeId| -> Result<_> {
+        stopped_before_the_snapshot(
+            "nothing refers to the trees it wrote, and the next prune removes them",
+        )?;
+        Ok(repo.cat_blob(BlobType::Tree, id.to_hex().as_str())?)
+    };
     for (source, root) in sources.iter().zip(&trees) {
         let paths = source.get("paths").and_then(|paths| paths.as_array());
-        for path in paths.into_iter().flatten().filter_map(|path| path.as_str()) {
-            let held = tree_holds_path(*root, path, |id| {
-                Ok(repo.cat_blob(BlobType::Tree, id.to_hex().as_str())?)
-            })?;
-            if !held {
+        let paths: Vec<&str> =
+            paths.into_iter().flatten().filter_map(|path| path.as_str()).collect();
+        // A tree that holds anything outside its paths is not laid out as
+        // they say, wherever a path of that name happens to lead in it.
+        let keeps_to_paths = tree_keeps_to_paths(*root, &paths, read_tree)?;
+        for path in paths {
+            if !(keeps_to_paths && tree_holds_path(*root, path, read_tree)?) {
                 let _ = misplaced_paths.insert(path.to_string());
             }
         }
@@ -823,9 +831,10 @@ pub(crate) struct MergeOutcome {
     /// writing it, reported as failed, may still be completed by the server
     /// (`lock::Published::attempt_still_open`,
     /// `lock::WriteGate::attempt_still_open`). That attempt writes the same
-    /// file again. It matters only if the merged snapshot is deleted and
-    /// pruned before it arrives: it would then bring back a file that names
-    /// what the prune removed.
+    /// file again. It matters only if the file is gone by the time it
+    /// arrives — the snapshot deleted, or the index rewritten by a prune,
+    /// which the merged snapshot being kept does not prevent: it then brings
+    /// back a file that names what the prune removed.
     pub(crate) attempt_still_open: bool,
 }
 
@@ -1184,6 +1193,9 @@ fn cross_host_link_defect<B: AsRef<[u8]>>(
         Ok(())
     })?;
     groups.retain(|_, paths| paths.len() > 1);
+    if groups.is_empty() {
+        return Ok(None);
+    }
 
     // What each source records of them.
     let mut recorded: Vec<HashSet<(Identity, String)>> = Vec::with_capacity(sources.len());
@@ -1226,19 +1238,86 @@ fn cross_host_link_defect<B: AsRef<[u8]>>(
 /// The names a backed-up path has in a restic tree, from the root down.
 /// restic stores a target under its absolute path: `/data/extra` is `data`,
 /// then `extra`. On Windows the volume is the first directory, without its
-/// colon: `C:\Users\me` is `C`, `Users`, `me`.
+/// colon: `C:\Users\me` is `C`, `Users`, `me`. A network share is one
+/// directory under its whole name, `\\nas\share\dir` being `\\nas\share`, then
+/// `dir`: restic puts the volume name first as it stands, and takes the colon
+/// off a drive letter only (`pathComponents` in its `archiver/tree.go`).
 fn archive_components(path: &str) -> Vec<&str> {
     if path.starts_with('/') {
         return path.split('/').filter(|part| !part.is_empty()).collect();
     }
     // `\\?\C:\…` is the same path spelled the long way.
-    path.strip_prefix(r"\\?\")
-        .unwrap_or(path)
-        .split(['/', '\\'])
-        .filter(|part| !part.is_empty())
-        .enumerate()
-        .map(|(i, part)| if i == 0 { part.strip_suffix(':').unwrap_or(part) } else { part })
+    let path = path.strip_prefix(r"\\?\").unwrap_or(path);
+    let (volume, rest) = match path.strip_prefix(r"\\") {
+        // Host and share, up to the separator after the share.
+        Some(unc) => {
+            let end = unc
+                .match_indices(['/', '\\'])
+                .nth(1)
+                .map_or(path.len(), |(at, _)| at + r"\\".len());
+            (Some(&path[..end]), &path[end..])
+        }
+        None => (None, path),
+    };
+    volume
+        .into_iter()
+        .chain(
+            rest.split(['/', '\\'])
+                .filter(|part| !part.is_empty())
+                .enumerate()
+                .map(|(i, part)| match (i, volume) {
+                    (0, None) => part.strip_suffix(':').unwrap_or(part),
+                    _ => part,
+                }),
+        )
         .collect()
+}
+
+/// Whether everything in the tree at `root` lies within `paths`, laid out as
+/// restic stores absolute paths ([`archive_components`]): above the targets
+/// such a tree holds only the directories that lead to them. An entry beside
+/// those was not put there by a backup of these paths as absolute ones — a
+/// target given as a relative path, or a merge that kept such a one — and
+/// then a path of the right name in the tree ([`tree_holds_path`]) need not
+/// be the directory the path names.
+fn tree_keeps_to_paths<B: AsRef<[u8]>>(
+    root: TreeId,
+    paths: &[&str],
+    read_tree: impl Fn(&TreeId) -> Result<B>,
+) -> Result<bool> {
+    let targets: Vec<Vec<&str>> = paths.iter().map(|path| archive_components(path)).collect();
+    // The directories above the targets still to look into, each with how
+    // deep it is and the targets that lie below it.
+    let mut above = vec![(root, 0, targets.iter().collect::<Vec<_>>())];
+    while let Some((tree, depth, below)) = above.pop() {
+        // A target itself: all of it is within the paths.
+        if below.iter().any(|target| target.len() == depth) {
+            continue;
+        }
+        let raw = read_tree(&tree)?;
+        let parsed: serde_json::Value = serde_json::from_slice(raw.as_ref())
+            .with_context(|| format!("parsing tree {}", tree.to_hex().as_str()))?;
+        let nodes = parsed.get("nodes").and_then(serde_json::Value::as_array);
+        for node in nodes.into_iter().flatten() {
+            let name = restic_name_bytes(raw_name(node));
+            let through: Vec<_> = below
+                .iter()
+                .copied()
+                .filter(|target| target[depth].as_bytes() == name)
+                .collect();
+            if through.is_empty() {
+                return Ok(false);
+            }
+            if through.iter().any(|target| target.len() == depth + 1) {
+                continue;
+            }
+            match node.get("subtree").and_then(|s| s.as_str()).map(str::parse::<TreeId>) {
+                Some(Ok(subtree)) => above.push((subtree, depth + 1, through)),
+                _ => return Ok(false),
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// Whether the tree at `root` holds `path` where restic stores an absolute
@@ -2271,6 +2350,12 @@ mod tests {
             (6, vec![raw_dir("Users", 3)]),
             // Names restic stores quoted: `we"ird` and `tab<TAB>bed`.
             (7, vec![raw_dir(r#"we\"ird"#, 3), raw_dir(r"tab\tbed", 3)]),
+            // A network share: one directory, stored under its quoted name.
+            (8, vec![raw_dir(r"\\\\nas\\share", 3)]),
+            // `/data` with a file beside it, and with what a relative backup
+            // of `extra` left at the root.
+            (9, vec![raw_dir("data", 2), file("root.txt")]),
+            (10, vec![raw_dir("data", 2), raw_dir("extra", 3)]),
         ]);
         let holds = |root: u8, path: &str| tree_holds_path(tree_id(root), path, &read).unwrap();
         assert!(holds(1, "/data"));
@@ -2287,9 +2372,38 @@ mod tests {
         assert!(holds(7, "/we\"ird/n.txt"), "a quoted name is the plain one in `paths`");
         assert!(holds(7, "/tab\tbed"));
         assert!(!holds(7, r#"/we\"ird"#), "the quoted form is not the name");
+        assert!(holds(8, r"\\nas\share\n.txt"), "the share is the volume, whole");
+        assert!(!holds(8, r"\\nas\other\n.txt"));
+
+        // A path of the right name is not enough: a tree laid out as its
+        // paths say holds nothing beside the way to them.
+        let keeps = |root: u8, paths: &[&str]| {
+            tree_keeps_to_paths(tree_id(root), paths, &read).unwrap()
+        };
+        assert!(keeps(1, &["/data"]));
+        assert!(keeps(1, &["/data", "/data/extra"]));
+        assert!(keeps(1, &["/data/extra", "/data/keep.txt"]));
+        assert!(keeps(1, &["/"]));
+        assert!(!keeps(1, &["/data/extra"]), "`keep.txt` is beside it");
+        assert!(keeps(4, &["/extra"]));
+        assert!(!keeps(4, &["/data/extra"]));
+        assert!(holds(9, "/data") && !keeps(9, &["/data"]), "`/root.txt` is outside `/data`");
+        assert!(keeps(9, &["/data", "/root.txt"]));
+        assert!(
+            holds(10, "/data/extra") && !keeps(10, &["/data", "/data/extra"]),
+            "`/extra` is outside both, though `/data` holds an `extra`"
+        );
+        assert!(keeps(8, &[r"\\nas\share\n.txt"]));
 
         assert_eq!(archive_components("/data/extra/"), ["data", "extra"]);
         assert_eq!(archive_components(r"C:\Users/me"), ["C", "Users", "me"]);
+        assert_eq!(archive_components(r"\\nas\share\dir\sub"), [r"\\nas\share", "dir", "sub"]);
+        assert_eq!(archive_components(r"\\nas\share"), [r"\\nas\share"]);
+        // Nested paths on a share fold into the outer one's path set.
+        assert_eq!(
+            merged_paths(&[r"\\nas\share\data\extra", r"\\nas\share\data"]),
+            [r"\\nas\share\data"]
+        );
         assert!(archive_components("/").is_empty());
     }
 

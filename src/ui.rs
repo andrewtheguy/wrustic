@@ -1330,14 +1330,17 @@ fn render_merging(frame: &mut Frame, app: &App, area: Rect) {
     if app.merge_stop_requested {
         // Not "waiting for the write": a stop is only seen at a write or
         // between reads, and `merge_trees` reads on until it has one to make.
+        // Nor "nothing more is written": a request already sent is not
+        // called back, and the server may store it even after it timed out.
         body.push_str(
-            "Stopping — nothing more is written. The merge ends when the step under way \
-             returns…",
+            "Stopping — no new write is begun; one already sent may still be stored. The \
+             merge ends when the step under way returns…",
         );
     } else {
         body.push_str(
-            "Ctrl+C stops the merge: nothing more is written, and no failed write is tried \
-             again. The sources are not touched either way.",
+            "Ctrl+C stops the merge: no new write is begun and no failed one is tried again, \
+             though one already sent may still be stored. The sources are not touched either \
+             way.",
         );
     }
     let para = Paragraph::new(body)
