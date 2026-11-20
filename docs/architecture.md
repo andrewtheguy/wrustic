@@ -230,7 +230,7 @@ smbanything's own docs. The architectural points:
   which restic restores wrong. rustic_core's writes go through
   `lock::gate_writes`, so nothing is written once the lock is lost or
   after the merge has returned. Sources of two hosts give a snapshot
-  without a hostname, which no backup takes for its parent.
+  named for both, which neither host's backups take for their parent.
 - `unlock(profile)` — native stale-lock removal, offered with `u` on the
   delete-error screen when `lock::is_lock_error()` matches the failure.
   Only locks that are provably dead are removed (older than restic's

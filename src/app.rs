@@ -3935,7 +3935,7 @@ mod tests {
                 "two hosts",
                 "nas",
                 vec!["/srv/data"],
-                "host   (none: the sources are two hosts', so no backup's parent)",
+                "host   fileserver-01.example.internal+nas  (two hosts: parent of neither)",
             ),
         ] {
             let mut app = boot_app_with_snapshots(vec![

@@ -1181,15 +1181,13 @@ fn render_merge_confirm(frame: &mut Frame, app: &App, area: Rect) {
     lines.extend(describe("newer", newer));
     lines.extend(describe("older", older));
     lines.push(String::new());
-    // Sources of one host keep it; a merge across hosts has no hostname
-    // (repo::merged_hostname), so no backup takes it for its parent.
-    let host = match crate::repo::merged_hostname(&[newer.host.as_str(), older.host.as_str()]) {
-        Some(host) => host,
-        None if newer.host == older.host => "(none)".to_string(),
-        None => "(none: the sources are two hosts', so no backup's parent)".to_string(),
-    };
+    // Sources of one host keep it; a merge across hosts gets a name made of
+    // both (repo::merged_hostname), which neither host's backups look for.
+    let host = crate::repo::merged_hostname(&[newer.host.as_str(), older.host.as_str()])
+        .unwrap_or_else(|| "(none)".to_string());
+    let host_note = if newer.host == older.host { "" } else { "  (two hosts: parent of neither)" };
     lines.push(" The new snapshot takes its time from the newer one, and".to_string());
-    lines.push(format!("   host   {host}"));
+    lines.push(format!("   host   {host}{host_note}"));
     lines.push(format!("   paths  {}", crate::repo::merged_paths(&all_paths).join(", ")));
     lines.push(format!("   tags   {tags}"));
     let sources = Paragraph::new(

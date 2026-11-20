@@ -292,17 +292,20 @@ lists, restores, checks, forgets and prunes like any other.
   - `username`, `uid`, `gid` — the newest source's, copied as stored.
   - `hostname` — the sources' own when they share one, which is what lets
     that host's next backup find the merged snapshot. Sources of several
-    hosts get none (`repo::merged_hostname`): such a merge holds another
-    machine's files, and a backup that took it for its parent would
-    compare its own files against those. A name made up for the purpose
-    would not keep backups away, because `restic backup --host` takes any
-    name; but every backup has *some* hostname — restic 0.19.1 records the
-    machine's own for an empty `--host` — so a snapshot without one is
-    the only kind no backup's host matches. (A backup run with
-    `--group-by` leaving the host out chooses its parent across hosts by
-    request, this one included.) So the guarantee that the next backup
-    uses the merged snapshot as its parent holds for sources of one host
-    only.
+    hosts get a name made of all of them, sorted and joined with `+`
+    (`repo::merged_hostname`; a source without a hostname counts as
+    `unknown`): such a merge holds another machine's files, and a backup
+    that took it for its parent would compare its own files against
+    those. The name shows in restic and wrustic where the snapshot came
+    from, and is nobody's, so neither host's backups look for it. That is
+    a convention, not a barrier — `restic backup --host alpha+beta` on
+    the same paths does take the merge for its parent, as does a backup
+    whose `--group-by` leaves the host out. Leaving the hostname out
+    altogether would close the first of those (every backup has some
+    hostname; restic 0.19.1 records the machine's own for an empty
+    `--host`), and was passed over because the snapshot would then show
+    no host anywhere. So the guarantee that the next backup uses the
+    merged snapshot as its parent holds for sources of one host only.
   - `time` — the newest source's plus one nanosecond, in the same UTC
     offset (`repo::just_after`). The merged snapshot is as recent as its
     newest data, and has to be strictly the latest: restic takes the latest
@@ -410,10 +413,10 @@ holding `"a` and `A` merged with a later backup of `A` is refused; `"a`
 and `b`, which sort one way either way, merge and restore byte for byte;
 after two backups of one directory are merged, restic lists the merged
 snapshot as strictly the latest and takes it as the next backup's parent;
-a merge of one directory's backups as two hosts is listed without a
-hostname, the next backup as either host takes that host's own last
-backup, and a backup with an empty `--host` gets the machine's name and
-does not take it either).
+a merge of one directory's backups as two hosts is listed as `alpha+beta`,
+the next backup as either host takes that host's own last backup, and a
+backup with an empty `--host` gets the machine's name and does not take
+it either).
 
 **Long-running reads — non-exclusive lock (implemented):** the snapshot
 SMB share (`smb::ShareServer::share_snapshot`). Reads take no lock in wrustic's

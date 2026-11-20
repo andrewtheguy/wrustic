@@ -1005,9 +1005,10 @@ fn json_is_empty(value: &serde_json::Value) -> bool {
 ///
 /// - `username`, `uid`, `gid` come from the newest source (`newest` indexes
 ///   `sources`), copied as stored.
-/// - `hostname` is the sources' own where they share one, and otherwise
-///   left out ([`merged_hostname`]) — a merge across hosts is not a backup of
-///   either, and must not be taken for the parent of one.
+/// - `hostname` is the sources' own where they share one, and otherwise a
+///   name of its own made of all of theirs ([`merged_hostname`]) — a merge
+///   across hosts is not a backup of either, and should not be taken for the
+///   parent of one.
 /// - `time` is the newest source's plus one nanosecond ([`just_after`]): as
 ///   recent as its newest data, and still the *latest* of the snapshots that
 ///   match — restic takes the latest as parent and leaves a tie to chance,
@@ -1126,15 +1127,26 @@ fn just_after(time: &str) -> Result<String> {
 /// The hostname of a merged snapshot, if it gets one. Sources of one host
 /// keep it, which is what lets `restic backup` on that host find the merged
 /// snapshot as its parent (it looks for its own hostname and path set).
-/// Sources of several hosts — or of none that is named — get no hostname at
-/// all: such a merge holds another machine's files, and a backup that took it
-/// for its parent would compare its own against those. No name would do
-/// instead, since `restic backup --host` accepts any; but a backup always
-/// has *a* hostname (an empty `--host` falls back to the machine's), so a
-/// snapshot without one is the only kind no backup's host can match.
+/// Sources of several hosts get a name made of all of them, sorted and joined
+/// with `+`, a source without a hostname counting as `unknown`: such a merge
+/// holds another machine's files, and a backup that took it for its parent
+/// would compare its own against those. The name says where the snapshot
+/// came from, and is not one a machine has — which keeps backups away from
+/// it unless one is run with `--host` set to that very name. Leaving the
+/// hostname out would close that gap too, at the price of a snapshot that
+/// shows no host anywhere. Sources none of which names a host give none.
 pub(crate) fn merged_hostname(hosts: &[&str]) -> Option<String> {
-    let first = hosts.first().filter(|host| !host.is_empty())?;
-    hosts.iter().all(|host| host == first).then(|| first.to_string())
+    let distinct: std::collections::BTreeSet<&str> = hosts
+        .iter()
+        .map(|host| if host.is_empty() { "unknown" } else { host })
+        .collect();
+    match hosts.first() {
+        None => None,
+        Some(first) if hosts.iter().all(|host| host == first) => {
+            (!first.is_empty()).then(|| first.to_string())
+        }
+        Some(_) => Some(distinct.into_iter().collect::<Vec<_>>().join("+")),
+    }
 }
 
 /// The path set of a merged snapshot: every source path, sorted, without
@@ -1918,16 +1930,15 @@ mod tests {
 
     // restic looks for a backup's parent by hostname and paths. A merge of
     // two hosts' snapshots holds another machine's files, so it must not
-    // answer to any name a backup can have — while sources of one host keep
-    // theirs.
+    // answer to either host's name — while sources of one host keep theirs.
     #[test]
-    fn merged_snapshot_of_two_hosts_has_no_hostname() {
+    fn merged_snapshot_of_two_hosts_is_named_for_both() {
         assert_eq!(merged_hostname(&["laptop", "laptop"]).as_deref(), Some("laptop"));
         assert_eq!(merged_hostname(&["laptop"]).as_deref(), Some("laptop"));
-        // Not a name made of both: `restic backup --host` takes any name.
-        assert_eq!(merged_hostname(&["nas", "laptop"]), None);
-        assert_eq!(merged_hostname(&["laptop", ""]), None);
-        assert_eq!(merged_hostname(&["", "laptop"]), None);
+        assert_eq!(merged_hostname(&["nas", "laptop"]).as_deref(), Some("laptop+nas"));
+        assert_eq!(merged_hostname(&["nas", "laptop", "nas"]).as_deref(), Some("laptop+nas"));
+        assert_eq!(merged_hostname(&["laptop", ""]).as_deref(), Some("laptop+unknown"));
+        assert_eq!(merged_hostname(&["", "laptop"]).as_deref(), Some("laptop+unknown"));
         assert_eq!(merged_hostname(&["", ""]), None);
         assert_eq!(merged_hostname(&[]), None);
 
@@ -1957,15 +1968,18 @@ mod tests {
         );
         assert_eq!(
             hostname_of(&[source(Some("nas"), newer), source(Some("laptop"), older)]),
-            None,
-            "neither the newest source's nor one made of both"
+            Some(serde_json::json!("laptop+nas")),
+            "not the newest source's alone"
         );
-        assert_eq!(hostname_of(&[source(Some("nas"), newer), source(None, older)]), None);
+        assert_eq!(
+            hostname_of(&[source(Some("nas"), newer), source(None, older)]),
+            Some(serde_json::json!("nas+unknown"))
+        );
         assert_eq!(hostname_of(&[source(None, newer), source(None, older)]), None);
 
         // rustic_core still reads a snapshot without a hostname.
         let out = merged_snapshot_json(
-            &[source(Some("nas"), newer), source(Some("laptop"), older)],
+            &[source(None, newer), source(None, older)],
             0,
             &"ab".repeat(32),
             &summary_for_tests(),
@@ -3223,10 +3237,10 @@ mod tests {
             .expect("the new snapshot is listed");
         assert_eq!(latest["parent"], serde_json::json!(merged));
 
-        // The same directory backed up as two hosts: the merged snapshot has
-        // no hostname, and the next backup as either host passes it over for
-        // that host's own last backup. Nor can a backup be made to match it:
-        // an empty `--host` is the machine's own name to restic.
+        // The same directory backed up as two hosts: the merged snapshot is
+        // named for both, and the next backup as either host — or with no
+        // host given, which is the machine's own name to restic — passes it
+        // over.
         let hosts = root.join("source/hosts");
         std::fs::create_dir_all(&hosts).unwrap();
         std::fs::write(hosts.join("f"), b"from alpha\n").unwrap();
@@ -3255,11 +3269,7 @@ mod tests {
             .iter()
             .find(|s| s["id"] == serde_json::json!(merged))
             .expect("restic lists the merged snapshot");
-        assert_eq!(
-            merged_listed.get("hostname").and_then(|h| h.as_str()).unwrap_or(""),
-            "",
-            "a merge across hosts must not carry a hostname"
-        );
+        assert_eq!(merged_listed["hostname"], "alpha+beta");
         let summary = backup_as("beta", "hosts-next");
         let latest = restic_snapshots()
             .into_iter()
