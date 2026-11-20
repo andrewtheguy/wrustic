@@ -718,6 +718,11 @@ impl RepoLock {
             if retried {
                 std::thread::sleep(WRITE_RETRY_PAUSE);
             }
+            // Looking and pausing both took time, and a write begun under a
+            // lost lock is one more that can land late.
+            if self.poisoned() {
+                break;
+            }
             retried = true;
             written = backend.write(&name, &sealed);
             stored = written.is_ok();
@@ -1829,6 +1834,48 @@ mod tests {
         let message = format!("{err:#}");
         assert!(message.contains("injected write failure"), "{message}");
         assert!(message.starts_with("writing "), "{message}");
+        drop(lock);
+    }
+
+    // The lock can go while the publication is looking for the file of a
+    // failed write, or pausing before the next attempt. That attempt must
+    // not be made: its file could not be trusted, and it would be one more
+    // write for the server to complete late.
+    #[test]
+    fn no_write_is_begun_once_the_lock_is_lost() {
+        let _guard = test_acquire_guard();
+        let crypto = test_crypto(true);
+        let (_locks, lock) = steady_lock(&crypto);
+
+        // Loses the lock when asked whether the file is there.
+        struct LosesLockOnRead(Arc<MemLockBackend>, LockHealth, AtomicUsize);
+        impl LockBackend for LosesLockOnRead {
+            fn list(&self) -> Result<Vec<(String, u64)>> {
+                self.0.list()
+            }
+            fn read(&self, name: &str) -> Result<Option<Vec<u8>>> {
+                self.1.expire_for_tests();
+                self.0.read(name)
+            }
+            fn write(&self, name: &str, data: &[u8]) -> Result<()> {
+                let _ = self.2.fetch_add(1, Ordering::SeqCst);
+                self.0.write(name, data)
+            }
+            fn remove(&self, name: &str) -> Result<()> {
+                self.0.remove(name)
+            }
+        }
+        let files = MemLockBackend::new();
+        files.fail_writes.store(true, Ordering::SeqCst);
+        let backend = LosesLockOnRead(Arc::clone(&files), lock.health(), AtomicUsize::new(0));
+        let err = lock
+            .write_unpacked_while_held(&backend, &crypto, b"{\"n\":1}")
+            .expect_err("the write failed and the lock is lost");
+        let message = format!("{err:#}");
+        assert_eq!(backend.2.load(Ordering::SeqCst), 1, "no attempt under the lost lock");
+        assert!(message.contains("could not be refreshed"), "{message}");
+        assert!(message.contains("injected write failure"), "{message}");
+        assert_eq!(files.count(), 0);
         drop(lock);
     }
 

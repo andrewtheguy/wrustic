@@ -289,7 +289,9 @@ lists, restores, checks, forgets and prunes like any other.
   that turns up afterwards would name them. Under the lock a late write
   does no harm, so for these backends the merge does not give up while
   the lock is healthy — it checks the repository and writes again, five
-  seconds apart, until the snapshot is stored or the lock is lost. With
+  seconds apart, until the snapshot is stored or the lock is lost (the
+  lock is asked again right before each attempt, so none starts under a
+  lost one). With
   the repository out of reach that is the 22.5 minutes the lock takes to
   turn bad, during which the merge screen stays up. A local repository
   gets one more attempt, and then the file is removed and the error
@@ -298,6 +300,13 @@ lists, restores, checks, forgets and prunes like any other.
   error does not pretend otherwise: it says the snapshot may still turn
   up and is to be removed if it does — it would by then name trees that
   a prune is free to delete.
+  What stays open is an earlier attempt still held by the server after a
+  later one stored the snapshot. Every attempt writes the same file
+  under the same name, so it changes nothing when it lands — unless the
+  snapshot was deleted in the meantime, which it then brings back, naming
+  trees a prune may have removed since. Nothing a client can send
+  completes, cancels or fences a request a server holds, and restic's
+  own retry of a failed save is in the same position.
 - **Trees** go through rustic_core's `Repository::merge_trees`: entries are
   matched by path from the root, an entry only one snapshot has is taken
   as is, directories are merged recursively, and where the same path
