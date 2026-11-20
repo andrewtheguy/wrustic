@@ -25,10 +25,12 @@ exactly which workflows that means.
 - **Snapshot deletion**, native and guarded by a restic-compatible exclusive
   repository lock; when the repo is locked, `u` on the error screen removes
   stale locks (live ones are kept) and retries
-- **Snapshot merge** (`M` on the snapshot list): combine two snapshots into
-  a new one holding the files of both — back up just a new file or
-  directory with restic, then merge it into the earlier snapshot without
-  reading the rest again. Only directory listings are written, the two
+- **Snapshot merge** (`M` on the snapshot list), for special cases such as
+  adding content to an existing snapshot — not a step of ordinary backups,
+  where every `restic backup` already yields a complete snapshot. Back up
+  just a new file or directory with restic, then merge it into the earlier
+  snapshot without reading the rest again: the result is a new snapshot
+  holding the files of both. Only directory listings are written, the two
   source snapshots are kept, and it runs under restic's non-exclusive lock
   alongside running backups. restic itself has no merge; the result is an
   ordinary snapshot restic reads, and the next `restic backup` uses it as

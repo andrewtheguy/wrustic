@@ -57,9 +57,10 @@ These stay on a user-run `restic` (>= 0.19), outside wrustic — wrustic
 itself will never run them:
 
 - `restic init` — creating a new repository
-- `restic backup` — creating snapshots, including the one a merge adds to
-  an existing snapshot: back up only the new file or directory, then merge
-  the two in wrustic
+- `restic backup` — creating snapshots. That is the whole of an ordinary
+  backup flow; the merge is for special cases such as adding content to an
+  existing snapshot, and there too the backup is restic's: back up only
+  the new file or directory, then merge the two in wrustic
 - maintenance beyond prune: `repair`, `migrate`, key management
 
 Description edits are not planned — `description` is a rustic-only

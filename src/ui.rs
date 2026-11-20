@@ -66,7 +66,7 @@ pub(crate) fn help_rows(screen: &Screen) -> Option<&'static [(&'static str, &'st
             ("f", "filter the list by host, tag or path"),
             ("d", "delete this snapshot (no prune)"),
             ("t", "edit this snapshot's tags"),
-            ("M", "merge this snapshot with another into a new one"),
+            ("M", "merge with another snapshot (to add content to one)"),
             ("p", "prune the repository"),
             ("r", "reload the snapshot list"),
             ("q / Esc", "back to the profile list"),

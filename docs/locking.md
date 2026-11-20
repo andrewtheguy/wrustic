@@ -200,7 +200,13 @@ both tools:
 the TUI's `M` on the snapshot list):** two snapshots become one new
 snapshot holding the files of both — the way to add a file or directory to
 an existing snapshot without reading the rest of it again: back up only
-the addition, then merge. restic has no merge command, so unlike every
+the addition, then merge. It is a tool for special cases like that one,
+not a step of ordinary backups. A regular `restic backup` of the whole
+path set already yields a complete snapshot and stores nothing twice, and
+nothing about it calls for a merge; merging two full backups of one
+directory is possible but rarely what is wanted, since the result is the
+union — a file deleted between the two is back in it. restic has no merge
+command, so unlike every
 other native write there is no restic behaviour to mirror, only restic's
 rules to stay inside. That is also why this one is in scope while
 description edits are not: a description is a *field* restic cannot keep,
