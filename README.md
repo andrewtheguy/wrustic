@@ -32,8 +32,10 @@ exactly which workflows that means.
   source snapshots are kept, and it runs under restic's non-exclusive lock
   alongside running backups. restic itself has no merge; the result is an
   ordinary snapshot restic reads, and the next `restic backup` uses it as
-  its parent. Snapshots restic took on Windows are refused rather than
-  merged with their Windows attributes lost (docs/locking.md)
+  its parent. Metadata is kept as far as the merge can: a merged snapshot
+  of backups restic took on Windows is without their Windows attributes
+  (creation time, file attributes, security descriptors), which the
+  sources keep (docs/locking.md)
 - **Prune** (`p` on the snapshot list): reclaim the space deleted snapshots
   left behind — runs `restic prune` (restic >= 0.19, the one the installers
   bundle and only that one) with live progress and safe Ctrl+C

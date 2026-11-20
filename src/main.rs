@@ -640,12 +640,10 @@ fn run(
             match merge_snapshots(profile, &[first, second]) {
                 // Reload the list with the cursor on the new snapshot, and say
                 // what happened to the two it came from.
-                Ok(new_id) => {
+                Ok(outcome) => {
+                    let new_id = outcome.snapshot_id;
                     app.clear_merge_scratch();
-                    app.notice = Some(format!(
-                        "Merged into new snapshot {} — both source snapshots were kept.",
-                        &new_id[..new_id.len().min(8)]
-                    ));
+                    app.notice = Some(merge_notice(&new_id, &outcome.dropped_node_fields));
                     app.post_delete_select = app.list_state.selected();
                     app.post_reload_select_id = Some(new_id);
                     app.snapshots.clear();
@@ -1028,6 +1026,22 @@ fn open_and_walk(
     Ok((repo, stack))
 }
 
+// The one-line notice after a merge. The merge keeps metadata as far as it
+// can; where the sources held node fields it could not carry over
+// (`MergeOutcome::dropped_node_fields`), they are named here, ahead of
+// anything a narrow terminal would cut off.
+fn merge_notice(new_id: &str, dropped_node_fields: &[String]) -> String {
+    let short = &new_id[..new_id.len().min(8)];
+    if dropped_node_fields.is_empty() {
+        format!("Merged into new snapshot {short} — both source snapshots were kept.")
+    } else {
+        format!(
+            "Merged into {short}, sources kept. Not carried over: {}",
+            dropped_node_fields.join(", ")
+        )
+    }
+}
+
 // Prepend a synthetic `..` row and pick a default selection: the first real
 // entry if any, otherwise the `..` row itself.
 fn with_parent(items: Vec<ContentRow>) -> (Vec<ContentRow>, TableState) {
@@ -1050,6 +1064,21 @@ mod tests {
 
     fn press(code: KeyCode) -> Event {
         key(code, KeyModifiers::NONE, KeyEventKind::Press)
+    }
+
+    #[test]
+    fn merge_notice_names_the_metadata_that_was_not_carried_over() {
+        let id = "0123456789abcdef";
+        assert_eq!(
+            merge_notice(id, &[]),
+            "Merged into new snapshot 01234567 — both source snapshots were kept."
+        );
+        let lossy = merge_notice(id, &["generic_attributes".to_string()]);
+        assert_eq!(
+            lossy,
+            "Merged into 01234567, sources kept. Not carried over: generic_attributes"
+        );
+        assert!(lossy.chars().count() <= 78, "must fit an 80-column bottom bar");
     }
 
     fn coalesce(first: Event, queued: Vec<Event>) -> (Event, Option<Event>) {

@@ -1156,7 +1156,9 @@ fn render_merge_confirm(frame: &mut Frame, app: &App, area: Rect) {
          \x20 paths  {}\n\
          \x20 tags   {tags}\n\n\
          Files and directories of both are combined by path. Where both hold the same \
-         path, the entry modified later wins.\n\n\
+         path, the entry modified later wins. Metadata is kept as far as the merge can: \
+         what restic stores only on Windows (creation time, file attributes, security \
+         descriptors) is not carried into the new snapshot.\n\n\
          Only directory listings are written — no file content is read or stored again. \
          Both snapshots are kept; delete them afterwards (d) if the merged one replaces \
          them. Runs under restic's non-exclusive lock, alongside running backups.\n\n\

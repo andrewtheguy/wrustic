@@ -249,20 +249,25 @@ lists, restores, checks, forgets and prunes like any other.
     those of the merged tree.
   - `parent`, `original`, `excludes` — left out. They describe one backup
     run, and the merged snapshot is the product of several.
-- **What `merge_trees` cannot keep, and the check that guards it.**
-  `merge_trees` re-serializes every node of every directory it rewrites
-  from rustic_core's typed `Node`, which has no field for restic's
-  `generic_attributes` (Windows creation time, file attributes, security
-  descriptors) — the tree-level twin of the `excludes` problem that made
-  tag edits a raw-JSON rewrite. rustic_core offers no way to write a tree
-  blob except through that type, so the merge cannot be made lossless the
-  same way; instead it refuses. Before anything is written, every tree
-  the sources reach is read raw and each node round-tripped through the
-  typed `Node` (`repo::unpreserved_node_fields`); a field that held
-  something and does not come back fails the merge with the entry and the
-  field named. The check is the round trip itself rather than a list of
-  field names, so it stays right when rustic_core learns a field.
-  **Snapshots taken by restic on Windows therefore do not merge.**
+- **Metadata is best effort: what `merge_trees` cannot keep is left out
+  and reported.** `merge_trees` reads every directory of every source into
+  rustic_core's typed `Node` and writes it back from there, and that type
+  has no field for restic's `generic_attributes` (Windows creation time,
+  file attributes, security descriptors) — the tree-level twin of the
+  `excludes` problem that made tag edits a raw-JSON rewrite. rustic_core
+  offers no way to write a tree blob except through that type, so the
+  merge cannot be made lossless the same way. It goes ahead: everything
+  the type does hold (names, content, sizes, times, modes, owners, links,
+  extended attributes) is carried over, and **a merged snapshot of
+  restic-on-Windows backups has no Windows attributes** — a restore from
+  it brings back the files without them. The sources keep theirs, and the
+  merge does not delete the sources. So that this is never silent, every
+  tree the sources reach is read raw and each node round-tripped through
+  the typed `Node` (`repo::node_fields_the_merge_drops`); the fields that
+  held something and do not come back are returned with the new snapshot's
+  id, and the TUI names them in its notice. The check is the round trip
+  itself rather than a list of field names, so it stays right when
+  rustic_core learns a field.
 - **How much is rewritten depends on the timezone.** rustic_core renders
   node times with the local zone's offset. Where that is what the trees
   already hold, a directory only one source has serializes back to the

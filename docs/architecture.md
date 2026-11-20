@@ -220,10 +220,11 @@ smbanything's own docs. The architectural points:
   fields rustic_core does not model survive.
 - `merge_snapshots(profile, ids)` — merges snapshots into a new one under
   restic's *non-exclusive* lock (it only adds files): rustic_core's
-  `merge_trees` for the directory trees, after a scan that refuses the
-  merge if a node carries a field that call would drop, then a snapshot
-  file wrustic writes itself so restic finds it as the parent of the next
-  backup. The source snapshots are kept.
+  `merge_trees` for the directory trees, then a snapshot file wrustic
+  writes itself so restic finds it as the parent of the next backup. The
+  source snapshots are kept. Metadata is best effort: the returned
+  `MergeOutcome` names the node fields `merge_trees` could not carry over
+  (restic's Windows attributes), for the notice the TUI shows.
 - `unlock(profile)` — native stale-lock removal, offered with `u` on the
   delete-error screen when `lock::is_lock_error()` matches the failure.
   Only locks that are provably dead are removed (older than restic's

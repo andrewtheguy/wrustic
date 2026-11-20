@@ -518,15 +518,15 @@ fn retag_snapshot_json(raw: &[u8], old_id: &str, new_tags: &[String]) -> Result<
 /// The trees go through `Repository::merge_trees`, which round-trips every
 /// node through rustic_core's typed `Node` — and that type does not model
 /// everything restic stores (`generic_attributes`, the Windows metadata).
-/// Rather than drop such fields silently, the sources are scanned first and
-/// the merge refused if any node carries one (see
-/// [`ensure_merge_keeps_every_node_field`]).
+/// Metadata is kept as far as that type goes: what it cannot hold is left
+/// out of the merged snapshot, and the sources, which still carry it, are
+/// scanned so the caller can say so ([`node_fields_the_merge_drops`]).
 ///
 /// The snapshot file is written by wrustic, not by rustic_core's
 /// `merge_snapshots`: that one stamps the merging machine's hostname and
 /// keeps nested paths apart, either of which stops `restic backup` from
 /// finding the merged snapshot as its parent (see [`merged_snapshot_json`]).
-pub(crate) fn merge_snapshots(profile: &Profile, snapshot_ids: &[String]) -> Result<String> {
+pub(crate) fn merge_snapshots(profile: &Profile, snapshot_ids: &[String]) -> Result<MergeOutcome> {
     for id in snapshot_ids {
         ensure_full_snapshot_id(id)?;
     }
@@ -542,8 +542,9 @@ pub(crate) fn merge_snapshots(profile: &Profile, snapshot_ids: &[String]) -> Res
     let crypto = lock::RepoCrypto::from_repo(&repo)?;
     let repo_lock =
         lock::RepoLock::acquire_shared(lock::backend_for_profile(profile)?, crypto.clone())?;
-    // The full index, not the ids-only one: the pre-merge scan reads raw tree
-    // blobs, which rustic_core only offers on a fully indexed repository.
+    // The full index, not the ids-only one: the scan for dropped metadata
+    // reads raw tree blobs, which rustic_core only offers on a fully indexed
+    // repository.
     let repo = repo.to_indexed()?;
 
     // Resolve the ids under the lock, like every other native write: the rows
@@ -570,7 +571,9 @@ pub(crate) fn merge_snapshots(profile: &Profile, snapshot_ids: &[String]) -> Res
     }
     let newest = newest.map(|(i, _)| i).unwrap_or(0);
 
-    ensure_merge_keeps_every_node_field(&repo, &trees)?;
+    let dropped_node_fields = node_fields_the_merge_drops(&trees, |id| {
+        Ok(repo.cat_blob(BlobType::Tree, id.to_hex().as_str())?)
+    })?;
 
     let started = rustic_core::jiff::Timestamp::now();
     let mut summary = SnapshotSummary::default();
@@ -615,30 +618,43 @@ pub(crate) fn merge_snapshots(profile: &Profile, snapshot_ids: &[String]) -> Res
         let _ = snapshots.remove(&new_id);
         bail!("merged snapshot {new_id} did not read back as written; it was removed again");
     }
-    Ok(new_id)
+    Ok(MergeOutcome {
+        snapshot_id: new_id,
+        dropped_node_fields: dropped_node_fields.into_iter().collect(),
+    })
 }
 
-/// Refuses a merge that would lose node metadata.
+/// What [`merge_snapshots`] produced.
+#[derive(Debug)]
+pub(crate) struct MergeOutcome {
+    /// The new snapshot's id.
+    pub(crate) snapshot_id: String,
+    /// Tree-node fields the sources hold and the merged snapshot does not
+    /// ([`node_fields_the_merge_drops`]), sorted; empty when nothing was lost.
+    pub(crate) dropped_node_fields: Vec<String>,
+}
+
+/// The node metadata a merge of these trees leaves behind, by field name.
 ///
-/// `Repository::merge_trees` re-serializes every node of every directory it
-/// rewrites from rustic_core's typed `Node`, and a field that type does not
-/// model is simply gone afterwards — as of rustic_core 0.14 that is restic's
-/// `generic_attributes` (Windows creation time, file attributes and security
-/// descriptors). Which directories get rewritten is not knowable up front
-/// either: at least every one the sources share, and all of them when the
-/// trees were written in another timezone, because rustic_core renders node
-/// times in the local one. So every tree the sources reach is read raw and
-/// each node checked ([`unpreserved_node_fields`]) before anything is written.
-fn ensure_merge_keeps_every_node_field<S: IndexedFull>(
-    repo: &Repository<S>,
+/// `Repository::merge_trees` reads every directory of every source into
+/// rustic_core's typed `Node` and writes it back from there, and a field that
+/// type does not model is not in the merged snapshot — as of rustic_core 0.14
+/// that is restic's `generic_attributes` (Windows creation time, file
+/// attributes and security descriptors). The merge goes ahead regardless;
+/// this is how it knows what to report. Every tree the sources reach is read
+/// raw through `read_tree` and each node checked
+/// ([`unpreserved_node_fields`]).
+fn node_fields_the_merge_drops<B: AsRef<[u8]>>(
     roots: &[TreeId],
-) -> Result<()> {
+    read_tree: impl Fn(&TreeId) -> Result<B>,
+) -> Result<std::collections::BTreeSet<String>> {
+    let mut dropped = std::collections::BTreeSet::new();
     let mut seen: std::collections::HashSet<TreeId> = roots.iter().copied().collect();
     let mut pending: Vec<TreeId> = seen.iter().copied().collect();
     while let Some(id) = pending.pop() {
         let hex = id.to_hex();
-        let raw = repo.cat_blob(BlobType::Tree, hex.as_str())?;
-        let tree: serde_json::Value = serde_json::from_slice(&raw)
+        let raw = read_tree(&id)?;
+        let tree: serde_json::Value = serde_json::from_slice(raw.as_ref())
             .with_context(|| format!("parsing tree {}", hex.as_str()))?;
         let nodes = match tree.get("nodes") {
             None | Some(serde_json::Value::Null) => continue,
@@ -646,16 +662,7 @@ fn ensure_merge_keeps_every_node_field<S: IndexedFull>(
             Some(_) => bail!("tree {} has a `nodes` entry that is not a list", hex.as_str()),
         };
         for node in nodes {
-            let lost = unpreserved_node_fields(node)?;
-            if !lost.is_empty() {
-                let name = node.get("name").and_then(|n| n.as_str()).unwrap_or("?");
-                bail!(
-                    "these snapshots cannot be merged without losing metadata: `{name}` \
-                     carries {}, which the merge cannot preserve (restic stores Windows \
-                     attributes there). Nothing was written.",
-                    lost.iter().map(|f| format!("`{f}`")).collect::<Vec<_>>().join(", ")
-                );
-            }
+            dropped.extend(unpreserved_node_fields(node)?);
             if let Some(subtree) = node.get("subtree").and_then(|s| s.as_str()) {
                 let subtree: TreeId = subtree
                     .parse()
@@ -666,7 +673,7 @@ fn ensure_merge_keeps_every_node_field<S: IndexedFull>(
             }
         }
     }
-    Ok(())
+    Ok(dropped)
 }
 
 /// The fields of one raw tree node that would not survive a round trip
@@ -1631,6 +1638,60 @@ mod tests {
         assert!(unpreserved_node_fields(&serde_json::json!([])).is_err());
     }
 
+    // The merge is best effort about metadata, and has to know what it left
+    // behind: the scan must reach every directory of every source — a field
+    // lost three levels down counts — and read a directory both share once.
+    #[test]
+    fn dropped_node_fields_are_collected_from_every_tree_the_sources_reach() {
+        let id = |n: u8| -> TreeId { format!("{n:02x}").repeat(32).parse().expect("tree id") };
+        let file = |name: &str| {
+            serde_json::json!({
+                "name": name, "type": "file", "mode": 420, "uid": 0, "gid": 0,
+                "mtime": "2026-11-20T06:50:55Z", "content": [],
+            })
+        };
+        let dir = |name: &str, subtree: TreeId| {
+            serde_json::json!({
+                "name": name, "type": "dir", "mode": 2147484141u32, "uid": 0, "gid": 0,
+                "mtime": "2026-11-20T06:50:55Z", "subtree": subtree.to_hex().as_str(),
+            })
+        };
+        let mut windows = file("w.txt");
+        windows["generic_attributes"] = serde_json::json!({"windows.file_attributes": 32});
+        let mut unknown = file("u.txt");
+        unknown["a_field_of_the_future"] = serde_json::json!("x");
+
+        let (first, second, shared, deep, deeper) = (id(1), id(2), id(3), id(4), id(5));
+        use std::collections::HashMap;
+        let trees: HashMap<TreeId, serde_json::Value> = HashMap::from([
+            (first, serde_json::json!({"nodes": [file("a.txt"), dir("shared", shared)]})),
+            (second, serde_json::json!({"nodes": [dir("shared", shared), dir("deep", deep)]})),
+            (shared, serde_json::json!({"nodes": [file("s.txt")]})),
+            (deep, serde_json::json!({"nodes": [unknown, dir("deeper", deeper)]})),
+            (deeper, serde_json::json!({"nodes": [windows]})),
+        ]);
+        let reads = std::cell::RefCell::new(Vec::new());
+        let read_tree = |id: &TreeId| -> Result<Vec<u8>> {
+            reads.borrow_mut().push(*id);
+            let tree = trees.get(id).ok_or_else(|| anyhow!("no such tree"))?;
+            Ok(serde_json::to_vec(tree)?)
+        };
+
+        let dropped = node_fields_the_merge_drops(&[first, second], read_tree).expect("scan");
+        assert_eq!(
+            dropped.into_iter().collect::<Vec<_>>(),
+            ["a_field_of_the_future", "generic_attributes"]
+        );
+        let mut read = reads.borrow().clone();
+        read.sort();
+        assert_eq!(read, [first, second, shared, deep, deeper], "each tree is read once");
+
+        // Nothing to report where every field survives.
+        assert!(node_fields_the_merge_drops(&[first], read_tree).expect("scan").is_empty());
+        // A tree that cannot be read is an error, not "nothing lost".
+        assert!(node_fields_the_merge_drops(&[id(9)], read_tree).is_err());
+    }
+
     fn set_mtime(path: &std::path::Path, secs_ago: u64) {
         let when = std::time::SystemTime::now() - Duration::from_secs(secs_ago);
         std::fs::File::options()
@@ -1714,9 +1775,15 @@ mod tests {
 
         // Coexists with a shared lock.
         let shared = plant_shared_lock(&fixture);
-        let merged = merge_snapshots(fixture.profile(), &ids)
+        let outcome = merge_snapshots(fixture.profile(), &ids)
             .expect("a merge runs alongside a shared lock");
         assert_eq!(fixture.lock_count(), 1, "the merge must release its own lock");
+        assert!(
+            outcome.dropped_node_fields.is_empty(),
+            "nothing in these trees is beyond rustic_core's node: {:?}",
+            outcome.dropped_node_fields
+        );
+        let merged = outcome.snapshot_id;
         drop(shared);
 
         // Nothing was removed or rewritten: every file from before is intact.
@@ -2094,7 +2161,8 @@ mod tests {
         assert_eq!(base.paths, [data_str]);
 
         let merged = merge_snapshots(&profile, &[base.id.clone(), added.id.clone()])
-            .expect("native merge");
+            .expect("native merge")
+            .snapshot_id;
 
         let restic_snapshots = || -> Vec<serde_json::Value> {
             let out = crate::restic::run(&profile, &["snapshots", "--json"])

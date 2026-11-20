@@ -33,8 +33,8 @@
   option is exactly this — a long-running write under the non-exclusive
   lock that docs/locking.md so far keeps on the restic CLI
 - Lossless snapshot merge. The merge goes through rustic_core's typed tree
-  nodes, so it refuses snapshots whose nodes carry what that type cannot
-  hold (restic's Windows `generic_attributes`), and it rewrites every
+  nodes, so the merged snapshot is without what that type cannot hold
+  (restic's Windows `generic_attributes`), and it rewrites every
   directory when the trees were written in another timezone
   (docs/locking.md, "Native snapshot merge"). Merging the tree JSON itself
   would lift both limits and write only the directories the sources
