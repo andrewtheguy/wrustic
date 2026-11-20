@@ -105,18 +105,6 @@ pub(crate) struct Published {
     pub(crate) attempt_still_open: bool,
 }
 
-/// What a backend puts on the error of a write it had tried more than once:
-/// the error is the last attempt's, and says nothing of the earlier ones,
-/// which were retried because they failed without the server's answer.
-#[derive(Debug)]
-pub(crate) struct AfterEarlierAttempts;
-
-impl std::fmt::Display for AfterEarlierAttempts {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("after earlier attempts that got no answer")
-    }
-}
-
 // restic's refreshability rule (`internal/repository/lock.go`
 // refreshabilityTimeout): when a lock has not been successfully refreshed for
 // StaleLockTimeout − 1.5 × refreshInterval = 22.5 minutes, the operation must
@@ -343,6 +331,11 @@ pub(crate) trait LockBackend: Send + Sync {
     /// `None` when the lock vanished between list and read — a lock that is
     /// gone cannot conflict, so callers just skip it.
     fn read(&self, name: &str) -> Result<Option<Vec<u8>>>;
+    /// One request, not tried again by the backend: its outcome is then that
+    /// request's own, and whoever tries again knows of every attempt. A
+    /// backend that retried by itself would report only its last attempt —
+    /// an error, or a success — with an earlier one possibly still at the
+    /// server ([`LockBackend::failed_write_can_land_later`]).
     fn write(&self, name: &str, data: &[u8]) -> Result<()>;
     /// Removing an already-missing lock is not an error.
     fn remove(&self, name: &str) -> Result<()>;
@@ -355,9 +348,7 @@ pub(crate) trait LockBackend: Send + Sync {
     /// yet. No client-side call cancels such a write or waits for it. So for
     /// these backends a failed write followed by a successful `remove` does
     /// not mean the file will not appear — unless the error is the server's
-    /// own answer that it turned the write down ([`server_refused`]), and
-    /// the backend made no earlier attempt of its own that went unanswered
-    /// ([`AfterEarlierAttempts`]).
+    /// own answer that it turned the write down ([`server_refused`]).
     fn failed_write_can_land_later(&self, _error: &anyhow::Error) -> bool {
         true
     }
@@ -365,10 +356,17 @@ pub(crate) trait LockBackend: Send + Sync {
 
 /// Whether the error of a failed write is the server saying no to it, which
 /// leaves nothing of the request under way: an HTTP answer in the 400s or
-/// 507 (out of space), or S3 denying access or not finding the bucket. A
-/// timeout, a broken connection or an answer in the 500s says no such thing —
-/// the first two leave open what the server did with a body it had, and a
-/// proxy answers 502 or 504 for a server that is still at work.
+/// 507 (out of space). A timeout, a broken connection or an answer in the
+/// 500s says no such thing — the first two leave open what the server did
+/// with a body it had, and a proxy answers 502 or 504 for a server that is
+/// still at work.
+///
+/// opendal has an error kind of its own for few answers (403, 404) and files
+/// the rest under `Unexpected`, along with the failures that are no answer
+/// at all. What it does tell apart is whether trying again can help: the
+/// failures without an answer, and 429, 499, 500, 502, 503 and 504, are
+/// temporary — and persistent once its own retries ran out. Everything else
+/// is the server's no, or a request that was never sent.
 pub(crate) fn server_refused(error: &(dyn std::error::Error + 'static)) -> bool {
     std::iter::successors(Some(error), |link| link.source()).any(|link| {
         if let Some(http) = link.downcast_ref::<reqwest::Error>() {
@@ -376,10 +374,7 @@ pub(crate) fn server_refused(error: &(dyn std::error::Error + 'static)) -> bool 
                 status.is_client_error() || status == reqwest::StatusCode::INSUFFICIENT_STORAGE
             })
         } else if let Some(s3) = link.downcast_ref::<opendal::Error>() {
-            matches!(
-                s3.kind(),
-                opendal::ErrorKind::PermissionDenied | opendal::ErrorKind::NotFound
-            )
+            s3.is_permanent()
         } else {
             false
         }
@@ -978,6 +973,12 @@ impl LockHealth {
 /// ([`WriteGate::unconfirmed_removals`]), and so is one stored with another
 /// attempt still open ([`WriteGate::attempt_still_open`]).
 ///
+/// For that count to hold, every attempt has to be the gate's own: a backend
+/// that tries a request again by itself reports only its last attempt, and a
+/// success after one that got no answer looks like any other. So everything
+/// but packs is written through `one_attempt`, the same repository opened
+/// without retries, and what failed is tried again here.
+///
 /// It also ends the writing: rustic_core's packer hands its packs to threads
 /// it only waits for when it finishes normally, so after an error return
 /// they may still be storing a pack and the index entry for it.
@@ -985,6 +986,7 @@ impl LockHealth {
 /// later one, and has to be called before the lock is given up.
 pub(crate) fn gate_writes(
     backends: &RepositoryBackends,
+    one_attempt: &RepositoryBackends,
     retries: Arc<WriteRetries>,
     failed_write_can_land_later: impl Fn(&RusticError) -> bool + Send + Sync + 'static,
 ) -> (RepositoryBackends, WriteGate) {
@@ -996,12 +998,14 @@ pub(crate) fn gate_writes(
         closed: std::sync::RwLock::new(false),
         unconfirmed: Mutex::new(Vec::new()),
     }));
-    let gated = |inner: Arc<dyn WriteBackend>| -> Arc<dyn WriteBackend> {
-        Arc::new(LockGatedBackend { inner, gate: gate.clone() })
+    let gated = |inner: Arc<dyn WriteBackend>,
+                 one_attempt: Arc<dyn WriteBackend>|
+     -> Arc<dyn WriteBackend> {
+        Arc::new(LockGatedBackend { inner, one_attempt, gate: gate.clone() })
     };
     let gated = RepositoryBackends::new(
-        gated(backends.repository()),
-        backends.repo_hot().map(gated),
+        gated(backends.repository(), one_attempt.repository()),
+        backends.repo_hot().zip(one_attempt.repo_hot()).map(|(hot, once)| gated(hot, once)),
     );
     (gated, gate)
 }
@@ -1077,6 +1081,8 @@ impl Drop for ClosesGate {
 
 struct LockGatedBackend {
     inner: Arc<dyn WriteBackend>,
+    // Where a call is one request: see `gate_writes`.
+    one_attempt: Arc<dyn WriteBackend>,
     gate: WriteGate,
 }
 
@@ -1166,7 +1172,8 @@ impl WriteBackend for LockGatedBackend {
         let lands_later = |written: &RusticResult<()>| {
             matches!(written, Err(e) if (self.gate.0.failed_write_can_land_later)(e))
         };
-        let mut written = self.inner.write_bytes(tpe, id, cacheable, content.clone());
+        let writer = if tpe == FileType::Pack { &self.inner } else { &self.one_attempt };
+        let mut written = writer.write_bytes(tpe, id, cacheable, content.clone());
         // How many attempts the backend may yet complete.
         let mut open = usize::from(lands_later(&written));
         if tpe != FileType::Pack {
@@ -1197,7 +1204,7 @@ impl WriteBackend for LockGatedBackend {
                     break;
                 }
                 retried = true;
-                written = self.inner.write_bytes(tpe, id, cacheable, content.clone());
+                written = writer.write_bytes(tpe, id, cacheable, content.clone());
                 open += usize::from(lands_later(&written));
             }
             retries.set_waiting_on(None);
@@ -2445,27 +2452,27 @@ mod tests {
 
     // What counts as a refusal, of the errors the real backends give: the
     // server's own no. A timeout or an error of the server's says nothing
-    // about what became of the request.
+    // about what became of the request. opendal marks those temporary —
+    // persistent after its retries — whatever kind it gives them
+    // (`s3_backend::tests::every_answer_that_turns_a_put_down_is_a_refusal`
+    // has a server give the answers).
     #[test]
     fn only_the_servers_no_counts_as_a_refusal() {
-        let s3 = |kind| {
-            RusticError::with_source(
-                ErrorKind::Backend,
-                "S3 backend: write failed",
-                opendal::Error::new(kind, "injected"),
-            )
+        use opendal::ErrorKind::{PermissionDenied, RateLimited, Unexpected};
+        let answer = |kind| opendal::Error::new(kind, "injected");
+        let s3 = |error: opendal::Error| {
+            RusticError::with_source(ErrorKind::Backend, "S3 backend: write failed", error)
         };
-        assert!(server_refused(&*s3(opendal::ErrorKind::PermissionDenied)));
-        assert!(server_refused(&*s3(opendal::ErrorKind::NotFound)));
-        assert!(!server_refused(&*s3(opendal::ErrorKind::Unexpected)));
-        assert!(!server_refused(&*s3(opendal::ErrorKind::RateLimited)));
+        assert!(server_refused(&*s3(answer(PermissionDenied))));
+        assert!(server_refused(&*s3(answer(Unexpected))), "a 400, or a full disk");
+        assert!(!server_refused(&*s3(answer(Unexpected).set_temporary())));
+        assert!(!server_refused(&*s3(answer(RateLimited).set_temporary())));
+        assert!(!server_refused(&*s3(answer(Unexpected).set_persistent())), "retried in vain");
         assert!(!server_refused(&*RusticError::new(ErrorKind::Backend, "no source")));
 
-        let s3 = |kind| {
-            anyhow::Error::new(opendal::Error::new(kind, "injected")).context("writing S3 x")
-        };
-        assert!(server_refused(as_std_error(&s3(opendal::ErrorKind::PermissionDenied))));
-        assert!(!server_refused(as_std_error(&s3(opendal::ErrorKind::Unexpected))));
+        let s3 = |error: opendal::Error| anyhow::Error::new(error).context("writing S3 x");
+        assert!(server_refused(as_std_error(&s3(answer(PermissionDenied)))));
+        assert!(!server_refused(as_std_error(&s3(answer(Unexpected).set_temporary()))));
         assert!(!server_refused(as_std_error(&anyhow!("no source"))));
     }
 
@@ -2605,11 +2612,9 @@ mod tests {
             let (_locks, lock) = steady_lock(&test_crypto(true));
             let data = Arc::new(MemDataBackend::default());
             let retries = Arc::new(WriteRetries::default());
-            let (backends, gate) = gate_writes(
-                &RepositoryBackends::new(Arc::clone(&data) as Arc<dyn WriteBackend>, None),
-                Arc::clone(&retries),
-                failed_write_can_land_later,
-            );
+            let over = RepositoryBackends::new(Arc::clone(&data) as Arc<dyn WriteBackend>, None);
+            let (backends, gate) =
+                gate_writes(&over, &over, Arc::clone(&retries), failed_write_can_land_later);
             gate.arm(&lock);
             Self { lock, data, retries, gate, backend: backends.repository() }
         }
@@ -2637,6 +2642,28 @@ mod tests {
         }
     }
 
+    // The gate counts the attempts a server may still complete, so it has to
+    // make each of them itself: all but packs go to the backend that does
+    // not retry on its own.
+    #[test]
+    fn the_gate_writes_all_but_packs_through_the_backend_that_does_not_retry() {
+        let retrying = Arc::new(MemDataBackend::default());
+        let once = Arc::new(MemDataBackend::default());
+        let over = |data: &Arc<MemDataBackend>| {
+            RepositoryBackends::new(Arc::clone(data) as Arc<dyn WriteBackend>, None)
+        };
+        let (backends, _gate) =
+            gate_writes(&over(&retrying), &over(&once), Arc::default(), |_| true);
+        let backend = backends.repository();
+        backend.write_bytes(FileType::Pack, &Gated::id(1), false, vec![1].into()).unwrap();
+        backend.write_bytes(FileType::Index, &Gated::id(2), false, vec![2].into()).unwrap();
+        let files = |data: &MemDataBackend| -> Vec<(String, Id)> {
+            data.files.lock().unwrap().keys().cloned().collect()
+        };
+        assert_eq!(files(&retrying), [file_key(FileType::Pack, &Gated::id(1))]);
+        assert_eq!(files(&once), [file_key(FileType::Index, &Gated::id(2))]);
+    }
+
     // What `merge_trees` writes goes through the gate: packs first, then the
     // index that names them. Once the lock is lost — which is when a prune may
     // delete packs no index names yet — no index may be written any more, and
@@ -2647,8 +2674,10 @@ mod tests {
 
         // Unarmed: writes go through.
         let data = Arc::new(MemDataBackend::default());
+        let over = RepositoryBackends::new(Arc::clone(&data) as Arc<dyn WriteBackend>, None);
         let (backends, _gate) = gate_writes(
-            &RepositoryBackends::new(Arc::clone(&data) as Arc<dyn WriteBackend>, None),
+            &over,
+            &over,
             Arc::default(),
             |_| false,
         );
@@ -3336,50 +3365,65 @@ mod tests {
         assert!(!backend.failed_write_can_land_later(&refusal), "{refusal:#}");
     }
 
-    // rustic_backend's REST backend, which the merge's packs and index files
-    // go through, retries a request by itself and reports the last attempt's
-    // error. So it can report a refusal for a write whose first attempt the
-    // server is still holding — and goes on to store. That is why none of
-    // its failures is taken for settled (`repo::data_write_can_land_later`).
+    // rustic_backend's REST backend retries a request by itself and reports
+    // the last attempt's outcome. So it can report a refusal for a write
+    // whose first attempt the server is still holding — and goes on to
+    // store. That is why the index is not written through it as it stands:
+    // the gate is given the same repository under
+    // `RequestPolicy::ONE_ATTEMPT`, where a write is one POST and its error
+    // that POST's own.
     #[test]
-    fn rustic_rest_write_reports_a_refusal_with_an_attempt_still_open() {
-        let mock = RestMock::start(false);
-        let profile = crate::config::Profile::Rest {
+    fn rustic_rest_write_hides_an_open_attempt_unless_it_makes_only_one() {
+        let profile = |mock: &RestMock| crate::config::Profile::Rest {
             password: "pw".into(),
             rest_url: mock.base_url.clone(),
             rest_user: String::new(),
             rest_password: String::new(),
         };
-        let backends = crate::repo::build_backends_with_policy(
-            &profile,
-            crate::repo::RequestPolicy { retries: 1, read_timeout: Duration::from_secs(1) },
-        )
-        .expect("the REST backend");
-        let backend = backends.repository();
+        let backend = |mock: &RestMock, retries: usize| {
+            crate::repo::build_backends_with_policy(
+                &profile(mock),
+                crate::repo::RequestPolicy { retries, read_timeout: Duration::from_secs(1) },
+            )
+            .expect("the REST backend")
+            .repository()
+        };
         let id = Gated::id(7);
 
         // The first POST is held; the retry rustic_backend makes is refused.
+        let mock = RestMock::start(false);
+        let retrying = backend(&mock, 1);
         mock.hold_posts(true);
         mock.refuse_posts_while_one_is_held();
-        let err = backend
+        let err = retrying
             .write_bytes(FileType::Index, &id, false, vec![7].into())
             .expect_err("the retry is refused");
         assert!(server_refused(&*err), "the error is the refusal of the second attempt: {err}");
-        assert!(
-            crate::repo::data_write_can_land_later(&profile)(&err),
-            "and must not be taken for the whole write's"
-        );
         mock.wait_for_a_held_post();
-        assert!(backend.read_full(FileType::Index, &id).is_err(), "not stored yet");
+        assert!(retrying.read_full(FileType::Index, &id).is_err(), "not stored yet");
 
         // The server gets on with the first one.
         mock.hold_posts(false);
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while backend.read_full(FileType::Index, &id).is_err() {
+        while retrying.read_full(FileType::Index, &id).is_err() {
             assert!(std::time::Instant::now() < deadline, "the held write never landed");
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert_eq!(backend.read_full(FileType::Index, &id).unwrap().as_ref(), [7]);
+        assert_eq!(retrying.read_full(FileType::Index, &id).unwrap().as_ref(), [7]);
+
+        // Without retries the held POST is the only one, and what comes back
+        // is its timeout.
+        let mock = RestMock::start(false);
+        let once = backend(&mock, crate::repo::RequestPolicy::ONE_ATTEMPT.retries);
+        mock.hold_posts(true);
+        let err = once
+            .write_bytes(FileType::Index, &id, false, vec![7].into())
+            .expect_err("no answer in time");
+        assert!(!server_refused(&*err), "{err}");
+        assert!(crate::repo::data_write_can_land_later(&profile(&mock))(&err), "{err}");
+        mock.wait_for_a_held_post();
+        assert_eq!(mock.hold_posts.0.lock().unwrap().waiting, 1, "not sent again");
+        mock.hold_posts(false);
     }
 
     #[test]

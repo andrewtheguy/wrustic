@@ -144,6 +144,15 @@ impl RequestPolicy {
         retries: 0,
         read_timeout: CONNECT_TIMEOUT,
     };
+
+    /// [`RequestPolicy::STANDARD`] without the retries, for the writes whose
+    /// attempts the lock module has to count (`lock::gate_writes`): a backend
+    /// that tries a request again by itself reports only its last attempt,
+    /// and says nothing of an earlier one the server may still complete.
+    pub(crate) const ONE_ATTEMPT: Self = Self {
+        retries: 0,
+        ..Self::STANDARD
+    };
 }
 
 // All backends are write-capable; keeping write operations safe against
@@ -546,10 +555,44 @@ pub(crate) fn merge_snapshots(
     // could name packs a prune has deleted in between.
     let (backends, write_gate) = lock::gate_writes(
         &build_backends(profile)?,
+        &build_backends_with_policy(profile, RequestPolicy::ONE_ATTEMPT)?,
         std::sync::Arc::clone(retries),
         data_write_can_land_later(profile),
     );
-    let repo = Repository::new(&RepositoryOptions::default(), &backends)?
+    merge_through_gate(profile, snapshot_ids, retries, &backends, &write_gate).map_err(|e| {
+        // A merge that failed leaves its packs for the next prune, and that
+        // is when a late copy of an index naming them does harm. The success
+        // path says the same through `MergeOutcome::attempt_still_open`.
+        if write_gate.attempt_still_open() {
+            anyhow!(
+                "{e:#} — also: an index file this merge stored may be written again by a \
+                 request the server still holds. If a prune removes the merge's packs before \
+                 it arrives, it names packs that are gone: run `restic check` after the next \
+                 prune (docs/locking.md)"
+            )
+        } else {
+            e
+        }
+    })
+}
+
+// [`merge_snapshots`] from the opened gate on.
+fn merge_through_gate(
+    profile: &Profile,
+    snapshot_ids: &[String],
+    retries: &std::sync::Arc<lock::WriteRetries>,
+    backends: &RepositoryBackends,
+    write_gate: &lock::WriteGate,
+) -> Result<MergeOutcome> {
+    // Stopping (`lock::WriteRetries::stop`) refuses writes; the long reads
+    // around them ask here, so that a stop does not wait for them to finish.
+    let stopped_before_the_snapshot = |written: &str| -> Result<()> {
+        if retries.stopped() {
+            bail!("the merge was stopped before writing its snapshot; {written}");
+        }
+        Ok(())
+    };
+    let repo = Repository::new(&RepositoryOptions::default(), backends)?
         .open(&Credentials::password(profile.password()))?;
     let crypto = lock::RepoCrypto::from_repo(&repo)?;
     let repo_lock =
@@ -589,6 +632,7 @@ pub(crate) fn merge_snapshots(
     let newest = newest.map(|(i, _)| i).unwrap_or(0);
 
     let scan = scan_source_trees(&trees, |id| {
+        stopped_before_the_snapshot("nothing was written")?;
         Ok(repo.cat_blob(BlobType::Tree, id.to_hex().as_str())?)
     })?;
 
@@ -648,6 +692,9 @@ pub(crate) fn merge_snapshots(
     if scan.quoted_names || scan.hardlinked_files {
         let merged = open_indexed_full(profile)?;
         let read_tree = |id: &TreeId| -> Result<_> {
+            stopped_before_the_snapshot(
+                "nothing refers to the trees it wrote, and the next prune removes them",
+            )?;
             Ok(merged.cat_blob(BlobType::Tree, id.to_hex().as_str())?)
         };
         let hostname = |source: &serde_json::Value| {
@@ -748,22 +795,18 @@ pub(crate) fn merge_snapshots(
 ///
 /// A local write is this process's own system calls and is over when it has
 /// returned. A server can store what it took in full after the client gave
-/// up, unless the error is its own refusal (`lock::server_refused`) — and
-/// that only counts when the refused attempt was the only one. Both remote
-/// backends retry by themselves and report the last attempt's error:
-/// wrustic's S3 backend marks an error that followed a retry, and
-/// rustic_backend's REST backend gives no sign of one, so none of its
-/// failures is taken for settled.
+/// up, unless the error is its own refusal (`lock::server_refused`). That
+/// reads the error as one request's, which it is for what the gate writes
+/// one attempt at a time ([`RequestPolicy::ONE_ATTEMPT`]) — all but packs,
+/// where a late arrival is only waste.
 pub(crate) fn data_write_can_land_later(
     profile: &Profile,
 ) -> impl Fn(&rustic_core::RusticError) -> bool + Send + Sync + 'static {
     let backend = profile.backend_kind();
     move |error| match backend {
         crate::config::BackendKind::Local => false,
-        crate::config::BackendKind::Rest => true,
-        crate::config::BackendKind::S3 => {
-            error.context_value(crate::s3_backend::AFTER_EARLIER_ATTEMPTS).is_some()
-                || !lock::server_refused(error)
+        crate::config::BackendKind::Rest | crate::config::BackendKind::S3 => {
+            !lock::server_refused(error)
         }
     }
 }
@@ -1217,7 +1260,12 @@ fn tree_holds_path<B: AsRef<[u8]>>(
         let Some(node) = parsed
             .get("nodes")
             .and_then(serde_json::Value::as_array)
-            .and_then(|nodes| nodes.iter().find(|node| raw_name(node) == *component))
+            .and_then(|nodes| {
+                // The name as stored is quoted; the path is not.
+                nodes
+                    .iter()
+                    .find(|node| restic_name_bytes(raw_name(node)) == component.as_bytes())
+            })
         else {
             return Ok(false);
         };
@@ -2221,6 +2269,8 @@ mod tests {
             // A Windows volume is the first directory.
             (5, vec![raw_dir("C", 6)]),
             (6, vec![raw_dir("Users", 3)]),
+            // Names restic stores quoted: `we"ird` and `tab<TAB>bed`.
+            (7, vec![raw_dir(r#"we\"ird"#, 3), raw_dir(r"tab\tbed", 3)]),
         ]);
         let holds = |root: u8, path: &str| tree_holds_path(tree_id(root), path, &read).unwrap();
         assert!(holds(1, "/data"));
@@ -2234,6 +2284,9 @@ mod tests {
         assert!(holds(5, r"C:\Users"));
         assert!(holds(5, r"\\?\C:\Users\n.txt"));
         assert!(!holds(5, r"D:\Users"));
+        assert!(holds(7, "/we\"ird/n.txt"), "a quoted name is the plain one in `paths`");
+        assert!(holds(7, "/tab\tbed"));
+        assert!(!holds(7, r#"/we\"ird"#), "the quoted form is not the name");
 
         assert_eq!(archive_components("/data/extra/"), ["data", "extra"]);
         assert_eq!(archive_components(r"C:\Users/me"), ["C", "Users", "me"]);
@@ -2872,6 +2925,27 @@ mod tests {
             .open(path)
             .and_then(|f| f.set_modified(when))
             .expect("set fixture mtime");
+    }
+
+    // A stop refuses writes, and the reads before them ask for it too: a
+    // merge stopped while it reads its sources ends there, not at the first
+    // write it would have got to.
+    #[test]
+    fn a_merge_stopped_while_reading_ends_before_it_writes() {
+        let _guard = lock::test_acquire_guard();
+        let fixture = TestRepo::init("merge-stopped");
+        let first = fixture.backup(&[("a.txt", b"a\n")], &[]);
+        let second = fixture.backup(&[("b.txt", b"b\n")], &[]);
+        let retries = std::sync::Arc::new(lock::WriteRetries::default());
+        retries.stop();
+        let err = super::merge_snapshots(fixture.profile(), &[first, second], &retries)
+            .expect_err("stopped");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("stopped before writing its snapshot; nothing was written"),
+            "{message}"
+        );
+        assert_eq!(load_snapshots(fixture.profile()).unwrap().rows.len(), 2);
     }
 
     // The merge end to end on an in-process repository, and its lock: the

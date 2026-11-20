@@ -240,7 +240,9 @@ smbanything's own docs. The architectural points:
   returned. It runs on a worker thread (the main loop polls it, as for
   prune): a write a server may still complete is retried for as long as
   the lock holds, and `retries` (`lock::WriteRetries`) is how the TUI
-  shows that and how Ctrl+C ends it.
+  shows that and how Ctrl+C ends it. `App`'s drop stops a merge still
+  running and waits for the worker, so an error out of the main loop
+  does not exit the process under it.
 - `unlock(profile)` — native stale-lock removal, offered with `u` on the
   delete-error screen when `lock::is_lock_error()` matches the failure.
   Only locks that are provably dead are removed (older than restic's

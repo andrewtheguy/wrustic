@@ -510,6 +510,15 @@ fn smb_start_error(e: anyhow::Error, port: u16) -> String {
     }
 }
 
+// However the app goes away — the main loop returning an error because the
+// terminal is gone, a panic — a merge its worker is still running is not left
+// to be killed by the process exiting: see `App::wind_down_merge`.
+impl Drop for App {
+    fn drop(&mut self) {
+        self.wind_down_merge();
+    }
+}
+
 impl App {
     pub(crate) fn boot(
         paths: Paths,
@@ -1197,6 +1206,18 @@ impl App {
                 other == first_paths
             })
             .collect()
+    }
+
+    // Stops a merge that is still running and waits for its worker: no write
+    // is begun after the stop, one under way is waited for, and the worker
+    // gives up its lock before it reports (`repo::merge_snapshots`).
+    fn wind_down_merge(&mut self) {
+        if let (Some(retries), Some(rx)) = (&self.merge_retries, &self.merge_rx) {
+            retries.stop();
+            // An error here is the worker gone without reporting.
+            let _ = rx.recv();
+        }
+        self.clear_merge_worker();
     }
 
     // The merge worker has reported (or is gone).
@@ -3936,9 +3957,6 @@ mod tests {
             .collect()
     }
 
-    // The confirmation is the last thing read before a merge runs, so what it
-    // says about the consequences has to be on the screen in full — on an
-    // 80×24 terminal, and with snapshots that have far more to list than fits.
     // The merging screen is up for as long as the worker runs, which can be
     // long: it says how to stop the merge, and that a stop was asked for.
     #[test]
@@ -3960,6 +3978,37 @@ mod tests {
         assert!(app.merge_retries.is_none() && !app.merge_stop_requested);
     }
 
+    // The loop that would have taken the worker's report can end first — an
+    // error from the terminal, say. The merge must not be cut off by the
+    // process exiting under it, its lock left behind and a write in flight:
+    // the app going away stops it and waits for it.
+    #[test]
+    fn a_merge_still_running_is_stopped_and_waited_for_when_the_app_goes_away() {
+        let mut app = boot_app_with_snapshots(vec![row("h", &[], &["/srv/data"])]);
+        let retries = std::sync::Arc::new(crate::lock::WriteRetries::default());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let wound_down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker = {
+            let (retries, wound_down) = (retries.clone(), wound_down.clone());
+            std::thread::spawn(move || {
+                while !retries.stopped() {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                wound_down.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = tx.send(Err("stopped".to_string()));
+            })
+        };
+        app.merge_rx = Some(rx);
+        app.merge_retries = Some(retries);
+        drop(app);
+        assert!(wound_down.load(std::sync::atomic::Ordering::SeqCst), "not waited for");
+        worker.join().unwrap();
+    }
+
+    // The confirmation is the last thing read before a merge runs, so what it
+    // says about the consequences has to be on the screen in full — on an
+    // 80×24 terminal, and with snapshots that have far more to list than fits.
     #[test]
     fn merge_confirmation_shows_every_consequence_on_an_80x24_terminal() {
         let snapshot = |id: &str, host: &str, time: &str, tags: &[&str], paths: &[&str]| {
@@ -4024,6 +4073,13 @@ mod tests {
             ] {
                 assert!(text.contains(shown), "{case}: `{shown}` missing:\n{lines:#?}");
             }
+            // `/srv/data/extra` is left out under `/srv/data`, which the
+            // merge only does if the tree is laid out that way.
+            assert_eq!(
+                text.contains("/srv/data  (nested ones too, if backed up relative)"),
+                case != "forty long paths",
+                "{case}:\n{lines:#?}"
+            );
         }
     }
 

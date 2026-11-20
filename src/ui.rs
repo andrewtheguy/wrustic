@@ -1182,9 +1182,21 @@ fn render_merge_confirm(frame: &mut Frame, app: &App, area: Rect) {
     lines.push(format!("   host   {host}{host_note}"));
     // As the paths say. A backup of a relative path is not laid out that
     // way, which only reading its tree shows: the merge then keeps its path
-    // apart (repo::merged_paths).
+    // apart (repo::merged_paths). So where a path is left out here as lying
+    // under another, the line says that it may stay — after the list, which
+    // is cut short to leave it room.
     let paths = crate::repo::merged_paths(&all_paths, &Default::default());
-    lines.push(format!("   paths  {}", paths.join(", ")));
+    let distinct: std::collections::BTreeSet<&str> = all_paths.iter().copied().collect();
+    let nested_note = if paths.len() < distinct.len() {
+        "  (nested ones too, if backed up relative)"
+    } else {
+        ""
+    };
+    let paths = fit_columns(
+        format!("   paths  {}", paths.join(", ")),
+        room.saturating_sub(nested_note.len()),
+    );
+    lines.push(format!("{paths}{nested_note}"));
     lines.push(format!("   tags   {tags}"));
     let sources = Paragraph::new(
         lines
@@ -1316,7 +1328,12 @@ fn render_merging(frame: &mut Frame, app: &App, area: Rect) {
         ));
     }
     if app.merge_stop_requested {
-        body.push_str("Stopping — waiting for the write under way to return…");
+        // Not "waiting for the write": a stop is only seen at a write or
+        // between reads, and `merge_trees` reads on until it has one to make.
+        body.push_str(
+            "Stopping — nothing more is written. The merge ends when the step under way \
+             returns…",
+        );
     } else {
         body.push_str(
             "Ctrl+C stops the merge: nothing more is written, and no failed write is tried \

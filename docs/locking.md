@@ -271,22 +271,30 @@ lists, restores, checks, forgets and prunes like any other.
     is stopped (Ctrl+C). An index given up with an attempt still open is
     named in the merge's error like one that could not be removed.
     Which failures leave an attempt open is the backend's to say
-    (`repo::data_write_can_land_later`): none of a local repository's;
-    all of rustic_backend's REST backend, which retries a request by
-    itself and reports only the last attempt's error, so that a refusal
-    can stand for a write whose first attempt the server still holds
-    (`rustic_rest_write_reports_a_refusal_with_an_attempt_still_open`
-    shows it doing so); and of wrustic's S3 backend all but a refusal of
-    the only attempt — opendal retries the same way
-    (`a_refusal_after_a_put_that_got_no_answer_is_not_final`), and the
-    backend counts those retries to tell.
+    (`repo::data_write_can_land_later`): none of a local repository's,
+    and of a server's all but its own refusal.
+  - *One request per attempt.* That count holds only if every attempt is
+    the gate's own. Both remote backends retry a request by themselves —
+    rustic_backend's REST backend, and opendal's retry layer under the S3
+    one — and report only the last attempt: a refusal can then stand for
+    a write whose first attempt the server still holds, and so can a
+    success
+    (`rustic_rest_write_hides_an_open_attempt_unless_it_makes_only_one`,
+    `s3_backend::tests::a_write_is_one_put_and_reports_that_puts_outcome`).
+    So the gate writes everything but packs through the same repository
+    opened without retries (`RequestPolicy::ONE_ATTEMPT`), where a call
+    is one request and its outcome that request's, and does the trying
+    again itself. Packs keep the backend's retries: one that arrives late
+    is waste. The lock backends make one request per write for the same
+    reason (`LockBackend::write`), the S3 one through an operator without
+    the retry layer.
   The lock is checked once more when the snapshot write has returned
   (`RepoLock::write_unpacked_while_held`), because the write itself can
   outlast the lock: restic gets out of this by cancelling the backend
   request when its lock goes bad, and wrustic's backends cannot be
   cancelled, nor do they bound a write to the 7.5 minutes that separate a
   poisoned lock from a stale one — a local write blocks as long as the
-  filesystem does, S3 has a stall timeout and retries but no total, only
+  filesystem does, S3 has a stall timeout but no total, only
   REST gives up after 30 seconds. A lock still healthy after the write
   was refreshed in time throughout (poisoning latches), so no prune can
   have started before the snapshot existed; a poisoned one means the
@@ -322,18 +330,22 @@ lists, restores, checks, forgets and prunes like any other.
   made and the snapshot is not in the repository, with the file removed
   and the error passed on, naming it. That is any failure of a local
   write, and a server's own no (`lock::server_refused`): an HTTP answer
-  in the 400s or 507, or S3 denying access or not finding the bucket. A
+  in the 400s or 507. A
   server that refuses the snapshot goes on refusing it while the lock is
   refreshed without trouble, and must not keep the merge and its lock. A
   timeout, a broken connection or an answer in the 500s is no refusal:
   the first two leave open what the server did with a body it had, and a
-  proxy answers 502 or 504 for a server still at work.
+  proxy answers 502 or 504 for a server still at work. On S3 the line is
+  the one opendal draws between errors worth trying again — no answer,
+  429, 499, 500, 502, 503, 504 — and the rest: it has a kind of its own
+  for few answers and files a full disk or a rejected request under the
+  same kind as a broken connection, so the kind does not tell
+  (`s3_backend::tests::every_answer_that_turns_a_put_down_is_a_refusal`).
   A refusal ends the attempts after one that may still land, too:
   waiting would not get a refused write stored, and the repository has
   been looked at first, since the refusal can be about the earlier write
   having arrived. The earlier attempt is then still open, and the error
-  says so. The same holds where a backend had retried by itself before
-  the refusal, as the S3 one does and says.
+  says so.
   That leaves a write that keeps failing without an answer while the
   lock stays healthy, which nothing would end. No request a client can
   send completes, cancels or fences a write a server holds — rest-server
@@ -343,7 +355,12 @@ lists, restores, checks, forgets and prunes like any other.
   would only pick an arbitrary one. The merge therefore runs on a worker
   thread, the merging screen shows which file is being retried, and
   Ctrl+C stops it (`lock::WriteRetries`): no write is begun after that
-  and none is tried again, while one under way is waited for.
+  and none is tried again, while one under way is waited for. The reads
+  of the source and merged trees ask for the stop as well; `merge_trees`
+  itself reads on until it has a write to make. The app going away while
+  the worker runs — the terminal gone, an error out of the main loop —
+  does the same and waits for the worker, so the process does not exit
+  under a merge with its lock in place and a write in flight.
   Where the attempts end with one of them still open — the lock lost, a
   refusal, or the merge stopped — the write is abandoned unsettled, and
   the error
@@ -359,6 +376,9 @@ lists, restores, checks, forgets and prunes like any other.
   pruned), which it then brings back, naming what the prune removed.
   That cannot be prevented from here either, so it is said: the notice
   after such a merge reads "A late write is possible" and points here.
+  A merge that fails after storing an index that way says it in its
+  error — its packs are what the next prune removes, and a late copy of
+  the index would name them: run `restic check` after that prune.
   Until the server has had time to finish what it took, leave the merged
   snapshot in place, or run `restic check` after deleting and pruning
   it.
@@ -417,7 +437,11 @@ lists, restores, checks, forgets and prunes like any other.
     records `/data/extra` and stores `/extra`; checked against restic
     0.19.1), so its files were not merged into the directory its path
     names. Such a path is listed beside the other, and the merged
-    snapshot does not pass for a backup of the one directory.
+    snapshot does not pass for a backup of the one directory. Names in a
+    tree are compared as restic means them, with its quoting undone. The
+    confirmation screen shows the folded set from the paths alone — the
+    trees are read only under the lock — and says next to it that a
+    nested path may stay.
   - `tags` — the union.
   - `program_version` — `wrustic <version>`.
   - `summary` — the fields restic and rustic_core share, totals being
@@ -701,10 +725,13 @@ one the server refuses, which ends the attempts and reports any that is
 still open
 (`only_the_servers_no_counts_as_a_refusal`,
 `rest_write_that_timed_out_is_stored_after_its_removal`,
-`rustic_rest_write_reports_a_refusal_with_an_attempt_still_open` and
-`s3_backend::tests::a_refusal_after_a_put_that_got_no_answer_is_not_final`
+`rustic_rest_write_hides_an_open_attempt_unless_it_makes_only_one`,
+`s3_backend::tests::a_write_is_one_put_and_reports_that_puts_outcome` and
+`s3_backend::tests::every_answer_that_turns_a_put_down_is_a_refusal`
 show what the real backends' errors count as, against servers that hold
-a write and store it after the client has given up), a removal that
+a write and store it after the client has given up, and
+`the_gate_writes_all_but_packs_through_the_backend_that_does_not_retry`
+that the attempts counted are all there are), a removal that
 fails, and
 `closing_the_gate_waits_for_writes_and_refuses_later_ones` that the gate
 does not close over a write under way. These tests lose the lock at a
