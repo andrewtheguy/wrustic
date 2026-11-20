@@ -30,24 +30,39 @@ exactly which workflows that means.
   where every `restic backup` already yields a complete snapshot. Back up just
   a new file or directory with restic, then merge it into the earlier snapshot
   without reading the rest again: the result is a new snapshot holding the
-  files of both. The two backups have to agree on where things are: restic
-  records every file under the path it was backed up from, and the merge lines
-  files up by that path alone — matching hosts or tags do not. So back up the
-  addition from its place inside the base: `restic backup /data` as the base,
-  then `restic backup /data/extra` for the addition, not a copy of `extra`
-  somewhere else. Only directory listings are written, the two source
+  files of both. The two backups have to agree on where things are inside
+  the snapshot: the merge lines files up by their path in the snapshot's tree
+  alone — matching hosts or tags do not. For a target given to restic as an
+  absolute path that is the filesystem path, so back up the addition from its
+  place inside the base: `restic backup /data` as the base, then
+  `restic backup /data/extra` for the addition, not a copy of `extra`
+  somewhere else. A target given as a relative path is stored under that
+  relative path instead — `cd /data && restic backup extra` holds its files
+  under `/extra`, though the snapshot lists `/data/extra` — so check with
+  `restic ls <snapshot>` where a snapshot's files are. Only directory
+  listings are written, the two source
   snapshots are kept, and it runs under restic's non-exclusive lock alongside
   running backups. restic itself has no merge; the result is an ordinary
-  snapshot restic reads, and the next `restic backup` uses it as its parent —
-  when both sources are one host's; a merge of two hosts' snapshots is named
-  for both (`alpha+beta`), which neither host's backups look for. Metadata is
+  snapshot restic reads, and restic chooses it as the parent of the next
+  `restic backup` by its usual rule: the latest snapshot with the backup's
+  host and exactly its paths, unless `--parent`, `--force` or another
+  `--group-by` says otherwise. The merged snapshot is made to be that one —
+  it has the sources' host, their paths with a nested one folded into the
+  directory that holds it, and a time just after the newer source's — when
+  both sources are one host's and their files are where their paths say. A
+  merge of two hosts' snapshots is named for both (`alpha+beta`), which
+  neither host's backups look for, and the path of a relative-path backup is
+  listed apart, not folded. Metadata is
   kept as far as the merge can: a merged snapshot of backups restic took on
   Windows is without their Windows attributes (creation time, file attributes,
   security descriptors), which the sources keep. A merge restic would restore
   wrong is refused: the two snapshots record one hardlinked inode with
   different content, permissions, owner, modification time or extended
-  attributes, or a directory of both holds names with quotes or backslashes
-  that the merge cannot keep in restic's order (docs/locking.md)
+  attributes, snapshots of two hosts would have their files hardlinked to
+  each other, or a directory of both holds names with quotes or backslashes
+  that the merge cannot keep in restic's order (docs/locking.md). The merge
+  runs in the background of the TUI; a write the server may still complete
+  is retried while the lock holds, and Ctrl+C stops it
 - **Prune** (`p` on the snapshot list): reclaim the space deleted snapshots
   left behind — runs `restic prune` (restic >= 0.19, the one the installers
   bundle and only that one) with live progress and safe Ctrl+C

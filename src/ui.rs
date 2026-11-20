@@ -441,9 +441,9 @@ fn footer_text(screen: &Screen, keychain_enabled: bool) -> &'static str {
         | Screen::SnapshotDeleting
         | Screen::SnapshotDeleteLoading
         | Screen::SnapshotTagSaving
-        | Screen::SnapshotMerging
         | Screen::Unlocking
         | Screen::SnapshotCompareLoading => "working…",
+        Screen::SnapshotMerging => "merging — Ctrl+C stop, other keys disabled",
         Screen::PruneConfirm => "y start prune  n/Esc cancel",
         Screen::PruneRunning => "running restic prune — Ctrl+C cancel (safe), other keys disabled",
         Screen::PruneDone(_) => "Up/Dn scroll  PgUp/PgDn page  g/G top/bottom  q/Esc back",
@@ -669,17 +669,7 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
         Screen::SnapshotCompareResults => render_compare_results(frame, app, area),
         Screen::SnapshotMergeSecond => render_merge_second(frame, app, area),
         Screen::SnapshotMergeConfirm => render_merge_confirm(frame, app, area),
-        Screen::SnapshotMerging => {
-            let para = Paragraph::new(
-                "Merging the two snapshots under restic's non-exclusive repository lock…\n\n\
-                 Reading every directory of both, which can take a while on large snapshots. \
-                 If the repository cannot be reached when the new snapshot is written, the \
-                 write is tried again for as long as the lock holds.",
-            )
-            .wrap(Wrap { trim: false })
-            .block(Block::bordered().title("Merging snapshots"));
-            frame.render_widget(para, area);
-        }
+        Screen::SnapshotMerging => render_merging(frame, app, area),
         Screen::SnapshotMergeError(msg) => {
             let body = if crate::lock::is_lock_error(msg) {
                 format!(
@@ -1190,7 +1180,11 @@ fn render_merge_confirm(frame: &mut Frame, app: &App, area: Rect) {
     let host_note = if newer.host == older.host { "" } else { "  (two hosts: parent of neither)" };
     lines.push(" The new snapshot takes its time from the newer one, and".to_string());
     lines.push(format!("   host   {host}{host_note}"));
-    lines.push(format!("   paths  {}", crate::repo::merged_paths(&all_paths).join(", ")));
+    // As the paths say. A backup of a relative path is not laid out that
+    // way, which only reading its tree shows: the merge then keeps its path
+    // apart (repo::merged_paths).
+    let paths = crate::repo::merged_paths(&all_paths, &Default::default());
+    lines.push(format!("   paths  {}", paths.join(", ")));
     lines.push(format!("   tags   {tags}"));
     let sources = Paragraph::new(
         lines
@@ -1297,6 +1291,41 @@ fn render_prune_confirm(frame: &mut Frame, app: &App, area: Rect) {
     let para = Paragraph::new(body)
         .wrap(Wrap { trim: false })
         .block(Block::bordered().title("Prune repository"));
+    frame.render_widget(para, area);
+}
+
+fn render_merging(frame: &mut Frame, app: &App, area: Rect) {
+    const FRAMES: [char; 4] = ['|', '/', '-', '\\'];
+    let elapsed = app.merge_started.map(|t| t.elapsed()).unwrap_or_default();
+    let spinner = FRAMES[(elapsed.as_millis() / 150) as usize % FRAMES.len()];
+    let secs = elapsed.as_secs();
+    let mut body = format!(
+        "{spinner} Merging the two snapshots under restic's non-exclusive repository lock…  \
+         elapsed {}m{:02}s\n\n\
+         Reading every directory of both, which can take a while on large snapshots.\n\n",
+        secs / 60,
+        secs % 60
+    );
+    // A write being retried (lock::WriteRetries): say why the merge is still
+    // going, since nothing else on the screen moves.
+    if let Some(what) = app.merge_retries.as_ref().and_then(|retries| retries.waiting_on()) {
+        body.push_str(&format!(
+            "Writing {what} failed in a way that leaves open whether the server still stores \
+             it. Giving up would release the lock with that write to come, so it is tried \
+             again for as long as the lock holds.\n\n"
+        ));
+    }
+    if app.merge_stop_requested {
+        body.push_str("Stopping — waiting for the write under way to return…");
+    } else {
+        body.push_str(
+            "Ctrl+C stops the merge: nothing more is written, and no failed write is tried \
+             again. The sources are not touched either way.",
+        );
+    }
+    let para = Paragraph::new(body)
+        .wrap(Wrap { trim: false })
+        .block(Block::bordered().title("Merging snapshots"));
     frame.render_widget(para, area);
 }
 

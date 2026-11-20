@@ -44,6 +44,79 @@ const STALE_TIMEOUT_SECS: i64 = 30 * 60;
 const WRITE_RETRY_PAUSE: Duration =
     if cfg!(test) { Duration::from_millis(2) } else { Duration::from_secs(5) };
 
+/// What an operation that retries its writes shares with whoever watches it:
+/// the watcher can read what is being retried, and can end the retrying.
+///
+/// A write that fails without the server's answer is retried for as long as
+/// the lock holds, because giving up releases the lock with that write
+/// possibly still to come (`RepoLock::write_unpacked_while_held`,
+/// `gate_writes`). Nothing a client can send settles such a write, so where
+/// it keeps failing that way and the lock keeps being refreshed, there is no
+/// point at which the retrying would end by itself; ending it is a decision,
+/// and this is how it is made. A write given up this way is reported as one
+/// that may still arrive.
+#[derive(Default)]
+pub(crate) struct WriteRetries {
+    stop: std::sync::atomic::AtomicBool,
+    waiting_on: Mutex<Option<String>>,
+}
+
+impl WriteRetries {
+    /// Ends the retrying under way, and refuses the writes not yet begun.
+    pub(crate) fn stop(&self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn stopped(&self) -> bool {
+        self.stop.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The file whose write is being retried right now, if one is.
+    pub(crate) fn waiting_on(&self) -> Option<String> {
+        self.waiting_on.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    fn set_waiting_on(&self, what: Option<String>) {
+        *self.waiting_on.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = what;
+    }
+
+    // The pause between two attempts, cut short when the retrying is stopped.
+    fn pause(&self) {
+        let until = std::time::Instant::now() + WRITE_RETRY_PAUSE;
+        while !self.stopped() {
+            let left = until.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            std::thread::sleep(left.min(Duration::from_millis(100)));
+        }
+    }
+}
+
+/// A file [`RepoLock::write_unpacked_while_held`] stored.
+#[derive(Debug)]
+pub(crate) struct Published {
+    pub(crate) name: String,
+    /// An attempt at writing it was reported as failed in a way that leaves
+    /// open whether the server completes it, and is not the one that stored
+    /// the file. It writes the same file under the same name, so it changes
+    /// nothing if it arrives — unless the file has been removed by then,
+    /// which it then brings back.
+    pub(crate) attempt_still_open: bool,
+}
+
+/// What a backend puts on the error of a write it had tried more than once:
+/// the error is the last attempt's, and says nothing of the earlier ones,
+/// which were retried because they failed without the server's answer.
+#[derive(Debug)]
+pub(crate) struct AfterEarlierAttempts;
+
+impl std::fmt::Display for AfterEarlierAttempts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("after earlier attempts that got no answer")
+    }
+}
+
 // restic's refreshability rule (`internal/repository/lock.go`
 // refreshabilityTimeout): when a lock has not been successfully refreshed for
 // StaleLockTimeout − 1.5 × refreshInterval = 22.5 minutes, the operation must
@@ -282,7 +355,9 @@ pub(crate) trait LockBackend: Send + Sync {
     /// yet. No client-side call cancels such a write or waits for it. So for
     /// these backends a failed write followed by a successful `remove` does
     /// not mean the file will not appear — unless the error is the server's
-    /// own answer that it turned the write down ([`server_refused`]).
+    /// own answer that it turned the write down ([`server_refused`]), and
+    /// the backend made no earlier attempt of its own that went unanswered
+    /// ([`AfterEarlierAttempts`]).
     fn failed_write_can_land_later(&self, _error: &anyhow::Error) -> bool {
         true
     }
@@ -711,34 +786,43 @@ impl RepoLock {
     /// is not is written again, because a write that then succeeds settles
     /// the matter whatever became of the earlier ones.
     ///
-    /// How often depends on what the failure leaves behind
-    /// ([`LockBackend::failed_write_can_land_later`]). One that leaves
-    /// nothing — a local write that returned, a server that answered no —
-    /// gets one more attempt, and then the file is removed and the error
-    /// passed on: a server that keeps refusing must not keep the merge and
-    /// its lock for ever. For one that can still land there is no giving up
-    /// while the lock holds: returning drops the lock, a prune can then
-    /// delete the blobs the file names, and the write the server was still
-    /// holding publishes a file pointing at nothing. Under the lock a late
-    /// write is harmless, so the attempts go on, checking the repository
-    /// before each, until the file is stored, the server refuses, or the
-    /// lock is lost — with the repository out of reach that is the 22.5
-    /// minutes the lock takes to turn bad.
+    /// How often depends on what the latest failure says
+    /// ([`LockBackend::failed_write_can_land_later`], [`server_refused`]).
+    /// One that can still land — a timeout, a broken connection — is not
+    /// given up on while the lock holds: returning drops the lock, a prune
+    /// can then delete the blobs the file names, and the write the server
+    /// was still holding publishes a file pointing at nothing. Under the
+    /// lock a late write is harmless, so the attempts go on, checking the
+    /// repository before each, until the file is stored, the lock is lost —
+    /// with the repository out of reach that is the 22.5 minutes the lock
+    /// takes to turn bad — or `retries` is stopped by whoever watches.
     ///
-    /// Where the attempts end with one of them still open — the lock lost,
-    /// or a refusal after an attempt that may yet land — the removal proves
-    /// nothing: it cannot be ordered after a write the server is still
-    /// holding, and the error says so instead of claiming the file is gone.
-    /// The name is known beforehand — it is the hash of what is written —
-    /// and is in every error, so such a file can be found.
+    /// A failure that is final — a local write that returned, a server that
+    /// answered no — ends the attempts once a second one has been made and
+    /// the file is not there: a server that refuses will go on refusing
+    /// while the lock is refreshed without trouble, and must not keep the
+    /// operation and its lock. That holds after an attempt that may still
+    /// land, too. Waiting longer would not get a refused write stored, and
+    /// the open attempt is reported instead.
+    ///
+    /// Where the attempts end with one of them still open, the removal
+    /// proves nothing: it cannot be ordered after a write the server is
+    /// still holding, and the error says so instead of claiming the file is
+    /// gone. The name is known beforehand — it is the hash of what is
+    /// written — and is in every error, so such a file can be found. A
+    /// success says so too ([`Published::attempt_still_open`]).
     pub(crate) fn write_unpacked_while_held(
         &self,
         backend: &dyn LockBackend,
         crypto: &RepoCrypto,
         plain: &[u8],
-    ) -> Result<String> {
+        retries: &WriteRetries,
+    ) -> Result<Published> {
         if self.poisoned() {
             bail!("the repository lock could not be refreshed in time; nothing was written");
+        }
+        if retries.stopped() {
+            bail!("the operation was stopped; nothing was written");
         }
         let (name, sealed) = seal_named(crypto, plain)?;
         let is_stored = || matches!(backend.read(&name), Ok(Some(found)) if found == sealed);
@@ -748,34 +832,51 @@ impl RepoLock {
         let mut written = backend.write(&name, &sealed);
         let mut stored = written.is_ok();
         let a_write_failed = written.is_err();
-        let mut can_land_later = lands_later(&written);
-        // Whether any attempt is one the backend may yet complete.
-        let mut unsettled = can_land_later;
+        // How many attempts the backend may yet complete.
+        let mut open = usize::from(lands_later(&written));
         let mut retried = false;
-        while !stored && !self.poisoned() {
-            stored = is_stored();
-            if stored || (!can_land_later && retried) {
+        while !stored && !self.poisoned() && !retries.stopped() {
+            if is_stored() {
+                // Stored by an attempt that was reported as failed.
+                stored = true;
+                open = open.saturating_sub(1);
                 break;
             }
+            // The latest attempt's own verdict: nothing of it is under way.
+            let refused = matches!(
+                &written,
+                Err(e) if !backend.failed_write_can_land_later(e)
+                    || server_refused(as_std_error(e))
+            );
+            if refused && retried {
+                break;
+            }
+            if !refused {
+                retries.set_waiting_on(Some(format!("snapshot {name}")));
+            }
             if retried {
-                std::thread::sleep(WRITE_RETRY_PAUSE);
+                retries.pause();
             }
             // Looking and pausing both took time, and a write begun under a
             // lost lock is one more that can land late.
-            if self.poisoned() {
+            if self.poisoned() || retries.stopped() {
                 break;
             }
             retried = true;
             written = backend.write(&name, &sealed);
             stored = written.is_ok();
-            can_land_later = lands_later(&written);
-            unsettled |= can_land_later;
+            open += usize::from(lands_later(&written));
         }
+        retries.set_waiting_on(None);
         let lost = self.poisoned();
         if stored && !lost {
-            return Ok(name);
+            return Ok(Published { name, attempt_still_open: open > 0 });
         }
+        let unsettled = open > 0;
         let why = match (&written, lost) {
+            (Err(e), false) if retries.stopped() => {
+                format!("writing {name} failed ({e:#}), and trying again was stopped")
+            }
             (Err(e), false) => format!("writing {name} failed ({e:#})"),
             (Ok(()), _) => format!(
                 "the repository lock could not be refreshed while {name} was being written, so \
@@ -794,7 +895,7 @@ impl RepoLock {
                 "{why}, and removing it failed ({e:#}) — {name} may be in the repository \
                  without being meant to: check the repository and remove it"
             ),
-            Ok(()) if !a_write_failed => bail!("{why}; it was removed again"),
+            Ok(()) if !a_write_failed && !unsettled => bail!("{why}; it was removed again"),
             Ok(()) if !unsettled => bail!(
                 "{why}; it is not in the repository (removed again in case it had been stored)"
             ),
@@ -866,11 +967,16 @@ impl LockHealth {
 /// error leaves that open — see [`LockBackend::failed_write_can_land_later`]
 /// and [`server_refused`]). For a pack that is waste the next prune collects.
 /// An index stored late names packs, and after a prune packs that are gone;
-/// so the gate does not pass such a failure on while the lock holds, but
-/// looks whether the index is there and writes it again, as
-/// [`RepoLock::write_unpacked_while_held`] does for the snapshot. An index
-/// whose write is given up with an attempt still open is reported
-/// ([`WriteGate::unconfirmed_removals`]).
+/// so once an attempt at an index is open the gate does not pass a failure
+/// on at once, but reads the index back — a refusal after a write the
+/// server may have taken is what rest-server answers once that write has
+/// arrived — and, unless the latest answer was a refusal, writes it again
+/// while the lock holds, as [`RepoLock::write_unpacked_while_held`] does for
+/// the snapshot: until it is stored, refused, the lock is lost, or
+/// `retries` is stopped. An index whose
+/// write is given up with an attempt still open is reported
+/// ([`WriteGate::unconfirmed_removals`]), and so is one stored with another
+/// attempt still open ([`WriteGate::attempt_still_open`]).
 ///
 /// It also ends the writing: rustic_core's packer hands its packs to threads
 /// it only waits for when it finishes normally, so after an error return
@@ -879,9 +985,12 @@ impl LockHealth {
 /// later one, and has to be called before the lock is given up.
 pub(crate) fn gate_writes(
     backends: &RepositoryBackends,
+    retries: Arc<WriteRetries>,
     failed_write_can_land_later: impl Fn(&RusticError) -> bool + Send + Sync + 'static,
 ) -> (RepositoryBackends, WriteGate) {
     let gate = WriteGate(Arc::new(GateState {
+        retries,
+        attempt_still_open: std::sync::atomic::AtomicBool::new(false),
         failed_write_can_land_later: Box::new(failed_write_can_land_later),
         health: std::sync::OnceLock::new(),
         closed: std::sync::RwLock::new(false),
@@ -902,6 +1011,9 @@ pub(crate) fn gate_writes(
 pub(crate) struct WriteGate(Arc<GateState>);
 
 struct GateState {
+    retries: Arc<WriteRetries>,
+    // An index was stored while another attempt at it may still arrive.
+    attempt_still_open: std::sync::atomic::AtomicBool,
     failed_write_can_land_later: Box<dyn Fn(&RusticError) -> bool + Send + Sync>,
     health: std::sync::OnceLock<LockHealth>,
     // Held shared by every write for as long as it runs, exclusively by
@@ -939,6 +1051,14 @@ impl WriteGate {
     pub(crate) fn unconfirmed_removals(&self) -> Vec<String> {
         use std::sync::PoisonError;
         self.0.unconfirmed.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// Whether an index file was stored with another attempt at writing it
+    /// still open: reported as failed, and not the one that stored it. That
+    /// attempt writes the same file again, which changes nothing — unless a
+    /// prune has removed the file by then, and the packs it names.
+    pub(crate) fn attempt_still_open(&self) -> bool {
+        self.0.attempt_still_open.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn lock_lost(&self) -> bool {
@@ -1035,30 +1155,60 @@ impl WriteBackend for LockGatedBackend {
                 "the repository lock could not be refreshed in time; nothing more is written",
             ));
         }
+        let retries = &self.gate.0.retries;
+        if retries.stopped() {
+            return Err(RusticError::new(
+                ErrorKind::Backend,
+                "the operation was stopped; nothing more is written",
+            ));
+        }
+        let what = format!("{} {}", tpe.dirname(), id.to_hex().as_str());
         let lands_later = |written: &RusticResult<()>| {
             matches!(written, Err(e) if (self.gate.0.failed_write_can_land_later)(e))
         };
         let mut written = self.inner.write_bytes(tpe, id, cacheable, content.clone());
-        // Whether any attempt is one the backend may yet complete.
-        let unsettled = lands_later(&written);
+        // How many attempts the backend may yet complete.
+        let mut open = usize::from(lands_later(&written));
         if tpe != FileType::Pack {
             let mut retried = false;
-            while lands_later(&written) && !self.gate.lock_lost() {
-                if self.inner.list(tpe).is_ok_and(|present| present.contains(id)) {
+            // With an attempt open, a failure is not passed on before the
+            // index has been read back: a refusal after a write the server
+            // may have taken is what rest-server answers once that write has
+            // arrived. The file is its own name's hash, so reading it back
+            // as written is the proof. A refusal with the index not there
+            // ends it; anything else is tried again.
+            while written.is_err() && open > 0 && !self.gate.lock_lost() && !retries.stopped() {
+                let stored = self.inner.read_full(tpe, id).is_ok_and(|found| {
+                    found.as_ref() == content.clone().into_vec().concat().as_slice()
+                });
+                if stored {
                     written = Ok(());
+                    open -= 1;
                     break;
                 }
-                if retried {
-                    std::thread::sleep(WRITE_RETRY_PAUSE);
+                if matches!(&written, Err(e) if !lands_later(&written) || server_refused(&**e)) {
+                    break;
                 }
-                if self.gate.lock_lost() {
+                retries.set_waiting_on(Some(what.clone()));
+                if retried {
+                    retries.pause();
+                }
+                if self.gate.lock_lost() || retries.stopped() {
                     break;
                 }
                 retried = true;
                 written = self.inner.write_bytes(tpe, id, cacheable, content.clone());
+                open += usize::from(lands_later(&written));
+            }
+            retries.set_waiting_on(None);
+            if written.is_ok() && open > 0 {
+                self.gate
+                    .0
+                    .attempt_still_open
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
             }
         }
-        let what = format!("{} {}", tpe.dirname(), id.to_hex().as_str());
+        let unsettled = open > 0;
         let report_unconfirmed = || {
             if tpe != FileType::Pack {
                 self.gate
@@ -1070,8 +1220,8 @@ impl WriteBackend for LockGatedBackend {
             }
         };
         if !self.gate.lock_lost() {
-            // Given up under a healthy lock — the server refused — with an
-            // earlier attempt still open.
+            // Given up under a healthy lock — refused, or the retrying was
+            // stopped — with an attempt still open.
             if written.is_err() && unsettled {
                 report_unconfirmed();
             }
@@ -1530,6 +1680,16 @@ mod tests {
         }
     }
 
+    // A publication nobody watches.
+    fn publish(
+        lock: &RepoLock,
+        backend: &dyn LockBackend,
+        crypto: &RepoCrypto,
+        plain: &[u8],
+    ) -> Result<Published> {
+        lock.write_unpacked_while_held(backend, crypto, plain, &WriteRetries::default())
+    }
+
     fn test_crypto(compress: bool) -> RepoCrypto {
         let mut key = AeadKey::default();
         for (i, b) in key.iter_mut().enumerate() {
@@ -1882,17 +2042,16 @@ mod tests {
         let (locks, lock) = steady_lock(&crypto);
 
         let files = MemLockBackend::new();
-        let name = lock
-            .write_unpacked_while_held(files.as_ref(), &crypto, b"{\"kept\":true}")
-            .expect("a healthy lock publishes");
+        let name = publish(&lock, files.as_ref(), &crypto, b"{\"kept\":true}")
+            .expect("a healthy lock publishes")
+            .name;
         assert!(files.read(&name).unwrap().is_some());
 
         // The lock is lost while the next write is under way: the hook runs
         // inside the backend's write, after the file is stored.
         let health = lock.health();
         files.set_write_hook(Box::new(move |_| health.expire_for_tests()));
-        let err = lock
-            .write_unpacked_while_held(files.as_ref(), &crypto, b"{\"kept\":false}")
+        let err = publish(&lock, files.as_ref(), &crypto, b"{\"kept\":false}")
             .expect_err("a write that outlasted the lock must not count as written");
         assert!(format!("{err:#}").contains("removed again"), "{err:#}");
         assert_eq!(files.count(), 1, "only the file written under the healthy lock remains");
@@ -1902,8 +2061,7 @@ mod tests {
         let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = Arc::clone(&reached);
         files.set_write_hook(Box::new(move |_| flag.store(true, Ordering::SeqCst)));
-        let err = lock
-            .write_unpacked_while_held(files.as_ref(), &crypto, b"{\"late\":true}")
+        let err = publish(&lock, files.as_ref(), &crypto, b"{\"late\":true}")
             .expect_err("a poisoned lock must not publish at all");
         assert!(format!("{err:#}").contains("nothing was written"), "{err:#}");
         assert!(!reached.load(Ordering::SeqCst), "the write must not reach the backend");
@@ -1928,8 +2086,7 @@ mod tests {
         files.report_write_failure.store(true, Ordering::SeqCst);
         let health = lock.health();
         files.set_write_hook(Box::new(move |_| health.expire_for_tests()));
-        let err = lock
-            .write_unpacked_while_held(files.as_ref(), &crypto, b"{\"n\":1}")
+        let err = publish(&lock, files.as_ref(), &crypto, b"{\"n\":1}")
             .expect_err("the write failed and the lock is lost");
         let message = format!("{err:#}");
         assert!(message.contains("removed again"), "{message}");
@@ -1944,8 +2101,7 @@ mod tests {
         files.fail_removes.store(true, Ordering::SeqCst);
         let health = lock.health();
         files.set_write_hook(Box::new(move |_| health.expire_for_tests()));
-        let err = lock
-            .write_unpacked_while_held(files.as_ref(), &crypto, b"{\"n\":2}")
+        let err = publish(&lock, files.as_ref(), &crypto, b"{\"n\":2}")
             .expect_err("the lock is lost");
         let message = format!("{err:#}");
         let left = files.list().unwrap().remove(0).0;
@@ -1960,8 +2116,7 @@ mod tests {
         let (_locks, lock) = steady_lock(&crypto);
         let files = MemLockBackend::new();
         files.fail_writes.store(true, Ordering::SeqCst);
-        let err = lock
-            .write_unpacked_while_held(&Synchronous(Arc::clone(&files)), &crypto, b"{\"n\":3}")
+        let err = publish(&lock, &Synchronous(Arc::clone(&files)), &crypto, b"{\"n\":3}")
             .expect_err("the write failed");
         let message = format!("{err:#}");
         assert!(message.contains("injected write failure"), "{message}");
@@ -2000,8 +2155,7 @@ mod tests {
         let files = MemLockBackend::new();
         files.fail_writes.store(true, Ordering::SeqCst);
         let backend = LosesLockOnRead(Arc::clone(&files), lock.health(), AtomicUsize::new(0));
-        let err = lock
-            .write_unpacked_while_held(&backend, &crypto, b"{\"n\":1}")
+        let err = publish(&lock, &backend, &crypto, b"{\"n\":1}")
             .expect_err("the write failed and the lock is lost");
         let message = format!("{err:#}");
         assert_eq!(backend.2.load(Ordering::SeqCst), 1, "no attempt under the lost lock");
@@ -2024,9 +2178,10 @@ mod tests {
         // Stored, reported as failed: found in the repository as written.
         let files = MemLockBackend::new();
         files.report_write_failure.store(true, Ordering::SeqCst);
-        let name = lock
-            .write_unpacked_while_held(files.as_ref(), &crypto, b"{\"n\":1}")
+        let published = publish(&lock, files.as_ref(), &crypto, b"{\"n\":1}")
             .expect("the file is there, whatever the write said");
+        assert!(!published.attempt_still_open, "the one attempt is what stored it");
+        let name = published.name;
         assert_eq!(files.count(), 1);
         assert!(files.read(&name).unwrap().is_some());
         assert!(!lock.poisoned(), "the lock was healthy throughout");
@@ -2056,17 +2211,19 @@ mod tests {
                 self.0.remove(name)
             }
         }
-        let name = lock
-            .write_unpacked_while_held(&Recovers(recovering, Arc::clone(&attempts)), &crypto, b"{\"n\":2}")
+        let recovers = Recovers(recovering, Arc::clone(&attempts));
+        let published = publish(&lock, &recovers, &crypto, b"{\"n\":2}")
             .expect("the fourth attempt succeeds");
         assert_eq!(attempts.load(Ordering::SeqCst), 4);
+        assert!(published.attempt_still_open, "the three that failed may still arrive");
+        let name = published.name;
         assert!(files.read(&name).unwrap().is_some());
 
         // A write that succeeds is still just that, in one attempt.
         let files = MemLockBackend::new();
-        let name = lock
-            .write_unpacked_while_held(files.as_ref(), &crypto, b"{\"n\":3}")
-            .expect("a healthy lock publishes");
+        let name = publish(&lock, files.as_ref(), &crypto, b"{\"n\":3}")
+            .expect("a healthy lock publishes")
+            .name;
         assert!(files.read(&name).unwrap().is_some());
         drop(lock);
     }
@@ -2097,9 +2254,9 @@ mod tests {
         let (_locks, lock) = steady_lock(&crypto);
         let files = MemLockBackend::new();
         files.hold_writes.store(true, Ordering::SeqCst);
-        let name = std::thread::scope(|scope| {
+        let published = std::thread::scope(|scope| {
             let publication = scope
-                .spawn(|| lock.write_unpacked_while_held(files.as_ref(), &crypto, b"{\"n\":1}"));
+                .spawn(|| publish(&lock, files.as_ref(), &crypto, b"{\"n\":1}"));
             wait_for_attempts(&files, 3);
             assert!(!publication.is_finished(), "no giving up under a healthy lock");
             assert_eq!(files.count(), 0, "nothing is stored yet");
@@ -2107,6 +2264,8 @@ mod tests {
             publication.join().expect("the publication panicked")
         })
         .expect("the file is there, under a lock that held throughout");
+        assert!(published.attempt_still_open, "one held write stored it; the others are out");
+        let name = published.name;
         assert!(files.read(&name).unwrap().is_some());
         assert!(!lock.poisoned());
         drop(lock);
@@ -2118,7 +2277,7 @@ mod tests {
         files.hold_writes.store(true, Ordering::SeqCst);
         let err = std::thread::scope(|scope| {
             let publication = scope
-                .spawn(|| lock.write_unpacked_while_held(files.as_ref(), &crypto, b"{\"n\":1}"));
+                .spawn(|| publish(&lock, files.as_ref(), &crypto, b"{\"n\":1}"));
             wait_for_attempts(&files, 3);
             assert!(!publication.is_finished(), "no giving up under a healthy lock");
             lock.health().expire_for_tests();
@@ -2145,8 +2304,7 @@ mod tests {
         let (_locks, lock) = steady_lock(&crypto);
         let files = MemLockBackend::new();
         files.fail_writes.store(true, Ordering::SeqCst);
-        let err = lock
-            .write_unpacked_while_held(&Synchronous(Arc::clone(&files)), &crypto, b"{\"n\":2}")
+        let err = publish(&lock, &Synchronous(Arc::clone(&files)), &crypto, b"{\"n\":2}")
             .expect_err("the write failed");
         let message = format!("{err:#}");
         assert_eq!(files.write_calls.load(Ordering::SeqCst), 2);
@@ -2172,8 +2330,7 @@ mod tests {
         let (_locks, lock) = steady_lock(&crypto);
         let files = MemLockBackend::new();
         files.refuse_writes.store(true, Ordering::SeqCst);
-        let err = lock
-            .write_unpacked_while_held(files.as_ref(), &crypto, b"{\"n\":1}")
+        let err = publish(&lock, files.as_ref(), &crypto, b"{\"n\":1}")
             .expect_err("the server refuses");
         let message = format!("{err:#}");
         assert_eq!(files.write_calls.load(Ordering::SeqCst), 2);
@@ -2185,18 +2342,22 @@ mod tests {
         drop(lock);
 
         // A refusal after an attempt the server may still be holding ends
-        // them too, but that attempt is still open, and the error says so.
+        // them as well — waiting would not get a refused write stored — but
+        // that attempt is still open, and the error says so.
+        let wait_for = |what: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !what() {
+                assert!(std::time::Instant::now() < deadline, "the publication made no progress");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
         let (_locks, lock) = steady_lock(&crypto);
         let files = MemLockBackend::new();
         files.hold_writes.store(true, Ordering::SeqCst);
         let err = std::thread::scope(|scope| {
-            let publication = scope
-                .spawn(|| lock.write_unpacked_while_held(files.as_ref(), &crypto, b"{\"n\":2}"));
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            while files.held.lock().unwrap().is_empty() {
-                assert!(std::time::Instant::now() < deadline, "no write was attempted");
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            let publication =
+                scope.spawn(|| publish(&lock, files.as_ref(), &crypto, b"{\"n\":2}"));
+            wait_for(&|| !files.held.lock().unwrap().is_empty());
             files.refuse_writes.store(true, Ordering::SeqCst);
             publication.join().expect("the publication panicked")
         })
@@ -2209,6 +2370,76 @@ mod tests {
         files.complete_held_writes();
         let published = files.list().unwrap().remove(0).0;
         assert!(message.contains(&published), "the error must name the file: {message}");
+        drop(lock);
+
+        // The refusal can also be about the earlier write having arrived,
+        // as rest-server's is for a file that is there. The repository is
+        // looked at before the refusal is believed, and the file published.
+        struct ArrivesThenRefuses(Arc<MemLockBackend>);
+        impl LockBackend for ArrivesThenRefuses {
+            fn list(&self) -> Result<Vec<(String, u64)>> {
+                self.0.list()
+            }
+            fn read(&self, name: &str) -> Result<Option<Vec<u8>>> {
+                self.0.read(name)
+            }
+            fn write(&self, name: &str, data: &[u8]) -> Result<()> {
+                if self.0.held.lock().unwrap().is_empty() {
+                    return self.0.write(name, data);
+                }
+                self.0.complete_held_writes();
+                Err(anyhow::Error::new(Refused))
+            }
+            fn remove(&self, name: &str) -> Result<()> {
+                self.0.remove(name)
+            }
+            fn failed_write_can_land_later(&self, error: &anyhow::Error) -> bool {
+                self.0.failed_write_can_land_later(error)
+            }
+        }
+        let (_locks, lock) = steady_lock(&crypto);
+        let files = MemLockBackend::new();
+        files.hold_writes.store(true, Ordering::SeqCst);
+        let published =
+            publish(&lock, &ArrivesThenRefuses(Arc::clone(&files)), &crypto, b"{\"n\":3}")
+                .expect("the file is there");
+        assert!(files.read(&published.name).unwrap().is_some());
+        assert!(!published.attempt_still_open, "the one open attempt is what stored it");
+        drop(lock);
+
+        // Failures that are no refusal go on for as long as the lock holds,
+        // until whoever watches stops them.
+        let (_locks, lock) = steady_lock(&crypto);
+        let files = MemLockBackend::new();
+        files.hold_writes.store(true, Ordering::SeqCst);
+        let retries = WriteRetries::default();
+        let err = std::thread::scope(|scope| {
+            let publication = scope.spawn(|| {
+                lock.write_unpacked_while_held(files.as_ref(), &crypto, b"{\"n\":5}", &retries)
+            });
+            wait_for(&|| files.held.lock().unwrap().len() >= 3);
+            assert!(!publication.is_finished(), "no giving up under a healthy lock");
+            assert!(retries.waiting_on().is_some_and(|what| what.starts_with("snapshot ")));
+            retries.stop();
+            publication.join().expect("the publication panicked")
+        })
+        .expect_err("stopped");
+        let message = format!("{err:#}");
+        assert!(retries.waiting_on().is_none());
+        assert!(message.contains("trying again was stopped"), "{message}");
+        assert!(message.contains("turns up later"), "{message}");
+        drop(lock);
+
+        // Stopped beforehand, nothing is written at all.
+        let (_locks, lock) = steady_lock(&crypto);
+        let files = MemLockBackend::new();
+        let retries = WriteRetries::default();
+        retries.stop();
+        let err = lock
+            .write_unpacked_while_held(files.as_ref(), &crypto, b"{\"n\":4}", &retries)
+            .expect_err("stopped");
+        assert!(format!("{err:#}").contains("nothing was written"), "{err:#}");
+        assert_eq!(files.write_calls.load(Ordering::SeqCst), 0);
         drop(lock);
     }
 
@@ -2350,6 +2581,7 @@ mod tests {
     struct Gated {
         lock: RepoLock,
         data: Arc<MemDataBackend>,
+        retries: Arc<WriteRetries>,
         gate: WriteGate,
         backend: Arc<dyn WriteBackend>,
     }
@@ -2372,12 +2604,14 @@ mod tests {
         ) -> Self {
             let (_locks, lock) = steady_lock(&test_crypto(true));
             let data = Arc::new(MemDataBackend::default());
+            let retries = Arc::new(WriteRetries::default());
             let (backends, gate) = gate_writes(
                 &RepositoryBackends::new(Arc::clone(&data) as Arc<dyn WriteBackend>, None),
+                Arc::clone(&retries),
                 failed_write_can_land_later,
             );
             gate.arm(&lock);
-            Self { lock, data, gate, backend: backends.repository() }
+            Self { lock, data, retries, gate, backend: backends.repository() }
         }
 
         fn write_calls(&self) -> usize {
@@ -2415,6 +2649,7 @@ mod tests {
         let data = Arc::new(MemDataBackend::default());
         let (backends, _gate) = gate_writes(
             &RepositoryBackends::new(Arc::clone(&data) as Arc<dyn WriteBackend>, None),
+            Arc::default(),
             |_| false,
         );
         backends
@@ -2523,6 +2758,7 @@ mod tests {
         assert_eq!(gated.write_calls(), 2);
         assert!(gated.stored(FileType::Index, 3));
         assert!(gated.gate.unconfirmed_removals().is_empty());
+        assert!(gated.gate.attempt_still_open(), "the first attempt may still arrive");
 
         // Stored, reported as failed: found, not written again.
         let gated = Gated::remote();
@@ -2530,6 +2766,7 @@ mod tests {
         gated.write(FileType::Index, 3).expect("the index is there, whatever the write said");
         assert_eq!(gated.write_calls(), 1);
         assert!(gated.stored(FileType::Index, 3));
+        assert!(!gated.gate.attempt_still_open(), "the one attempt is what stored it");
 
         // Refused: nothing is under way, and the failure is passed on.
         let gated = Gated::remote();
@@ -2540,7 +2777,8 @@ mod tests {
         assert!(gated.gate.unconfirmed_removals().is_empty());
 
         // Refused after an attempt the server may still complete: passed on
-        // too, with the index reported as not known to stay out.
+        // once the index has been looked for, and reported as not known to
+        // stay out.
         let gated = Gated::remote();
         gated.data.drop_writes.store(true, Ordering::SeqCst);
         let data = Arc::clone(&gated.data);
@@ -2550,6 +2788,69 @@ mod tests {
         assert!(format!("{err}").contains(REFUSAL), "{err}");
         assert_eq!(gated.write_calls(), 2);
         assert_eq!(gated.gate.unconfirmed_removals(), std::slice::from_ref(&index_3));
+
+        // Failures that are no refusal go on for as long as the lock holds,
+        // until whoever watches stops them.
+        let gated = Gated::remote();
+        gated.data.drop_writes.store(true, Ordering::SeqCst);
+        let err = std::thread::scope(|scope| {
+            let writer = scope.spawn(|| gated.write(FileType::Index, 3));
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while gated.write_calls() < 4 {
+                assert!(std::time::Instant::now() < deadline, "the write was not retried");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(!writer.is_finished(), "no giving up under a healthy lock");
+            assert_eq!(gated.retries.waiting_on(), Some(index_3.clone()));
+            gated.retries.stop();
+            writer.join().expect("the writer panicked")
+        })
+        .expect_err("stopped");
+        assert!(format!("{err}").contains("injected write failure"), "{err}");
+        assert_eq!(gated.gate.unconfirmed_removals(), std::slice::from_ref(&index_3));
+        assert!(gated.retries.waiting_on().is_none());
+        // And once stopped, nothing more is written.
+        let before = gated.write_calls();
+        let err = gated.write(FileType::Pack, 6).expect_err("stopped");
+        assert!(format!("{err}").contains("was stopped"), "{err}");
+        assert_eq!(gated.write_calls(), before);
+
+        // The same, and the attempt that was open arrives: the refusals were
+        // about the file being there, and reading it back as written proves
+        // it.
+        let gated = Gated::remote();
+        gated.data.drop_writes.store(true, Ordering::SeqCst);
+        let data = Arc::clone(&gated.data);
+        *gated.data.on_write.lock().unwrap() = Some(Box::new(move || {
+            data.refuse_writes.store(true, Ordering::SeqCst);
+            let _ = data
+                .files
+                .lock()
+                .unwrap()
+                .insert(file_key(FileType::Index, &Gated::id(3)), vec![3]);
+        }));
+        gated.write(FileType::Index, 3).expect("the index is there");
+        assert_eq!(gated.write_calls(), 1, "found before another attempt");
+        assert!(gated.gate.unconfirmed_removals().is_empty());
+
+        // Something else under that name is not it.
+        let gated = Gated::remote();
+        gated.data.drop_writes.store(true, Ordering::SeqCst);
+        let data = Arc::clone(&gated.data);
+        *gated.data.on_write.lock().unwrap() = Some(Box::new(move || {
+            data.drop_writes.store(false, Ordering::SeqCst);
+            let _ = data
+                .files
+                .lock()
+                .unwrap()
+                .insert(file_key(FileType::Index, &Gated::id(3)), vec![0xff]);
+        }));
+        gated.write(FileType::Index, 3).expect("written again");
+        assert_eq!(gated.write_calls(), 2, "what was there did not count as stored");
+        assert_eq!(
+            gated.backend.read_full(FileType::Index, &Gated::id(3)).unwrap().as_ref(),
+            [3]
+        );
 
         // The lock lost over a write the server may still complete: taking
         // the file back finds nothing, which does not make it gone for good.
@@ -2603,13 +2904,15 @@ mod tests {
                 closed.store(true, Ordering::SeqCst);
             });
             std::thread::sleep(Duration::from_millis(100));
-            assert!(
-                !closed.load(Ordering::SeqCst),
-                "close returned while a write was still under way"
-            );
+            // Looked at now, judged once both threads are done: a failed
+            // assertion in here would leave the writer waiting for ever.
+            let closed_early = closed.load(Ordering::SeqCst);
             release_tx.send(()).expect("release the write");
-            writer.join().unwrap().expect("the write under way completes");
-            closer.join().unwrap();
+            let written = writer.join();
+            let closer = closer.join();
+            assert!(!closed_early, "close returned while a write was still under way");
+            written.unwrap().expect("the write under way completes");
+            closer.unwrap();
         });
         assert!(closed.load(Ordering::SeqCst));
         assert!(gated.stored(FileType::Pack, 1));
@@ -2786,7 +3089,16 @@ mod tests {
         // the file — a server stuck syncing to a stalled disk. Like
         // rest-server, it then stores the file without looking at whether
         // the client is still there.
-        hold_posts: Arc<(Mutex<bool>, Condvar)>,
+        hold_posts: Arc<(Mutex<Hold>, Condvar)>,
+    }
+
+    #[derive(Default)]
+    struct Hold {
+        on: bool,
+        // POSTs that have arrived in full and are waiting to be stored.
+        waiting: usize,
+        // Answer a POST with 403 while another is waiting.
+        refuse_more: bool,
     }
 
     impl RestMock {
@@ -2807,7 +3119,7 @@ mod tests {
                 files: &Mutex<HashMap<String, Vec<u8>>>,
                 auths: &Mutex<Vec<Option<String>>>,
                 accepts: &Mutex<Vec<Option<String>>>,
-                hold_posts: &(Mutex<bool>, Condvar),
+                hold_posts: &(Mutex<Hold>, Condvar),
                 v1_list: bool,
             ) -> std::io::Result<()> {
                 let mut writer = stream.try_clone()?;
@@ -2822,6 +3134,8 @@ mod tests {
                     let method = parts.next().unwrap_or("").to_string();
                     let path = parts.next().unwrap_or("").to_string();
                     let (mut len, mut auth, mut accept) = (0_usize, None, None);
+                    // rustic_core's backend streams its POSTs.
+                    let mut chunked = false;
                     loop {
                         let mut h = String::new();
                         reader.read_line(&mut h)?;
@@ -2833,6 +3147,7 @@ mod tests {
                         let v = v.trim();
                         match k.to_ascii_lowercase().as_str() {
                             "content-length" => len = v.parse().unwrap_or(0),
+                            "transfer-encoding" => chunked = v.eq_ignore_ascii_case("chunked"),
                             "authorization" => auth = Some(v.to_string()),
                             "accept" => accept = Some(v.to_string()),
                             _ => {}
@@ -2840,11 +3155,23 @@ mod tests {
                     }
                     let mut body = vec![0_u8; len];
                     reader.read_exact(&mut body)?;
+                    while chunked {
+                        let mut size = String::new();
+                        reader.read_line(&mut size)?;
+                        let size = usize::from_str_radix(size.trim(), 16).unwrap_or(0);
+                        let mut chunk = vec![0_u8; size + 2];
+                        reader.read_exact(&mut chunk)?;
+                        body.extend_from_slice(&chunk[..size]);
+                        chunked = size > 0;
+                    }
                     auths.lock().unwrap().push(auth);
                     accepts.lock().unwrap().push(accept.clone());
 
-                    let (status, resp): (u16, Vec<u8>) = if let Some(name) =
-                        path.strip_prefix("/repo/locks/")
+                    // One directory's worth of files: whichever one a test
+                    // talks to (`locks/`, or `index/` for rustic_core's
+                    // backend).
+                    let (status, resp): (u16, Vec<u8>) = if let Some((_dir, name)) =
+                        path.strip_prefix("/repo/").and_then(|rest| rest.split_once('/'))
                     {
                         match (method.as_str(), name) {
                             ("GET", "") => {
@@ -2876,14 +3203,19 @@ mod tests {
                                 (403, Vec::new())
                             }
                             ("POST", name) => {
-                                drop(
-                                    hold_posts
-                                        .1
-                                        .wait_while(hold_posts.0.lock().unwrap(), |held| *held)
-                                        .unwrap(),
-                                );
-                                let _ = files.lock().unwrap().insert(name.to_string(), body);
-                                (200, Vec::new())
+                                let mut hold = hold_posts.0.lock().unwrap();
+                                if hold.on && hold.refuse_more && hold.waiting > 0 {
+                                    (403, Vec::new())
+                                } else {
+                                    hold.waiting += 1;
+                                    hold_posts.1.notify_all();
+                                    let mut hold =
+                                        hold_posts.1.wait_while(hold, |hold| hold.on).unwrap();
+                                    hold.waiting -= 1;
+                                    drop(hold);
+                                    let _ = files.lock().unwrap().insert(name.to_string(), body);
+                                    (200, Vec::new())
+                                }
                             }
                             ("DELETE", name) => {
                                 if files.lock().unwrap().remove(name).is_some() {
@@ -2908,7 +3240,7 @@ mod tests {
                 }
             }
 
-            let hold_posts: Arc<(Mutex<bool>, Condvar)> = Arc::default();
+            let hold_posts: Arc<(Mutex<Hold>, Condvar)> = Arc::default();
             {
                 let (files, auths, accepts, hold_posts) = (
                     Arc::clone(&files),
@@ -2935,8 +3267,28 @@ mod tests {
         }
 
         fn hold_posts(&self, held: bool) {
-            *self.hold_posts.0.lock().unwrap() = held;
+            self.hold_posts.0.lock().unwrap().on = held;
             self.hold_posts.1.notify_all();
+        }
+
+        // While a POST is being held, answer every other one with 403.
+        fn refuse_posts_while_one_is_held(&self) {
+            self.hold_posts.0.lock().unwrap().refuse_more = true;
+        }
+
+        // Returns once a POST has arrived in full and is being held.
+        fn wait_for_a_held_post(&self) {
+            let (hold, timed_out) = self
+                .hold_posts
+                .1
+                .wait_timeout_while(
+                    self.hold_posts.0.lock().unwrap(),
+                    Duration::from_secs(10),
+                    |hold| hold.waiting == 0,
+                )
+                .unwrap();
+            assert!(!timed_out.timed_out(), "no POST reached the server");
+            drop(hold);
         }
     }
 
@@ -2948,7 +3300,9 @@ mod tests {
     #[test]
     fn rest_write_that_timed_out_is_stored_after_its_removal() {
         let mock = RestMock::start(false);
-        let backend = RestLockBackend::with_timeout(
+        // The write gives up quickly; what looks at the server afterwards
+        // must not, or a slow machine fails the test for it.
+        let impatient = RestLockBackend::with_timeout(
             &mock.base_url,
             "",
             "",
@@ -2956,12 +3310,15 @@ mod tests {
             Duration::from_millis(300),
         )
         .unwrap();
+        let backend = RestLockBackend::new(&mock.base_url, "", "", "locks").unwrap();
 
         mock.hold_posts(true);
-        let timeout = backend
+        let timeout = impatient
             .write("cccc", b"late")
             .expect_err("the client times out waiting for the server");
-        assert!(backend.failed_write_can_land_later(&timeout), "{timeout:#}");
+        assert!(impatient.failed_write_can_land_later(&timeout), "{timeout:#}");
+        // The server has the whole POST, and is holding it.
+        mock.wait_for_a_held_post();
         backend.remove("cccc").expect("removing what is not there yet succeeds");
         assert_eq!(backend.read("cccc").unwrap(), None, "not published yet");
 
@@ -2977,6 +3334,52 @@ mod tests {
         // under way.
         let refusal = backend.write("cccc", b"late").expect_err("the file is there");
         assert!(!backend.failed_write_can_land_later(&refusal), "{refusal:#}");
+    }
+
+    // rustic_backend's REST backend, which the merge's packs and index files
+    // go through, retries a request by itself and reports the last attempt's
+    // error. So it can report a refusal for a write whose first attempt the
+    // server is still holding — and goes on to store. That is why none of
+    // its failures is taken for settled (`repo::data_write_can_land_later`).
+    #[test]
+    fn rustic_rest_write_reports_a_refusal_with_an_attempt_still_open() {
+        let mock = RestMock::start(false);
+        let profile = crate::config::Profile::Rest {
+            password: "pw".into(),
+            rest_url: mock.base_url.clone(),
+            rest_user: String::new(),
+            rest_password: String::new(),
+        };
+        let backends = crate::repo::build_backends_with_policy(
+            &profile,
+            crate::repo::RequestPolicy { retries: 1, read_timeout: Duration::from_secs(1) },
+        )
+        .expect("the REST backend");
+        let backend = backends.repository();
+        let id = Gated::id(7);
+
+        // The first POST is held; the retry rustic_backend makes is refused.
+        mock.hold_posts(true);
+        mock.refuse_posts_while_one_is_held();
+        let err = backend
+            .write_bytes(FileType::Index, &id, false, vec![7].into())
+            .expect_err("the retry is refused");
+        assert!(server_refused(&*err), "the error is the refusal of the second attempt: {err}");
+        assert!(
+            crate::repo::data_write_can_land_later(&profile)(&err),
+            "and must not be taken for the whole write's"
+        );
+        mock.wait_for_a_held_post();
+        assert!(backend.read_full(FileType::Index, &id).is_err(), "not stored yet");
+
+        // The server gets on with the first one.
+        mock.hold_posts(false);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while backend.read_full(FileType::Index, &id).is_err() {
+            assert!(std::time::Instant::now() < deadline, "the held write never landed");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(backend.read_full(FileType::Index, &id).unwrap().as_ref(), [7]);
     }
 
     #[test]

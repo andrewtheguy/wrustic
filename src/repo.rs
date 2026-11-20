@@ -153,7 +153,7 @@ pub(crate) fn build_backends(profile: &Profile) -> Result<RepositoryBackends> {
     build_backends_with_policy(profile, RequestPolicy::STANDARD)
 }
 
-fn build_backends_with_policy(
+pub(crate) fn build_backends_with_policy(
     profile: &Profile,
     policy: RequestPolicy,
 ) -> Result<RepositoryBackends> {
@@ -526,7 +526,11 @@ fn retag_snapshot_json(raw: &[u8], old_id: &str, new_tags: &[String]) -> Result<
 /// `merge_snapshots`: that one stamps the merging machine's hostname and
 /// keeps nested paths apart, either of which stops `restic backup` from
 /// finding the merged snapshot as its parent (see [`merged_snapshot_json`]).
-pub(crate) fn merge_snapshots(profile: &Profile, snapshot_ids: &[String]) -> Result<MergeOutcome> {
+pub(crate) fn merge_snapshots(
+    profile: &Profile,
+    snapshot_ids: &[String],
+    retries: &std::sync::Arc<lock::WriteRetries>,
+) -> Result<MergeOutcome> {
     for id in snapshot_ids {
         ensure_full_snapshot_id(id)?;
     }
@@ -540,12 +544,11 @@ pub(crate) fn merge_snapshots(profile: &Profile, snapshot_ids: &[String]) -> Res
     // lock: `merge_trees` writes packs and then the index naming them and
     // cannot be interrupted, and an index written after the lock was lost
     // could name packs a prune has deleted in between.
-    // A write to a server can be stored after it was reported as failed,
-    // unless the failure is the server's refusal; a local write cannot.
-    let remote = !matches!(profile, Profile::Local { .. });
-    let (backends, write_gate) = lock::gate_writes(&build_backends(profile)?, move |error| {
-        remote && !lock::server_refused(error)
-    });
+    let (backends, write_gate) = lock::gate_writes(
+        &build_backends(profile)?,
+        std::sync::Arc::clone(retries),
+        data_write_can_land_later(profile),
+    );
     let repo = Repository::new(&RepositoryOptions::default(), &backends)?
         .open(&Credentials::password(profile.password()))?;
     let crypto = lock::RepoCrypto::from_repo(&repo)?;
@@ -644,9 +647,19 @@ pub(crate) fn merge_snapshots(profile: &Profile, snapshot_ids: &[String]) -> Res
     // (this one's index predates the trees just written).
     if scan.quoted_names || scan.hardlinked_files {
         let merged = open_indexed_full(profile)?;
-        let defect = merged_tree_defect(tree, |id| {
+        let read_tree = |id: &TreeId| -> Result<_> {
             Ok(merged.cat_blob(BlobType::Tree, id.to_hex().as_str())?)
-        })?;
+        };
+        let hostname = |source: &serde_json::Value| {
+            source.get("hostname").and_then(|h| h.as_str()).unwrap_or("").to_string()
+        };
+        let several_hosts = sources.iter().any(|source| hostname(source) != hostname(&sources[0]));
+        let defect = match merged_tree_defect(tree, read_tree)? {
+            None if scan.hardlinked_files && several_hosts => {
+                cross_host_link_defect(tree, &trees, read_tree)?
+            }
+            defect => defect,
+        };
         if let Some(defect) = defect {
             bail!(
                 "these snapshots cannot be merged: {defect}. No snapshot was written; nothing \
@@ -655,8 +668,24 @@ pub(crate) fn merge_snapshots(profile: &Profile, snapshot_ids: &[String]) -> Res
         }
     }
 
+    // The source paths whose files are not where the path says: see
+    // `merged_paths`.
+    let mut misplaced_paths = std::collections::BTreeSet::new();
+    for (source, root) in sources.iter().zip(&trees) {
+        let paths = source.get("paths").and_then(|paths| paths.as_array());
+        for path in paths.into_iter().flatten().filter_map(|path| path.as_str()) {
+            let held = tree_holds_path(*root, path, |id| {
+                Ok(repo.cat_blob(BlobType::Tree, id.to_hex().as_str())?)
+            })?;
+            if !held {
+                let _ = misplaced_paths.insert(path.to_string());
+            }
+        }
+    }
+
     let json = merged_snapshot_json(
         &sources,
+        &misplaced_paths,
         newest,
         tree.to_hex().as_str(),
         &summary,
@@ -676,7 +705,9 @@ pub(crate) fn merge_snapshots(profile: &Profile, snapshot_ids: &[String]) -> Res
     // out to have gone bad while the write was under way: until the snapshot
     // exists nothing refers to the merged trees, and a prune that got in
     // would have removed them.
-    let new_id = repo_lock.write_unpacked_while_held(snapshots.as_ref(), &crypto, &json)?;
+    let published =
+        repo_lock.write_unpacked_while_held(snapshots.as_ref(), &crypto, &json, retries)?;
+    let new_id = published.name;
     // Same proof the tag edit asks for: an independent reader decodes our
     // envelope to exactly the JSON we meant to store.
     // A snapshot that cannot be shown to be what was meant is not left
@@ -689,17 +720,52 @@ pub(crate) fn merge_snapshots(profile: &Profile, snapshot_ids: &[String]) -> Res
     };
     if let Some(problem) = problem {
         match snapshots.remove(&new_id) {
+            // The removal is final only for writes that are over.
+            Ok(()) if published.attempt_still_open => bail!(
+                "merged snapshot {new_id} {problem}; it was removed again, but the server can \
+                 still complete an earlier write of it that was reported as failed — if \
+                 {new_id} turns up later it was not meant to be published: remove it"
+            ),
             Ok(()) => bail!("merged snapshot {new_id} {problem}; it was removed again"),
             Err(e) => bail!(
-                "merged snapshot {new_id} {problem}, and removing it failed ({e:#}); it is \
-                 still in the repository, unverified"
+                "merged snapshot {new_id} {problem}, and its removal could not be confirmed \
+                 ({e:#}) — check whether {new_id} is in the repository; if it is, it is \
+                 unverified: remove it"
             ),
         }
     }
     Ok(MergeOutcome {
         snapshot_id: new_id,
         dropped_node_fields: scan.dropped_node_fields.into_iter().collect(),
+        attempt_still_open: published.attempt_still_open || write_gate.attempt_still_open(),
     })
+}
+
+/// Whether a write of repository data that failed with the given error can
+/// still be stored by the backend afterwards
+/// (`lock::LockBackend::failed_write_can_land_later`, for the backends
+/// rustic_core writes through).
+///
+/// A local write is this process's own system calls and is over when it has
+/// returned. A server can store what it took in full after the client gave
+/// up, unless the error is its own refusal (`lock::server_refused`) — and
+/// that only counts when the refused attempt was the only one. Both remote
+/// backends retry by themselves and report the last attempt's error:
+/// wrustic's S3 backend marks an error that followed a retry, and
+/// rustic_backend's REST backend gives no sign of one, so none of its
+/// failures is taken for settled.
+pub(crate) fn data_write_can_land_later(
+    profile: &Profile,
+) -> impl Fn(&rustic_core::RusticError) -> bool + Send + Sync + 'static {
+    let backend = profile.backend_kind();
+    move |error| match backend {
+        crate::config::BackendKind::Local => false,
+        crate::config::BackendKind::Rest => true,
+        crate::config::BackendKind::S3 => {
+            error.context_value(crate::s3_backend::AFTER_EARLIER_ATTEMPTS).is_some()
+                || !lock::server_refused(error)
+        }
+    }
 }
 
 /// What [`merge_snapshots`] produced.
@@ -710,6 +776,14 @@ pub(crate) struct MergeOutcome {
     /// Tree-node fields the sources hold and the merged snapshot does not
     /// ([`scan_source_trees`]), sorted; empty when nothing was lost.
     pub(crate) dropped_node_fields: Vec<String>,
+    /// The snapshot or an index file was stored while another attempt at
+    /// writing it, reported as failed, may still be completed by the server
+    /// (`lock::Published::attempt_still_open`,
+    /// `lock::WriteGate::attempt_still_open`). That attempt writes the same
+    /// file again. It matters only if the merged snapshot is deleted and
+    /// pruned before it arrives: it would then bring back a file that names
+    /// what the prune removed.
+    pub(crate) attempt_still_open: bool,
 }
 
 /// What a merge has to know about its sources before it runs.
@@ -742,7 +816,7 @@ fn scan_source_trees<B: AsRef<[u8]>>(
         for node in nodes {
             scan.dropped_node_fields.extend(unpreserved_node_fields(node)?);
             scan.quoted_names |= raw_name(node).contains('\\');
-            scan.hardlinked_files |= RawFile::of(node).is_some_and(|file| file.links > 1);
+            scan.hardlinked_files |= file_identity(node).is_some_and(|(_, links)| links > 1);
         }
         Ok(())
     })?;
@@ -756,12 +830,24 @@ fn scan_source_trees<B: AsRef<[u8]>>(
 fn visit_raw_trees<B: AsRef<[u8]>>(
     roots: &[TreeId],
     read_tree: impl Fn(&TreeId) -> Result<B>,
+    visit: impl FnMut(&str, &[serde_json::Value]) -> Result<()>,
+) -> Result<()> {
+    walk_raw_trees(roots, true, read_tree, visit)
+}
+
+/// [`visit_raw_trees`], or with `each_tree_once` off, every *directory*:
+/// a tree that is two directories is then visited as both, each under its
+/// own path — what a caller needs that goes by the paths.
+fn walk_raw_trees<B: AsRef<[u8]>>(
+    roots: &[TreeId],
+    each_tree_once: bool,
+    read_tree: impl Fn(&TreeId) -> Result<B>,
     mut visit: impl FnMut(&str, &[serde_json::Value]) -> Result<()>,
 ) -> Result<()> {
     let mut seen = std::collections::HashSet::new();
     let mut pending: Vec<(TreeId, String)> = roots
         .iter()
-        .filter(|id| seen.insert(**id))
+        .filter(|id| seen.insert(**id) || !each_tree_once)
         .map(|id| (*id, String::new()))
         .collect();
     while let Some((id, dir)) = pending.pop() {
@@ -780,7 +866,7 @@ fn visit_raw_trees<B: AsRef<[u8]>>(
                 let subtree: TreeId = subtree
                     .parse()
                     .map_err(|e| anyhow!("tree {} names a bad subtree id: {e}", hex.as_str()))?;
-                if seen.insert(subtree) {
+                if seen.insert(subtree) || !each_tree_once {
                     pending.push((subtree, format!("{dir}/{}", raw_name(node))));
                 }
             }
@@ -844,6 +930,16 @@ fn restic_name_bytes(quoted: &str) -> Vec<u8> {
     out
 }
 
+/// A raw file node's device and inode, and its link count; `None` for
+/// anything that is not a file.
+fn file_identity(node: &serde_json::Value) -> Option<((u64, u64), u64)> {
+    if node.get("type").and_then(|t| t.as_str()) != Some("file") {
+        return None;
+    }
+    let number = |key: &str| node.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0);
+    Some(((number("device_id"), number("inode")), number("links")))
+}
+
 /// What restic's restorer goes by to rebuild hardlinks, from a raw file node.
 struct RawFile {
     /// Device and inode.
@@ -863,9 +959,7 @@ struct RawFile {
 
 impl RawFile {
     fn of(node: &serde_json::Value) -> Option<Self> {
-        if node.get("type").and_then(|t| t.as_str()) != Some("file") {
-            return None;
-        }
+        let (identity, links) = file_identity(node)?;
         let number = |key: &str| node.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0);
         // Nothing and an empty list are the same thing written two ways: an
         // empty file is `null` to restic and `[]` to rustic_core.
@@ -891,8 +985,8 @@ impl RawFile {
             (name.to_string(), attribute.to_string())
         });
         Some(Self {
-            identity: (number("device_id"), number("inode")),
-            links: number("links"),
+            identity,
+            links,
             content: list("content"),
             metadata: [
                 ("permissions", serde_json::json!(number("mode"))),
@@ -1004,6 +1098,140 @@ fn merged_tree_defect<B: AsRef<[u8]>>(
     Ok(defect)
 }
 
+/// What [`merged_tree_defect`] cannot see, for sources of more than one host.
+///
+/// It lets files of different sources share a device and inode when they
+/// agree in everything else, because on one machine that is one file seen by
+/// two backups. Between machines the numbers say nothing: two hosts set up
+/// alike hand out the same ones, and a file copied to both agrees in the
+/// rest. restic would restore such files as hardlinks of one another. So
+/// across hosts a group of files restic would link has to be one that some
+/// single source records as it is — every path of it, under that device and
+/// inode. `sources` are walked by path, so that a directory stored once and
+/// found in two places counts as both.
+fn cross_host_link_defect<B: AsRef<[u8]>>(
+    merged: TreeId,
+    sources: &[TreeId],
+    read_tree: impl Fn(&TreeId) -> Result<B>,
+) -> Result<Option<String>> {
+    use std::collections::{BTreeMap, HashSet};
+    type Identity = (u64, u64);
+
+    // The groups restic would form: every file that shares a device and inode
+    // with one of several links, by path.
+    let mut groups: BTreeMap<Identity, Vec<String>> = BTreeMap::new();
+    visit_raw_trees(&[merged], &read_tree, |_, nodes| {
+        for (identity, _) in nodes.iter().filter_map(file_identity).filter(|(_, links)| *links > 1)
+        {
+            let _ = groups.entry(identity).or_default();
+        }
+        Ok(())
+    })?;
+    if groups.is_empty() {
+        return Ok(None);
+    }
+    walk_raw_trees(&[merged], false, &read_tree, |dir, nodes| {
+        for node in nodes {
+            if let Some((identity, _)) = file_identity(node)
+                && let Some(paths) = groups.get_mut(&identity)
+            {
+                paths.push(format!("{dir}/{}", raw_name(node)));
+            }
+        }
+        Ok(())
+    })?;
+    groups.retain(|_, paths| paths.len() > 1);
+
+    // What each source records of them.
+    let mut recorded: Vec<HashSet<(Identity, String)>> = Vec::with_capacity(sources.len());
+    for source in sources {
+        let mut own = HashSet::new();
+        walk_raw_trees(&[*source], false, &read_tree, |dir, nodes| {
+            for node in nodes {
+                if let Some((identity, _)) = file_identity(node)
+                    && groups.contains_key(&identity)
+                {
+                    let _ = own.insert((identity, format!("{dir}/{}", raw_name(node))));
+                }
+            }
+            Ok(())
+        })?;
+        recorded.push(own);
+    }
+
+    for (identity, paths) in &groups {
+        let holds = |own: &HashSet<(Identity, String)>, path: &String| {
+            own.contains(&(*identity, path.clone()))
+        };
+        if recorded.iter().any(|own| paths.iter().all(|path| holds(own, path))) {
+            continue;
+        }
+        let first = &paths[0];
+        let other = paths[1..]
+            .iter()
+            .find(|path| !recorded.iter().any(|own| holds(own, first) && holds(own, path)))
+            .unwrap_or(&paths[1]);
+        return Ok(Some(format!(
+            "`{first}` and `{other}` are recorded under one device and inode by snapshots of \
+             different hosts, where the numbers of one machine say nothing about another's, \
+             and restic would restore them as hardlinks of one file"
+        )));
+    }
+    Ok(None)
+}
+
+/// The names a backed-up path has in a restic tree, from the root down.
+/// restic stores a target under its absolute path: `/data/extra` is `data`,
+/// then `extra`. On Windows the volume is the first directory, without its
+/// colon: `C:\Users\me` is `C`, `Users`, `me`.
+fn archive_components(path: &str) -> Vec<&str> {
+    if path.starts_with('/') {
+        return path.split('/').filter(|part| !part.is_empty()).collect();
+    }
+    // `\\?\C:\…` is the same path spelled the long way.
+    path.strip_prefix(r"\\?\")
+        .unwrap_or(path)
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty())
+        .enumerate()
+        .map(|(i, part)| if i == 0 { part.strip_suffix(':').unwrap_or(part) } else { part })
+        .collect()
+}
+
+/// Whether the tree at `root` holds `path` where restic stores an absolute
+/// path ([`archive_components`]). It does not for a target that was given to
+/// `restic backup` as a relative path: `paths` still records the absolute
+/// path, while the tree is rooted at the relative one — `cd /data && restic
+/// backup extra` records `/data/extra` and stores `/extra`.
+fn tree_holds_path<B: AsRef<[u8]>>(
+    root: TreeId,
+    path: &str,
+    read_tree: impl Fn(&TreeId) -> Result<B>,
+) -> Result<bool> {
+    let mut tree = root;
+    let components = archive_components(path);
+    for (i, component) in components.iter().enumerate() {
+        let raw = read_tree(&tree)?;
+        let parsed: serde_json::Value = serde_json::from_slice(raw.as_ref())
+            .with_context(|| format!("parsing tree {}", tree.to_hex().as_str()))?;
+        let Some(node) = parsed
+            .get("nodes")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|nodes| nodes.iter().find(|node| raw_name(node) == *component))
+        else {
+            return Ok(false);
+        };
+        if i + 1 == components.len() {
+            break;
+        }
+        match node.get("subtree").and_then(|s| s.as_str()).map(str::parse::<TreeId>) {
+            Some(Ok(subtree)) => tree = subtree,
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
 /// The fields of one raw tree node that would not survive a round trip
 /// through rustic_core's typed `Node`. Found by doing the round trip rather
 /// than from a list of field names, so it stays right when rustic_core learns
@@ -1060,6 +1288,7 @@ fn json_is_empty(value: &serde_json::Value) -> bool {
 ///   those of the merged tree.
 fn merged_snapshot_json(
     sources: &[serde_json::Value],
+    misplaced_paths: &std::collections::BTreeSet<String>,
     newest: usize,
     tree: &str,
     summary: &SnapshotSummary,
@@ -1097,7 +1326,10 @@ fn merged_snapshot_json(
         .ok_or_else(|| anyhow!("the newest source snapshot has no `time`"))?;
     let _ = snapshot.insert("time".into(), json!(just_after(time)?));
     let _ = snapshot.insert("tree".into(), json!(tree));
-    let _ = snapshot.insert("paths".into(), json!(merged_paths(&strings("paths")?)));
+    let _ = snapshot.insert(
+        "paths".into(),
+        json!(merged_paths(&strings("paths")?, misplaced_paths)),
+    );
     let hosts: Vec<&str> = sources
         .iter()
         .map(|source| source.get("hostname").and_then(Value::as_str).unwrap_or(""))
@@ -1199,10 +1431,25 @@ pub(crate) fn merged_hostname(hosts: &[&str]) -> Option<String> {
 /// of `/data` already covers `/data/extra`. Folding those is what lets a later
 /// `restic backup /data` recognize the merged snapshot as its parent; restic
 /// compares path sets exactly.
-pub(crate) fn merged_paths(paths: &[&str]) -> Vec<String> {
+///
+/// That holds only where the trees are laid out as the paths say. A path in
+/// `misplaced` is one whose source does not hold it there
+/// ([`tree_holds_path`]: a backup of a relative path), so its files were not
+/// merged into the directory its path names, and it is neither folded into
+/// another nor another into it: the merged snapshot then lists both, and
+/// does not pass for a backup of the one.
+pub(crate) fn merged_paths(
+    paths: &[&str],
+    misplaced: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
     let set: std::collections::BTreeSet<&str> = paths.iter().copied().collect();
+    let placed = |path: &str| !misplaced.contains(path);
     set.iter()
-        .filter(|path| !set.iter().any(|other| path_is_inside(path, other)))
+        .filter(|path| {
+            !set.iter().any(|other| {
+                path_is_inside(path, other) && placed(path) && placed(other)
+            })
+        })
         .map(|path| path.to_string())
         .collect()
 }
@@ -1640,6 +1887,35 @@ fn collect_all_as(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The merge and its parts as most tests want them: watched by nobody,
+    // and with every source laid out as its paths say.
+    fn merge_snapshots(profile: &Profile, snapshot_ids: &[String]) -> Result<MergeOutcome> {
+        super::merge_snapshots(profile, snapshot_ids, &Default::default())
+    }
+
+    fn merged_paths(paths: &[&str]) -> Vec<String> {
+        super::merged_paths(paths, &Default::default())
+    }
+
+    fn merged_snapshot_json(
+        sources: &[serde_json::Value],
+        newest: usize,
+        tree: &str,
+        summary: &SnapshotSummary,
+        started: &str,
+        finished: &str,
+    ) -> Result<Vec<u8>> {
+        super::merged_snapshot_json(
+            sources,
+            &Default::default(),
+            newest,
+            tree,
+            summary,
+            started,
+            finished,
+        )
+    }
     use crate::testrepo::TestRepo;
 
     #[test]
@@ -1895,6 +2171,120 @@ mod tests {
             ["C:\\Users\\me", "D:\\Users\\me\\Docs"]
         );
         assert!(merged_paths(&[]).is_empty());
+
+        // A path whose files are not where it says is not folded, either way
+        // round: the merged snapshot is then no backup of the one directory.
+        let misplaced = |paths: &[&str]| paths.iter().map(|path| path.to_string()).collect();
+        assert_eq!(
+            super::merged_paths(&["/data", "/data/extra"], &misplaced(&["/data/extra"])),
+            ["/data", "/data/extra"]
+        );
+        assert_eq!(
+            super::merged_paths(&["/data", "/data/extra"], &misplaced(&["/data"])),
+            ["/data", "/data/extra"]
+        );
+        assert_eq!(
+            super::merged_paths(&["/data", "/data/extra", "/data/more"], &misplaced(&["/data/more"])),
+            ["/data", "/data/more"]
+        );
+    }
+
+    fn tree_id(n: u8) -> TreeId {
+        format!("{n:02x}").repeat(32).parse().expect("tree id")
+    }
+
+    // Trees given as `(tree number, entries)`, to read by id.
+    fn tree_store(
+        trees: &[(u8, Vec<serde_json::Value>)],
+    ) -> impl Fn(&TreeId) -> Result<Vec<u8>> + use<> {
+        let stored: std::collections::HashMap<TreeId, Vec<u8>> = trees
+            .iter()
+            .map(|(n, nodes)| {
+                (tree_id(*n), serde_json::to_vec(&serde_json::json!({"nodes": nodes})).unwrap())
+            })
+            .collect();
+        move |id| stored.get(id).cloned().ok_or_else(|| anyhow!("no such tree"))
+    }
+
+    // restic stores a target under its absolute path, and a target given as
+    // a relative path under that one instead — while recording the absolute
+    // path in `paths` either way. Only the tree tells them apart.
+    #[test]
+    fn a_tree_holds_a_path_where_restic_stores_an_absolute_one() {
+        let file = |name: &str| raw_file(name, 1, 1, 0, "aa");
+        let read = tree_store(&[
+            (1, vec![raw_dir("data", 2)]),
+            (2, vec![raw_dir("extra", 3), file("keep.txt")]),
+            (3, vec![file("n.txt")]),
+            // `cd /data && restic backup extra`.
+            (4, vec![raw_dir("extra", 3)]),
+            // A Windows volume is the first directory.
+            (5, vec![raw_dir("C", 6)]),
+            (6, vec![raw_dir("Users", 3)]),
+        ]);
+        let holds = |root: u8, path: &str| tree_holds_path(tree_id(root), path, &read).unwrap();
+        assert!(holds(1, "/data"));
+        assert!(holds(1, "/data/extra"));
+        assert!(holds(1, "/data/extra/n.txt"), "a file target");
+        assert!(holds(1, "/"));
+        assert!(!holds(1, "/data/missing"));
+        assert!(!holds(1, "/data/keep.txt/below"), "nothing is inside a file");
+        assert!(!holds(4, "/data/extra"), "a relative backup is rooted at the relative path");
+        assert!(holds(4, "/extra"));
+        assert!(holds(5, r"C:\Users"));
+        assert!(holds(5, r"\\?\C:\Users\n.txt"));
+        assert!(!holds(5, r"D:\Users"));
+
+        assert_eq!(archive_components("/data/extra/"), ["data", "extra"]);
+        assert_eq!(archive_components(r"C:\Users/me"), ["C", "Users", "me"]);
+        assert!(archive_components("/").is_empty());
+    }
+
+    // Device and inode numbers of two machines say nothing about each other.
+    // In a merge across hosts, files restic would link have to be a group
+    // some one source records as it is; one made of two sources' files is
+    // refused, however alike they are.
+    #[test]
+    fn across_hosts_a_hardlink_group_must_be_one_sources_own() {
+        let link = |name: &str, links: u64| raw_file(name, links, 1, 7, "aa");
+        let other = |name: &str| raw_file(name, 1, 1, 8, "bb");
+        let read = tree_store(&[
+            // One source holds `/a` and `/a2`, one file; the other `/b`, with
+            // the same numbers and content.
+            (1, vec![link("a", 2), link("a2", 2)]),
+            (2, vec![link("b", 1), other("c")]),
+            (3, vec![link("a", 2), link("a2", 2), link("b", 1), other("c")]),
+            // The first source's group alone, next to another file.
+            (4, vec![link("a", 2), link("a2", 2), other("c")]),
+            // A directory stored once and found in two places: four paths of
+            // one file, all of them the one source's.
+            (5, vec![raw_dir("x", 6), raw_dir("y", 6)]),
+            (6, vec![link("f", 2), link("g", 2)]),
+            (7, vec![link("b", 1), raw_dir("x", 6), raw_dir("y", 6)]),
+            (8, vec![other("c")]),
+        ]);
+        let defect = |merged: u8, sources: &[u8]| {
+            let sources: Vec<TreeId> = sources.iter().map(|n| tree_id(*n)).collect();
+            cross_host_link_defect(tree_id(merged), &sources, &read).expect("read the trees")
+        };
+
+        let clash = defect(3, &[1, 2]).expect("a group made of two hosts' files");
+        assert!(clash.contains("`/a`") && clash.contains("`/b`"), "{clash}");
+        assert!(clash.contains("different hosts"), "{clash}");
+
+        assert_eq!(defect(4, &[1, 2]), None, "one source's own group");
+        assert_eq!(defect(1, &[1, 1]), None, "a group both sources record whole");
+        assert_eq!(defect(8, &[8, 2]), None, "no hardlinks at all");
+        assert_eq!(defect(5, &[5, 8]), None, "every path of a directory found twice");
+        let clash = defect(7, &[5, 2]).expect("the other host's file joins the group");
+        assert!(clash.contains("`/b`"), "{clash}");
+    }
+
+    #[test]
+    fn a_local_write_is_over_when_it_has_returned() {
+        let local = Profile::Local { password: "pw".into(), local_path: "tmp/none".into() };
+        let error = rustic_core::RusticError::new(rustic_core::ErrorKind::Backend, "failed");
+        assert!(!data_write_can_land_later(&local)(&error));
     }
 
     fn summary_for_tests() -> SnapshotSummary {
@@ -2904,14 +3294,19 @@ mod tests {
     // volume as its first directory and forward slashes throughout:
     // `C:\Users\me` is `/C/Users/me`.
     fn restic_archive_path(fs_path: &str) -> String {
-        if fs_path.starts_with('/') {
-            return fs_path.to_string();
-        }
-        // `std::fs::canonicalize` answers in the verbatim form.
-        let path = fs_path.strip_prefix(r"\\?\").unwrap_or(fs_path).replace('\\', "/");
-        match path.split_once(':') {
-            Some((volume, rest)) => format!("/{volume}{rest}"),
-            None => format!("/{path}"),
+        format!("/{}", archive_components(fs_path).join("/"))
+    }
+
+    // `std::fs::canonicalize`, for a path that goes to restic and is looked
+    // for in what restic reports. On Windows the answer is in the verbatim
+    // form (`\\?\D:\…`), which restic would take as given; this is the same
+    // path with the drive letter first, the spelling restic's own output and
+    // its `/D/…` archive paths go with.
+    fn canonical(path: &std::path::Path) -> std::path::PathBuf {
+        let path = std::fs::canonicalize(path).expect("canonicalize");
+        match path.to_str().and_then(|verbatim| verbatim.strip_prefix(r"\\?\")) {
+            Some(plain) => std::path::PathBuf::from(plain),
+            None => path,
         }
     }
 
@@ -2942,7 +3337,7 @@ mod tests {
         std::fs::create_dir_all(root.join("source/data/docs")).unwrap();
         // restic records absolute paths; the tree and `paths` are compared
         // against this below.
-        let data = std::fs::canonicalize(root.join("source/data")).unwrap();
+        let data = canonical(&root.join("source/data"));
         std::fs::write(data.join("docs/a.txt"), b"a\n").unwrap();
         std::fs::write(data.join("keep.txt"), b"keep\n").unwrap();
         std::fs::write(data.join("skip.o"), b"object file").unwrap();
@@ -3081,7 +3476,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("source/data/links")).unwrap();
         std::fs::create_dir_all(root.join("source/clash/one")).unwrap();
-        let root = std::fs::canonicalize(&root).unwrap();
+        let root = canonical(&root);
         let (data, clash) = (root.join("source/data"), root.join("source/clash"));
 
         let profile = Profile::Local {
@@ -3202,7 +3597,7 @@ mod tests {
             std::path::PathBuf::from("tmp").join(format!("merge-names-it-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("source")).unwrap();
-        let root = std::fs::canonicalize(&root).unwrap();
+        let root = canonical(&root);
         let profile = Profile::Local {
             password: "pw".into(),
             local_path: root.join("repo").to_string_lossy().into_owned(),

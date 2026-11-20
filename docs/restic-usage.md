@@ -61,11 +61,16 @@ itself will never run them:
   backup flow; the merge is for special cases such as adding content to an
   existing snapshot, and there too the backup is restic's: back up only
   the new file or directory, then merge the two in wrustic. The two
-  backups have to use one layout — restic records a file under the path it
-  was backed up from, and the merge lines files up by that path alone,
-  whatever host or tags the snapshots share. With `restic backup /data` as
-  the base, the addition is `restic backup /data/extra`: the directory in
-  its place inside the base, not a copy of it somewhere else
+  backups have to use one layout: the merge lines files up by their path
+  in the snapshot's tree alone, whatever host or tags the snapshots share.
+  restic stores a target given as an absolute path under that path, so
+  with `restic backup /data` as the base, the addition is
+  `restic backup /data/extra`: the directory in its place inside the base,
+  not a copy of it somewhere else. A target given as a relative path is
+  stored under the relative path instead (`cd /data && restic backup
+  extra` holds `/extra/…`, while the snapshot's `paths` say
+  `/data/extra`); `restic ls <snapshot>` shows where a snapshot's files
+  are
 - maintenance beyond prune: `repair`, `migrate`, key management
 
 Description edits are not planned — `description` is a rustic-only

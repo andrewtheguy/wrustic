@@ -624,26 +624,59 @@ fn run(
             continue;
         }
 
+        // On a worker, like prune: a merge reads every directory of both
+        // snapshots, and a write the server may still complete is retried
+        // for as long as the lock holds, which can be many minutes. The
+        // worker owns the repository lock from acquiring it to releasing it.
         if matches!(app.screen, Screen::SnapshotMerging) {
-            let (Some(first), Some(second)) =
-                (app.merge_first_id.clone(), app.merge_second_id.clone())
-            else {
-                app.screen = Screen::SnapshotMergeError("No snapshots selected to merge.".into());
-                continue;
+            if app.merge_rx.is_none() {
+                let (Some(first), Some(second)) =
+                    (app.merge_first_id.clone(), app.merge_second_id.clone())
+                else {
+                    app.screen =
+                        Screen::SnapshotMergeError("No snapshots selected to merge.".into());
+                    continue;
+                };
+                let idx = app.loading_index;
+                let Some((_, profile)) = app.config.profile_at(idx) else {
+                    app.screen =
+                        Screen::SnapshotMergeError("Selected profile no longer exists.".into());
+                    continue;
+                };
+                let profile = profile.clone();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let retries = std::sync::Arc::new(lock::WriteRetries::default());
+                let worker_retries = retries.clone();
+                std::thread::spawn(move || {
+                    let result = merge_snapshots(&profile, &[first, second], &worker_retries);
+                    // The receiver is gone only if the app quit; nothing to do.
+                    let _ = tx.send(result.map_err(|e| format!("{e:#}")));
+                });
+                app.merge_rx = Some(rx);
+                app.merge_retries = Some(retries);
+                app.merge_stop_requested = false;
+                app.merge_started = Some(std::time::Instant::now());
+            }
+            let rx = app.merge_rx.as_ref().expect("receiver set above");
+            let finished = match rx.try_recv() {
+                Ok(outcome) => Some(outcome),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("merge worker exited without reporting".to_string()))
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
             };
-            let idx = app.loading_index;
-            let Some((_, profile)) = app.config.profile_at(idx) else {
-                app.screen =
-                    Screen::SnapshotMergeError("Selected profile no longer exists.".into());
-                continue;
-            };
-            match merge_snapshots(profile, &[first, second]) {
+            match finished {
                 // Reload the list with the cursor on the new snapshot, and say
                 // what happened to the two it came from.
-                Ok(outcome) => {
+                Some(Ok(outcome)) => {
+                    app.clear_merge_worker();
                     let new_id = outcome.snapshot_id;
                     app.clear_merge_scratch();
-                    app.notice = Some(merge_notice(&new_id, &outcome.dropped_node_fields));
+                    app.notice = Some(merge_notice(
+                        &new_id,
+                        &outcome.dropped_node_fields,
+                        outcome.attempt_still_open,
+                    ));
                     app.post_delete_select = app.list_state.selected();
                     app.post_reload_select_id = Some(new_id);
                     app.snapshots.clear();
@@ -651,8 +684,26 @@ fn run(
                 }
                 // Keep both ids so an `unlock`-and-retry from the error screen
                 // redoes the same merge.
-                Err(e) => {
-                    app.screen = Screen::SnapshotMergeError(format!("{e:#}"));
+                Some(Err(msg)) => {
+                    app.clear_merge_worker();
+                    app.screen = Screen::SnapshotMergeError(msg);
+                }
+                // Wait briefly so the loop redraws the elapsed clock without
+                // spinning. Ctrl+C stops the merge where that is safe: no
+                // write is begun any more and none is tried again, while one
+                // under way is waited for — the worker goes on to report.
+                // Every other event is swallowed.
+                None => {
+                    if events.poll(std::time::Duration::from_millis(150))?
+                        && let Event::Key(key) = events.read()?
+                        && key.kind == KeyEventKind::Press
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+                        && let Some(retries) = &app.merge_retries
+                    {
+                        retries.stop();
+                        app.merge_stop_requested = true;
+                    }
                 }
             }
             continue;
@@ -1029,17 +1080,25 @@ fn open_and_walk(
 // The one-line notice after a merge. The merge keeps metadata as far as it
 // can; where the sources held node fields it could not carry over
 // (`MergeOutcome::dropped_node_fields`), they are named here, ahead of
-// anything a narrow terminal would cut off.
-fn merge_notice(new_id: &str, dropped_node_fields: &[String]) -> String {
+// anything a narrow terminal would cut off. A merge that stored a file while
+// another write of it may still arrive (`MergeOutcome::attempt_still_open`)
+// says so, and where to read what that means.
+fn merge_notice(new_id: &str, dropped_node_fields: &[String], attempt_still_open: bool) -> String {
     let short = &new_id[..new_id.len().min(8)];
-    if dropped_node_fields.is_empty() {
-        format!("Merged into new snapshot {short} — both source snapshots were kept.")
-    } else {
-        format!(
-            "Merged into {short}, sources kept. Not carried over: {}",
-            dropped_node_fields.join(", ")
-        )
+    if dropped_node_fields.is_empty() && !attempt_still_open {
+        return format!("Merged into new snapshot {short} — both source snapshots were kept.");
     }
+    let mut notice = format!("Merged into {short}, sources kept.");
+    if !dropped_node_fields.is_empty() {
+        notice.push_str(&format!(" Not carried over: {}", dropped_node_fields.join(", ")));
+        if attempt_still_open {
+            notice.push('.');
+        }
+    }
+    if attempt_still_open {
+        notice.push_str(" A late write is possible: docs/locking.md");
+    }
+    notice
 }
 
 // Prepend a synthetic `..` row and pick a default selection: the first real
@@ -1070,15 +1129,28 @@ mod tests {
     fn merge_notice_names_the_metadata_that_was_not_carried_over() {
         let id = "0123456789abcdef";
         assert_eq!(
-            merge_notice(id, &[]),
+            merge_notice(id, &[], false),
             "Merged into new snapshot 01234567 — both source snapshots were kept."
         );
-        let lossy = merge_notice(id, &["generic_attributes".to_string()]);
+        let lossy = merge_notice(id, &["generic_attributes".to_string()], false);
         assert_eq!(
             lossy,
             "Merged into 01234567, sources kept. Not carried over: generic_attributes"
         );
         assert!(lossy.chars().count() <= 78, "must fit an 80-column bottom bar");
+
+        let open = merge_notice(id, &[], true);
+        assert_eq!(
+            open,
+            "Merged into 01234567, sources kept. A late write is possible: docs/locking.md"
+        );
+        assert!(open.chars().count() <= 78, "must fit an 80-column bottom bar");
+        // What was lost comes first; the pointer is what a narrow bar cuts.
+        assert_eq!(
+            merge_notice(id, &["generic_attributes".to_string()], true),
+            "Merged into 01234567, sources kept. Not carried over: generic_attributes. A late \
+             write is possible: docs/locking.md"
+        );
     }
 
     fn coalesce(first: Event, queued: Vec<Event>) -> (Event, Option<Event>) {

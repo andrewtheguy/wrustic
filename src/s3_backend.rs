@@ -13,14 +13,17 @@
 //! constructor parameter, so the same backend also serves `snapshots/` for
 //! the native tag edit's raw-JSON rewrite. See docs/locking.md.
 
-use std::sync::OnceLock;
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use opendal::{
     HttpTransporter, OperationContext,
     blocking::Operator,
-    layers::RetryLayer,
+    layers::{RetryEvent, RetryInterceptor, RetryLayer},
     options::{ListOptions, ReadOptions},
     services::S3,
 };
@@ -32,6 +35,31 @@ use tokio::runtime::Runtime;
 
 use crate::lock::LockBackend;
 use crate::repo::{CONNECT_TIMEOUT, RequestPolicy};
+
+/// Counts the retries an operator makes by itself. opendal retries a request
+/// that failed without the server's answer and reports only the last
+/// attempt's error, so a write can come back as refused while an earlier
+/// attempt of it is still on its way to being stored. A write during which
+/// the count moved was attempted more than once — or another thread's
+/// request was, which errs on the side of saying so.
+#[derive(Clone, Debug, Default)]
+struct Retries(Arc<AtomicUsize>);
+
+impl Retries {
+    fn count(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+impl RetryInterceptor for Retries {
+    fn intercept(&self, _event: RetryEvent<'_>) {
+        let _ = self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// The context key [`S3DataBackend`] puts on the error of a write that was
+/// attempted more than once ([`Retries`]).
+pub(crate) const AFTER_EARLIER_ATTEMPTS: &str = "after-earlier-attempts";
 
 /// Blocking S3 operator for a profile's repository root. Shared by the data
 /// and lock backends so both speak to the same place the same way: the same
@@ -45,7 +73,7 @@ fn build_operator(
     access_key: &str,
     secret_key: &str,
     policy: RequestPolicy,
-) -> Result<Operator> {
+) -> Result<(Operator, Retries)> {
     let mut builder = S3::default()
         .bucket(bucket)
         .region(region)
@@ -64,17 +92,24 @@ fn build_operator(
     let context = OperationContext::new()
         .with_http_transport(HttpTransporter::new(ReqwestTransport::new(client)));
 
+    let retries = Retries::default();
     let operator = opendal::Operator::new(builder)
         .context("creating the S3 backend")?
         .with_context(context)
-        .layer(RetryLayer::new().with_max_times(policy.retries).with_jitter());
+        .layer(
+            RetryLayer::new()
+                .with_max_times(policy.retries)
+                .with_jitter()
+                .with_notify(retries.clone()),
+        );
 
     let _guard = runtime().enter();
-    Operator::new(operator).context("creating the blocking S3 backend")
+    Ok((Operator::new(operator).context("creating the blocking S3 backend")?, retries))
 }
 
 pub(crate) struct S3LockBackend {
     operator: Operator,
+    retries: Retries,
     dir: String,
 }
 
@@ -88,19 +123,17 @@ impl S3LockBackend {
         secret_key: &str,
         dir: &str,
     ) -> Result<Self> {
-        Ok(Self {
-            operator: build_operator(
-                endpoint,
-                bucket,
-                region,
-                root,
-                access_key,
-                secret_key,
-                RequestPolicy::STANDARD,
-            )
-            .with_context(|| format!("creating the S3 {dir} backend"))?,
-            dir: dir.to_string(),
-        })
+        let (operator, retries) = build_operator(
+            endpoint,
+            bucket,
+            region,
+            root,
+            access_key,
+            secret_key,
+            RequestPolicy::STANDARD,
+        )
+        .with_context(|| format!("creating the S3 {dir} backend"))?;
+        Ok(Self { operator, retries, dir: dir.to_string() })
     }
 
     fn key(&self, name: &str) -> String {
@@ -137,10 +170,17 @@ impl LockBackend for S3LockBackend {
     }
 
     fn write(&self, name: &str, data: &[u8]) -> Result<()> {
+        let retries_before = self.retries.count();
         self.operator
             .write(&self.key(name), data.to_vec())
             .map_err(|err| {
-                anyhow::Error::new(err).context(format!("writing S3 {}", self.key(name)))
+                let error =
+                    anyhow::Error::new(err).context(format!("writing S3 {}", self.key(name)));
+                if self.retries.count() == retries_before {
+                    error
+                } else {
+                    error.context(crate::lock::AfterEarlierAttempts)
+                }
             })?;
         Ok(())
     }
@@ -153,8 +193,11 @@ impl LockBackend for S3LockBackend {
         }
     }
 
+    // A refusal is the last attempt's answer; it settles the write only if
+    // that attempt was the only one.
     fn failed_write_can_land_later(&self, error: &anyhow::Error) -> bool {
-        !crate::lock::server_refused(crate::lock::as_std_error(error))
+        error.downcast_ref::<crate::lock::AfterEarlierAttempts>().is_some()
+            || !crate::lock::server_refused(crate::lock::as_std_error(error))
     }
 }
 
@@ -180,6 +223,7 @@ fn runtime() -> &'static Runtime {
 #[derive(Clone, Debug)]
 pub(crate) struct S3DataBackend {
     operator: Operator,
+    retries: Retries,
 }
 
 impl S3DataBackend {
@@ -192,12 +236,10 @@ impl S3DataBackend {
         secret_key: &str,
         policy: RequestPolicy,
     ) -> Result<Self> {
-        Ok(Self {
-            operator: build_operator(
-                endpoint, bucket, region, root, access_key, secret_key, policy,
-            )
-            .context("creating the S3 data backend")?,
-        })
+        let (operator, retries) =
+            build_operator(endpoint, bucket, region, root, access_key, secret_key, policy)
+                .context("creating the S3 data backend")?;
+        Ok(Self { operator, retries })
     }
 
     /// Repo-relative object key for a file — restic's on-disk layout:
@@ -327,10 +369,15 @@ impl WriteBackend for S3DataBackend {
         content: BytesList,
     ) -> RusticResult<()> {
         let path = Self::path(tpe, id);
-        self.operator
-            .write(&path, content.into_vec())
-            .map(|_| ())
-            .map_err(|err| backend_error(err, "write", &path))
+        let retries_before = self.retries.count();
+        self.operator.write(&path, content.into_vec()).map(|_| ()).map_err(|err| {
+            let error = backend_error(err, "write", &path);
+            if self.retries.count() == retries_before {
+                error
+            } else {
+                error.attach_context(AFTER_EARLIER_ATTEMPTS, "yes")
+            }
+        })
     }
 
     fn remove(&self, tpe: FileType, id: &Id, _cacheable: bool) -> RusticResult<()> {
@@ -359,6 +406,176 @@ mod tests {
             S3DataBackend::path(FileType::Snapshot, &id),
             "snapshots/03dc1178e4e54f69beaf35dd9d4256a5a600e9fa3452b9db80bd649938923e67"
         );
+    }
+
+    // A stand-in for S3 that takes PUTs: with `hold_first` it has the first
+    // one in full and sits on it until released — a server stuck storing —
+    // and answers every other one with AccessDenied; without, it refuses
+    // them all.
+    struct PutMock {
+        endpoint: String,
+        state: Arc<(std::sync::Mutex<PutState>, std::sync::Condvar)>,
+    }
+
+    #[derive(Default)]
+    struct PutState {
+        puts: usize,
+        held: bool,
+        released: bool,
+        stored: bool,
+    }
+
+    impl PutMock {
+        fn start(hold_first: bool) -> Self {
+            use std::io::{BufRead, BufReader, Read, Write};
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let state: Arc<(std::sync::Mutex<PutState>, std::sync::Condvar)> = Arc::default();
+            let shared = Arc::clone(&state);
+            std::thread::spawn(move || {
+                for conn in listener.incoming() {
+                    let Ok(stream) = conn else { return };
+                    let state = Arc::clone(&shared);
+                    std::thread::spawn(move || -> std::io::Result<()> {
+                        let mut writer = stream.try_clone()?;
+                        let mut reader = BufReader::new(stream);
+                        loop {
+                            let mut line = String::new();
+                            if reader.read_line(&mut line)? == 0 {
+                                return Ok(());
+                            }
+                            let is_put = line.starts_with("PUT ");
+                            let mut len = 0_usize;
+                            loop {
+                                let mut header = String::new();
+                                let _ = reader.read_line(&mut header)?;
+                                let header = header.trim_end().to_ascii_lowercase();
+                                if header.is_empty() {
+                                    break;
+                                }
+                                if let Some(value) = header.strip_prefix("content-length:") {
+                                    len = value.trim().parse().unwrap_or(0);
+                                }
+                            }
+                            let mut body = vec![0_u8; len];
+                            reader.read_exact(&mut body)?;
+
+                            let first = {
+                                let mut put = state.0.lock().unwrap();
+                                if is_put {
+                                    put.puts += 1;
+                                }
+                                is_put && hold_first && put.puts == 1
+                            };
+                            let response = if first {
+                                let mut put = state.0.lock().unwrap();
+                                put.held = true;
+                                state.1.notify_all();
+                                let mut put = state.1.wait_while(put, |put| !put.released).unwrap();
+                                put.stored = true;
+                                state.1.notify_all();
+                                "HTTP/1.1 200 OK\r\nETag: \"etag\"\r\nContent-Length: 0\r\n\r\n"
+                                    .to_string()
+                            } else {
+                                let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error>\
+                                           <Code>AccessDenied</Code><Message>Access Denied\
+                                           </Message></Error>";
+                                format!(
+                                    "HTTP/1.1 403 Forbidden\r\nContent-Type: application/xml\r\n\
+                                     Content-Length: {}\r\n\r\n{xml}",
+                                    xml.len()
+                                )
+                            };
+                            writer.write_all(response.as_bytes())?;
+                            writer.flush()?;
+                        }
+                    });
+                }
+            });
+            Self { endpoint, state }
+        }
+
+        fn backend(&self) -> S3LockBackend {
+            let (operator, retries) = build_operator(
+                &self.endpoint,
+                "bucket",
+                "us-east-1",
+                "",
+                "key",
+                "secret",
+                RequestPolicy { retries: 2, read_timeout: std::time::Duration::from_millis(500) },
+            )
+            .expect("an operator for the mock");
+            S3LockBackend { operator, retries, dir: "snapshots".into() }
+        }
+
+        fn wait_for(&self, what: impl Fn(&PutState) -> bool) {
+            let (state, timed_out) = self
+                .state
+                .1
+                .wait_timeout_while(
+                    self.state.0.lock().unwrap(),
+                    std::time::Duration::from_secs(20),
+                    |put| !what(put),
+                )
+                .unwrap();
+            assert!(!timed_out.timed_out(), "the mock did not get there");
+            drop(state);
+        }
+    }
+
+    // opendal retries a PUT that got no answer and reports the last
+    // attempt's error. So a write can come back as AccessDenied while its
+    // first PUT is still with the server, which goes on to store it: such a
+    // refusal must not count as settling the write. A refusal of the only
+    // attempt does.
+    #[test]
+    fn a_refusal_after_a_put_that_got_no_answer_is_not_final() {
+        let refused = |error: &anyhow::Error| {
+            crate::lock::server_refused(crate::lock::as_std_error(error))
+        };
+
+        let mock = PutMock::start(true);
+        let backend = mock.backend();
+        let err = backend.write("aaaa", b"late").expect_err("the retry is refused");
+        assert!(refused(&err), "the error is the refusal of a later attempt: {err:#}");
+        assert!(
+            backend.failed_write_can_land_later(&err),
+            "and must not be taken for the whole write's: {err:#}"
+        );
+        // The first PUT had arrived in full, and is stored once the server
+        // gets on with it.
+        mock.wait_for(|put| put.held);
+        mock.state.0.lock().unwrap().released = true;
+        mock.state.1.notify_all();
+        mock.wait_for(|put| put.stored);
+
+        // The same through rustic_core's backend, which the index goes by.
+        let mock = PutMock::start(true);
+        let lock_backend = mock.backend();
+        let data = S3DataBackend {
+            operator: lock_backend.operator.clone(),
+            retries: lock_backend.retries.clone(),
+        };
+        let id: Id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            .parse()
+            .unwrap();
+        let err = data
+            .write_bytes(FileType::Index, &id, false, Bytes::from_static(b"late").into())
+            .expect_err("the retry is refused");
+        assert!(crate::lock::server_refused(&*err), "{err}");
+        assert!(err.context_value(AFTER_EARLIER_ATTEMPTS).is_some(), "{err}");
+        mock.state.0.lock().unwrap().released = true;
+        mock.state.1.notify_all();
+
+        // Refused at once: the one attempt is all there was.
+        let mock = PutMock::start(false);
+        let backend = mock.backend();
+        let err = backend.write("aaaa", b"never").expect_err("refused");
+        assert!(refused(&err), "{err:#}");
+        assert!(!backend.failed_write_can_land_later(&err), "{err:#}");
+        assert_eq!(mock.state.0.lock().unwrap().puts, 1, "a refusal is not retried");
     }
 
     // Live: the full ReadBackend + WriteBackend surface against a real Silo

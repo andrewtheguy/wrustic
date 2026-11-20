@@ -218,19 +218,29 @@ smbanything's own docs. The architectural points:
 - `edit_snapshot_tags(profile, id, tags)` — native tag edit under the same
   exclusive lock, as a raw-JSON rewrite of the snapshot file so restic
   fields rustic_core does not model survive.
-- `merge_snapshots(profile, ids)` — merges snapshots into a new one under
-  restic's *non-exclusive* lock (it only adds files): rustic_core's
-  `merge_trees` for the directory trees, then a snapshot file wrustic
-  writes itself so restic finds it as the parent of the next backup. The
-  source snapshots are kept. Metadata is best effort: the returned
-  `MergeOutcome` names the node fields `merge_trees` could not carry over
-  (restic's Windows attributes), for the notice the TUI shows. Refused
-  when the merged tree would put one hardlink identity on different
-  content or metadata, or list a directory out of restic's order,
-  which restic restores wrong. rustic_core's writes go through
-  `lock::gate_writes`, so nothing is written once the lock is lost or
-  after the merge has returned. Sources of two hosts give a snapshot
-  named for both, which neither host's backups take for their parent.
+- `merge_snapshots(profile, ids, retries)` — merges snapshots into a new
+  one under restic's *non-exclusive* lock (it only adds files):
+  rustic_core's `merge_trees` for the directory trees, then a snapshot
+  file wrustic writes itself, built so that restic's parent rule — the
+  latest snapshot with the backup's host and exact path set, absent
+  `--parent`, `--force` or another `--group-by` — picks it for the next
+  backup: the sources' host, their paths with nested ones folded, a time
+  just after the newest source's. That holds for sources of one host
+  whose files are where their paths say; sources of two hosts give a
+  snapshot named for both, which neither host's backups take for their
+  parent, and a path whose tree is laid out otherwise (a relative-path
+  backup) is not folded. The source snapshots are kept. Metadata is best
+  effort: the returned `MergeOutcome` names the node fields `merge_trees`
+  could not carry over (restic's Windows attributes), for the notice the
+  TUI shows. Refused when the merged tree would put one hardlink identity
+  on different content or metadata, link files of two hosts' snapshots to
+  each other, or list a directory out of restic's order, which restic
+  restores wrong. rustic_core's writes go through `lock::gate_writes`, so
+  nothing is written once the lock is lost or after the merge has
+  returned. It runs on a worker thread (the main loop polls it, as for
+  prune): a write a server may still complete is retried for as long as
+  the lock holds, and `retries` (`lock::WriteRetries`) is how the TUI
+  shows that and how Ctrl+C ends it.
 - `unlock(profile)` — native stale-lock removal, offered with `u` on the
   delete-error screen when `lock::is_lock_error()` matches the failure.
   Only locks that are provably dead are removed (older than restic's

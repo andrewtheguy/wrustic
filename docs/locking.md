@@ -259,12 +259,27 @@ lists, restores, checks, forgets and prunes like any other.
     server can store a file after its write was reported as failed (see
     the snapshot write below). For a pack that is waste the next prune
     collects. An index that turns up after a prune names packs that are
-    gone, so its failure is not passed on while the lock holds: the gate
-    looks whether the index is there and writes it again, five seconds
-    apart, until it is stored, the server refuses, or the lock is lost.
-    An index given up with an attempt still open — the lock lost, or a
-    refusal after a failure that was none — is named in the merge's
-    error like one that could not be removed.
+    gone. So once an attempt at an index is open — it failed in a way
+    that leaves the server free to complete it — a failure is not passed
+    on at once: the gate reads the index back and counts it as stored if
+    it is what was written. A refusal after an open attempt is what
+    rest-server answers once that attempt has arrived, and reading the
+    index back shows it. If the index is not there and the latest answer
+    was a refusal, the failure is passed on — a server that says no goes
+    on saying it; otherwise the index is written again, five seconds
+    apart, until it is stored, refused, the lock is lost, or the merge
+    is stopped (Ctrl+C). An index given up with an attempt still open is
+    named in the merge's error like one that could not be removed.
+    Which failures leave an attempt open is the backend's to say
+    (`repo::data_write_can_land_later`): none of a local repository's;
+    all of rustic_backend's REST backend, which retries a request by
+    itself and reports only the last attempt's error, so that a refusal
+    can stand for a write whose first attempt the server still holds
+    (`rustic_rest_write_reports_a_refusal_with_an_attempt_still_open`
+    shows it doing so); and of wrustic's S3 backend all but a refusal of
+    the only attempt — opendal retries the same way
+    (`a_refusal_after_a_put_that_got_no_answer_is_not_final`), and the
+    backend counts those retries to tell.
   The lock is checked once more when the snapshot write has returned
   (`RepoLock::write_unpacked_while_held`), because the write itself can
   outlast the lock: restic gets out of this by cancelling the backend
@@ -297,36 +312,56 @@ lists, restores, checks, forgets and prunes like any other.
   Giving up on such a write would release the lock with the write still
   to come: a prune could then delete the merged trees, and the snapshot
   that turns up afterwards would name them. Under the lock a late write
-  does no harm, so for these backends the merge does not give up while
-  the lock is healthy — it checks the repository and writes again, five
-  seconds apart, until the snapshot is stored or the lock is lost (the
-  lock is asked again right before each attempt, so none starts under a
-  lost one). With
-  the repository out of reach that is the 22.5 minutes the lock takes to
-  turn bad, during which the merge screen stays up.
-  A failure that leaves nothing behind ends the attempts after one
-  more, with the file removed and the error passed on, naming it. That
-  is any failure of a local write, and a server's own no
-  (`lock::server_refused`): an HTTP answer in the 400s or 507, or S3
-  denying access or not finding the bucket. A server that refuses the
-  snapshot goes on refusing it while the lock is refreshed without
-  trouble, and retrying until the lock is lost would keep the merge and
-  its lock for ever. A timeout, a broken connection or an answer in the
-  500s is no refusal: the first two leave open what the server did with
-  a body it had, and a proxy answers 502 or 504 for a server still at
-  work.
-  Where the attempts end with one of them still open — the lock lost,
-  or a refusal after a failure that was none — the write is abandoned
-  unsettled, and the error does not pretend otherwise: it says the
-  snapshot may still turn up and is to be removed if it does — it would
-  by then name trees that a prune is free to delete.
-  What stays open is an earlier attempt still held by the server after a
-  later one stored the snapshot. Every attempt writes the same file
-  under the same name, so it changes nothing when it lands — unless the
-  snapshot was deleted in the meantime, which it then brings back, naming
-  trees a prune may have removed since. Nothing a client can send
-  completes, cancels or fences a request a server holds, and restic's
-  own retry of a failed save is in the same position.
+  does no harm, so a write that failed without the server's answer is
+  not given up on while the lock is healthy — the merge checks the
+  repository and writes again, five seconds apart, until the snapshot is
+  stored or the lock is lost (the lock is asked again right before each
+  attempt, so none starts under a lost one). With the repository out of
+  reach that is the 22.5 minutes the lock takes to turn bad.
+  A failure that is final ends the attempts once a second one has been
+  made and the snapshot is not in the repository, with the file removed
+  and the error passed on, naming it. That is any failure of a local
+  write, and a server's own no (`lock::server_refused`): an HTTP answer
+  in the 400s or 507, or S3 denying access or not finding the bucket. A
+  server that refuses the snapshot goes on refusing it while the lock is
+  refreshed without trouble, and must not keep the merge and its lock. A
+  timeout, a broken connection or an answer in the 500s is no refusal:
+  the first two leave open what the server did with a body it had, and a
+  proxy answers 502 or 504 for a server still at work.
+  A refusal ends the attempts after one that may still land, too:
+  waiting would not get a refused write stored, and the repository has
+  been looked at first, since the refusal can be about the earlier write
+  having arrived. The earlier attempt is then still open, and the error
+  says so. The same holds where a backend had retried by itself before
+  the refusal, as the S3 one does and says.
+  That leaves a write that keeps failing without an answer while the
+  lock stays healthy, which nothing would end. No request a client can
+  send completes, cancels or fences a write a server holds — rest-server
+  never looks at the connection again once it has the body, and restic's
+  own retry of a failed save is in the same position — so there is no
+  point at which giving up becomes safe by itself, and a retry limit
+  would only pick an arbitrary one. The merge therefore runs on a worker
+  thread, the merging screen shows which file is being retried, and
+  Ctrl+C stops it (`lock::WriteRetries`): no write is begun after that
+  and none is tried again, while one under way is waited for.
+  Where the attempts end with one of them still open — the lock lost, a
+  refusal, or the merge stopped — the write is abandoned unsettled, and
+  the error
+  does not pretend otherwise: it says the snapshot may still turn up and
+  is to be removed if it does — it would by then name trees that a prune
+  is free to delete. The same goes for a snapshot removed again because
+  it did not read back as written.
+  A merge that succeeds can leave an attempt open as well: an earlier
+  one still held by the server after a later one stored the file, the
+  snapshot or an index. Every attempt writes the same file under the
+  same name, so it changes nothing when it lands — unless the file was
+  removed in the meantime (the merged snapshot deleted, the repository
+  pruned), which it then brings back, naming what the prune removed.
+  That cannot be prevented from here either, so it is said: the notice
+  after such a merge reads "A late write is possible" and points here.
+  Until the server has had time to finish what it took, leave the merged
+  snapshot in place, or run `restic check` after deleting and pruning
+  it.
 - **Trees** go through rustic_core's `Repository::merge_trees`: entries are
   matched by path from the root, an entry only one snapshot has is taken
   as is, directories are merged recursively, and where the same path
@@ -360,8 +395,10 @@ lists, restores, checks, forgets and prunes like any other.
     altogether would close the first of those (every backup has some
     hostname; restic 0.19.1 records the machine's own for an empty
     `--host`), and was passed over because the snapshot would then show
-    no host anywhere. So the guarantee that the next backup uses the
-    merged snapshot as its parent holds for sources of one host only.
+    no host anywhere. So restic's choice of a parent — the latest
+    snapshot with the backup's host and exact path set, unless
+    `--parent`, `--force` or another `--group-by` changes that — falls
+    on the merged snapshot for sources of one host only.
   - `time` — the newest source's plus one nanosecond, in the same UTC
     offset (`repo::just_after`). The merged snapshot is as recent as its
     newest data, and has to be strictly the latest: restic takes the latest
@@ -372,7 +409,15 @@ lists, restores, checks, forgets and prunes like any other.
     merge held.
   - `paths` — every source's paths, with a path that lies inside another
     folded into it (`repo::merged_paths`; whole components, Unix and
-    Windows separators).
+    Windows separators), which is what makes the path set that of a
+    backup of the outer directory. A path is folded only where the trees
+    are laid out as the paths say (`repo::tree_holds_path`): restic
+    stores a target given as a relative path under that relative path
+    while recording its absolute one (`cd /data && restic backup extra`
+    records `/data/extra` and stores `/extra`; checked against restic
+    0.19.1), so its files were not merged into the directory its path
+    names. Such a path is listed beside the other, and the merged
+    snapshot does not pass for a backup of the one directory.
   - `tags` — the union.
   - `program_version` — `wrustic <version>`.
   - `summary` — the fields restic and rustic_core share, totals being
@@ -462,6 +507,13 @@ lists, restores, checks, forgets and prunes like any other.
     the two cases apart, and refusing what cannot be proven would
     refuse the first; keeping them apart takes separate identities per
     source (docs/roadmap.md, "Lossless snapshot merge").
+    Between hosts there is no first case: the device and inode numbers
+    of one machine say nothing about another's, and two machines set up
+    alike hand out the same ones. So when the sources' hostnames differ,
+    a group of files restic would link has to be one that a single
+    source records as it is — every path of it, under that device and
+    inode — and a group made of two sources' files is refused
+    (`repo::cross_host_link_defect`).
 - **How much is rewritten depends on the timezone.** rustic_core renders
   node times with the local zone's offset. Where that is what the trees
   already hold, a directory only one source has serializes back to the
@@ -644,11 +696,16 @@ the lock does not stay, and nothing is written after it.
 `an_index_that_could_not_be_taken_back_is_reported` cover a write that
 reports failure for a file it stored, one the server is still holding —
 retried under a healthy lock until the file is there, and reported as
-possibly still to come once the lock is lost — one the server refuses,
-which ends the attempts (`only_the_servers_no_counts_as_a_refusal` and
-`rest_write_that_timed_out_is_stored_after_its_removal` show what the
-real backends' errors count as, the latter with the real REST client
-meeting a write stored after its removal), a removal that fails, and
+possibly still to come once the lock is lost or the retrying stopped —
+one the server refuses, which ends the attempts and reports any that is
+still open
+(`only_the_servers_no_counts_as_a_refusal`,
+`rest_write_that_timed_out_is_stored_after_its_removal`,
+`rustic_rest_write_reports_a_refusal_with_an_attempt_still_open` and
+`s3_backend::tests::a_refusal_after_a_put_that_got_no_answer_is_not_final`
+show what the real backends' errors count as, against servers that hold
+a write and store it after the client has given up), a removal that
+fails, and
 `closing_the_gate_waits_for_writes_and_refuses_later_ones` that the gate
 does not close over a write under way. These tests lose the lock at a
 point they choose (`LockHealth::expire_for_tests`, inside the backend's

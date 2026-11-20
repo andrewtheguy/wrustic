@@ -438,6 +438,17 @@ pub(crate) struct App {
     // one a merge just created. Takes precedence over `post_delete_select`.
     pub(crate) post_reload_select_id: Option<String>,
 
+    // The merge runs on a worker thread too, for the same reason as prune
+    // below. `merge_rx` is the completion channel, Some while a merge is in
+    // flight; `merge_retries` is what the worker shares about the writes it
+    // is retrying, and how Ctrl+C on the merging screen stops them
+    // (`merge_stop_requested` remembers that it was pressed).
+    pub(crate) merge_rx:
+        Option<std::sync::mpsc::Receiver<Result<crate::repo::MergeOutcome, String>>>,
+    pub(crate) merge_retries: Option<std::sync::Arc<crate::lock::WriteRetries>>,
+    pub(crate) merge_stop_requested: bool,
+    pub(crate) merge_started: Option<Instant>,
+
     // Prune runs `restic prune` on a worker thread so the TUI stays alive
     // (redraws, elapsed clock) during an operation that can take minutes.
     // `prune_rx` is the completion channel: Some while a prune is in flight
@@ -605,6 +616,10 @@ impl App {
             merge_second_id: None,
             merge_picker_state: TableState::default(),
             post_reload_select_id: None,
+            merge_rx: None,
+            merge_retries: None,
+            merge_stop_requested: false,
+            merge_started: None,
             prune_rx: None,
             prune_started: None,
             prune_scroll: 0,
@@ -1182,6 +1197,14 @@ impl App {
                 other == first_paths
             })
             .collect()
+    }
+
+    // The merge worker has reported (or is gone).
+    pub(crate) fn clear_merge_worker(&mut self) {
+        self.merge_rx = None;
+        self.merge_retries = None;
+        self.merge_stop_requested = false;
+        self.merge_started = None;
     }
 
     pub(crate) fn clear_merge_scratch(&mut self) {
@@ -3916,6 +3939,27 @@ mod tests {
     // The confirmation is the last thing read before a merge runs, so what it
     // says about the consequences has to be on the screen in full — on an
     // 80×24 terminal, and with snapshots that have far more to list than fits.
+    // The merging screen is up for as long as the worker runs, which can be
+    // long: it says how to stop the merge, and that a stop was asked for.
+    #[test]
+    fn merging_screen_says_how_to_stop_and_that_it_is_stopping() {
+        let mut app = boot_app_with_snapshots(vec![row("h", &[], &["/srv/data"])]);
+        app.screen = Screen::SnapshotMerging;
+        app.merge_started = Some(Instant::now());
+        app.merge_retries = Some(Default::default());
+        let text = screen_text(&mut app, 80, 24).join("\n");
+        assert!(text.contains("Ctrl+C stops the merge"), "{text}");
+        assert!(text.contains("merging — Ctrl+C stop"), "{text}");
+
+        app.merge_stop_requested = true;
+        let text = screen_text(&mut app, 80, 24).join("\n");
+        assert!(text.contains("Stopping"), "{text}");
+        assert!(!text.contains("Ctrl+C stops the merge"), "{text}");
+
+        app.clear_merge_worker();
+        assert!(app.merge_retries.is_none() && !app.merge_stop_requested);
+    }
+
     #[test]
     fn merge_confirmation_shows_every_consequence_on_an_80x24_terminal() {
         let snapshot = |id: &str, host: &str, time: &str, tags: &[&str], paths: &[&str]| {
@@ -4113,7 +4157,7 @@ mod tests {
             app.merge_first_id.clone().expect("first id"),
             app.merge_second_id.clone().expect("second id"),
         ];
-        crate::repo::merge_snapshots(fixture.profile(), &ids)
+        crate::repo::merge_snapshots(fixture.profile(), &ids, &Default::default())
             .expect("the merge must run alongside the share's lock");
         assert_eq!(
             crate::repo::load_snapshots(fixture.profile()).expect("list snapshots").rows.len(),
