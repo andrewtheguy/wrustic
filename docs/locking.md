@@ -267,9 +267,12 @@ lists, restores, checks, forgets and prunes like any other.
   have started before the snapshot existed; a poisoned one means the
   snapshot may name pruned trees, and it is removed again and the merge
   reported as failed. The snapshot's name is the hash of what is written,
-  so it is known before the write: a write that failed is treated as
-  possibly stored and removed too once the lock is lost, and an error
-  names the file whenever its removal could not be confirmed.
+  so it is known before the write, and a write that reports an error is
+  treated as possibly stored — a timeout after the server committed —
+  whatever the lock's health: the file is removed before the error is
+  passed on, so a failed merge does not leave a published snapshot
+  behind, and the error names the file whenever its removal could not be
+  confirmed.
 - **Trees** go through rustic_core's `Repository::merge_trees`: entries are
   matched by path from the root, an entry only one snapshot has is taken
   as is, directories are merged recursively, and where the same path
@@ -289,12 +292,17 @@ lists, restores, checks, forgets and prunes like any other.
   - `username`, `uid`, `gid` — the newest source's, copied as stored.
   - `hostname` — the sources' own when they share one, which is what lets
     that host's next backup find the merged snapshot. Sources of several
-    hosts get a name made of all of them, joined with `+`
-    (`repo::merged_hostname`; no hostname contains a `+`): such a merge
-    holds another machine's files, and a backup that took it for its
-    parent would compare its own files against those. So the guarantee
-    that the next backup uses the merged snapshot as its parent holds for
-    sources of one host only.
+    hosts get none (`repo::merged_hostname`): such a merge holds another
+    machine's files, and a backup that took it for its parent would
+    compare its own files against those. A name made up for the purpose
+    would not keep backups away, because `restic backup --host` takes any
+    name; but every backup has *some* hostname — restic 0.19.1 records the
+    machine's own for an empty `--host` — so a snapshot without one is
+    the only kind no backup's host matches. (A backup run with
+    `--group-by` leaving the host out chooses its parent across hosts by
+    request, this one included.) So the guarantee that the next backup
+    uses the merged snapshot as its parent holds for sources of one host
+    only.
   - `time` — the newest source's plus one nanosecond, in the same UTC
     offset (`repo::just_after`). The merged snapshot is as recent as its
     newest data, and has to be strictly the latest: restic takes the latest
@@ -364,9 +372,13 @@ lists, restores, checks, forgets and prunes like any other.
     given the same device number. restic restores such a merged snapshot
     with every one of those files holding the first one's bytes. The
     merge is refused when a file's content differs from that of a
-    multi-link file with its device and inode — or its permissions do:
-    links of one file share one mode, so two recorded modes cannot both
-    be restored. Two backups of one
+    multi-link file with its device and inode — or its permissions,
+    owner, modification time or extended attributes do: restic links the
+    paths and then puts each one's recorded metadata back, and an inode
+    has one of each, so of two that differ only the last applied
+    survives. Access and change times are not compared: restic reads the
+    links of one file at different moments, and restores neither as
+    recorded. Two backups of one
     directory with a hardlinked file changed in between differ in the
     sources and merge fine, both links coming from the newer.
 - **How much is rewritten depends on the timezone.** rustic_core renders
@@ -398,8 +410,10 @@ holding `"a` and `A` merged with a later backup of `A` is refused; `"a`
 and `b`, which sort one way either way, merge and restore byte for byte;
 after two backups of one directory are merged, restic lists the merged
 snapshot as strictly the latest and takes it as the next backup's parent;
-a merge of one directory's backups as two hosts is listed as `alpha+beta`,
-and the next backup as either host takes that host's own last backup).
+a merge of one directory's backups as two hosts is listed without a
+hostname, the next backup as either host takes that host's own last
+backup, and a backup with an empty `--host` gets the machine's name and
+does not take it either).
 
 **Long-running reads — non-exclusive lock (implemented):** the snapshot
 SMB share (`smb::ShareServer::share_snapshot`). Reads take no lock in wrustic's
@@ -541,7 +555,8 @@ and an already poisoned lock writes nothing.
 `lock::tests::gated_writes_stop_when_the_lock_is_lost` does the same for
 what rustic_core writes through the gate: an index whose write outlasted
 the lock does not stay, and nothing is written after it.
-`a_failed_write_past_the_lock_is_reconciled` and
+`a_failed_write_past_the_lock_is_reconciled`,
+`a_failed_write_under_a_healthy_lock_leaves_nothing_published` and
 `an_index_that_could_not_be_taken_back_is_reported` cover a write that
 reports failure for a file it stored and a removal that fails, and
 `closing_the_gate_waits_for_writes_and_refuses_later_ones` that the gate

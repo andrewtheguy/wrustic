@@ -39,15 +39,15 @@ exactly which workflows that means.
   snapshots are kept, and it runs under restic's non-exclusive lock alongside
   running backups. restic itself has no merge; the result is an ordinary
   snapshot restic reads, and the next `restic backup` uses it as its parent —
-  when both sources are one host's; a merge of two hosts' snapshots is named
-  for both (`alpha+beta`), and no backup takes it for its parent. Metadata is
-  kept as far as the merge can: a merged snapshot of backups restic took on
-  Windows is without their Windows attributes (creation time, file attributes,
-  security descriptors), which the sources keep. A merge restic would restore
-  wrong is refused: the two snapshots record one hardlinked inode with
-  different content or permissions, or a directory of both holds names with
-  quotes or backslashes that the merge cannot keep in restic's order
-  (docs/locking.md)
+  when both sources are one host's; a merge of two hosts' snapshots carries no
+  hostname, so no backup takes it for its parent. Metadata is kept as far as
+  the merge can: a merged snapshot of backups restic took on Windows is
+  without their Windows attributes (creation time, file attributes, security
+  descriptors), which the sources keep. A merge restic would restore wrong is
+  refused: the two snapshots record one hardlinked inode with different
+  content, permissions, owner, modification time or extended attributes, or a
+  directory of both holds names with quotes or backslashes that the merge
+  cannot keep in restic's order (docs/locking.md)
 - **Prune** (`p` on the snapshot list): reclaim the space deleted snapshots
   left behind — runs `restic prune` (restic >= 0.19, the one the installers
   bundle and only that one) with live progress and safe Ctrl+C

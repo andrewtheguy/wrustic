@@ -830,8 +830,13 @@ struct RawFile {
     /// Device and inode.
     identity: (u64, u64),
     links: u64,
-    mode: u64,
     content: serde_json::Value,
+    /// What a restore puts back on a path besides its content, by the name
+    /// to call it: an inode has one of each, so links of one file agree on
+    /// all of them. Access and change times are left out — restic reads the
+    /// links of one file at different moments, and neither is restored as
+    /// recorded anyway.
+    metadata: [(&'static str, serde_json::Value); 4],
 }
 
 impl RawFile {
@@ -840,15 +845,27 @@ impl RawFile {
             return None;
         }
         let number = |key: &str| node.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0);
+        // Nothing and an empty list are the same thing written two ways: an
+        // empty file is `null` to restic and `[]` to rustic_core.
+        let list = |key: &str| match node.get(key) {
+            Some(value) if !value.is_null() => value.clone(),
+            _ => serde_json::Value::Array(Vec::new()),
+        };
+        // One instant can be written with different offsets.
+        let mtime = node.get("mtime").and_then(|t| t.as_str()).map(|text| {
+            text.parse::<rustic_core::jiff::Timestamp>()
+                .map_or_else(|_| text.to_string(), |instant| instant.to_string())
+        });
         Some(Self {
             identity: (number("device_id"), number("inode")),
             links: number("links"),
-            mode: number("mode"),
-            // An empty file is `null` to restic and `[]` to rustic_core.
-            content: match node.get("content") {
-                Some(content) if !content.is_null() => content.clone(),
-                _ => serde_json::Value::Array(Vec::new()),
-            },
+            content: list("content"),
+            metadata: [
+                ("permissions", serde_json::json!(number("mode"))),
+                ("owners", serde_json::json!([number("uid"), number("gid")])),
+                ("modification times", serde_json::json!(mtime)),
+                ("extended attributes", list("extended_attributes")),
+            ],
         })
     }
 }
@@ -873,16 +890,16 @@ impl RawFile {
 /// file. Across two they need not be: an inode rewritten or reused under
 /// another path, or two filesystems given the same device number, and files
 /// with different content are restored as one. Links of one file also share
-/// its permissions, so files that agree in content but not in mode cannot
-/// both come back as recorded either. The first walk collects the groups, the
-/// second holds every file against them.
+/// everything else an inode has one of — permissions, owner, modification
+/// time, extended attributes — and restic puts each path's own back after
+/// linking it, so of two that differ only one survives. The first walk
+/// collects the groups, the second holds every file against them.
 fn merged_tree_defect<B: AsRef<[u8]>>(
     root: TreeId,
     read_tree: impl Fn(&TreeId) -> Result<B>,
 ) -> Result<Option<String>> {
     let mut defect = None;
-    // (device, inode) → the content, mode and path of a file with several
-    // links.
+    // (device, inode) → a file with several links, and its path.
     let mut groups = std::collections::HashMap::new();
     visit_raw_trees(&[root], &read_tree, |dir, nodes| {
         let mut previous: Option<(&str, Vec<u8>)> = None;
@@ -908,9 +925,8 @@ fn merged_tree_defect<B: AsRef<[u8]>>(
             if let Some(file) = RawFile::of(node)
                 && file.links > 1
             {
-                let _ = groups
-                    .entry(file.identity)
-                    .or_insert_with(|| (file.content, file.mode, format!("{dir}/{name}")));
+                let path = format!("{dir}/{name}");
+                let _ = groups.entry(file.identity).or_insert_with(|| (file, path));
             }
         }
         Ok(())
@@ -920,24 +936,29 @@ fn merged_tree_defect<B: AsRef<[u8]>>(
     }
     visit_raw_trees(&[root], &read_tree, |dir, nodes| {
         for node in nodes {
-            if let Some(file) = RawFile::of(node)
-                && defect.is_none()
-                && let Some((content, mode, first)) = groups.get(&file.identity)
-                && (*content != file.content || *mode != file.mode)
-            {
-                let differ = if *content != file.content {
-                    "hold different content, and restic would restore them as hardlinks of \
-                     one file, both with the content of one"
-                } else {
-                    "have different permissions, and restic would restore them as hardlinks \
-                     of one file, which has only one set"
-                };
-                defect = Some(format!(
-                    "`{first}` and `{dir}/{}` are recorded under one device and inode but \
-                     {differ}",
-                    raw_name(node)
-                ));
+            let Some(file) = RawFile::of(node) else { continue };
+            let Some((group, first)) = groups.get(&file.identity) else { continue };
+            if defect.is_some() {
+                continue;
             }
+            let differ = if group.content != file.content {
+                "hold different content, and restic would restore them as hardlinks of one \
+                 file, both with the content of one"
+                    .to_string()
+            } else if let Some((what, _)) =
+                group.metadata.iter().zip(&file.metadata).find(|(a, b)| a.1 != b.1).map(|(a, _)| a)
+            {
+                format!(
+                    "have different {what}, and restic would restore them as hardlinks of one \
+                     file, which keeps only one of the two"
+                )
+            } else {
+                continue;
+            };
+            defect = Some(format!(
+                "`{first}` and `{dir}/{}` are recorded under one device and inode but {differ}",
+                raw_name(node)
+            ));
         }
         Ok(())
     })?;
@@ -984,10 +1005,9 @@ fn json_is_empty(value: &serde_json::Value) -> bool {
 ///
 /// - `username`, `uid`, `gid` come from the newest source (`newest` indexes
 ///   `sources`), copied as stored.
-/// - `hostname` is the sources' own where they share one, and otherwise a
-///   name of its own made of all of theirs ([`merged_hostname`]) — a merge
-///   across hosts is not a backup of either, and must not be taken for the
-///   parent of one.
+/// - `hostname` is the sources' own where they share one, and otherwise
+///   left out ([`merged_hostname`]) — a merge across hosts is not a backup of
+///   either, and must not be taken for the parent of one.
 /// - `time` is the newest source's plus one nanosecond ([`just_after`]): as
 ///   recent as its newest data, and still the *latest* of the snapshots that
 ///   match — restic takes the latest as parent and leaves a tie to chance,
@@ -1042,9 +1062,8 @@ fn merged_snapshot_json(
         .iter()
         .map(|source| source.get("hostname").and_then(Value::as_str).unwrap_or(""))
         .collect();
-    // No source names a host: nor does the merged snapshot.
-    if hosts.iter().any(|host| !host.is_empty()) {
-        let _ = snapshot.insert("hostname".into(), json!(merged_hostname(&hosts)));
+    if let Some(host) = merged_hostname(&hosts) {
+        let _ = snapshot.insert("hostname".into(), json!(host));
     }
     for key in ["username", "uid", "gid"] {
         if let Some(value) = newest.get(key) {
@@ -1104,22 +1123,18 @@ fn just_after(time: &str) -> Result<String> {
     })
 }
 
-/// The hostname of a merged snapshot. Sources of one host keep it, which is
-/// what lets `restic backup` on that host find the merged snapshot as its
-/// parent (it looks for its own hostname and path set). Sources of several
-/// hosts get a name made of all of them, joined with `+` — a character no
-/// hostname has, so the name is nobody's and no backup takes the merged
-/// snapshot for its parent: it would be compared against another machine's
-/// files. A source without a hostname counts as `unknown`.
-pub(crate) fn merged_hostname(hosts: &[&str]) -> String {
-    let distinct: std::collections::BTreeSet<&str> = hosts
-        .iter()
-        .map(|host| if host.is_empty() { "unknown" } else { host })
-        .collect();
-    if hosts.iter().all(|host| host == &hosts[0]) {
-        return hosts.first().copied().unwrap_or_default().to_string();
-    }
-    distinct.into_iter().collect::<Vec<_>>().join("+")
+/// The hostname of a merged snapshot, if it gets one. Sources of one host
+/// keep it, which is what lets `restic backup` on that host find the merged
+/// snapshot as its parent (it looks for its own hostname and path set).
+/// Sources of several hosts — or of none that is named — get no hostname at
+/// all: such a merge holds another machine's files, and a backup that took it
+/// for its parent would compare its own against those. No name would do
+/// instead, since `restic backup --host` accepts any; but a backup always
+/// has *a* hostname (an empty `--host` falls back to the machine's), so a
+/// snapshot without one is the only kind no backup's host can match.
+pub(crate) fn merged_hostname(hosts: &[&str]) -> Option<String> {
+    let first = hosts.first().filter(|host| !host.is_empty())?;
+    hosts.iter().all(|host| host == first).then(|| first.to_string())
 }
 
 /// The path set of a merged snapshot: every source path, sorted, without
@@ -1903,15 +1918,18 @@ mod tests {
 
     // restic looks for a backup's parent by hostname and paths. A merge of
     // two hosts' snapshots holds another machine's files, so it must not
-    // answer to either host's name — while sources of one host keep theirs.
+    // answer to any name a backup can have — while sources of one host keep
+    // theirs.
     #[test]
-    fn merged_snapshot_of_two_hosts_is_named_for_both() {
-        assert_eq!(merged_hostname(&["laptop", "laptop"]), "laptop");
-        assert_eq!(merged_hostname(&["laptop"]), "laptop");
-        assert_eq!(merged_hostname(&["nas", "laptop"]), "laptop+nas");
-        assert_eq!(merged_hostname(&["nas", "laptop", "nas"]), "laptop+nas");
-        assert_eq!(merged_hostname(&["laptop", ""]), "laptop+unknown");
-        assert_eq!(merged_hostname(&["", ""]), "");
+    fn merged_snapshot_of_two_hosts_has_no_hostname() {
+        assert_eq!(merged_hostname(&["laptop", "laptop"]).as_deref(), Some("laptop"));
+        assert_eq!(merged_hostname(&["laptop"]).as_deref(), Some("laptop"));
+        // Not a name made of both: `restic backup --host` takes any name.
+        assert_eq!(merged_hostname(&["nas", "laptop"]), None);
+        assert_eq!(merged_hostname(&["laptop", ""]), None);
+        assert_eq!(merged_hostname(&["", "laptop"]), None);
+        assert_eq!(merged_hostname(&["", ""]), None);
+        assert_eq!(merged_hostname(&[]), None);
 
         let source = |host: Option<&str>, time: &str| {
             let mut v = serde_json::json!({"time": time, "tree": "11", "paths": ["/data"]});
@@ -1939,14 +1957,24 @@ mod tests {
         );
         assert_eq!(
             hostname_of(&[source(Some("nas"), newer), source(Some("laptop"), older)]),
-            Some(serde_json::json!("laptop+nas")),
-            "not the newest source's alone"
+            None,
+            "neither the newest source's nor one made of both"
         );
-        assert_eq!(
-            hostname_of(&[source(Some("nas"), newer), source(None, older)]),
-            Some(serde_json::json!("nas+unknown"))
-        );
+        assert_eq!(hostname_of(&[source(Some("nas"), newer), source(None, older)]), None);
         assert_eq!(hostname_of(&[source(None, newer), source(None, older)]), None);
+
+        // rustic_core still reads a snapshot without a hostname.
+        let out = merged_snapshot_json(
+            &[source(Some("nas"), newer), source(Some("laptop"), older)],
+            0,
+            &"ab".repeat(32),
+            &summary_for_tests(),
+            "2026-11-20T10:00:00Z",
+            "2026-11-20T10:00:01Z",
+        )
+        .unwrap();
+        let typed: SnapshotFile = serde_json::from_slice(&out).unwrap();
+        assert_eq!(typed.hostname, "");
     }
 
     #[test]
@@ -2191,25 +2219,54 @@ mod tests {
         assert!(found.contains("hardlinks of one file"), "{found}");
         assert!(found.contains("`/p`") || found.contains("`/w`"), "{found}");
 
-        // The same content under different permissions: one inode has one
-        // mode, so the two cannot both be restored as recorded.
-        let with_mode = |name: &str, links: u64, mode: u64| {
+        // The same content with other metadata an inode has one of: restic
+        // links the files and then puts each path's own back, so the two
+        // cannot both be restored as recorded.
+        let with = |name: &str, links: u64, fields: serde_json::Value| {
             let mut file = raw_file(name, links, 1, 7, "aa");
-            file["mode"] = serde_json::json!(mode);
+            for (key, value) in fields.as_object().unwrap() {
+                file[key.as_str()] = value.clone();
+            }
             file
         };
+        let recorded = serde_json::json!({
+            "mode": 0o644, "uid": 1000, "gid": 1000,
+            "mtime": "2026-11-20T06:50:55.5-08:00",
+            "atime": "2026-11-20T06:50:55.5-08:00", "ctime": "2026-11-20T06:50:55.5-08:00",
+            "extended_attributes": [{"name": "user.x", "value": "eA=="}],
+        });
+        // What does not make two links differ: the times restic does not
+        // put back, the same instant in another offset, and nothing written
+        // two ways.
+        let mut same = recorded.clone();
+        same["atime"] = serde_json::json!("2026-11-21T00:00:00Z");
+        same["ctime"] = serde_json::json!("2026-11-21T00:00:00Z");
+        same["mtime"] = serde_json::json!("2026-11-20T14:50:55.5Z");
         assert_eq!(
-            defect_of(&[(1, vec![with_mode("p", 2, 0o644), with_mode("q", 2, 0o644)])]),
+            defect_of(&[(1, vec![with("p", 2, recorded.clone()), with("q", 2, same)])]),
             None
         );
-        for other_links in [2, 1] {
-            let found = defect_of(&[(
-                1,
-                vec![with_mode("p", 2, 0o644), with_mode("q", other_links, 0o600)],
-            )])
-            .expect("one inode recorded with two modes");
-            assert!(found.contains("different permissions"), "{found}");
-            assert!(found.contains("hardlinks of one file"), "{found}");
+        let none = serde_json::json!({"extended_attributes": null});
+        let empty = serde_json::json!({"extended_attributes": []});
+        assert_eq!(defect_of(&[(1, vec![with("p", 2, none), with("q", 2, empty)])]), None);
+        for (key, other, what) in [
+            ("mode", serde_json::json!(0o600), "different permissions"),
+            ("uid", serde_json::json!(0), "different owners"),
+            ("gid", serde_json::json!(0), "different owners"),
+            ("mtime", serde_json::json!("2026-11-20T06:50:56-08:00"), "different modification times"),
+            ("extended_attributes", serde_json::json!([]), "different extended attributes"),
+        ] {
+            let mut changed = recorded.clone();
+            changed[key] = other;
+            for other_links in [2, 1] {
+                let found = defect_of(&[(
+                    1,
+                    vec![with("p", 2, recorded.clone()), with("q", other_links, changed.clone())],
+                )])
+                .unwrap_or_else(|| panic!("one inode recorded with two values of {key}"));
+                assert!(found.contains(what), "{key}: {found}");
+                assert!(found.contains("hardlinks of one file"), "{key}: {found}");
+            }
         }
 
         // One whose link count fell to one before it was rewritten, in
@@ -3166,9 +3223,10 @@ mod tests {
             .expect("the new snapshot is listed");
         assert_eq!(latest["parent"], serde_json::json!(merged));
 
-        // The same directory backed up as two hosts: the merged snapshot is
-        // named for both, and the next backup as either host passes it over
-        // for that host's own last backup.
+        // The same directory backed up as two hosts: the merged snapshot has
+        // no hostname, and the next backup as either host passes it over for
+        // that host's own last backup. Nor can a backup be made to match it:
+        // an empty `--host` is the machine's own name to restic.
         let hosts = root.join("source/hosts");
         std::fs::create_dir_all(&hosts).unwrap();
         std::fs::write(hosts.join("f"), b"from alpha\n").unwrap();
@@ -3197,7 +3255,11 @@ mod tests {
             .iter()
             .find(|s| s["id"] == serde_json::json!(merged))
             .expect("restic lists the merged snapshot");
-        assert_eq!(merged_listed["hostname"], "alpha+beta");
+        assert_eq!(
+            merged_listed.get("hostname").and_then(|h| h.as_str()).unwrap_or(""),
+            "",
+            "a merge across hosts must not carry a hostname"
+        );
         let summary = backup_as("beta", "hosts-next");
         let latest = restic_snapshots()
             .into_iter()
@@ -3208,6 +3270,16 @@ mod tests {
             serde_json::json!(beta),
             "beta's backup must take beta's own, not the merge of two hosts"
         );
+        let summary = backup_as("", "hosts-unnamed");
+        let unnamed = restic_snapshots()
+            .into_iter()
+            .find(|s| s["id"] == summary["snapshot_id"])
+            .expect("the new snapshot is listed");
+        assert!(
+            unnamed["hostname"].as_str().is_some_and(|host| !host.is_empty()),
+            "restic gives every backup a hostname: {unnamed}"
+        );
+        assert_ne!(unnamed["parent"], serde_json::json!(merged));
 
         crate::restic::run(&profile, &["check", "--read-data", "--json"])
             .expect("restic check");

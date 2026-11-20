@@ -637,12 +637,15 @@ impl RepoLock {
     /// file existed. Poisoned means that is no longer known, and the file is
     /// removed again rather than reported as written.
     ///
-    /// That holds for a write that reported an error, too: a backend can fail
-    /// a write it has in fact stored (a timeout after the server committed),
-    /// so with the lock lost the file is taken to be there and removed all
-    /// the same. Its name is known beforehand — it is the hash of what is
-    /// written — and is in every error, so a file that could not be confirmed
-    /// gone can be found.
+    /// A write that reports an error says nothing about whether the file is
+    /// there: a backend can fail a write it has in fact stored (a timeout
+    /// after the server committed). So an error is never passed on with the
+    /// file possibly published behind it — the file is removed first,
+    /// whatever the lock's health, and the same once the lock is lost. Its
+    /// name is known beforehand — it is the hash of what is written — and is
+    /// in every error, so a file that could not be confirmed gone can be
+    /// found. The file is in the repository when this returns `Ok`, and only
+    /// then, unless the error says otherwise.
     pub(crate) fn write_unpacked_while_held(
         &self,
         backend: &dyn LockBackend,
@@ -654,26 +657,28 @@ impl RepoLock {
         }
         let (name, sealed) = seal_named(crypto, plain)?;
         let written = backend.write(&name, &sealed);
-        if !self.poisoned() {
-            written.with_context(|| format!("writing {name}"))?;
-            return Ok(name);
-        }
-        let write_error = match &written {
-            Ok(()) => String::new(),
-            Err(e) => format!(" (the write itself reported: {e:#})"),
+        let why = match (&written, self.poisoned()) {
+            (Ok(()), false) => return Ok(name),
+            (Err(e), false) => format!("writing {name} failed ({e:#})"),
+            (Ok(()), true) => format!(
+                "the repository lock could not be refreshed while {name} was being written, so \
+                 it cannot be trusted"
+            ),
+            (Err(e), true) => format!(
+                "the repository lock could not be refreshed while {name} was being written, so \
+                 it cannot be trusted (the write itself reported: {e:#})"
+            ),
         };
         // `LockBackend::remove` succeeds for a file that is not there, so a
         // success means the file is gone whether or not it was ever stored.
         match backend.remove(&name) {
+            Ok(()) if written.is_ok() => bail!("{why}; it was removed again"),
             Ok(()) => bail!(
-                "the repository lock could not be refreshed while {name} was being written, so \
-                 it cannot be trusted; it was removed again{write_error}"
+                "{why}; it is not in the repository (removed again in case it had been stored)"
             ),
             Err(e) => bail!(
-                "the repository lock could not be refreshed while {name} was being written, so \
-                 it cannot be trusted, and removing it failed ({e:#}){write_error} — if {name} \
-                 is in the repository it may refer to data a prune has deleted, so check the \
-                 repository and remove it"
+                "{why}, and removing it failed ({e:#}) — {name} may be in the repository \
+                 without being meant to: check the repository and remove it"
             ),
         }
     }
@@ -1711,6 +1716,52 @@ mod tests {
         let message = format!("{err:#}");
         assert!(message.contains("injected write failure"), "{message}");
         assert!(message.starts_with("writing "), "{message}");
+        drop(lock);
+    }
+
+    // The same ambiguity with the lock in good health: a write reported as
+    // failed may have stored the file, and an error must not leave a file
+    // behind that the caller was told is not there — here, a published
+    // snapshot behind a failed merge.
+    #[test]
+    fn a_failed_write_under_a_healthy_lock_leaves_nothing_published() {
+        let _guard = test_acquire_guard();
+        let crypto = test_crypto(true);
+        let (_locks, lock) = steady_lock(&crypto);
+
+        // Stored, reported as failed: removed, and reported as a failure.
+        let files = MemLockBackend::new();
+        files.report_write_failure.store(true, Ordering::SeqCst);
+        let err = lock
+            .write_unpacked_while_held(files.as_ref(), &crypto, b"{\"n\":1}")
+            .expect_err("the write reported a failure");
+        let message = format!("{err:#}");
+        assert!(message.contains("injected failure of a write that was stored"), "{message}");
+        assert!(message.contains("not in the repository"), "{message}");
+        assert_eq!(files.count(), 0, "a file behind a failed write must not stay published");
+        assert!(!lock.poisoned(), "the lock was healthy throughout");
+
+        // Stored, reported as failed, and not removable: the error names the
+        // file and does not claim it is gone.
+        let files = MemLockBackend::new();
+        files.report_write_failure.store(true, Ordering::SeqCst);
+        files.fail_removes.store(true, Ordering::SeqCst);
+        let err = lock
+            .write_unpacked_while_held(files.as_ref(), &crypto, b"{\"n\":2}")
+            .expect_err("the write reported a failure");
+        let message = format!("{err:#}");
+        let left = files.list().unwrap().remove(0).0;
+        assert!(message.contains(&left), "the file left behind must be named: {message}");
+        assert!(message.contains("removing it failed"), "{message}");
+        assert!(message.contains("may be in the repository"), "{message}");
+        assert!(!message.contains("not in the repository"), "{message}");
+
+        // A write that succeeds is still just that.
+        let files = MemLockBackend::new();
+        let name = lock
+            .write_unpacked_while_held(files.as_ref(), &crypto, b"{\"n\":3}")
+            .expect("a healthy lock publishes");
+        assert!(files.read(&name).unwrap().is_some());
         drop(lock);
     }
 
