@@ -40,6 +40,10 @@
   identity on different content, where giving the files separate
   identities would do, and directories whose quoted names sort
   differently from the names (docs/locking.md, "Native snapshot merge").
+  Files of different sources with one hardlink identity that agree in
+  everything recorded it keeps as one hardlink group, which is wrong
+  where they are separate files; separate identities per source would
+  keep them apart.
   Merging the tree JSON itself would lift all of these limits and write
   only the directories the sources share, but
   rustic_core has no public way to store a tree blob, so it means wrustic

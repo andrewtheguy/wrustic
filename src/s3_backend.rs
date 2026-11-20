@@ -139,7 +139,9 @@ impl LockBackend for S3LockBackend {
     fn write(&self, name: &str, data: &[u8]) -> Result<()> {
         self.operator
             .write(&self.key(name), data.to_vec())
-            .map_err(|err| anyhow!("writing S3 {}: {err}", self.key(name)))?;
+            .map_err(|err| {
+                anyhow::Error::new(err).context(format!("writing S3 {}", self.key(name)))
+            })?;
         Ok(())
     }
 
@@ -149,6 +151,10 @@ impl LockBackend for S3LockBackend {
             Err(err) if err.kind() == opendal::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(anyhow!("removing S3 {}: {err}", self.key(name))),
         }
+    }
+
+    fn failed_write_can_land_later(&self, error: &anyhow::Error) -> bool {
+        !crate::lock::server_refused(crate::lock::as_std_error(error))
     }
 }
 

@@ -540,7 +540,12 @@ pub(crate) fn merge_snapshots(profile: &Profile, snapshot_ids: &[String]) -> Res
     // lock: `merge_trees` writes packs and then the index naming them and
     // cannot be interrupted, and an index written after the lock was lost
     // could name packs a prune has deleted in between.
-    let (backends, write_gate) = lock::gate_writes(&build_backends(profile)?);
+    // A write to a server can be stored after it was reported as failed,
+    // unless the failure is the server's refusal; a local write cannot.
+    let remote = !matches!(profile, Profile::Local { .. });
+    let (backends, write_gate) = lock::gate_writes(&build_backends(profile)?, move |error| {
+        remote && !lock::server_refused(error)
+    });
     let repo = Repository::new(&RepositoryOptions::default(), &backends)?
         .open(&Credentials::password(profile.password()))?;
     let crypto = lock::RepoCrypto::from_repo(&repo)?;
@@ -594,21 +599,27 @@ pub(crate) fn merge_snapshots(profile: &Profile, snapshot_ids: &[String]) -> Res
     write_gate.close();
     let finished = rustic_core::jiff::Timestamp::now();
 
+    // What the gate could not take back is worse than orphaned trees: an
+    // index file that is there after all may name packs that prune deleted.
+    let left_behind = write_gate.unconfirmed_removals();
+    let left_behind = (!left_behind.is_empty()).then(|| {
+        format!(
+            "{} is not known to be out of the repository for good: it could not be removed \
+             again, or the server can still complete a write it reported as failed. If it \
+             is there after a prune it names packs that are gone: remove it from the \
+             repository and run `restic check`",
+            left_behind.join(", ")
+        )
+    });
     // restic's abort-if-unrefreshable rule: a lock that went unrefreshed for
     // too long may already have been removed as stale, after which a prune
     // could have run — the merged tree may refer to blobs that are gone. It
     // is also why `merge_trees` failed, if it did: the gate refused a write.
     if repo_lock.poisoned() {
-        // What the gate could not take back is worse than orphaned trees:
-        // an index file left behind may name packs that prune deleted.
-        let left_behind = write_gate.unconfirmed_removals();
-        if !left_behind.is_empty() {
+        if let Some(left_behind) = left_behind {
             bail!(
                 "the repository lock could not be refreshed in time, so the merge was \
-                 abandoned before writing its snapshot — but {} had been written after the \
-                 lock was lost and could not be removed again. It may name packs a prune has \
-                 deleted: remove it from the repository and run `restic check`",
-                left_behind.join(", ")
+                 abandoned before writing its snapshot — but {left_behind}"
             );
         }
         bail!(
@@ -617,7 +628,15 @@ pub(crate) fn merge_snapshots(profile: &Profile, snapshot_ids: &[String]) -> Res
              prune removes them"
         );
     }
-    let tree = merged?;
+    let tree = match (merged, left_behind) {
+        (Ok(tree), _) => tree,
+        (Err(e), None) => return Err(e.into()),
+        (Err(e), Some(left_behind)) => {
+            return Err(anyhow::Error::from(e).context(format!(
+                "the merge failed before writing its snapshot, and {left_behind}"
+            )));
+        }
+    };
 
     // Two things `merge_trees` gets wrong for restic, both rare and neither
     // visible from the sources alone, so the merged tree is read back — when
