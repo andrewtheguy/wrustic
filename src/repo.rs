@@ -856,15 +856,32 @@ impl RawFile {
             text.parse::<rustic_core::jiff::Timestamp>()
                 .map_or_else(|_| text.to_string(), |instant| instant.to_string())
         });
+        // A name that is not recorded and an empty one are the same.
+        let text = |key: &str| node.get(key).and_then(|t| t.as_str()).unwrap_or("").to_string();
+        // Attributes are a set: the order they are listed in is whatever the
+        // filesystem gave at the time, and says nothing.
+        let mut attributes = match list("extended_attributes") {
+            serde_json::Value::Array(attributes) => attributes,
+            other => vec![other],
+        };
+        attributes.sort_by_cached_key(|attribute| {
+            let name = attribute.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            (name.to_string(), attribute.to_string())
+        });
         Some(Self {
             identity: (number("device_id"), number("inode")),
             links: number("links"),
             content: list("content"),
             metadata: [
                 ("permissions", serde_json::json!(number("mode"))),
-                ("owners", serde_json::json!([number("uid"), number("gid")])),
+                // By number and by name: restic restores the numbers, a
+                // restore through rustic_core goes by the names.
+                (
+                    "owners",
+                    serde_json::json!([number("uid"), number("gid"), text("user"), text("group")]),
+                ),
                 ("modification times", serde_json::json!(mtime)),
-                ("extended attributes", list("extended_attributes")),
+                ("extended attributes", serde_json::Value::Array(attributes)),
             ],
         })
     }
@@ -1135,18 +1152,24 @@ fn just_after(time: &str) -> Result<String> {
 /// it unless one is run with `--host` set to that very name. Leaving the
 /// hostname out would close that gap too, at the price of a snapshot that
 /// shows no host anywhere. Sources none of which names a host give none.
+///
+/// A name made of two or more different parts is longer than any of them,
+/// so it is never a source's own hostname. That only fails if the stand-in
+/// for a missing hostname is also a real one among the sources — a host
+/// called `unknown` merged with a snapshot that names none would come out as
+/// plain `unknown` — and then the hostname is left out instead.
 pub(crate) fn merged_hostname(hosts: &[&str]) -> Option<String> {
-    let distinct: std::collections::BTreeSet<&str> = hosts
-        .iter()
-        .map(|host| if host.is_empty() { "unknown" } else { host })
-        .collect();
-    match hosts.first() {
-        None => None,
-        Some(first) if hosts.iter().all(|host| host == first) => {
-            (!first.is_empty()).then(|| first.to_string())
-        }
-        Some(_) => Some(distinct.into_iter().collect::<Vec<_>>().join("+")),
+    const UNNAMED: &str = "unknown";
+    let first = hosts.first()?;
+    if hosts.iter().all(|host| host == first) {
+        return (!first.is_empty()).then(|| first.to_string());
     }
+    let mut names: std::collections::BTreeSet<&str> =
+        hosts.iter().copied().filter(|host| !host.is_empty()).collect();
+    if hosts.iter().any(|host| host.is_empty()) && !names.insert(UNNAMED) {
+        return None;
+    }
+    Some(names.into_iter().collect::<Vec<_>>().join("+"))
 }
 
 /// The path set of a merged snapshot: every source path, sorted, without
@@ -1941,6 +1964,19 @@ mod tests {
         assert_eq!(merged_hostname(&["", "laptop"]).as_deref(), Some("laptop+unknown"));
         assert_eq!(merged_hostname(&["", ""]), None);
         assert_eq!(merged_hostname(&[]), None);
+        // A host really called what stands for a missing name: the two must
+        // not fold into that host's own name, which its backups look for.
+        assert_eq!(merged_hostname(&["", "unknown"]), None);
+        assert_eq!(merged_hostname(&["unknown", ""]), None);
+        assert_eq!(merged_hostname(&["unknown", "", "nas"]), None);
+        assert_eq!(merged_hostname(&["unknown", "unknown"]).as_deref(), Some("unknown"));
+        assert_eq!(merged_hostname(&["unknown", "nas"]).as_deref(), Some("nas+unknown"));
+        // Whatever comes out for several hosts is none of theirs.
+        for hosts in [["a", "b"], ["a", "a+b"], ["a+b", "b"], ["", "a"], ["unknown", ""]] {
+            if let Some(merged) = merged_hostname(&hosts) {
+                assert!(!hosts.contains(&merged.as_str()), "{hosts:?} gave {merged}");
+            }
+        }
 
         let source = |host: Option<&str>, time: &str| {
             let mut v = serde_json::json!({"time": time, "tree": "11", "paths": ["/data"]});
@@ -2244,10 +2280,13 @@ mod tests {
             file
         };
         let recorded = serde_json::json!({
-            "mode": 0o644, "uid": 1000, "gid": 1000,
+            "mode": 0o644, "uid": 1000, "gid": 1000, "user": "debian", "group": "staff",
             "mtime": "2026-11-20T06:50:55.5-08:00",
             "atime": "2026-11-20T06:50:55.5-08:00", "ctime": "2026-11-20T06:50:55.5-08:00",
-            "extended_attributes": [{"name": "user.x", "value": "eA=="}],
+            "extended_attributes": [
+                {"name": "user.x", "value": "eA=="},
+                {"name": "user.y", "value": "eQ=="},
+            ],
         });
         // What does not make two links differ: the times restic does not
         // put back, the same instant in another offset, and nothing written
@@ -2256,19 +2295,36 @@ mod tests {
         same["atime"] = serde_json::json!("2026-11-21T00:00:00Z");
         same["ctime"] = serde_json::json!("2026-11-21T00:00:00Z");
         same["mtime"] = serde_json::json!("2026-11-20T14:50:55.5Z");
+        // The same attributes, listed the other way round.
+        same["extended_attributes"] = serde_json::json!([
+            {"name": "user.y", "value": "eQ=="},
+            {"name": "user.x", "value": "eA=="},
+        ]);
         assert_eq!(
             defect_of(&[(1, vec![with("p", 2, recorded.clone()), with("q", 2, same)])]),
             None
         );
-        let none = serde_json::json!({"extended_attributes": null});
-        let empty = serde_json::json!({"extended_attributes": []});
+        let none = serde_json::json!({"extended_attributes": null, "user": null});
+        let empty = serde_json::json!({"extended_attributes": [], "user": ""});
         assert_eq!(defect_of(&[(1, vec![with("p", 2, none), with("q", 2, empty)])]), None);
         for (key, other, what) in [
             ("mode", serde_json::json!(0o600), "different permissions"),
             ("uid", serde_json::json!(0), "different owners"),
             ("gid", serde_json::json!(0), "different owners"),
+            // The same numbers under another name: another machine's user.
+            ("user", serde_json::json!("backup"), "different owners"),
+            ("group", serde_json::json!("users"), "different owners"),
             ("mtime", serde_json::json!("2026-11-20T06:50:56-08:00"), "different modification times"),
             ("extended_attributes", serde_json::json!([]), "different extended attributes"),
+            // One attribute's value differs, in either order.
+            (
+                "extended_attributes",
+                serde_json::json!([
+                    {"name": "user.y", "value": "eQ=="},
+                    {"name": "user.x", "value": "other"},
+                ]),
+                "different extended attributes",
+            ),
         ] {
             let mut changed = recorded.clone();
             changed[key] = other;

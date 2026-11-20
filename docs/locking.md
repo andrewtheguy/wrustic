@@ -269,10 +269,25 @@ lists, restores, checks, forgets and prunes like any other.
   reported as failed. The snapshot's name is the hash of what is written,
   so it is known before the write, and a write that reports an error is
   treated as possibly stored — a timeout after the server committed —
-  whatever the lock's health: the file is removed before the error is
-  passed on, so a failed merge does not leave a published snapshot
-  behind, and the error names the file whenever its removal could not be
-  confirmed.
+  whatever the lock's health. It is checked against the repository
+  first: a snapshot that is there as written, under a healthy lock, is
+  published and reported as that; one that is not is written once more,
+  since a write that then succeeds settles it whatever became of the
+  first. Only if that fails too, or the lock is lost, is the file
+  removed and the error passed on, naming the file.
+  A removal cannot settle everything, though, and the error does not
+  pretend it does. A server that has taken a write in full stores it
+  whether or not the client is still waiting: rest-server reads the
+  body and goes on to sync and rename without looking at the connection
+  again, and answers a removal sent in between with success, there being
+  nothing to remove yet. No call from the client cancels such a write or
+  waits for it, so for the REST and S3 backends a failed write followed
+  by a successful removal can still be published later
+  (`LockBackend::failed_write_can_land_later`; false for a local
+  repository, where the write is this process's own system calls). In
+  that case the error says the snapshot may still turn up and is to be
+  removed if it does — it would by then name trees that a prune is free
+  to delete.
 - **Trees** go through rustic_core's `Repository::merge_trees`: entries are
   matched by path from the root, an entry only one snapshot has is taken
   as is, directories are merged recursively, and where the same path
@@ -294,7 +309,9 @@ lists, restores, checks, forgets and prunes like any other.
     that host's next backup find the merged snapshot. Sources of several
     hosts get a name made of all of them, sorted and joined with `+`
     (`repo::merged_hostname`; a source without a hostname counts as
-    `unknown`): such a merge holds another machine's files, and a backup
+    `unknown`, and if a source really is called that, the merged
+    snapshot gets no hostname rather than that host's own): such a merge
+    holds another machine's files, and a backup
     that took it for its parent would compare its own files against
     those. The name shows in restic and wrustic where the snapshot came
     from, and is nobody's, so neither host's backups look for it. That is
@@ -376,7 +393,9 @@ lists, restores, checks, forgets and prunes like any other.
     with every one of those files holding the first one's bytes. The
     merge is refused when a file's content differs from that of a
     multi-link file with its device and inode — or its permissions,
-    owner, modification time or extended attributes do: restic links the
+    owner (by number and by name), modification time or extended
+    attributes (as a set, whatever order they are listed in) do: restic
+    links the
     paths and then puts each one's recorded metadata back, and an inode
     has one of each, so of two that differ only the last applied
     survives. Access and change times are not compared: restic reads the
@@ -559,9 +578,13 @@ and an already poisoned lock writes nothing.
 what rustic_core writes through the gate: an index whose write outlasted
 the lock does not stay, and nothing is written after it.
 `a_failed_write_past_the_lock_is_reconciled`,
-`a_failed_write_under_a_healthy_lock_leaves_nothing_published` and
+`a_write_reported_as_failed_but_stored_counts_as_published`,
+`a_failed_write_the_server_still_holds_is_not_reported_as_gone` and
 `an_index_that_could_not_be_taken_back_is_reported` cover a write that
-reports failure for a file it stored and a removal that fails, and
+reports failure for a file it stored, one the server stores only after
+its removal (`rest_write_that_timed_out_is_stored_after_its_removal`
+shows the real REST client meeting exactly that), a removal that fails,
+and
 `closing_the_gate_waits_for_writes_and_refuses_later_ones` that the gate
 does not close over a write under way. These tests lose the lock at a
 point they choose (`LockHealth::expire_for_tests`, inside the backend's
