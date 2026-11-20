@@ -636,6 +636,13 @@ impl RepoLock {
     /// through (poisoning latches), so no prune can have started before the
     /// file existed. Poisoned means that is no longer known, and the file is
     /// removed again rather than reported as written.
+    ///
+    /// That holds for a write that reported an error, too: a backend can fail
+    /// a write it has in fact stored (a timeout after the server committed),
+    /// so with the lock lost the file is taken to be there and removed all
+    /// the same. Its name is known beforehand — it is the hash of what is
+    /// written — and is in every error, so a file that could not be confirmed
+    /// gone can be found.
     pub(crate) fn write_unpacked_while_held(
         &self,
         backend: &dyn LockBackend,
@@ -645,21 +652,30 @@ impl RepoLock {
         if self.poisoned() {
             bail!("the repository lock could not be refreshed in time; nothing was written");
         }
-        let name = write_unpacked(backend, crypto, plain)?;
-        if self.poisoned() {
-            let cleanup = match backend.remove(&name) {
-                Ok(()) => "it was removed again".to_string(),
-                Err(e) => format!(
-                    "and removing it failed ({e:#}) — it may refer to data a prune has \
-                     deleted, so check the repository and remove it"
-                ),
-            };
-            bail!(
-                "the repository lock could not be refreshed while {name} was being written, so \
-                 it cannot be trusted; {cleanup}"
-            );
+        let (name, sealed) = seal_named(crypto, plain)?;
+        let written = backend.write(&name, &sealed);
+        if !self.poisoned() {
+            written.with_context(|| format!("writing {name}"))?;
+            return Ok(name);
         }
-        Ok(name)
+        let write_error = match &written {
+            Ok(()) => String::new(),
+            Err(e) => format!(" (the write itself reported: {e:#})"),
+        };
+        // `LockBackend::remove` succeeds for a file that is not there, so a
+        // success means the file is gone whether or not it was ever stored.
+        match backend.remove(&name) {
+            Ok(()) => bail!(
+                "the repository lock could not be refreshed while {name} was being written, so \
+                 it cannot be trusted; it was removed again{write_error}"
+            ),
+            Err(e) => bail!(
+                "the repository lock could not be refreshed while {name} was being written, so \
+                 it cannot be trusted, and removing it failed ({e:#}){write_error} — if {name} \
+                 is in the repository it may refer to data a prune has deleted, so check the \
+                 repository and remove it"
+            ),
+        }
     }
 
     // restic's acquisition protocol: write our lock, wait 200 ms, then check
@@ -715,8 +731,18 @@ impl LockHealth {
 /// whose write returned after the lock went bad is removed again and reported
 /// as failed — so whatever is left was written under a lock that had been
 /// healthy all along (poisoning latches), which no prune can have preceded.
+///
+/// It also ends the writing: rustic_core's packer hands its packs to threads
+/// it only waits for when it finishes normally, so after an error return
+/// they may still be storing a pack and the index entry for it.
+/// [`WriteGate::close`] waits for the writes under way and refuses every
+/// later one, and has to be called before the lock is given up.
 pub(crate) fn gate_writes(backends: &RepositoryBackends) -> (RepositoryBackends, WriteGate) {
-    let gate = WriteGate(Arc::new(std::sync::OnceLock::new()));
+    let gate = WriteGate(Arc::new(GateState {
+        health: std::sync::OnceLock::new(),
+        closed: std::sync::RwLock::new(false),
+        unconfirmed: Mutex::new(Vec::new()),
+    }));
     let gated = |inner: Arc<dyn WriteBackend>| -> Arc<dyn WriteBackend> {
         Arc::new(LockGatedBackend { inner, gate: gate.clone() })
     };
@@ -729,15 +755,55 @@ pub(crate) fn gate_writes(backends: &RepositoryBackends) -> (RepositoryBackends,
 
 /// See [`gate_writes`]. Lets everything through until it is armed.
 #[derive(Clone)]
-pub(crate) struct WriteGate(Arc<std::sync::OnceLock<LockHealth>>);
+pub(crate) struct WriteGate(Arc<GateState>);
+
+struct GateState {
+    health: std::sync::OnceLock<LockHealth>,
+    // Held shared by every write for as long as it runs, exclusively by
+    // `close`, which is how closing waits for the writes under way.
+    closed: std::sync::RwLock<bool>,
+    // Files written past a lost lock whose removal could not be confirmed.
+    unconfirmed: Mutex<Vec<String>>,
+}
 
 impl WriteGate {
     pub(crate) fn arm(&self, lock: &RepoLock) {
-        let _ = self.0.set(lock.health());
+        let _ = self.0.health.set(lock.health());
+    }
+
+    /// Waits for the writes under way and refuses every later one. Idempotent.
+    pub(crate) fn close(&self) {
+        use std::sync::PoisonError;
+        *self.0.closed.write().unwrap_or_else(PoisonError::into_inner) = true;
+    }
+
+    /// A guard that closes the gate when dropped. Declared after the lock it
+    /// protects, it is dropped before it — on every way out, a panic included.
+    pub(crate) fn close_on_drop(&self) -> ClosesGate {
+        ClosesGate(self.clone())
+    }
+
+    /// The files (`<directory> <id>`) that were written after the lock was
+    /// lost and are not known to be gone again: removing them failed, and
+    /// they could not be shown to be absent. Anything but a pack is listed —
+    /// an index file left behind may name packs a prune has deleted, whereas
+    /// a pack nothing names is only waste the next prune collects.
+    pub(crate) fn unconfirmed_removals(&self) -> Vec<String> {
+        use std::sync::PoisonError;
+        self.0.unconfirmed.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
     fn lock_lost(&self) -> bool {
-        self.0.get().is_some_and(LockHealth::poisoned)
+        self.0.health.get().is_some_and(LockHealth::poisoned)
+    }
+}
+
+/// See [`WriteGate::close_on_drop`].
+pub(crate) struct ClosesGate(WriteGate);
+
+impl Drop for ClosesGate {
+    fn drop(&mut self) {
+        self.0.close();
     }
 }
 
@@ -805,28 +871,84 @@ impl WriteBackend for LockGatedBackend {
         cacheable: bool,
         content: BytesList,
     ) -> RusticResult<()> {
+        use std::sync::PoisonError;
+        // Shared for the whole write, so that `WriteGate::close` returns only
+        // when no write is under way.
+        let closed = self.gate.0.closed.read().unwrap_or_else(PoisonError::into_inner);
+        if *closed {
+            return Err(RusticError::new(
+                ErrorKind::Backend,
+                "the operation this write belongs to is over; nothing more is written",
+            ));
+        }
         if self.gate.lock_lost() {
             return Err(RusticError::new(
                 ErrorKind::Backend,
                 "the repository lock could not be refreshed in time; nothing more is written",
             ));
         }
-        self.inner.write_bytes(tpe, id, cacheable, content)?;
-        if self.gate.lock_lost() {
-            // Best effort: the caller is told either way, and what stays
-            // behind is a file nothing may rely on.
-            let _ = self.inner.remove(tpe, id, cacheable);
-            return Err(RusticError::new(
-                ErrorKind::Backend,
-                "the repository lock could not be refreshed while a file was being written, \
-                 so the file cannot be trusted and was removed again",
-            ));
+        let written = self.inner.write_bytes(tpe, id, cacheable, content);
+        if !self.gate.lock_lost() {
+            return written;
         }
-        Ok(())
+        // The lock was lost over this write. The file is taken to be there
+        // even if the write reported an error — a backend can fail a write it
+        // has stored — and must not stay.
+        let what = format!("{} {}", tpe.dirname(), id.to_hex().as_str());
+        let write_error = match &written {
+            Ok(()) => String::new(),
+            Err(e) => format!(" (the write itself reported: {e})"),
+        };
+        let gone = match self.inner.remove(tpe, id, cacheable) {
+            Ok(()) => Ok(()),
+            // A failed removal of something that is not there is no failure.
+            Err(e) if tpe != FileType::Pack => match self.inner.list(tpe) {
+                Ok(present) if !present.contains(id) => Ok(()),
+                _ => Err(e),
+            },
+            Err(e) => Err(e),
+        };
+        Err(match gone {
+            Ok(()) => RusticError::new(
+                ErrorKind::Backend,
+                format!(
+                    "the repository lock could not be refreshed while {what} was being \
+                     written, so it cannot be trusted and was removed again{write_error}"
+                ),
+            ),
+            Err(e) => {
+                if tpe != FileType::Pack {
+                    self.gate
+                        .0
+                        .unconfirmed
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push(what.clone());
+                }
+                RusticError::new(
+                    ErrorKind::Backend,
+                    format!(
+                        "the repository lock could not be refreshed while {what} was being \
+                         written, so it cannot be trusted, and removing it failed \
+                         ({e}){write_error}"
+                    ),
+                )
+            }
+        })
     }
 
     fn remove(&self, tpe: FileType, id: &Id, cacheable: bool) -> RusticResult<()> {
         self.inner.remove(tpe, id, cacheable)
+    }
+}
+
+#[cfg(test)]
+impl LockHealth {
+    /// Makes the lock count as unrefreshed past the cutoff from here on,
+    /// without waiting for it: the moment a test loses the lock is then one
+    /// it chooses, not one a slow scheduler can choose for it.
+    pub(crate) fn expire_for_tests(&self) {
+        self.shared.0.lock().expect("lock state poisoned").poisoned = true;
     }
 }
 
@@ -910,10 +1032,16 @@ pub(crate) fn write_unpacked(
     crypto: &RepoCrypto,
     plain: &[u8],
 ) -> Result<String> {
-    let sealed = crypto.seal(plain)?;
-    let name = hex(&Sha256::digest(&sealed));
+    let (name, sealed) = seal_named(crypto, plain)?;
     backend.write(&name, &sealed)?;
     Ok(name)
+}
+
+/// A payload sealed as an unpacked repo file, and the name it is stored
+/// under: known before anything is written.
+fn seal_named(crypto: &RepoCrypto, plain: &[u8]) -> Result<(String, Vec<u8>)> {
+    let sealed = crypto.seal(plain)?;
+    Ok((hex(&Sha256::digest(&sealed)), sealed))
 }
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
@@ -1083,6 +1211,10 @@ mod tests {
         // every write fails (reads and removes keep working, like a backend
         // that turned read-only or an object store rejecting PUTs).
         fail_writes: std::sync::atomic::AtomicBool,
+        // A write that is stored and then reported as failed — a timeout
+        // after the server committed — and a backend that cannot delete.
+        report_write_failure: std::sync::atomic::AtomicBool,
+        fail_removes: std::sync::atomic::AtomicBool,
     }
 
     impl MemLockBackend {
@@ -1091,6 +1223,8 @@ mod tests {
                 files: Mutex::new(HashMap::new()),
                 on_write: Mutex::new(None),
                 fail_writes: std::sync::atomic::AtomicBool::new(false),
+                report_write_failure: std::sync::atomic::AtomicBool::new(false),
+                fail_removes: std::sync::atomic::AtomicBool::new(false),
             })
         }
 
@@ -1127,10 +1261,16 @@ mod tests {
             if let Some(hook) = hook {
                 hook(self);
             }
+            if self.report_write_failure.load(Ordering::SeqCst) {
+                bail!("injected failure of a write that was stored");
+            }
             Ok(())
         }
 
         fn remove(&self, name: &str) -> Result<()> {
+            if self.fail_removes.load(Ordering::SeqCst) {
+                bail!("injected remove failure");
+            }
             let _ = self.files.lock().unwrap().remove(name);
             Ok(())
         }
@@ -1465,6 +1605,17 @@ mod tests {
         assert_eq!(backend.count(), 0);
     }
 
+    // A lock for the lock-loss tests: on restic's real timing, so it cannot
+    // go bad by itself however slowly the test is scheduled. A test loses it
+    // with `LockHealth::expire_for_tests`, at the moment it chooses.
+    fn steady_lock(crypto: &RepoCrypto) -> (Arc<MemLockBackend>, RepoLock) {
+        let locks = MemLockBackend::new();
+        let lock =
+            RepoLock::acquire_exclusive(Arc::clone(&locks) as Arc<dyn LockBackend>, crypto.clone())
+                .expect("acquire the lock");
+        (locks, lock)
+    }
+
     // A file that depends on the lock, written by a backend that takes longer
     // than the lock lasts: the write itself succeeds, so only asking the lock
     // again afterwards can tell that the file may already point at pruned
@@ -1473,14 +1624,8 @@ mod tests {
     #[test]
     fn a_file_whose_write_outlasted_the_lock_is_taken_back() {
         let _guard = test_acquire_guard();
-        let locks = MemLockBackend::new();
         let crypto = test_crypto(true);
-        let lock = RepoLock::acquire_exclusive_with_refresh_interval(
-            Arc::clone(&locks) as Arc<dyn LockBackend>,
-            crypto.clone(),
-            Duration::from_millis(20),
-        )
-        .unwrap();
+        let (locks, lock) = steady_lock(&crypto);
 
         let files = MemLockBackend::new();
         let name = lock
@@ -1488,17 +1633,10 @@ mod tests {
             .expect("a healthy lock publishes");
         assert!(files.read(&name).unwrap().is_some());
 
-        // From here no refresh succeeds, and the next write does not return
-        // until the lock has gone bad over it.
-        locks.fail_writes.store(true, Ordering::SeqCst);
+        // The lock is lost while the next write is under way: the hook runs
+        // inside the backend's write, after the file is stored.
         let health = lock.health();
-        files.set_write_hook(Box::new(move |_| {
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            while !health.poisoned() {
-                assert!(std::time::Instant::now() < deadline, "lock never became poisoned");
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        }));
+        files.set_write_hook(Box::new(move |_| health.expire_for_tests()));
         let err = lock
             .write_unpacked_while_held(files.as_ref(), &crypto, b"{\"kept\":false}")
             .expect_err("a write that outlasted the lock must not count as written");
@@ -1506,15 +1644,74 @@ mod tests {
         assert_eq!(files.count(), 1, "only the file written under the healthy lock remains");
         assert!(files.read(&name).unwrap().is_some());
 
+        // From then on a write never reaches the backend.
+        let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&reached);
+        files.set_write_hook(Box::new(move |_| flag.store(true, Ordering::SeqCst)));
         let err = lock
             .write_unpacked_while_held(files.as_ref(), &crypto, b"{\"late\":true}")
             .expect_err("a poisoned lock must not publish at all");
         assert!(format!("{err:#}").contains("nothing was written"), "{err:#}");
+        assert!(!reached.load(Ordering::SeqCst), "the write must not reach the backend");
         assert_eq!(files.count(), 1);
 
-        locks.fail_writes.store(false, Ordering::SeqCst);
         drop(lock);
         assert_eq!(locks.count(), 0);
+    }
+
+    // A backend can report a write as failed that it has stored. With the
+    // lock lost over it, that file is as untrustworthy as one whose write
+    // succeeded, so it is removed too; and when it cannot be removed, the
+    // error has to name it, with what the write and the removal reported.
+    #[test]
+    fn a_failed_write_past_the_lock_is_reconciled() {
+        let _guard = test_acquire_guard();
+        let crypto = test_crypto(true);
+
+        // Stored, reported as failed, lock lost: removed.
+        let (_locks, lock) = steady_lock(&crypto);
+        let files = MemLockBackend::new();
+        files.report_write_failure.store(true, Ordering::SeqCst);
+        let health = lock.health();
+        files.set_write_hook(Box::new(move |_| health.expire_for_tests()));
+        let err = lock
+            .write_unpacked_while_held(files.as_ref(), &crypto, b"{\"n\":1}")
+            .expect_err("the write failed and the lock is lost");
+        let message = format!("{err:#}");
+        assert!(message.contains("removed again"), "{message}");
+        assert!(message.contains("injected failure of a write that was stored"), "{message}");
+        assert_eq!(files.count(), 0, "the stored file must not stay");
+        drop(lock);
+
+        // Stored, lock lost, and the backend cannot remove it: the error
+        // names the file and says so.
+        let (_locks, lock) = steady_lock(&crypto);
+        let files = MemLockBackend::new();
+        files.fail_removes.store(true, Ordering::SeqCst);
+        let health = lock.health();
+        files.set_write_hook(Box::new(move |_| health.expire_for_tests()));
+        let err = lock
+            .write_unpacked_while_held(files.as_ref(), &crypto, b"{\"n\":2}")
+            .expect_err("the lock is lost");
+        let message = format!("{err:#}");
+        let left = files.list().unwrap().remove(0).0;
+        assert!(message.contains("removing it failed"), "{message}");
+        assert!(message.contains("injected remove failure"), "{message}");
+        assert!(message.contains(&left), "the file left behind must be named: {message}");
+        assert!(!message.contains("removed again"), "{message}");
+        drop(lock);
+
+        // Under a healthy lock a failed write is just that, named.
+        let (_locks, lock) = steady_lock(&crypto);
+        let files = MemLockBackend::new();
+        files.fail_writes.store(true, Ordering::SeqCst);
+        let err = lock
+            .write_unpacked_while_held(files.as_ref(), &crypto, b"{\"n\":3}")
+            .expect_err("the write failed");
+        let message = format!("{err:#}");
+        assert!(message.contains("injected write failure"), "{message}");
+        assert!(message.starts_with("writing "), "{message}");
+        drop(lock);
     }
 
     // A rustic_core data backend that keeps its files in memory. `on_write`
@@ -1523,6 +1720,11 @@ mod tests {
     struct MemDataBackend {
         files: Mutex<HashMap<(String, Id), Vec<u8>>>,
         on_write: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        // A write that is stored and then reported as failed, one that fails
+        // without storing anything, and a backend that cannot delete.
+        report_write_failure: std::sync::atomic::AtomicBool,
+        drop_writes: std::sync::atomic::AtomicBool,
+        fail_removes: std::sync::atomic::AtomicBool,
     }
 
     // `FileType` does not hash.
@@ -1584,17 +1786,69 @@ mod tests {
             _cacheable: bool,
             content: BytesList,
         ) -> RusticResult<()> {
-            let _ = self.files.lock().unwrap().insert(file_key(tpe, id), content.into_vec().concat());
+            let dropped = self.drop_writes.load(Ordering::SeqCst);
+            if !dropped {
+                let _ = self
+                    .files
+                    .lock()
+                    .unwrap()
+                    .insert(file_key(tpe, id), content.into_vec().concat());
+            }
             let hook = self.on_write.lock().unwrap().take();
             if let Some(hook) = hook {
                 hook();
+            }
+            if dropped || self.report_write_failure.load(Ordering::SeqCst) {
+                return Err(RusticError::new(ErrorKind::Backend, "injected write failure"));
             }
             Ok(())
         }
 
         fn remove(&self, tpe: FileType, id: &Id, _cacheable: bool) -> RusticResult<()> {
+            if self.fail_removes.load(Ordering::SeqCst) {
+                return Err(RusticError::new(ErrorKind::Backend, "injected remove failure"));
+            }
             let _ = self.files.lock().unwrap().remove(&file_key(tpe, id));
             Ok(())
+        }
+    }
+
+    struct Gated {
+        lock: RepoLock,
+        data: Arc<MemDataBackend>,
+        gate: WriteGate,
+        backend: Arc<dyn WriteBackend>,
+    }
+
+    impl Gated {
+        // A gate armed with a steady lock, over a memory backend.
+        fn new() -> Self {
+            let (_locks, lock) = steady_lock(&test_crypto(true));
+            let data = Arc::new(MemDataBackend::default());
+            let (backends, gate) = gate_writes(&RepositoryBackends::new(
+                Arc::clone(&data) as Arc<dyn WriteBackend>,
+                None,
+            ));
+            gate.arm(&lock);
+            Self { lock, data, gate, backend: backends.repository() }
+        }
+
+        fn id(n: u8) -> Id {
+            format!("{n:02x}").repeat(32).parse().expect("id")
+        }
+
+        fn write(&self, tpe: FileType, n: u8) -> RusticResult<()> {
+            self.backend.write_bytes(tpe, &Self::id(n), false, vec![n].into())
+        }
+
+        fn stored(&self, tpe: FileType, n: u8) -> bool {
+            self.data.files.lock().unwrap().contains_key(&file_key(tpe, &Self::id(n)))
+        }
+
+        // The lock is lost while the next write is under way.
+        fn lose_the_lock_during_the_next_write(&self) {
+            let health = self.lock.health();
+            *self.data.on_write.lock().unwrap() = Some(Box::new(move || health.expire_for_tests()));
         }
     }
 
@@ -1605,57 +1859,142 @@ mod tests {
     #[test]
     fn gated_writes_stop_when_the_lock_is_lost() {
         let _guard = test_acquire_guard();
-        let locks = MemLockBackend::new();
-        let lock = RepoLock::acquire_exclusive_with_refresh_interval(
-            Arc::clone(&locks) as Arc<dyn LockBackend>,
-            test_crypto(true),
-            Duration::from_millis(20),
-        )
-        .unwrap();
 
+        // Unarmed: writes go through.
         let data = Arc::new(MemDataBackend::default());
-        let (backends, gate) = gate_writes(&RepositoryBackends::new(
+        let (backends, _gate) = gate_writes(&RepositoryBackends::new(
             Arc::clone(&data) as Arc<dyn WriteBackend>,
             None,
         ));
-        let gated = backends.repository();
-        let id = |n: u8| -> Id { format!("{n:02x}").repeat(32).parse().expect("id") };
-        let stored = |tpe: FileType, n: u8| {
-            data.files.lock().unwrap().contains_key(&file_key(tpe, &id(n)))
-        };
-        let write = |tpe: FileType, n: u8| gated.write_bytes(tpe, &id(n), false, vec![n].into());
+        backends
+            .repository()
+            .write_bytes(FileType::Pack, &Gated::id(9), false, vec![9].into())
+            .expect("an unarmed gate lets writes through");
+        assert_eq!(data.files.lock().unwrap().len(), 1);
 
-        // Unarmed, and armed with a healthy lock: writes go through, and the
-        // rest of the backend is the inner one.
-        write(FileType::Pack, 1).expect("an unarmed gate lets writes through");
-        gate.arm(&lock);
-        write(FileType::Index, 2).expect("a healthy lock lets writes through");
-        assert!(stored(FileType::Pack, 1) && stored(FileType::Index, 2));
-        assert_eq!(gated.read_full(FileType::Index, &id(2)).unwrap().as_ref(), [2]);
-        assert_eq!(gated.list(FileType::Pack).unwrap(), [id(1)]);
+        // Armed with a healthy lock: writes go through, and the rest of the
+        // backend is the inner one.
+        let gated = Gated::new();
+        gated.write(FileType::Pack, 1).expect("a healthy lock lets writes through");
+        gated.write(FileType::Index, 2).expect("a healthy lock lets writes through");
+        assert!(gated.stored(FileType::Pack, 1) && gated.stored(FileType::Index, 2));
+        assert_eq!(
+            gated.backend.read_full(FileType::Index, &Gated::id(2)).unwrap().as_ref(),
+            [2]
+        );
+        assert_eq!(gated.backend.list(FileType::Pack).unwrap(), [Gated::id(1)]);
 
         // The lock is lost while an index write is under way.
-        locks.fail_writes.store(true, Ordering::SeqCst);
-        let health = lock.health();
-        *data.on_write.lock().unwrap() = Some(Box::new(move || {
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            while !health.poisoned() {
-                assert!(std::time::Instant::now() < deadline, "lock never became poisoned");
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        }));
-        let err = write(FileType::Index, 3).expect_err("the write outlasted the lock");
+        gated.lose_the_lock_during_the_next_write();
+        let err = gated.write(FileType::Index, 3).expect_err("the write outlasted the lock");
         assert!(format!("{err}").contains("removed again"), "{err}");
-        assert!(!stored(FileType::Index, 3), "an index written past the lock must not stay");
+        assert!(format!("{err}").contains(Gated::id(3).to_hex().as_str()), "{err}");
+        assert!(!gated.stored(FileType::Index, 3), "an index written past the lock must not stay");
+        assert!(gated.gate.unconfirmed_removals().is_empty());
 
-        // And afterwards nothing is written at all.
-        let err = write(FileType::Index, 4).expect_err("the lock is lost");
+        // And afterwards a write never reaches the backend.
+        let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&reached);
+        *gated.data.on_write.lock().unwrap() =
+            Some(Box::new(move || flag.store(true, Ordering::SeqCst)));
+        let err = gated.write(FileType::Index, 4).expect_err("the lock is lost");
         assert!(format!("{err}").contains("nothing more is written"), "{err}");
-        assert!(!stored(FileType::Index, 4));
-        assert!(stored(FileType::Pack, 1) && stored(FileType::Index, 2));
+        assert!(!reached.load(Ordering::SeqCst), "the write must not reach the backend");
+        assert!(!gated.stored(FileType::Index, 4));
+        assert!(gated.stored(FileType::Pack, 1) && gated.stored(FileType::Index, 2));
+    }
 
-        locks.fail_writes.store(false, Ordering::SeqCst);
-        drop(lock);
+    // Taking a file back can itself fail, and a write can report failure for
+    // a file it stored. What matters afterwards is whether an index written
+    // past the lock is still there: one that is has to be reported by name,
+    // because it may name packs a prune deleted; one that is gone, or was
+    // never stored, must not be reported at all.
+    #[test]
+    fn an_index_that_could_not_be_taken_back_is_reported() {
+        let _guard = test_acquire_guard();
+        let index_3 = format!("index {}", Gated::id(3).to_hex().as_str());
+
+        // Stored, reported as failed: removed like a write that succeeded.
+        let gated = Gated::new();
+        gated.data.report_write_failure.store(true, Ordering::SeqCst);
+        gated.lose_the_lock_during_the_next_write();
+        let err = gated.write(FileType::Index, 3).expect_err("failed, and the lock is lost");
+        assert!(format!("{err}").contains("removed again"), "{err}");
+        assert!(format!("{err}").contains("injected write failure"), "{err}");
+        assert!(!gated.stored(FileType::Index, 3));
+        assert!(gated.gate.unconfirmed_removals().is_empty());
+
+        // Stored and not removable: reported, by name.
+        let gated = Gated::new();
+        gated.data.fail_removes.store(true, Ordering::SeqCst);
+        gated.lose_the_lock_during_the_next_write();
+        let err = gated.write(FileType::Index, 3).expect_err("the lock is lost");
+        assert!(format!("{err}").contains("removing it failed"), "{err}");
+        assert!(format!("{err}").contains(&index_3), "{err}");
+        assert!(gated.stored(FileType::Index, 3));
+        assert_eq!(gated.gate.unconfirmed_removals(), std::slice::from_ref(&index_3));
+
+        // Never stored, and the removal fails: nothing is there, so nothing
+        // is left behind.
+        let gated = Gated::new();
+        gated.data.drop_writes.store(true, Ordering::SeqCst);
+        gated.data.fail_removes.store(true, Ordering::SeqCst);
+        gated.lose_the_lock_during_the_next_write();
+        let err = gated.write(FileType::Index, 3).expect_err("failed, and the lock is lost");
+        assert!(format!("{err}").contains("removed again"), "{err}");
+        assert!(gated.gate.unconfirmed_removals().is_empty());
+
+        // A pack nothing names is waste, not damage: not reported.
+        let gated = Gated::new();
+        gated.data.fail_removes.store(true, Ordering::SeqCst);
+        gated.lose_the_lock_during_the_next_write();
+        let _ = gated.write(FileType::Pack, 5).expect_err("the lock is lost");
+        assert!(gated.gate.unconfirmed_removals().is_empty());
+    }
+
+    // rustic_core's packer threads can still be writing when `merge_trees` has
+    // returned an error. Closing the gate is what makes it safe to give up
+    // the lock then: it must not return while a write is under way, and no
+    // write may start after it.
+    #[test]
+    fn closing_the_gate_waits_for_writes_and_refuses_later_ones() {
+        let _guard = test_acquire_guard();
+        let gated = Gated::new();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        *gated.data.on_write.lock().unwrap() = Some(Box::new(move || {
+            started_tx.send(()).expect("signal the write is under way");
+            release_rx.recv().expect("wait to be released");
+        }));
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| gated.write(FileType::Pack, 1));
+            started_rx.recv().expect("the write is under way");
+            let closer = scope.spawn(|| {
+                gated.gate.close();
+                closed.store(true, Ordering::SeqCst);
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(
+                !closed.load(Ordering::SeqCst),
+                "close returned while a write was still under way"
+            );
+            release_tx.send(()).expect("release the write");
+            writer.join().unwrap().expect("the write under way completes");
+            closer.join().unwrap();
+        });
+        assert!(closed.load(Ordering::SeqCst));
+        assert!(gated.stored(FileType::Pack, 1));
+
+        let err = gated.write(FileType::Index, 2).expect_err("the gate is closed");
+        assert!(format!("{err}").contains("is over"), "{err}");
+        assert!(!gated.stored(FileType::Index, 2));
+
+        // The guard does the same when it goes out of scope.
+        let gated = Gated::new();
+        drop(gated.gate.close_on_drop());
+        assert!(gated.write(FileType::Pack, 1).is_err());
     }
 
     // The same outage with nobody asking until it is over: a holder busy

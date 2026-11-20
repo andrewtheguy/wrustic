@@ -3918,8 +3918,8 @@ mod tests {
     // 80×24 terminal, and with snapshots that have far more to list than fits.
     #[test]
     fn merge_confirmation_shows_every_consequence_on_an_80x24_terminal() {
-        let snapshot = |id: &str, time: &str, tags: &[&str], paths: &[&str]| {
-            let mut r = row("fileserver-01.example.internal", tags, paths);
+        let snapshot = |id: &str, host: &str, time: &str, tags: &[&str], paths: &[&str]| {
+            let mut r = row(host, tags, paths);
             r.id = id.repeat(16);
             r.time = time.into();
             r
@@ -3927,12 +3927,26 @@ mod tests {
         let many: Vec<String> =
             (0..40).map(|i| format!("/srv/projects/department-{i:02}/shared-documents")).collect();
         let many: Vec<&str> = many.iter().map(String::as_str).collect();
-        for (case, older_paths) in
-            [("ordinary", vec!["/srv/data"]), ("forty long paths", many)]
-        {
+        let host = "fileserver-01.example.internal";
+        for (case, older_host, older_paths, host_line) in [
+            ("ordinary", host, vec!["/srv/data"], "host   fileserver-01.example.internal"),
+            ("forty long paths", host, many, "host   fileserver-01.example.internal"),
+            (
+                "two hosts",
+                "nas",
+                vec!["/srv/data"],
+                "host   fileserver-01.example.internal+nas  (two hosts: no backup's parent)",
+            ),
+        ] {
             let mut app = boot_app_with_snapshots(vec![
-                snapshot("abcd", "2026-11-20 06:50:55", &["added", "weekly"], &["/srv/data/extra"]),
-                snapshot("1234", "2026-11-19 22:05:10", &["base", "nightly"], &older_paths),
+                snapshot(
+                    "abcd",
+                    host,
+                    "2026-11-20 06:50:55",
+                    &["added", "weekly"],
+                    &["/srv/data/extra"],
+                ),
+                snapshot("1234", older_host, "2026-11-19 22:05:10", &["base", "nightly"], &older_paths),
             ]);
             app.screen = Screen::Snapshots;
             app.list_state.select(Some(1));
@@ -3956,8 +3970,14 @@ mod tests {
             ] {
                 assert!(text.contains(consequence), "{case}: `{consequence}` missing:\n{lines:#?}");
             }
-            for shown in ["abcdabcd", "12341234", "tags   added, base, nightly, weekly", "y merge"]
-            {
+            for shown in [
+                "abcdabcd",
+                "12341234",
+                host_line,
+                "paths  /srv/",
+                "tags   added, base, nightly, weekly",
+                "y merge",
+            ] {
                 assert!(text.contains(shown), "{case}: `{shown}` missing:\n{lines:#?}");
             }
         }

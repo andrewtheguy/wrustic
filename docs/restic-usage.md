@@ -60,7 +60,12 @@ itself will never run them:
 - `restic backup` — creating snapshots. That is the whole of an ordinary
   backup flow; the merge is for special cases such as adding content to an
   existing snapshot, and there too the backup is restic's: back up only
-  the new file or directory, then merge the two in wrustic
+  the new file or directory, then merge the two in wrustic. The two
+  backups have to use one layout — restic records a file under the path it
+  was backed up from, and the merge lines files up by that path alone,
+  whatever host or tags the snapshots share. With `restic backup /data` as
+  the base, the addition is `restic backup /data/extra`: the directory in
+  its place inside the base, not a copy of it somewhere else
 - maintenance beyond prune: `repair`, `migrate`, key management
 
 Description edits are not planned — `description` is a rustic-only

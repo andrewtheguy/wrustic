@@ -239,7 +239,22 @@ lists, restores, checks, forgets and prunes like any other.
   lock is poisoned, and a file whose write returned after the lock went
   bad is removed again and the write reported as failed, which fails
   `merge_trees`. What stays was written under a lock that had been healthy
-  all along.
+  all along. Two more things the gate is for:
+  - *Ending the writes.* rustic_core's packer stores packs on threads it
+    waits for only when it finishes normally; after an error return they
+    may still be writing a pack and the index entry for it. So the gate is
+    closed (`WriteGate::close`) as soon as `merge_trees` returns, and by a
+    guard on every other way out: closing waits for the writes under way
+    and refuses any that follow, and only then is the lock given up.
+  - *Saying what could not be taken back.* A write that reports an error
+    may have been stored all the same, so with the lock lost the file is
+    removed either way; and a removal that fails counts as done only if a
+    listing shows the file is not there. An index file that is still
+    there is named in the merge's error instead of the usual "the next
+    prune removes the trees" — it may name packs a prune deleted, and has
+    to be removed by hand. (A stale index entry does not spread by
+    itself: checked against restic 0.19.1, whose prune rebuilt the index
+    without an entry for an unused pack that no longer existed.)
   The lock is checked once more when the snapshot write has returned
   (`RepoLock::write_unpacked_while_held`), because the write itself can
   outlast the lock: restic gets out of this by cancelling the backend
@@ -251,7 +266,10 @@ lists, restores, checks, forgets and prunes like any other.
   was refreshed in time throughout (poisoning latches), so no prune can
   have started before the snapshot existed; a poisoned one means the
   snapshot may name pruned trees, and it is removed again and the merge
-  reported as failed.
+  reported as failed. The snapshot's name is the hash of what is written,
+  so it is known before the write: a write that failed is treated as
+  possibly stored and removed too once the lock is lost, and an error
+  names the file whenever its removal could not be confirmed.
 - **Trees** go through rustic_core's `Repository::merge_trees`: entries are
   matched by path from the root, an entry only one snapshot has is taken
   as is, directories are merged recursively, and where the same path
@@ -259,15 +277,24 @@ lists, restores, checks, forgets and prunes like any other.
   file content is read or stored again.
 - **The snapshot file is wrustic's own**, written through the same
   unpacked-file envelope as a tag edit and read back through rustic_core
-  before the call returns. rustic_core's `merge_snapshots` is not used: it
+  before the call returns — a snapshot that cannot be read back, or does
+  not read back as written, is removed again, and the error says whether
+  the removal worked. rustic_core's `merge_snapshots` is not used: it
   stamps the *merging* machine's hostname and user, and keeps nested paths
   apart (`/data` + `/data/extra`), and restic picks a backup's parent by
   exact hostname and path set — so the next `restic backup /data` would
   not find the merged snapshot and would read every file again. The file
   is built field by field in restic's layout
   (`repo::merged_snapshot_json`):
-  - `hostname`, `username`, `uid`, `gid` — the newest source's, copied as
-    stored.
+  - `username`, `uid`, `gid` — the newest source's, copied as stored.
+  - `hostname` — the sources' own when they share one, which is what lets
+    that host's next backup find the merged snapshot. Sources of several
+    hosts get a name made of all of them, joined with `+`
+    (`repo::merged_hostname`; no hostname contains a `+`): such a merge
+    holds another machine's files, and a backup that took it for its
+    parent would compare its own files against those. So the guarantee
+    that the next backup uses the merged snapshot as its parent holds for
+    sources of one host only.
   - `time` — the newest source's plus one nanosecond, in the same UTC
     offset (`repo::just_after`). The merged snapshot is as recent as its
     newest data, and has to be strictly the latest: restic takes the latest
@@ -337,7 +364,9 @@ lists, restores, checks, forgets and prunes like any other.
     given the same device number. restic restores such a merged snapshot
     with every one of those files holding the first one's bytes. The
     merge is refused when a file's content differs from that of a
-    multi-link file with its device and inode. Two backups of one
+    multi-link file with its device and inode — or its permissions do:
+    links of one file share one mode, so two recorded modes cannot both
+    be restored. Two backups of one
     directory with a hardlinked file changed in between differ in the
     sources and merge fine, both links coming from the newer.
 - **How much is rewritten depends on the timezone.** rustic_core renders
@@ -362,12 +391,15 @@ new or changed), `live_native_merge_restores_hardlinks_with_restic`
 both sources as separate groups with their own bytes; the renamed-and-
 rewritten pair, which restic restores as four links to one file when
 merged regardless, and the file that fell to one link before it was moved
-and rewritten are refused with nothing written) and
+and rewritten are refused before a snapshot is written — the trees the
+attempt stored stay unreferenced, for the next prune to reclaim) and
 `live_native_merge_quoted_names_and_parent_with_restic` (a directory
 holding `"a` and `A` merged with a later backup of `A` is refused; `"a`
 and `b`, which sort one way either way, merge and restore byte for byte;
 after two backups of one directory are merged, restic lists the merged
-snapshot as strictly the latest and takes it as the next backup's parent).
+snapshot as strictly the latest and takes it as the next backup's parent;
+a merge of one directory's backups as two hosts is listed as `alpha+beta`,
+and the next backup as either host takes that host's own last backup).
 
 **Long-running reads — non-exclusive lock (implemented):** the snapshot
 SMB share (`smb::ShareServer::share_snapshot`). Reads take no lock in wrustic's
@@ -509,6 +541,14 @@ and an already poisoned lock writes nothing.
 `lock::tests::gated_writes_stop_when_the_lock_is_lost` does the same for
 what rustic_core writes through the gate: an index whose write outlasted
 the lock does not stay, and nothing is written after it.
+`a_failed_write_past_the_lock_is_reconciled` and
+`an_index_that_could_not_be_taken_back_is_reported` cover a write that
+reports failure for a file it stored and a removal that fails, and
+`closing_the_gate_waits_for_writes_and_refuses_later_ones` that the gate
+does not close over a write under way. These tests lose the lock at a
+point they choose (`LockHealth::expire_for_tests`, inside the backend's
+write) on a lock with restic's real timing, so a slow scheduler cannot
+lose it for them early.
 
 `shared_open_holds_the_append_lock_for_the_handle_lifetime` covers the other
 direction: the guard `open_indexed_full_shared_lock` hands back is held for

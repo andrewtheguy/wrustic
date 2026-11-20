@@ -547,6 +547,10 @@ pub(crate) fn merge_snapshots(profile: &Profile, snapshot_ids: &[String]) -> Res
     let repo_lock =
         lock::RepoLock::acquire_shared(lock::backend_for_profile(profile)?, crypto.clone())?;
     write_gate.arm(&repo_lock);
+    // Declared after the lock, so dropped before it: no write of rustic_core's
+    // is under way or can start once the lock is given up, however this
+    // function is left.
+    let _writes_end_before_the_lock = write_gate.close_on_drop();
     // The full index, not the ids-only one: the scan for dropped metadata
     // reads raw tree blobs, which rustic_core only offers on a fully indexed
     // repository.
@@ -583,6 +587,11 @@ pub(crate) fn merge_snapshots(profile: &Profile, snapshot_ids: &[String]) -> Res
     let started = rustic_core::jiff::Timestamp::now();
     let mut summary = SnapshotSummary::default();
     let merged = repo.merge_trees(&trees, &last_modified_node, &mut summary);
+    // `merge_trees` waits for the threads that store its packs only when it
+    // succeeds; after an error they may still be writing. Nothing below
+    // writes through rustic_core, so the gate is closed here already: that
+    // waits for those writes and refuses any that would follow.
+    write_gate.close();
     let finished = rustic_core::jiff::Timestamp::now();
 
     // restic's abort-if-unrefreshable rule: a lock that went unrefreshed for
@@ -590,6 +599,18 @@ pub(crate) fn merge_snapshots(profile: &Profile, snapshot_ids: &[String]) -> Res
     // could have run — the merged tree may refer to blobs that are gone. It
     // is also why `merge_trees` failed, if it did: the gate refused a write.
     if repo_lock.poisoned() {
+        // What the gate could not take back is worse than orphaned trees:
+        // an index file left behind may name packs that prune deleted.
+        let left_behind = write_gate.unconfirmed_removals();
+        if !left_behind.is_empty() {
+            bail!(
+                "the repository lock could not be refreshed in time, so the merge was \
+                 abandoned before writing its snapshot — but {} had been written after the \
+                 lock was lost and could not be removed again. It may name packs a prune has \
+                 deleted: remove it from the repository and run `restic check`",
+                left_behind.join(", ")
+            );
+        }
         bail!(
             "the repository lock could not be refreshed in time, so the merge was abandoned \
              before writing its snapshot; nothing refers to the trees it wrote, and the next \
@@ -639,12 +660,22 @@ pub(crate) fn merge_snapshots(profile: &Profile, snapshot_ids: &[String]) -> Res
     let new_id = repo_lock.write_unpacked_while_held(snapshots.as_ref(), &crypto, &json)?;
     // Same proof the tag edit asks for: an independent reader decodes our
     // envelope to exactly the JSON we meant to store.
-    let readback = repo
-        .cat_file(FileType::Snapshot, &new_id)
-        .map_err(|e| anyhow!("verifying merged snapshot {new_id}: {e}"))?;
-    if readback.as_ref() != json.as_slice() {
-        let _ = snapshots.remove(&new_id);
-        bail!("merged snapshot {new_id} did not read back as written; it was removed again");
+    // A snapshot that cannot be shown to be what was meant is not left
+    // standing behind an error: it is removed, and the error says whether
+    // that worked.
+    let problem = match repo.cat_file(FileType::Snapshot, &new_id) {
+        Ok(readback) if readback.as_ref() == json.as_slice() => None,
+        Ok(_) => Some("did not read back as written".to_string()),
+        Err(e) => Some(format!("could not be read back ({e})")),
+    };
+    if let Some(problem) = problem {
+        match snapshots.remove(&new_id) {
+            Ok(()) => bail!("merged snapshot {new_id} {problem}; it was removed again"),
+            Err(e) => bail!(
+                "merged snapshot {new_id} {problem}, and removing it failed ({e:#}); it is \
+                 still in the repository, unverified"
+            ),
+        }
     }
     Ok(MergeOutcome {
         snapshot_id: new_id,
@@ -799,6 +830,7 @@ struct RawFile {
     /// Device and inode.
     identity: (u64, u64),
     links: u64,
+    mode: u64,
     content: serde_json::Value,
 }
 
@@ -811,6 +843,7 @@ impl RawFile {
         Some(Self {
             identity: (number("device_id"), number("inode")),
             links: number("links"),
+            mode: number("mode"),
             // An empty file is `null` to restic and `[]` to rustic_core.
             content: match node.get("content") {
                 Some(content) if !content.is_null() => content.clone(),
@@ -839,14 +872,17 @@ impl RawFile {
 /// count — a hardlink to it. Within one backup these are the links of one
 /// file. Across two they need not be: an inode rewritten or reused under
 /// another path, or two filesystems given the same device number, and files
-/// with different content are restored as one. The first walk collects the
-/// groups, the second holds every file against them.
+/// with different content are restored as one. Links of one file also share
+/// its permissions, so files that agree in content but not in mode cannot
+/// both come back as recorded either. The first walk collects the groups, the
+/// second holds every file against them.
 fn merged_tree_defect<B: AsRef<[u8]>>(
     root: TreeId,
     read_tree: impl Fn(&TreeId) -> Result<B>,
 ) -> Result<Option<String>> {
     let mut defect = None;
-    // (device, inode) → the content and path of a file with several links.
+    // (device, inode) → the content, mode and path of a file with several
+    // links.
     let mut groups = std::collections::HashMap::new();
     visit_raw_trees(&[root], &read_tree, |dir, nodes| {
         let mut previous: Option<(&str, Vec<u8>)> = None;
@@ -874,7 +910,7 @@ fn merged_tree_defect<B: AsRef<[u8]>>(
             {
                 let _ = groups
                     .entry(file.identity)
-                    .or_insert_with(|| (file.content, format!("{dir}/{name}")));
+                    .or_insert_with(|| (file.content, file.mode, format!("{dir}/{name}")));
             }
         }
         Ok(())
@@ -886,13 +922,19 @@ fn merged_tree_defect<B: AsRef<[u8]>>(
         for node in nodes {
             if let Some(file) = RawFile::of(node)
                 && defect.is_none()
-                && let Some((content, first)) = groups.get(&file.identity)
-                && *content != file.content
+                && let Some((content, mode, first)) = groups.get(&file.identity)
+                && (*content != file.content || *mode != file.mode)
             {
+                let differ = if *content != file.content {
+                    "hold different content, and restic would restore them as hardlinks of \
+                     one file, both with the content of one"
+                } else {
+                    "have different permissions, and restic would restore them as hardlinks \
+                     of one file, which has only one set"
+                };
                 defect = Some(format!(
                     "`{first}` and `{dir}/{}` are recorded under one device and inode but \
-                     hold different content, and restic would restore them as hardlinks of \
-                     one file, both with the content of one",
+                     {differ}",
                     raw_name(node)
                 ));
             }
@@ -940,8 +982,12 @@ fn json_is_empty(value: &serde_json::Value) -> bool {
 /// what it contains — `restic backup` picks its parent by exact hostname and
 /// path set:
 ///
-/// - `hostname`, `username`, `uid`, `gid` come from the newest source
-///   (`newest` indexes `sources`), copied as stored.
+/// - `username`, `uid`, `gid` come from the newest source (`newest` indexes
+///   `sources`), copied as stored.
+/// - `hostname` is the sources' own where they share one, and otherwise a
+///   name of its own made of all of theirs ([`merged_hostname`]) — a merge
+///   across hosts is not a backup of either, and must not be taken for the
+///   parent of one.
 /// - `time` is the newest source's plus one nanosecond ([`just_after`]): as
 ///   recent as its newest data, and still the *latest* of the snapshots that
 ///   match — restic takes the latest as parent and leaves a tie to chance,
@@ -992,7 +1038,15 @@ fn merged_snapshot_json(
     let _ = snapshot.insert("time".into(), json!(just_after(time)?));
     let _ = snapshot.insert("tree".into(), json!(tree));
     let _ = snapshot.insert("paths".into(), json!(merged_paths(&strings("paths")?)));
-    for key in ["hostname", "username", "uid", "gid"] {
+    let hosts: Vec<&str> = sources
+        .iter()
+        .map(|source| source.get("hostname").and_then(Value::as_str).unwrap_or(""))
+        .collect();
+    // No source names a host: nor does the merged snapshot.
+    if hosts.iter().any(|host| !host.is_empty()) {
+        let _ = snapshot.insert("hostname".into(), json!(merged_hostname(&hosts)));
+    }
+    for key in ["username", "uid", "gid"] {
         if let Some(value) = newest.get(key) {
             let _ = snapshot.insert(key.into(), value.clone());
         }
@@ -1048,6 +1102,24 @@ fn just_after(time: &str) -> Result<String> {
         }
         _ => later.to_string(),
     })
+}
+
+/// The hostname of a merged snapshot. Sources of one host keep it, which is
+/// what lets `restic backup` on that host find the merged snapshot as its
+/// parent (it looks for its own hostname and path set). Sources of several
+/// hosts get a name made of all of them, joined with `+` — a character no
+/// hostname has, so the name is nobody's and no backup takes the merged
+/// snapshot for its parent: it would be compared against another machine's
+/// files. A source without a hostname counts as `unknown`.
+pub(crate) fn merged_hostname(hosts: &[&str]) -> String {
+    let distinct: std::collections::BTreeSet<&str> = hosts
+        .iter()
+        .map(|host| if host.is_empty() { "unknown" } else { host })
+        .collect();
+    if hosts.iter().all(|host| host == &hosts[0]) {
+        return hosts.first().copied().unwrap_or_default().to_string();
+    }
+    distinct.into_iter().collect::<Vec<_>>().join("+")
 }
 
 /// The path set of a merged snapshot: every source path, sorted, without
@@ -1773,7 +1845,7 @@ mod tests {
             "parent": "22",
             "tree": "33",
             "paths": ["/home/it3/extra", "/mnt/usb"],
-            "hostname": "laptop",
+            "hostname": "it3s-MBP-4",
             "username": "root",
             "excludes": ["*.tmp"],
             "tags": ["keep", "added"],
@@ -1804,7 +1876,7 @@ mod tests {
             "just after the newest source, in its offset"
         );
         assert_eq!(v["tree"], serde_json::json!(tree));
-        assert_eq!(v["hostname"], "laptop");
+        assert_eq!(v["hostname"], "it3s-MBP-4", "both sources are this host's");
         assert_eq!(v["username"], "root");
         assert_eq!(
             v["paths"],
@@ -1826,7 +1898,55 @@ mod tests {
         // rustic_core reads it back as a snapshot of the merged tree.
         let typed: SnapshotFile = serde_json::from_slice(&out).unwrap();
         assert_eq!(typed.tree.to_hex().as_str(), tree);
-        assert_eq!(typed.hostname, "laptop");
+        assert_eq!(typed.hostname, "it3s-MBP-4");
+    }
+
+    // restic looks for a backup's parent by hostname and paths. A merge of
+    // two hosts' snapshots holds another machine's files, so it must not
+    // answer to either host's name — while sources of one host keep theirs.
+    #[test]
+    fn merged_snapshot_of_two_hosts_is_named_for_both() {
+        assert_eq!(merged_hostname(&["laptop", "laptop"]), "laptop");
+        assert_eq!(merged_hostname(&["laptop"]), "laptop");
+        assert_eq!(merged_hostname(&["nas", "laptop"]), "laptop+nas");
+        assert_eq!(merged_hostname(&["nas", "laptop", "nas"]), "laptop+nas");
+        assert_eq!(merged_hostname(&["laptop", ""]), "laptop+unknown");
+        assert_eq!(merged_hostname(&["", ""]), "");
+
+        let source = |host: Option<&str>, time: &str| {
+            let mut v = serde_json::json!({"time": time, "tree": "11", "paths": ["/data"]});
+            if let Some(host) = host {
+                v["hostname"] = serde_json::json!(host);
+            }
+            v
+        };
+        let hostname_of = |sources: &[serde_json::Value]| {
+            let out = merged_snapshot_json(
+                sources,
+                0,
+                &"ab".repeat(32),
+                &summary_for_tests(),
+                "2026-11-20T10:00:00Z",
+                "2026-11-20T10:00:01Z",
+            )
+            .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&out).unwrap().get("hostname").cloned()
+        };
+        let (newer, older) = ("2026-02-01T00:00:00Z", "2026-01-01T00:00:00Z");
+        assert_eq!(
+            hostname_of(&[source(Some("nas"), newer), source(Some("nas"), older)]),
+            Some(serde_json::json!("nas"))
+        );
+        assert_eq!(
+            hostname_of(&[source(Some("nas"), newer), source(Some("laptop"), older)]),
+            Some(serde_json::json!("laptop+nas")),
+            "not the newest source's alone"
+        );
+        assert_eq!(
+            hostname_of(&[source(Some("nas"), newer), source(None, older)]),
+            Some(serde_json::json!("nas+unknown"))
+        );
+        assert_eq!(hostname_of(&[source(None, newer), source(None, older)]), None);
     }
 
     #[test]
@@ -2071,6 +2191,27 @@ mod tests {
         assert!(found.contains("hardlinks of one file"), "{found}");
         assert!(found.contains("`/p`") || found.contains("`/w`"), "{found}");
 
+        // The same content under different permissions: one inode has one
+        // mode, so the two cannot both be restored as recorded.
+        let with_mode = |name: &str, links: u64, mode: u64| {
+            let mut file = raw_file(name, links, 1, 7, "aa");
+            file["mode"] = serde_json::json!(mode);
+            file
+        };
+        assert_eq!(
+            defect_of(&[(1, vec![with_mode("p", 2, 0o644), with_mode("q", 2, 0o644)])]),
+            None
+        );
+        for other_links in [2, 1] {
+            let found = defect_of(&[(
+                1,
+                vec![with_mode("p", 2, 0o644), with_mode("q", other_links, 0o600)],
+            )])
+            .expect("one inode recorded with two modes");
+            assert!(found.contains("different permissions"), "{found}");
+            assert!(found.contains("hardlinks of one file"), "{found}");
+        }
+
         // One whose link count fell to one before it was rewritten, in
         // another directory, and listed before the group it would join. Only
         // a restic backup records this (rustic_core's leaves the device of a
@@ -2290,7 +2431,6 @@ mod tests {
         assert_eq!(rows.len(), 3, "both sources are kept");
         let row = |id: &str| rows.iter().find(|r| r.id == id).expect("snapshot listed");
         let (m, newer) = (row(&merged), row(&second));
-        assert_eq!(m.time, newer.time);
         assert_eq!(m.host, newer.host);
         assert_eq!(m.paths, newer.paths, "both sources back up the same path");
         assert_eq!(m.tags, ["both", "one", "two"]);
@@ -2298,6 +2438,17 @@ mod tests {
         // The merged tree: everything from both, the newer mtime winning each
         // conflict whichever snapshot it came from.
         let repo = open_indexed(fixture.profile()).expect("open the repository");
+        // The time as stored, which the list has cut to the second: exactly
+        // one nanosecond after the newer source's.
+        let stored_time = |id: &str| -> rustic_core::jiff::Timestamp {
+            let raw = repo.cat_file(FileType::Snapshot, id).expect("read the snapshot file");
+            let snapshot: serde_json::Value = serde_json::from_slice(&raw).expect("snapshot json");
+            snapshot["time"].as_str().expect("a time").parse().expect("an RFC 3339 time")
+        };
+        assert_eq!(
+            stored_time(&merged).duration_since(stored_time(&second)),
+            rustic_core::jiff::SignedDuration::from_nanos(1)
+        );
         let preview = preview_snapshot_contents(&repo, &merged, 1000).expect("walk merged tree");
         let size_of = |suffix: &str| {
             preview
@@ -2598,6 +2749,29 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    // The path restic shows for a file inside a snapshot, from the path the
+    // filesystem knows it by. The same on Unix. On Windows a snapshot has the
+    // volume as its first directory and forward slashes throughout:
+    // `C:\Users\me` is `/C/Users/me`.
+    fn restic_archive_path(fs_path: &str) -> String {
+        if fs_path.starts_with('/') {
+            return fs_path.to_string();
+        }
+        // `std::fs::canonicalize` answers in the verbatim form.
+        let path = fs_path.strip_prefix(r"\\?\").unwrap_or(fs_path).replace('\\', "/");
+        match path.split_once(':') {
+            Some((volume, rest)) => format!("/{volume}{rest}"),
+            None => format!("/{path}"),
+        }
+    }
+
+    #[test]
+    fn restic_archive_paths_have_the_volume_as_a_directory() {
+        assert_eq!(restic_archive_path("/home/me/data"), "/home/me/data");
+        assert_eq!(restic_archive_path(r"C:\Users\me\data"), "/C/Users/me/data");
+        assert_eq!(restic_archive_path(r"\\?\D:\ci\tmp\data"), "/D/ci/tmp/data");
+    }
+
     // End-to-end interop for the native merge, which restic has no command
     // for: what matters is that restic treats the result as an ordinary
     // snapshot. restic backs up a directory and then, separately, one new
@@ -2701,8 +2875,11 @@ mod tests {
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
             .filter_map(|v| v.get("path").and_then(|p| p.as_str()).map(str::to_string))
             .collect();
+        // `ls` prints paths as the snapshot holds them, which on Windows is
+        // not how the filesystem spells them.
+        let data_in_snapshot = restic_archive_path(data_str);
         for file in ["docs/a.txt", "keep.txt", "extra/n.txt", "extra/sub/n2.txt"] {
-            let want = format!("{data_str}/{file}");
+            let want = format!("{data_in_snapshot}/{file}");
             assert!(ls_paths.contains(&want), "{want} missing from restic ls: {ls_paths:?}");
         }
         assert!(!ls_paths.iter().any(|p| p.ends_with("skip.o")));
@@ -2988,6 +3165,49 @@ mod tests {
             .find(|s| s["id"] == summary["snapshot_id"])
             .expect("the new snapshot is listed");
         assert_eq!(latest["parent"], serde_json::json!(merged));
+
+        // The same directory backed up as two hosts: the merged snapshot is
+        // named for both, and the next backup as either host passes it over
+        // for that host's own last backup.
+        let hosts = root.join("source/hosts");
+        std::fs::create_dir_all(&hosts).unwrap();
+        std::fs::write(hosts.join("f"), b"from alpha\n").unwrap();
+        let backup_as = |host: &str, tag: &str| -> serde_json::Value {
+            let out = crate::restic::run(
+                &profile,
+                &["backup", hosts.to_str().unwrap(), "--host", host, "--tag", tag, "--json"],
+            )
+            .unwrap_or_else(|e| panic!("restic backup as {host}: {e:#}"));
+            String::from_utf8(out)
+                .unwrap()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find(|v| v["message_type"] == "summary")
+                .expect("restic backup summary")
+        };
+        backup_as("alpha", "hosts-alpha");
+        std::fs::write(hosts.join("g"), b"from beta\n").unwrap();
+        backup_as("beta", "hosts-beta");
+        let beta = snapshot_tagged("hosts-beta");
+        let merged = merge_snapshots(&profile, &[snapshot_tagged("hosts-alpha"), beta.clone()])
+            .expect("native merge across hosts")
+            .snapshot_id;
+        let listed = restic_snapshots();
+        let merged_listed = listed
+            .iter()
+            .find(|s| s["id"] == serde_json::json!(merged))
+            .expect("restic lists the merged snapshot");
+        assert_eq!(merged_listed["hostname"], "alpha+beta");
+        let summary = backup_as("beta", "hosts-next");
+        let latest = restic_snapshots()
+            .into_iter()
+            .find(|s| s["id"] == summary["snapshot_id"])
+            .expect("the new snapshot is listed");
+        assert_eq!(
+            latest["parent"],
+            serde_json::json!(beta),
+            "beta's backup must take beta's own, not the merge of two hosts"
+        );
 
         crate::restic::run(&profile, &["check", "--read-data", "--json"])
             .expect("restic check");
