@@ -36,10 +36,12 @@
   nodes, so the merged snapshot is without what that type cannot hold
   (restic's Windows `generic_attributes`), it rewrites every directory
   when the trees were written in another timezone, and it has to refuse
-  sources that record one hardlink identity on different content, where
-  giving the files separate identities would do (docs/locking.md, "Native
-  snapshot merge"). Merging the tree JSON itself would lift all three
-  limits and write only the directories the sources share, but
+  what it cannot write correctly: sources that record one hardlink
+  identity on different content, where giving the files separate
+  identities would do, and directories whose quoted names sort
+  differently from the names (docs/locking.md, "Native snapshot merge").
+  Merging the tree JSON itself would lift all of these limits and write
+  only the directories the sources share, but
   rustic_core has no public way to store a tree blob, so it means wrustic
   writing pack and index files itself — the same trade the lock module
   made for its envelope, at a larger size

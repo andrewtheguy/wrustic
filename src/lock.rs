@@ -26,7 +26,10 @@ use aes256ctr_poly1305aes::{
 };
 use jiff::Timestamp;
 use rand::Rng;
-use rustic_core::{Open, Repository};
+use rustic_core::{
+    BytesList, ErrorKind, FileType, Id, Open, ReadBackend, Repository, RepositoryBackends,
+    RusticError, RusticResult, WriteBackend,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -694,6 +697,136 @@ impl LockHealth {
             state.poisoned = true;
         }
         state.poisoned
+    }
+}
+
+/// Makes everything rustic_core writes through `backends` depend on a lock:
+/// the returned backends are what the repository is opened with, and the
+/// [`WriteGate`] is armed with the lock once it is held (the lock needs the
+/// master key, which only the opened repository has).
+///
+/// This is restic's cancel-on-lost-lock for an operation that cannot be
+/// cancelled. A long rustic_core call — `merge_trees` — writes packs and then
+/// the index files that make them count, and returns only when it is done; a
+/// check of [`RepoLock::poisoned`] afterwards is too late if the lock was
+/// lost in between, because a prune that got in meanwhile deletes packs no
+/// index names yet, and the index written after that names deleted packs.
+/// Behind the gate, a write is refused once the lock is poisoned, and a file
+/// whose write returned after the lock went bad is removed again and reported
+/// as failed — so whatever is left was written under a lock that had been
+/// healthy all along (poisoning latches), which no prune can have preceded.
+pub(crate) fn gate_writes(backends: &RepositoryBackends) -> (RepositoryBackends, WriteGate) {
+    let gate = WriteGate(Arc::new(std::sync::OnceLock::new()));
+    let gated = |inner: Arc<dyn WriteBackend>| -> Arc<dyn WriteBackend> {
+        Arc::new(LockGatedBackend { inner, gate: gate.clone() })
+    };
+    let gated = RepositoryBackends::new(
+        gated(backends.repository()),
+        backends.repo_hot().map(gated),
+    );
+    (gated, gate)
+}
+
+/// See [`gate_writes`]. Lets everything through until it is armed.
+#[derive(Clone)]
+pub(crate) struct WriteGate(Arc<std::sync::OnceLock<LockHealth>>);
+
+impl WriteGate {
+    pub(crate) fn arm(&self, lock: &RepoLock) {
+        let _ = self.0.set(lock.health());
+    }
+
+    fn lock_lost(&self) -> bool {
+        self.0.get().is_some_and(LockHealth::poisoned)
+    }
+}
+
+struct LockGatedBackend {
+    inner: Arc<dyn WriteBackend>,
+    gate: WriteGate,
+}
+
+impl std::fmt::Debug for LockGatedBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LockGatedBackend({})", self.inner.location())
+    }
+}
+
+impl ReadBackend for LockGatedBackend {
+    fn location(&self) -> String {
+        self.inner.location()
+    }
+
+    fn list_with_size(&self, tpe: FileType) -> RusticResult<Vec<(Id, u32)>> {
+        self.inner.list_with_size(tpe)
+    }
+
+    fn list(&self, tpe: FileType) -> RusticResult<Vec<Id>> {
+        self.inner.list(tpe)
+    }
+
+    fn read_full(&self, tpe: FileType, id: &Id) -> RusticResult<bytes::Bytes> {
+        self.inner.read_full(tpe, id)
+    }
+
+    fn read_partial(
+        &self,
+        tpe: FileType,
+        id: &Id,
+        cacheable: bool,
+        offset: u32,
+        length: u32,
+    ) -> RusticResult<bytes::Bytes> {
+        self.inner.read_partial(tpe, id, cacheable, offset, length)
+    }
+
+    fn warmup_path(&self, tpe: FileType, id: &Id) -> String {
+        self.inner.warmup_path(tpe, id)
+    }
+
+    fn needs_warm_up(&self) -> bool {
+        self.inner.needs_warm_up()
+    }
+
+    fn warm_up(&self, tpe: FileType, id: &Id) -> RusticResult<()> {
+        self.inner.warm_up(tpe, id)
+    }
+}
+
+impl WriteBackend for LockGatedBackend {
+    fn create(&self) -> RusticResult<()> {
+        self.inner.create()
+    }
+
+    fn write_bytes(
+        &self,
+        tpe: FileType,
+        id: &Id,
+        cacheable: bool,
+        content: BytesList,
+    ) -> RusticResult<()> {
+        if self.gate.lock_lost() {
+            return Err(RusticError::new(
+                ErrorKind::Backend,
+                "the repository lock could not be refreshed in time; nothing more is written",
+            ));
+        }
+        self.inner.write_bytes(tpe, id, cacheable, content)?;
+        if self.gate.lock_lost() {
+            // Best effort: the caller is told either way, and what stays
+            // behind is a file nothing may rely on.
+            let _ = self.inner.remove(tpe, id, cacheable);
+            return Err(RusticError::new(
+                ErrorKind::Backend,
+                "the repository lock could not be refreshed while a file was being written, \
+                 so the file cannot be trusted and was removed again",
+            ));
+        }
+        Ok(())
+    }
+
+    fn remove(&self, tpe: FileType, id: &Id, cacheable: bool) -> RusticResult<()> {
+        self.inner.remove(tpe, id, cacheable)
     }
 }
 
@@ -1382,6 +1515,147 @@ mod tests {
         locks.fail_writes.store(false, Ordering::SeqCst);
         drop(lock);
         assert_eq!(locks.count(), 0);
+    }
+
+    // A rustic_core data backend that keeps its files in memory. `on_write`
+    // fires once, after the next write has stored its file.
+    #[derive(Default)]
+    struct MemDataBackend {
+        files: Mutex<HashMap<(String, Id), Vec<u8>>>,
+        on_write: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    // `FileType` does not hash.
+    fn file_key(tpe: FileType, id: &Id) -> (String, Id) {
+        (format!("{tpe:?}"), *id)
+    }
+
+    impl std::fmt::Debug for MemDataBackend {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("MemDataBackend")
+        }
+    }
+
+    impl ReadBackend for MemDataBackend {
+        fn location(&self) -> String {
+            "memory".into()
+        }
+
+        fn list_with_size(&self, tpe: FileType) -> RusticResult<Vec<(Id, u32)>> {
+            let files = self.files.lock().unwrap();
+            Ok(files
+                .iter()
+                .filter(|((t, _), _)| *t == format!("{tpe:?}"))
+                .map(|((_, id), data)| (*id, data.len() as u32))
+                .collect())
+        }
+
+        fn read_full(&self, tpe: FileType, id: &Id) -> RusticResult<bytes::Bytes> {
+            self.files
+                .lock()
+                .unwrap()
+                .get(&file_key(tpe, id))
+                .map(|data| data.clone().into())
+                .ok_or_else(|| RusticError::new(ErrorKind::Backend, "no such file"))
+        }
+
+        fn read_partial(
+            &self,
+            tpe: FileType,
+            id: &Id,
+            _cacheable: bool,
+            offset: u32,
+            length: u32,
+        ) -> RusticResult<bytes::Bytes> {
+            let all = self.read_full(tpe, id)?;
+            Ok(all.slice(offset as usize..(offset + length) as usize))
+        }
+
+        fn warmup_path(&self, _tpe: FileType, id: &Id) -> String {
+            id.to_hex().as_str().to_string()
+        }
+    }
+
+    impl WriteBackend for MemDataBackend {
+        fn write_bytes(
+            &self,
+            tpe: FileType,
+            id: &Id,
+            _cacheable: bool,
+            content: BytesList,
+        ) -> RusticResult<()> {
+            let _ = self.files.lock().unwrap().insert(file_key(tpe, id), content.into_vec().concat());
+            let hook = self.on_write.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+            Ok(())
+        }
+
+        fn remove(&self, tpe: FileType, id: &Id, _cacheable: bool) -> RusticResult<()> {
+            let _ = self.files.lock().unwrap().remove(&file_key(tpe, id));
+            Ok(())
+        }
+    }
+
+    // What `merge_trees` writes goes through the gate: packs first, then the
+    // index that names them. Once the lock is lost — which is when a prune may
+    // delete packs no index names yet — no index may be written any more, and
+    // one whose write was under way when the lock went bad must not stay.
+    #[test]
+    fn gated_writes_stop_when_the_lock_is_lost() {
+        let _guard = test_acquire_guard();
+        let locks = MemLockBackend::new();
+        let lock = RepoLock::acquire_exclusive_with_refresh_interval(
+            Arc::clone(&locks) as Arc<dyn LockBackend>,
+            test_crypto(true),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+
+        let data = Arc::new(MemDataBackend::default());
+        let (backends, gate) = gate_writes(&RepositoryBackends::new(
+            Arc::clone(&data) as Arc<dyn WriteBackend>,
+            None,
+        ));
+        let gated = backends.repository();
+        let id = |n: u8| -> Id { format!("{n:02x}").repeat(32).parse().expect("id") };
+        let stored = |tpe: FileType, n: u8| {
+            data.files.lock().unwrap().contains_key(&file_key(tpe, &id(n)))
+        };
+        let write = |tpe: FileType, n: u8| gated.write_bytes(tpe, &id(n), false, vec![n].into());
+
+        // Unarmed, and armed with a healthy lock: writes go through, and the
+        // rest of the backend is the inner one.
+        write(FileType::Pack, 1).expect("an unarmed gate lets writes through");
+        gate.arm(&lock);
+        write(FileType::Index, 2).expect("a healthy lock lets writes through");
+        assert!(stored(FileType::Pack, 1) && stored(FileType::Index, 2));
+        assert_eq!(gated.read_full(FileType::Index, &id(2)).unwrap().as_ref(), [2]);
+        assert_eq!(gated.list(FileType::Pack).unwrap(), [id(1)]);
+
+        // The lock is lost while an index write is under way.
+        locks.fail_writes.store(true, Ordering::SeqCst);
+        let health = lock.health();
+        *data.on_write.lock().unwrap() = Some(Box::new(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !health.poisoned() {
+                assert!(std::time::Instant::now() < deadline, "lock never became poisoned");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }));
+        let err = write(FileType::Index, 3).expect_err("the write outlasted the lock");
+        assert!(format!("{err}").contains("removed again"), "{err}");
+        assert!(!stored(FileType::Index, 3), "an index written past the lock must not stay");
+
+        // And afterwards nothing is written at all.
+        let err = write(FileType::Index, 4).expect_err("the lock is lost");
+        assert!(format!("{err}").contains("nothing more is written"), "{err}");
+        assert!(!stored(FileType::Index, 4));
+        assert!(stored(FileType::Pack, 1) && stored(FileType::Index, 2));
+
+        locks.fail_writes.store(false, Ordering::SeqCst);
+        drop(lock);
     }
 
     // The same outage with nobody asking until it is over: a holder busy

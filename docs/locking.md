@@ -224,7 +224,17 @@ lists, restores, checks, forgets and prunes like any other.
   `RepoLock::poisoned()` is checked between the two: a lock that went
   unrefreshed past restic's cutoff means a prune may have run, and the
   snapshot is then not written (the orphaned trees go with the next prune).
-  And it is checked once more when the snapshot write has returned
+  That check alone would come too late for what `merge_trees` itself
+  writes: it stores packs, then the index files naming them, and returns
+  only when done — a prune that got in after the lock was lost deletes
+  packs no index names yet, and the index written afterwards names
+  deleted packs. So the repository is opened on gated backends
+  (`lock::gate_writes`): every write rustic_core makes is refused once the
+  lock is poisoned, and a file whose write returned after the lock went
+  bad is removed again and the write reported as failed, which fails
+  `merge_trees`. What stays was written under a lock that had been healthy
+  all along.
+  The lock is checked once more when the snapshot write has returned
   (`RepoLock::write_unpacked_while_held`), because the write itself can
   outlast the lock: restic gets out of this by cancelling the backend
   request when its lock goes bad, and wrustic's backends cannot be
@@ -250,8 +260,16 @@ lists, restores, checks, forgets and prunes like any other.
   not find the merged snapshot and would read every file again. The file
   is built field by field in restic's layout
   (`repo::merged_snapshot_json`):
-  - `time`, `hostname`, `username`, `uid`, `gid` — the newest source's,
-    copied as stored. The merged snapshot is as recent as its newest data.
+  - `hostname`, `username`, `uid`, `gid` — the newest source's, copied as
+    stored.
+  - `time` — the newest source's plus one nanosecond, in the same UTC
+    offset (`repo::just_after`). The merged snapshot is as recent as its
+    newest data, and has to be strictly the latest: restic takes the latest
+    matching snapshot as a backup's parent and leaves a tie to chance, and
+    the newest source matches as well whenever its paths are the merged
+    ones (two backups of one directory). With the source's own time, the
+    next backup sometimes picked the source and read again what only the
+    merge held.
   - `paths` — every source's paths, with a path that lies inside another
     folded into it (`repo::merged_paths`; whole components, Unix and
     Windows separators).
@@ -280,26 +298,42 @@ lists, restores, checks, forgets and prunes like any other.
   id, and the TUI names them in its notice. The check is the round trip
   itself rather than a list of field names, so it stays right when
   rustic_core learns a field.
-- **Hardlinks are carried as recorded, and a merge that would restore
-  them wrong is refused.** restic rebuilds hardlinks on restore from each
-  file's recorded device and inode: of the files with more than one link
-  that share the pair, it writes the first and links the rest to it.
-  `merge_trees` passes the pair on untouched, which is right within a
-  source and usually right across them — but two sources can record one
-  pair on different content: an inode rewritten or reused between the two
-  backups under another path (a directory renamed and a file in it
-  changed in place is enough), or two filesystems that were given the same
-  device number. restic restores such a merged snapshot with every one of
-  those files holding the first one's bytes. Giving the files separate
-  identities would mean writing tree blobs rustic_core has no way to
-  write, so the merge refuses instead, naming the two paths, before any
-  snapshot is written. The test is on the merged tree
-  (`repo::HardlinkGroups`: same device and inode, more than one link,
-  different content), since which entries meet there depends on who won
-  each path — two backups of one directory with a hardlinked file changed
-  in between differ in the sources and merge fine. Reading the merged
-  tree needs a second repository handle with a fresh index, so it only
-  happens when the scan of the sources found such a pair at all.
+- **Two things `merge_trees` gets wrong for restic are refused**, each
+  before any snapshot is written and with the paths named. Neither can be
+  put right from here — that would mean writing tree blobs, which
+  rustic_core offers no way to do — and neither shows in the sources
+  alone, since it depends on which entries meet in the merged tree. So the
+  merged tree is read back and checked (`repo::merged_tree_defect`), which
+  takes a second repository handle with a fresh index and is therefore
+  done only when the scan of the sources found what makes it possible: a
+  quoted name, or a file with more than one link.
+  - *Order.* restic keeps a directory's entries sorted by name and relies
+    on it. It stores a name as Go's `strconv.Quote` writes it, so a name
+    with a quote, a backslash, a control character or bytes that are not
+    UTF-8 is stored quoted — and `merge_trees` merges two directories in
+    the order of the stored form, which is not the order of the names
+    (`"a` sorts before `A`, the stored `\"a` after it). Directories restic
+    wrote are then not in the order the merge assumes: an entry both
+    sources hold comes out twice, the older copy last, and a restore
+    writes the older over the newer — or the entries come out in an order
+    restic does not keep. `restic check` accepts both. The merge is
+    refused when a merged directory is not strictly in restic's order.
+  - *Hardlinks.* restic rebuilds hardlinks on restore from each file's
+    recorded device and inode: of the files with more than one link that
+    share the pair it writes the first, and it makes every other file with
+    that pair a hardlink to it, whatever link count that file records
+    itself. `merge_trees` passes the pair on untouched, which is right
+    within a source and usually right across them — but two sources can
+    record one pair on different content: an inode rewritten or reused
+    between the two backups under another path (a directory renamed and a
+    file in it changed in place is enough; so is a file that lost its
+    other link, was moved and rewritten), or two filesystems that were
+    given the same device number. restic restores such a merged snapshot
+    with every one of those files holding the first one's bytes. The
+    merge is refused when a file's content differs from that of a
+    multi-link file with its device and inode. Two backups of one
+    directory with a hardlinked file changed in between differ in the
+    sources and merge fine, both links coming from the newer.
 - **How much is rewritten depends on the timezone.** rustic_core renders
   node times with the local zone's offset. Where that is what the trees
   already hold, a directory only one source has serializes back to the
@@ -317,11 +351,17 @@ restic lists the merged snapshot under the directory's path alone, with
 the newer source's time and host and both tags, walks every file of both
 through it, and passes `check --read-data`; the next `restic backup` of
 the directory names the merged snapshot as its parent and finds nothing
-new or changed) and `live_native_merge_restores_hardlinks_with_restic`
+new or changed), `live_native_merge_restores_hardlinks_with_restic`
 (`restic restore` of a merged snapshot brings back the hardlink groups of
 both sources as separate groups with their own bytes; the renamed-and-
 rewritten pair, which restic restores as four links to one file when
-merged regardless, is refused with nothing written).
+merged regardless, and the file that fell to one link before it was moved
+and rewritten are refused with nothing written) and
+`live_native_merge_quoted_names_and_parent_with_restic` (a directory
+holding `"a` and `A` merged with a later backup of `A` is refused; `"a`
+and `b`, which sort one way either way, merge and restore byte for byte;
+after two backups of one directory are merged, restic lists the merged
+snapshot as strictly the latest and takes it as the next backup's parent).
 
 **Long-running reads — non-exclusive lock (implemented):** the snapshot
 SMB share (`smb::ShareServer::share_snapshot`). Reads take no lock in wrustic's
@@ -460,6 +500,9 @@ runs it against the SMB share's real lock.
 the publication rule: a write that only returns once the lock has gone
 unrefreshed past the cutoff comes back as an error with the file removed,
 and an already poisoned lock writes nothing.
+`lock::tests::gated_writes_stop_when_the_lock_is_lost` does the same for
+what rustic_core writes through the gate: an index whose write outlasted
+the lock does not stay, and nothing is written after it.
 
 `shared_open_holds_the_append_lock_for_the_handle_lifetime` covers the other
 direction: the guard `open_indexed_full_shared_lock` hands back is held for
