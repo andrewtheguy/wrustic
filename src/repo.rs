@@ -3291,6 +3291,14 @@ mod tests {
         let source_abs = std::fs::canonicalize(&source).unwrap();
         for part in source_abs.components().filter_map(|c| match c {
             std::path::Component::Normal(p) => Some(p.to_string_lossy().into_owned()),
+            // A Windows drive is a directory of its own in the tree
+            // rustic_core's backup writes, named for the letter.
+            std::path::Component::Prefix(p) => match p.kind() {
+                std::path::Prefix::Disk(d) | std::path::Prefix::VerbatimDisk(d) => {
+                    Some(char::from(d).to_string())
+                }
+                _ => None,
+            },
             _ => None,
         }) {
             dir = full
