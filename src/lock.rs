@@ -14,7 +14,6 @@
 //! Non-exclusive lock: holder only appends; conflicts with an exclusive
 //! lock. Exclusive lock: holder may delete/rewrite; conflicts with any lock.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -1523,24 +1522,51 @@ pub(crate) fn is_lock_error(message: &str) -> bool {
 // SIGHUP, which would kill us unless ignored. restic on Windows probes with
 // OpenProcess instead (`lock_windows.go`), so there is nothing to guard —
 // the counter still runs so both platforms share one code path.
+//
+// What SIGHUP did before the first lock is what it does again after the
+// last: the default for a process on a terminal, but a process started under
+// `nohup` came with it ignored and is meant to stay that way — the headless
+// merge still has its result to print once its lock is gone.
 // ---------------------------------------------------------------------------
 
-static LOCKS_HELD: AtomicUsize = AtomicUsize::new(0);
+#[cfg(unix)]
+type SighupDisposition = libc::sigaction;
+#[cfg(not(unix))]
+type SighupDisposition = ();
+
+// How many locks are held, and SIGHUP's disposition from before the first of
+// them. One mutex over both, so that a release and an acquire running at the
+// same time cannot leave the signal set for the wrong count.
+static LOCKS_HELD: Mutex<(usize, Option<SighupDisposition>)> = Mutex::new((0, None));
 
 fn sighup_ignore_acquire() {
-    if LOCKS_HELD.fetch_add(1, Ordering::SeqCst) == 0 {
+    let mut held = LOCKS_HELD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if held.0 == 0 {
         #[cfg(unix)]
         unsafe {
+            let mut before: libc::sigaction = std::mem::zeroed();
+            held.1 = (libc::sigaction(libc::SIGHUP, std::ptr::null(), &mut before) == 0)
+                .then_some(before);
             let _ = libc::signal(libc::SIGHUP, libc::SIG_IGN);
         }
     }
+    held.0 += 1;
 }
 
 fn sighup_ignore_release() {
-    if LOCKS_HELD.fetch_sub(1, Ordering::SeqCst) == 1 {
+    let mut held = LOCKS_HELD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    held.0 -= 1;
+    if held.0 == 0 {
         #[cfg(unix)]
         unsafe {
-            let _ = libc::signal(libc::SIGHUP, libc::SIG_DFL);
+            match held.1.take() {
+                Some(before) => {
+                    let _ = libc::sigaction(libc::SIGHUP, &before, std::ptr::null_mut());
+                }
+                None => {
+                    let _ = libc::signal(libc::SIGHUP, libc::SIG_DFL);
+                }
+            }
         }
     }
 }
@@ -1558,6 +1584,7 @@ pub(crate) fn test_acquire_guard() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
 
@@ -3149,6 +3176,24 @@ mod tests {
         assert_eq!(disposition(), libc::SIG_IGN, "still holding one lock");
         drop(shared);
         assert_eq!(disposition(), libc::SIG_DFL, "all locks released");
+
+        // A process started under `nohup` comes with SIGHUP ignored, and
+        // releasing a lock must not undo that: it is put back as it was
+        // found, not to the default.
+        unsafe {
+            let _ = libc::signal(libc::SIGHUP, libc::SIG_IGN);
+        }
+        let under_nohup = RepoLock::acquire_shared(
+            MemLockBackend::new() as Arc<dyn LockBackend>,
+            test_crypto(true),
+        )
+        .unwrap();
+        drop(under_nohup);
+        let after = disposition();
+        unsafe {
+            let _ = libc::signal(libc::SIGHUP, libc::SIG_DFL);
+        }
+        assert_eq!(after, libc::SIG_IGN, "an inherited ignore outlives the lock");
     }
 
     // -----------------------------------------------------------------------

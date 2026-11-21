@@ -25,7 +25,8 @@ exactly which workflows that means.
 - **Snapshot deletion**, native and guarded by a restic-compatible exclusive
   repository lock; when the repo is locked, `u` on the error screen removes
   stale locks (live ones are kept) and retries
-- **Snapshot merge** (`M` on the snapshot list), for special cases such as
+- **Snapshot merge** (`M` on the snapshot list, or `wrustic merge` from a
+  script), for special cases such as
   adding content to an existing snapshot — not a step of ordinary backups,
   where every `restic backup` already yields a complete snapshot. Back up just
   a new file or directory with restic, then merge it into the earlier snapshot
@@ -64,7 +65,9 @@ exactly which workflows that means.
   each other, or a directory of both holds names with quotes or backslashes
   that the merge cannot keep in restic's order (docs/locking.md). The merge
   runs in the background of the TUI; a write the server may still complete
-  is retried while the lock holds, and Ctrl+C stops it
+  is retried while the lock holds, and Ctrl+C stops it. `wrustic merge` runs
+  the same merge without the TUI and prints its result as JSON
+  ([Headless automation](#headless-automation-env-profiles-and-merge))
 - **Prune** (`p` on the snapshot list): reclaim the space deleted snapshots
   left behind — runs `restic prune` (restic >= 0.19, the one the installers
   bundle and only that one) with live progress and safe Ctrl+C
@@ -202,6 +205,7 @@ all.
 wrustic [-d|--config-dir <PATH>] [-p|--port <N>] [--smb-port <N>] [--no-restic-cache] [--no-keychain] [-h|--help]
 wrustic env <PROFILE> [--json]
 wrustic profiles [--json]
+wrustic merge <PROFILE> <SNAPSHOT> <SNAPSHOT>
 ```
 
 `--config-dir <PATH>` overrides the default config location —
@@ -281,7 +285,7 @@ binary was built with the `keychain` feature. See
 [`docs/keychain.md`](docs/keychain.md) for details on keychain support,
 why it is not enabled on Linux by default, and how to build with it.
 
-### Headless automation: `env` and `profiles`
+### Headless automation: `env`, `profiles` and `merge`
 
 Backup scripts and scheduled tasks can pull a profile's credentials out of the
 encrypted config without starting the TUI:
@@ -305,6 +309,49 @@ a script captures stdout); without a terminal — a scheduled task, cron, a
 keychain-less Linux host — it fails with a non-zero exit instead of hanging.
 Both commands are read-only and skip the config-directory lock, so they keep
 working while a TUI session is open.
+
+`merge` is the snapshot merge of the TUI's `M` key for scripts — back up an
+addition with restic, then fold it into the earlier snapshot:
+
+```sh
+wrustic merge myrepo 4f3c9a1e 9b07d2c4
+```
+
+```json
+{"snapshot_id":"c1d2…","sources":["4f3c9a1e…","9b07d2c4…"],"dropped_node_fields":[],"late_write_possible":false}
+```
+
+Each snapshot is named by its full id or by its first 8 characters or more, as
+long as only one snapshot begins with them — the short ids `restic snapshots`
+prints work, anything shorter is refused.
+The result is one JSON object on stdout, with or without `--json`:
+
+- `snapshot_id` — the full id of the new snapshot.
+- `sources` — the full ids of the two snapshots merged, in the order given.
+  They are kept.
+- `dropped_node_fields` — file metadata the sources hold and the merged
+  snapshot does not, by restic's field name (`generic_attributes` for a
+  Windows backup's creation times, file attributes and security descriptors);
+  empty when nothing was lost.
+- `late_write_possible` — `true` when a write the server reported as failed
+  may still be stored after the merge has returned. A warning on stderr says
+  so too: put off pruning and deleting the merged snapshot until the server
+  has had time to finish (docs/locking.md).
+
+A merge that fails prints its reason on stderr, exits non-zero and leaves
+stdout empty. The one non-zero exit after a merge that went through is a
+result that could not be written to stdout (a full disk, a closed pipe): the
+message says the merge is done and names the snapshot. It finds the passphrase as `env` does, and likewise skips the
+config-directory lock; in the repository it holds restic's non-exclusive
+lock, so it runs alongside backups and an open TUI. It does not wait for the
+repository: a prune, forget or tag edit holding it makes the merge fail with
+the lock error, and a lock left behind by a process that is gone is cleared
+with `restic unlock` (or `u` in the TUI). Ctrl+C or SIGTERM stops it where
+that is safe — no new write is begun, and the lock is released before it
+exits — which can take until the step under way returns. Closing the console
+window on Windows asks for the same stop, but Windows ends the process 5
+seconds later whether or not the merge got that far; one cut off there leaves
+its lock for `restic unlock`, like a killed one.
 
 Both variables unlock the TUI as well: with either set, `wrustic` goes
 straight from launch to the profile list, skipping the unlock-method choice

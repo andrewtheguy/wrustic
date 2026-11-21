@@ -1,6 +1,6 @@
 [package]
 name = "wrustic"
-version = "0.0.73"
+version = "0.0.74"
 edition = "2024"
 
 [dependencies]
@@ -58,6 +58,10 @@ tui-input = { version = "0.15", default-features = false, features = ["crossterm
 url = "2"
 zstd = "0.14"
 keyring-core = { version = "1", optional = true }
+# Lets the headless `wrustic merge` stop safely on Ctrl+C and, with
+# `termination`, on SIGTERM, instead of dying with its repository lock in
+# place (src/automation.rs). The TUI reads Ctrl+C as a key and does not use it.
+ctrlc = { version = "3.5", features = ["termination"] }
 
 [target.'cfg(unix)'.dependencies]
 # uid/gid for restic-compatible lock files, kill(pid, 0) staleness probes, and
@@ -67,9 +71,11 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 # OpenProcess-based liveness probe for same-host lock staleness — the Windows
-# counterpart of kill(pid, 0), mirroring restic's os.FindProcess use.
+# counterpart of kill(pid, 0), mirroring restic's os.FindProcess use — and
+# the console handler that stops a headless merge when its window is closed.
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_System_Console",
     "Win32_System_Threading",
 ] }
 [target.'cfg(target_os = "macos")'.dependencies]

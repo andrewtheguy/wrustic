@@ -247,7 +247,11 @@ smbanything's own docs. The architectural points:
   the lock holds, and `retries` (`lock::WriteRetries`) is how the TUI
   shows that and how Ctrl+C ends it. `App`'s drop stops a merge still
   running and waits for the worker, so an error out of the main loop
-  does not exit the process under it.
+  does not exit the process under it. The headless `wrustic merge`
+  (`automation::run_merge`) calls it on the main thread instead, after
+  `resolve_snapshot_ids` has turned short ids into full ones, prints the
+  `MergeOutcome` as JSON, and has SIGINT and SIGTERM do what Ctrl+C does
+  on the merging screen.
 - `unlock(profile)` — native stale-lock removal, offered with `u` on the
   delete-error screen when `lock::is_lock_error()` matches the failure.
   Only locks that are provably dead are removed (older than restic's

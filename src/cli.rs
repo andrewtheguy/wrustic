@@ -63,6 +63,7 @@ pub(crate) const USAGE: &str = "\
 Usage: wrustic [OPTIONS]
        wrustic env <PROFILE> [--json] [OPTIONS]
        wrustic profiles [--json] [OPTIONS]
+       wrustic merge <PROFILE> <SNAPSHOT> <SNAPSHOT> [OPTIONS]
 
 Commands (headless, for scripts and scheduled tasks — no TUI is started):
   env <PROFILE>       Decrypt profile <PROFILE> and print the environment
@@ -79,10 +80,31 @@ Commands (headless, for scripts and scheduled tasks — no TUI is started):
                       while the TUI is open.
   profiles            Print the profile names in the config, one per line, or
                       as a JSON array with --json. Needs no passphrase.
+  merge <PROFILE> <SNAPSHOT> <SNAPSHOT>
+                      Merge two snapshots of profile <PROFILE>'s repository
+                      into one new snapshot — what 'M' does on the TUI's
+                      snapshot list — and print the result as one JSON object
+                      on stdout: \"snapshot_id\" (the new snapshot),
+                      \"sources\" (the full ids of the two merged),
+                      \"dropped_node_fields\" (file metadata the sources hold
+                      and the merged snapshot does not; empty when nothing
+                      was lost) and \"late_write_possible\" (true when a write
+                      the server reported as failed may still be stored
+                      later; see docs/locking.md before the next prune).
+                      Each <SNAPSHOT> is a full snapshot id or its first 8
+                      characters or more, as long as only one snapshot begins
+                      with them. The source snapshots are kept. A failure is
+                      a message on stderr and a non-zero exit, with nothing
+                      on stdout.
+                      Runs under restic's non-exclusive repository lock, so
+                      it coexists with running backups and an open TUI.
+                      Ctrl+C (or SIGTERM) stops it where that is safe: no new
+                      write is begun, and the lock is released before it
+                      exits. The passphrase is found as for `env`.
 
 Options:
       --json                  With `env` or `profiles`: print JSON instead of
-                              plain lines.
+                              plain lines. `merge` prints JSON either way.
   -d, --config-dir <PATH>     Use <PATH> as the wrustic config directory instead
                               of the WRUSTIC_CONFIG_DIR environment variable or
                               the platform default (~/.config/wrustic on Linux).
@@ -183,6 +205,8 @@ Environment:
 pub(crate) enum Command {
     Env { profile: String, json: bool },
     Profiles { json: bool },
+    /// The two snapshots as given: full ids or prefixes, resolved later.
+    Merge { profile: String, snapshots: [String; 2] },
 }
 
 /// A developer harness, reached as `wrustic dev <name>`. Kept out of
@@ -331,6 +355,17 @@ requires compiling with `--features smb-tun`"
             }
             Some(Command::Profiles { json })
         }
+        // Its output is JSON whether or not `--json` is given: the flag is
+        // taken as it is for the other commands, and changes nothing here.
+        Some("merge") => {
+            let [_, profile, first, second] = positionals.as_slice() else {
+                bail!("usage: wrustic merge <PROFILE> <SNAPSHOT> <SNAPSHOT>");
+            };
+            Some(Command::Merge {
+                profile: profile.clone(),
+                snapshots: [first.clone(), second.clone()],
+            })
+        }
         // `dev` is not a [`Command`]: it is dispatched on its own, so this
         // arm records it and leaves the automation command unset.
         #[cfg(feature = "dev-harness")]
@@ -343,7 +378,7 @@ requires compiling with `--features smb-tun`"
     // A stray flag that silently does nothing would look like broken output
     // rather than a mistyped invocation — refuse it instead.
     if json && cli.command.is_none() {
-        bail!("--json only applies to `env` and `profiles`");
+        bail!("--json only applies to `env`, `profiles` and `merge`");
     }
     Ok(cli)
 }
@@ -517,6 +552,28 @@ mod tests {
             Some(Command::Profiles { json: true })
         );
         assert!(parse(&["profiles", "extra"]).is_err());
+    }
+
+    /// A merge is one profile and exactly two snapshots, on either side of
+    /// the flags; its output is JSON with or without `--json`.
+    #[test]
+    fn merge_command_takes_a_profile_and_exactly_two_snapshots() {
+        for argv in [
+            &["merge", "myrepo", "aaaa", "bbbb"][..],
+            &["merge", "myrepo", "aaaa", "bbbb", "--json"][..],
+            &["-d", "d", "merge", "myrepo", "aaaa", "bbbb"][..],
+        ] {
+            assert_eq!(
+                parse(argv).expect("parses").command,
+                Some(Command::Merge {
+                    profile: "myrepo".into(),
+                    snapshots: ["aaaa".into(), "bbbb".into()],
+                })
+            );
+        }
+        assert!(parse(&["merge"]).is_err());
+        assert!(parse(&["merge", "myrepo", "aaaa"]).is_err());
+        assert!(parse(&["merge", "myrepo", "aaaa", "bbbb", "cccc"]).is_err());
     }
 
     /// A flag that silently does nothing would read as broken output; it must

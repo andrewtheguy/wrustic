@@ -1,5 +1,5 @@
-//! Headless entry points for scripts and scheduled tasks: `env` and
-//! `profiles`. Nothing here starts the TUI — the passphrase comes from
+//! Headless entry points for scripts and scheduled tasks: `env`, `profiles`
+//! and `merge`. Nothing here starts the TUI — the passphrase comes from
 //! `WRUSTIC_PASSPHRASE`, the file named by `WRUSTIC_PASSPHRASE_FILE`, or the
 //! OS keychain, with a plain hidden-input prompt on the controlling terminal
 //! as the interactive fallback. Without a terminal (scheduled tasks, cron)
@@ -7,6 +7,7 @@
 //! with a non-zero exit.
 
 use std::io::IsTerminal;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
@@ -14,6 +15,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use crate::cli::Command;
 use crate::config::{self, Config, PassphraseMeta, Paths, Profile};
 use crate::crypto::Cipher;
+use crate::lock::WriteRetries;
 use crate::passphrase;
 
 /// Overrides the keychain when set. Together with [`PASSPHRASE_FILE_ENV`]
@@ -30,6 +32,9 @@ pub(crate) fn run(command: Command, paths: Paths, no_keychain: bool) -> Result<(
     match command {
         Command::Profiles { json } => run_profiles(&paths, json),
         Command::Env { profile, json } => run_env(&paths, &profile, json, no_keychain),
+        Command::Merge { profile, snapshots } => {
+            run_merge(&paths, &profile, &snapshots, no_keychain)
+        }
     }
 }
 
@@ -52,22 +57,7 @@ fn run_env(paths: &Paths, profile_name: &str, json: bool, no_keychain: bool) -> 
     // Read-only, and the config file is replaced atomically on save — no need
     // to contend for the exclusive config lock a running TUI holds.
     let config = unlock(paths, no_keychain)?;
-    let Some(profile) = config.profiles.get(profile_name) else {
-        if config.profiles.is_empty() {
-            bail!(
-                "no profile `{profile_name}` in {} — the config has no profiles yet; create one in the TUI",
-                paths.config.display()
-            );
-        }
-        let available = config
-            .profiles
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .join(", ");
-        bail!("no profile `{profile_name}` in {} (available: {available})", paths.config.display());
-    };
-    let vars = env_vars(profile)?;
+    let vars = env_vars(profile_named(&config, paths, profile_name)?)?;
     if json {
         let map: serde_json::Map<String, serde_json::Value> = vars
             .into_iter()
@@ -76,6 +66,213 @@ fn run_env(paths: &Paths, profile_name: &str, json: bool, no_keychain: bool) -> 
         println!("{}", serde_json::to_string(&map)?);
     } else {
         print!("{}", render_dotenv(&vars)?);
+    }
+    Ok(())
+}
+
+fn profile_named<'a>(config: &'a Config, paths: &Paths, name: &str) -> Result<&'a Profile> {
+    if let Some(profile) = config.profiles.get(name) {
+        return Ok(profile);
+    }
+    if config.profiles.is_empty() {
+        bail!(
+            "no profile `{name}` in {} — the config has no profiles yet; create one in the TUI",
+            paths.config.display()
+        );
+    }
+    let available = config
+        .profiles
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!("no profile `{name}` in {} (available: {available})", paths.config.display());
+}
+
+/// What `merge` prints on stdout, as one JSON object — the contract scripts
+/// parse, so a key is not renamed or dropped lightly.
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+struct MergeReport {
+    /// The new snapshot's full id.
+    snapshot_id: String,
+    /// The full ids of the snapshots merged, in the order they were given.
+    sources: Vec<String>,
+    /// `repo::MergeOutcome::dropped_node_fields`.
+    dropped_node_fields: Vec<String>,
+    /// `repo::MergeOutcome::attempt_still_open`.
+    late_write_possible: bool,
+}
+
+/// The TUI's merge (`M` on the snapshot list) without the TUI: the same
+/// `repo::merge_snapshots`, under the same repository lock. Only the config
+/// is read here, without its directory lock, so a TUI session may be open —
+/// and may itself be working in the repository, which the repository lock
+/// settles as it does between any two processes.
+fn run_merge(
+    paths: &Paths,
+    profile_name: &str,
+    snapshots: &[String; 2],
+    no_keychain: bool,
+) -> Result<()> {
+    let config = unlock(paths, no_keychain)?;
+    let profile = profile_named(&config, paths, profile_name)?;
+    let retries = Arc::new(WriteRetries::default());
+    stop_on_interrupt(Arc::clone(&retries))?;
+    let report = merge(profile, snapshots, &retries)?;
+    // The snapshot is in the repository from here on, so nothing below may
+    // panic or fail without saying so: `println!` and `eprintln!` panic where
+    // they cannot write, and an exit that reads as a failed merge invites
+    // running it again.
+    let written = write_report(&mut std::io::stdout().lock(), &report);
+    // On stderr as well: it is the one outcome that asks something of
+    // whoever runs the repository, and a script may read only the id.
+    if report.late_write_possible {
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
+            "warning: a write the server reported as failed may still be stored later. Until \
+             it has had time to finish, put off `restic prune`, `restic forget --prune`, \
+             `restic repair index` and deleting the merged snapshot (docs/locking.md)."
+        );
+    }
+    written
+}
+
+/// Prints the report as one line of JSON. A report that cannot be written is
+/// an error, since the result on stdout is what the caller asked for — but
+/// one that says the merge itself is done, and names its snapshot.
+fn write_report(out: &mut impl std::io::Write, report: &MergeReport) -> Result<()> {
+    let line = serde_json::to_string(report)?;
+    writeln!(out, "{line}").and_then(|()| out.flush()).map_err(|e| {
+        let why = if e.kind() == std::io::ErrorKind::BrokenPipe {
+            "whatever was reading stdout closed it".to_string()
+        } else {
+            e.to_string()
+        };
+        anyhow!(
+            "the merge is done and snapshot {} is in the repository, but its result could \
+             not be written to stdout: {why}. Do not run it again for this: that would merge \
+             a second time",
+            report.snapshot_id
+        )
+    })
+}
+
+fn merge(
+    profile: &Profile,
+    snapshots: &[String; 2],
+    retries: &Arc<WriteRetries>,
+) -> Result<MergeReport> {
+    let sources = crate::repo::resolve_snapshot_ids(profile, snapshots)?;
+    // The merge asks this itself, but only once it holds the lock and has
+    // loaded the index.
+    if retries.stopped() {
+        bail!("the merge was stopped before it began; nothing was written");
+    }
+    let outcome = crate::repo::merge_snapshots(profile, &sources, retries)?;
+    Ok(MergeReport {
+        snapshot_id: outcome.snapshot_id,
+        sources,
+        dropped_node_fields: outcome.dropped_node_fields,
+        late_write_possible: outcome.attempt_still_open,
+    })
+}
+
+/// Makes Ctrl+C and a termination request (SIGINT and SIGTERM on Unix, Ctrl+C
+/// and Ctrl+Break on Windows) stop the merge the way Ctrl+C does on the
+/// TUI's merging screen, instead of killing the process: killed, it would
+/// leave its lock file in the repository and whatever write was under way
+/// unaccounted for. Stopped, the merge returns — with an error, unless it
+/// was already past its last write — and gives the lock up on the way,
+/// however long the step under way takes.
+///
+/// SIGHUP stays as it was found. The lock module ignores it for as long as a
+/// lock is held (restic probes a lock's holder with it), and a merge started
+/// under `nohup` is meant to outlive its terminal.
+///
+/// A Windows console being closed is not such a request: see
+/// [`stop_on_console_close`].
+fn stop_on_interrupt(retries: Arc<WriteRetries>) -> Result<()> {
+    #[cfg(windows)]
+    let on_close = Arc::clone(&retries);
+    // `ctrlc` takes SIGHUP along with SIGTERM, so its disposition is read
+    // before and put back after.
+    #[cfg(unix)]
+    let hangup = unsafe {
+        let mut found: libc::sigaction = std::mem::zeroed();
+        (libc::sigaction(libc::SIGHUP, std::ptr::null(), &mut found) == 0).then_some(found)
+    };
+    let installed = ctrlc::set_handler(move || {
+        // The stop first, and the message without `eprintln!`: that panics
+        // where stderr cannot be written (closed, a pipe nobody reads), and
+        // a panic here ends the thread every later signal is handled on.
+        let stopped_already = retries.stopped();
+        retries.stop();
+        if !stopped_already {
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr(),
+                "Stopping the merge: no new write is begun and no failed one is tried again, \
+                 though one already sent may still be stored. It ends when the step under way \
+                 returns."
+            );
+        }
+    });
+    #[cfg(unix)]
+    if let Some(found) = hangup {
+        unsafe {
+            let _ = libc::sigaction(libc::SIGHUP, &found, std::ptr::null_mut());
+        }
+    }
+    installed.context("installing the handler that stops the merge on Ctrl+C")?;
+    #[cfg(windows)]
+    stop_on_console_close(on_close)?;
+    Ok(())
+}
+
+/// What Windows allows a process whose console is being closed: the stop is
+/// requested, as for Ctrl+C, but the merge has only the system's deadline to
+/// act on it — 5 seconds for a closed console — after which the process is
+/// terminated wherever it is. A merge whose step under way takes longer than
+/// that ends as a killed one does: its lock file stays in the repository
+/// until it is stale, and a write under way is unaccounted for. That is a
+/// weaker promise than Ctrl+C's, which waits as long as it takes.
+///
+/// `ctrlc` gets these events as well and answers them at once, and the
+/// system terminates a process as soon as a handler has answered — before
+/// the merge has so much as seen the stop. So this handler is registered
+/// after `ctrlc`'s, which has Windows call it first, and does not answer:
+/// the process ends when `main` returns, or at the deadline. Ctrl+C and
+/// Ctrl+Break are passed on to `ctrlc` untouched. (Logoff and shutdown come
+/// here too where Windows delivers them at all, which to a console program
+/// run by hand it generally does not.)
+#[cfg(windows)]
+fn stop_on_console_close(retries: Arc<WriteRetries>) -> Result<()> {
+    use windows_sys::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler,
+    };
+
+    static STOP: std::sync::OnceLock<Arc<WriteRetries>> = std::sync::OnceLock::new();
+
+    // Runs on a thread the system creates for it.
+    extern "system" fn on_event(event: u32) -> windows_sys::core::BOOL {
+        if matches!(event, CTRL_C_EVENT | CTRL_BREAK_EVENT) {
+            return 0;
+        }
+        if let Some(retries) = STOP.get() {
+            retries.stop();
+        }
+        loop {
+            std::thread::park();
+        }
+    }
+
+    if STOP.set(retries).is_err() {
+        bail!("the handler that stops the merge when the console closes is already installed");
+    }
+    if unsafe { SetConsoleCtrlHandler(Some(on_event), 1) } == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("installing the handler that stops the merge when the console closes");
     }
     Ok(())
 }
@@ -441,6 +638,92 @@ mod tests {
         .expect_err("reader failure must propagate");
         assert_eq!(calls, 1);
         assert!(format!("{err:#}").contains("tty gone"), "{err:#}");
+    }
+
+    /// The headless merge end to end on a real repository: ids given as a
+    /// script would have them — one in full, one cut short as restic prints
+    /// it — and the report naming the snapshot that is then in the
+    /// repository, under the keys the help text promises.
+    #[test]
+    fn merge_resolves_short_ids_and_reports_the_new_snapshot() {
+        let _guard = crate::lock::test_acquire_guard();
+        let fixture = crate::testrepo::TestRepo::init("headless-merge");
+        let first = fixture.backup(&[("a.txt", b"a\n")], &[]);
+        std::fs::remove_file(fixture.source_path().join("a.txt")).unwrap();
+        let second = fixture.backup(&[("b.txt", b"b\n")], &[]);
+
+        let given = [first[..8].to_ascii_uppercase(), second.clone()];
+        let report = merge(fixture.profile(), &given, &Default::default()).expect("merge");
+        assert_eq!(report.sources, vec![first.clone(), second.clone()]);
+        assert!(!report.late_write_possible, "a local write is over when it returns");
+        let rows = crate::repo::load_snapshots(fixture.profile()).expect("list snapshots").rows;
+        assert_eq!(rows.len(), 3, "the sources are kept");
+        assert!(report.snapshot_id != first && report.snapshot_id != second);
+        assert!(rows.iter().any(|row| row.id == report.snapshot_id));
+        assert_eq!(fixture.lock_count(), 0, "the lock is given up before the report");
+
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "snapshot_id": report.snapshot_id,
+                "sources": [first, second],
+                "dropped_node_fields": report.dropped_node_fields,
+                "late_write_possible": false,
+            })
+        );
+    }
+
+    /// A result that cannot be written — stdout on a full disk, a reader
+    /// that went away — is an error and not a panic, and one that says the
+    /// merge is done: by then the snapshot is in the repository.
+    #[test]
+    fn a_report_that_cannot_be_written_is_an_error_naming_the_snapshot() {
+        struct Refusing(std::io::ErrorKind);
+        impl std::io::Write for Refusing {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(self.0.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let report = MergeReport {
+            snapshot_id: "ab".repeat(32),
+            sources: vec!["cd".repeat(32), "ef".repeat(32)],
+            dropped_node_fields: Vec::new(),
+            late_write_possible: false,
+        };
+        let mut written = Vec::new();
+        write_report(&mut written, &report).expect("a writable stdout");
+        assert!(written.ends_with(b"\"late_write_possible\":false}\n"));
+
+        for kind in [std::io::ErrorKind::StorageFull, std::io::ErrorKind::BrokenPipe] {
+            let err = write_report(&mut Refusing(kind), &report).expect_err("an unwritable stdout");
+            let message = format!("{err:#}");
+            assert!(message.contains(&report.snapshot_id), "{message}");
+            assert!(message.contains("the merge is done"), "{message}");
+        }
+    }
+
+    /// A stop that arrives before the merge has begun — during the passphrase
+    /// lookup or while short ids are resolved — ends it there: no lock is
+    /// taken and nothing is written.
+    #[test]
+    fn a_merge_stopped_before_it_begins_writes_nothing() {
+        let fixture = crate::testrepo::TestRepo::init("headless-merge-stopped");
+        let first = fixture.backup(&[("a.txt", b"a\n")], &[]);
+        let second = fixture.backup(&[("b.txt", b"b\n")], &[]);
+        let before = fixture.fingerprint().expect("fingerprint");
+
+        let retries = Arc::new(WriteRetries::default());
+        retries.stop();
+        let err = merge(fixture.profile(), &[first, second], &retries)
+            .expect_err("a stopped merge must not run");
+        assert!(format!("{err:#}").contains("stopped before it began"), "{err:#}");
+        assert_eq!(fixture.fingerprint().expect("fingerprint"), before);
+        assert_eq!(fixture.lock_count(), 0);
     }
 
     #[test]
