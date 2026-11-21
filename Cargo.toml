@@ -71,9 +71,11 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 # OpenProcess-based liveness probe for same-host lock staleness — the Windows
-# counterpart of kill(pid, 0), mirroring restic's os.FindProcess use.
+# counterpart of kill(pid, 0), mirroring restic's os.FindProcess use — and
+# the console handler that stops a headless merge when its window is closed.
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_System_Console",
     "Win32_System_Threading",
 ] }
 [target.'cfg(target_os = "macos")'.dependencies]

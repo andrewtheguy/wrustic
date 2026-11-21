@@ -346,7 +346,10 @@ repository: a prune, forget or tag edit holding it makes the merge fail with
 the lock error, and a lock left behind by a process that is gone is cleared
 with `restic unlock` (or `u` in the TUI). Ctrl+C or SIGTERM stops it where
 that is safe — no new write is begun, and the lock is released before it
-exits — which can take until the step under way returns.
+exits — which can take until the step under way returns. Closing the console
+window on Windows asks for the same stop, but Windows ends the process 5
+seconds later whether or not the merge got that far; one cut off there leaves
+its lock for `restic unlock`, like a killed one.
 
 Both variables unlock the TUI as well: with either set, `wrustic` goes
 straight from launch to the profile list, skipping the unlock-method choice

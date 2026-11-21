@@ -372,7 +372,13 @@ lists, restores, checks, forgets and prunes like any other.
   command and stop the merge the same way, where they would otherwise kill
   the process with its lock file in the repository. SIGHUP is not among
   them: it stays with the lock module, which ignores it while a lock is
-  held.
+  held. A Windows console being closed is a weaker case, since the system
+  terminates the process 5 seconds after telling it, or as soon as a
+  handler answers: the stop is requested and the handler does not answer
+  (`automation::stop_on_console_close`), so a merge that can end within
+  the 5 seconds gives its lock up, and one that cannot is cut off like a
+  killed process — lock file left until stale, write under way
+  unaccounted for.
   Where the attempts end with one of them still open — the lock lost, a
   refusal, or the merge stopped — the write is abandoned unsettled, and
   the error

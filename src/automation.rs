@@ -152,17 +152,23 @@ fn merge(
     })
 }
 
-/// Makes Ctrl+C and a termination request (SIGINT and SIGTERM on Unix, every
-/// console control event on Windows) stop the merge the way Ctrl+C does on
-/// the TUI's merging screen, instead of killing the process: killed, it
-/// would leave its lock file in the repository and whatever write was under
-/// way unaccounted for. Stopped, the merge returns — with an error, unless it
-/// was already past its last write — and gives the lock up on the way.
+/// Makes Ctrl+C and a termination request (SIGINT and SIGTERM on Unix, Ctrl+C
+/// and Ctrl+Break on Windows) stop the merge the way Ctrl+C does on the
+/// TUI's merging screen, instead of killing the process: killed, it would
+/// leave its lock file in the repository and whatever write was under way
+/// unaccounted for. Stopped, the merge returns — with an error, unless it
+/// was already past its last write — and gives the lock up on the way,
+/// however long the step under way takes.
 ///
 /// SIGHUP stays as it was found. The lock module ignores it for as long as a
 /// lock is held (restic probes a lock's holder with it), and a merge started
 /// under `nohup` is meant to outlive its terminal.
+///
+/// A Windows console being closed is not such a request: see
+/// [`stop_on_console_close`].
 fn stop_on_interrupt(retries: Arc<WriteRetries>) -> Result<()> {
+    #[cfg(windows)]
+    let on_close = Arc::clone(&retries);
     // `ctrlc` takes SIGHUP along with SIGTERM, so its disposition is read
     // before and put back after.
     #[cfg(unix)]
@@ -171,14 +177,20 @@ fn stop_on_interrupt(retries: Arc<WriteRetries>) -> Result<()> {
         (libc::sigaction(libc::SIGHUP, std::ptr::null(), &mut found) == 0).then_some(found)
     };
     let installed = ctrlc::set_handler(move || {
-        if !retries.stopped() {
-            eprintln!(
+        // The stop first, and the message without `eprintln!`: that panics
+        // where stderr cannot be written (closed, a pipe nobody reads), and
+        // a panic here ends the thread every later signal is handled on.
+        let stopped_already = retries.stopped();
+        retries.stop();
+        if !stopped_already {
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr(),
                 "Stopping the merge: no new write is begun and no failed one is tried again, \
                  though one already sent may still be stored. It ends when the step under way \
                  returns."
             );
         }
-        retries.stop();
     });
     #[cfg(unix)]
     if let Some(found) = hangup {
@@ -186,7 +198,57 @@ fn stop_on_interrupt(retries: Arc<WriteRetries>) -> Result<()> {
             let _ = libc::sigaction(libc::SIGHUP, &found, std::ptr::null_mut());
         }
     }
-    installed.context("installing the handler that stops the merge on Ctrl+C")
+    installed.context("installing the handler that stops the merge on Ctrl+C")?;
+    #[cfg(windows)]
+    stop_on_console_close(on_close)?;
+    Ok(())
+}
+
+/// What Windows allows a process whose console is being closed: the stop is
+/// requested, as for Ctrl+C, but the merge has only the system's deadline to
+/// act on it — 5 seconds for a closed console — after which the process is
+/// terminated wherever it is. A merge whose step under way takes longer than
+/// that ends as a killed one does: its lock file stays in the repository
+/// until it is stale, and a write under way is unaccounted for. That is a
+/// weaker promise than Ctrl+C's, which waits as long as it takes.
+///
+/// `ctrlc` gets these events as well and answers them at once, and the
+/// system terminates a process as soon as a handler has answered — before
+/// the merge has so much as seen the stop. So this handler is registered
+/// after `ctrlc`'s, which has Windows call it first, and does not answer:
+/// the process ends when `main` returns, or at the deadline. Ctrl+C and
+/// Ctrl+Break are passed on to `ctrlc` untouched. (Logoff and shutdown come
+/// here too where Windows delivers them at all, which to a console program
+/// run by hand it generally does not.)
+#[cfg(windows)]
+fn stop_on_console_close(retries: Arc<WriteRetries>) -> Result<()> {
+    use windows_sys::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler,
+    };
+
+    static STOP: std::sync::OnceLock<Arc<WriteRetries>> = std::sync::OnceLock::new();
+
+    // Runs on a thread the system creates for it.
+    extern "system" fn on_event(event: u32) -> windows_sys::core::BOOL {
+        if matches!(event, CTRL_C_EVENT | CTRL_BREAK_EVENT) {
+            return 0;
+        }
+        if let Some(retries) = STOP.get() {
+            retries.stop();
+        }
+        loop {
+            std::thread::park();
+        }
+    }
+
+    if STOP.set(retries).is_err() {
+        bail!("the handler that stops the merge when the console closes is already installed");
+    }
+    if unsafe { SetConsoleCtrlHandler(Some(on_event), 1) } == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("installing the handler that stops the merge when the console closes");
+    }
+    Ok(())
 }
 
 /// KEY=VALUE lines. Line-oriented consumers would silently truncate a secret
