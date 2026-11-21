@@ -78,8 +78,9 @@ SIGHUP-ignore handler so its own processes survive the probe. The default
 action for SIGHUP is process termination — so if wrustic holds a lock and
 someone runs `restic unlock` on the same host, restic would *kill the
 wrustic TUI*. wrustic must ignore SIGHUP while it holds any lock (and
-restore the default disposition afterwards, so closing the terminal still
-terminates the app normally).
+restore the disposition it found afterwards: the default, so closing the
+terminal still terminates the app normally — or ignored, for a headless
+merge started under `nohup`, which still has its result to print).
 
 Windows has no SIGHUP: restic probes liveness with `OpenProcess` there
 (`internal/restic/lock_windows.go`) and writes uid/gid 0 into its lock

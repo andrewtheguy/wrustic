@@ -119,17 +119,43 @@ fn run_merge(
     let retries = Arc::new(WriteRetries::default());
     stop_on_interrupt(Arc::clone(&retries))?;
     let report = merge(profile, snapshots, &retries)?;
-    println!("{}", serde_json::to_string(&report)?);
+    // The snapshot is in the repository from here on, so nothing below may
+    // panic or fail without saying so: `println!` and `eprintln!` panic where
+    // they cannot write, and an exit that reads as a failed merge invites
+    // running it again.
+    let written = write_report(&mut std::io::stdout().lock(), &report);
     // On stderr as well: it is the one outcome that asks something of
     // whoever runs the repository, and a script may read only the id.
     if report.late_write_possible {
-        eprintln!(
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
             "warning: a write the server reported as failed may still be stored later. Until \
              it has had time to finish, put off `restic prune`, `restic forget --prune`, \
              `restic repair index` and deleting the merged snapshot (docs/locking.md)."
         );
     }
-    Ok(())
+    written
+}
+
+/// Prints the report as one line of JSON. A report that cannot be written is
+/// an error, since the result on stdout is what the caller asked for — but
+/// one that says the merge itself is done, and names its snapshot.
+fn write_report(out: &mut impl std::io::Write, report: &MergeReport) -> Result<()> {
+    let line = serde_json::to_string(report)?;
+    writeln!(out, "{line}").and_then(|()| out.flush()).map_err(|e| {
+        let why = if e.kind() == std::io::ErrorKind::BrokenPipe {
+            "whatever was reading stdout closed it".to_string()
+        } else {
+            e.to_string()
+        };
+        anyhow!(
+            "the merge is done and snapshot {} is in the repository, but its result could \
+             not be written to stdout: {why}. Do not run it again for this: that would merge \
+             a second time",
+            report.snapshot_id
+        )
+    })
 }
 
 fn merge(
@@ -647,6 +673,38 @@ mod tests {
                 "late_write_possible": false,
             })
         );
+    }
+
+    /// A result that cannot be written — stdout on a full disk, a reader
+    /// that went away — is an error and not a panic, and one that says the
+    /// merge is done: by then the snapshot is in the repository.
+    #[test]
+    fn a_report_that_cannot_be_written_is_an_error_naming_the_snapshot() {
+        struct Refusing(std::io::ErrorKind);
+        impl std::io::Write for Refusing {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(self.0.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let report = MergeReport {
+            snapshot_id: "ab".repeat(32),
+            sources: vec!["cd".repeat(32), "ef".repeat(32)],
+            dropped_node_fields: Vec::new(),
+            late_write_possible: false,
+        };
+        let mut written = Vec::new();
+        write_report(&mut written, &report).expect("a writable stdout");
+        assert!(written.ends_with(b"\"late_write_possible\":false}\n"));
+
+        for kind in [std::io::ErrorKind::StorageFull, std::io::ErrorKind::BrokenPipe] {
+            let err = write_report(&mut Refusing(kind), &report).expect_err("an unwritable stdout");
+            let message = format!("{err:#}");
+            assert!(message.contains(&report.snapshot_id), "{message}");
+            assert!(message.contains("the merge is done"), "{message}");
+        }
     }
 
     /// A stop that arrives before the merge has begun — during the passphrase

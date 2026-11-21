@@ -339,7 +339,9 @@ The result is one JSON object on stdout, with or without `--json`:
   has had time to finish (docs/locking.md).
 
 A merge that fails prints its reason on stderr, exits non-zero and leaves
-stdout empty. It finds the passphrase as `env` does, and likewise skips the
+stdout empty. The one non-zero exit after a merge that went through is a
+result that could not be written to stdout (a full disk, a closed pipe): the
+message says the merge is done and names the snapshot. It finds the passphrase as `env` does, and likewise skips the
 config-directory lock; in the repository it holds restic's non-exclusive
 lock, so it runs alongside backups and an open TUI. It does not wait for the
 repository: a prune, forget or tag edit holding it makes the merge fail with
