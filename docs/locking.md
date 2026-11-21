@@ -201,7 +201,8 @@ both tools:
   restic can itself retag the rewritten snapshot).
 
 **Native snapshot merge (implemented — phase 6, `repo::merge_snapshots`,
-the TUI's `M` on the snapshot list):** two snapshots become one new
+the TUI's `M` on the snapshot list and the headless `wrustic merge`):** two
+snapshots become one new
 snapshot holding the files of both — the way to add a file or directory to
 an existing snapshot without reading the rest of it again: back up only
 the addition, then merge. It is a tool for special cases like that one,
@@ -365,6 +366,13 @@ lists, restores, checks, forgets and prunes like any other.
   the worker runs — the terminal gone, an error out of the main loop —
   does the same and waits for the worker, so the process does not exit
   under a merge with its lock in place and a write in flight.
+  The headless `wrustic merge` (`automation::run_merge`) has no screen to
+  press Ctrl+C on, so the stop is the signal: SIGINT and SIGTERM — on
+  Windows the console's control events — are caught for the length of the
+  command and stop the merge the same way, where they would otherwise kill
+  the process with its lock file in the repository. SIGHUP is not among
+  them: it stays with the lock module, which ignores it while a lock is
+  held.
   Where the attempts end with one of them still open — the lock lost, a
   refusal, or the merge stopped — the write is abandoned unsettled, and
   the error
@@ -383,7 +391,9 @@ lists, restores, checks, forgets and prunes like any other.
   what is in them, so the index that comes back can name packs that are
   gone.
   That cannot be prevented from here either, so it is said: the notice
-  after such a merge says that a late write is possible and points here.
+  after such a merge says that a late write is possible and points here
+  (headless: `late_write_possible` in the JSON result, and a warning on
+  stderr).
   A merge that fails after storing an index that way says it in its
   error — its packs are what the next prune removes.
   Until the server has had time to finish what it took, put off pruning
@@ -862,8 +872,8 @@ the dev profile only.
    dropped from the plan — the restic CLI keeps them.
 
 6. **Native snapshot merge** — DONE (`repo::merge_snapshots`, the TUI's
-   `M` on the snapshot list; see "Native snapshot merge" above for the
-   full design). The first native write under the *non-exclusive* lock,
+   `M` on the snapshot list and the headless `wrustic merge`; see "Native
+   snapshot merge" above for the full design). The first native write under the *non-exclusive* lock,
    and the first with no restic command behind it. The backup that
    produces the snapshot to merge in stays on the restic CLI; the two are
    independent — nothing is lost if the merge never runs. A lock conflict

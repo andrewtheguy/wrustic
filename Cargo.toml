@@ -58,6 +58,10 @@ tui-input = { version = "0.15", default-features = false, features = ["crossterm
 url = "2"
 zstd = "0.14"
 keyring-core = { version = "1", optional = true }
+# Lets the headless `wrustic merge` stop safely on Ctrl+C and, with
+# `termination`, on SIGTERM, instead of dying with its repository lock in
+# place (src/automation.rs). The TUI reads Ctrl+C as a key and does not use it.
+ctrlc = { version = "3.5", features = ["termination"] }
 
 [target.'cfg(unix)'.dependencies]
 # uid/gid for restic-compatible lock files, kill(pid, 0) staleness probes, and

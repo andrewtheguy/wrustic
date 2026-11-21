@@ -6,7 +6,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use rustic_backend::BackendOptions;
-use rustic_core::repofile::{BlobType, Node, NodeType, SnapshotFile, SnapshotSummary};
+use rustic_core::repofile::{
+    BlobType, Node, NodeType, SnapshotFile, SnapshotId, SnapshotSummary,
+};
 use rustic_core::{
     Credentials, FileType, IndexedFull, IndexedFullStatus, IndexedIdsStatus, Repository,
     RepositoryOptions, RepositoryBackends, TreeId, last_modified_node,
@@ -503,6 +505,61 @@ fn retag_snapshot_json(raw: &[u8], old_id: &str, new_tags: &[String]) -> Result<
         let _ = obj.insert("original".into(), serde_json::Value::String(old_id.to_string()));
     }
     Ok(Some(serde_json::to_vec(&value).context("serializing snapshot JSON")?))
+}
+
+/// The fewest characters of a snapshot id [`resolve_snapshot_ids`] takes: the
+/// length of the short id restic prints. restic itself accepts any start
+/// that is unambiguous, down to one character — which in a small repository
+/// is nearly any character, too little to name what a write is done to.
+const SHORT_ID_LEN: usize = 8;
+
+/// The full ids of the snapshots `given` names, in the order given. Each is a
+/// full snapshot id or the start of one, [`SHORT_ID_LEN`] characters or more;
+/// a start has to be that of exactly one snapshot.
+///
+/// For the headless `merge`, whose ids are typed or scripted rather than
+/// picked from a list. Read without a lock, and only when a short id is among
+/// them: the write that follows reads each snapshot again by its full id
+/// under its own lock.
+pub(crate) fn resolve_snapshot_ids(profile: &Profile, given: &[String]) -> Result<Vec<String>> {
+    for id in given {
+        if !(SHORT_ID_LEN..=64).contains(&id.len()) || !id.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            bail!(
+                "`{id}` is not a snapshot id: expected a full 64-character hex id or at least \
+                 its first {SHORT_ID_LEN} characters"
+            );
+        }
+    }
+    let given: Vec<String> = given.iter().map(|id| id.to_ascii_lowercase()).collect();
+    if given.iter().all(|id| id.len() == 64) {
+        return Ok(given);
+    }
+    let backends = build_backends(profile)?;
+    let repo = Repository::new(&RepositoryOptions::default(), &backends)?
+        .open(&Credentials::password(profile.password()))?;
+    let present: Vec<String> = repo
+        .list::<SnapshotId>()?
+        .map(|id| id.to_hex().as_str().to_string())
+        .collect();
+    ids_starting_with(&present, &given)
+}
+
+// For each of `starts`, the one id of `present` that begins with it.
+fn ids_starting_with(present: &[String], starts: &[String]) -> Result<Vec<String>> {
+    starts
+        .iter()
+        .map(|start| {
+            let mut matching = present.iter().filter(|id| id.starts_with(start.as_str()));
+            match (matching.next(), matching.next()) {
+                (Some(id), None) => Ok(id.clone()),
+                (None, _) => bail!("no snapshot id starts with `{start}`"),
+                (Some(_), Some(_)) => bail!(
+                    "more than one snapshot id starts with `{start}`: give more of the id"
+                ),
+            }
+        })
+        .collect()
 }
 
 /// Merges snapshots into one new snapshot natively (docs/locking.md, "Native
@@ -3060,6 +3117,40 @@ mod tests {
             "{message}"
         );
         assert_eq!(load_snapshots(fixture.profile()).unwrap().rows.len(), 2);
+    }
+
+    /// A short id is the start of exactly one snapshot's id, in any letter
+    /// case, and at least as long as the one restic prints. A start that
+    /// fits none or several is an error naming it, and so is anything that
+    /// is no id or too little of one.
+    #[test]
+    fn snapshot_ids_resolve_from_an_unambiguous_start() {
+        let present =
+            ["ab12".repeat(16), "ab34".repeat(16), "cd56".repeat(16)].map(String::from).to_vec();
+        let starts = |starts: &[&str]| {
+            ids_starting_with(&present, &starts.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
+        assert_eq!(
+            starts(&["cd", "ab12", &present[1]]).expect("unambiguous"),
+            vec![present[2].clone(), present[0].clone(), present[1].clone()]
+        );
+        let err = starts(&["cd", "ab"]).expect_err("two ids start with ab");
+        assert!(format!("{err:#}").contains("more than one snapshot id starts with `ab`"));
+        let err = starts(&["ef"]).expect_err("no id starts with ef");
+        assert!(format!("{err:#}").contains("no snapshot id starts with `ef`"));
+
+        let fixture = TestRepo::init("resolve-ids");
+        let id = fixture.backup(&[("a.txt", b"a\n")], &[]);
+        let resolve = |given: &str| resolve_snapshot_ids(fixture.profile(), &[given.to_string()]);
+        assert_eq!(resolve(&id[..8].to_ascii_uppercase()).expect("short id"), vec![id.clone()]);
+        // A full id is taken as given, present or not: whatever uses it reads
+        // the snapshot under its lock and says so if it is not there.
+        let absent = "0".repeat(64);
+        assert_eq!(resolve(&absent).expect("full id"), vec![absent.clone()]);
+        for bad in ["", "latest", "xyz", &id[..7], &format!("{id}0")] {
+            let err = resolve(bad).expect_err("not a snapshot id");
+            assert!(format!("{err:#}").contains("is not a snapshot id"), "{bad}: {err:#}");
+        }
     }
 
     // The merge end to end on an in-process repository, and its lock: the

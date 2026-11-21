@@ -16,7 +16,7 @@ screen). Everything else wrustic does at runtime is native:
 | All reads (snapshot list, tree browsing, diff, file view/share, filters) | `rustic_core` |
 | Snapshot delete | native, under the restic-compatible repo lock (`repo::delete_snapshot`) |
 | Tag edits (`t` on the snapshot list) | native, under the same exclusive lock (`repo::edit_snapshot_tags`, lossless raw-JSON rewrite) |
-| Snapshot merge (`M` on the snapshot list) | native, under restic's non-exclusive lock (`repo::merge_snapshots`); restic has no merge command |
+| Snapshot merge (`M` on the snapshot list, or the headless `wrustic merge`) | native, under restic's non-exclusive lock (`repo::merge_snapshots`); restic has no merge command |
 | Unlock / stale-lock removal (`u` shortcut) | native (`repo::unlock`) |
 | Prune | **restic CLI**, via the spawn harness in `src/restic.rs` |
 
